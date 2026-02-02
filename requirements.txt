@@ -1,0 +1,37 @@
+# pytorch-lightning==1.8.6
+diffusers==0.29.1
+h5py==3.11.0
+einops==0.8.0
+ftfy==6.2.0
+imageio==2.34.1
+imageio-ffmpeg==0.5.1
+regex==2024.5.15
+scikit-video==1.1.11
+tqdm==4.66.4
+av==12.1.0
+beartype==0.18.5
+scikit-learn==1.5.0
+timm==1.0.7
+transformers==4.37.2
+decord==0.6.0
+fvcore==0.1.5.post20221221
+pycocotools==2.0.8
+cloudpickle==3.0.0
+omegaconf==2.3.0
+scikit-image==0.24.0
+lpips==0.1.4
+accelerate
+numpy==1.26.2
+# pip3 install git+https://github.com/nottombrown/imagenet_stubs
+
+fairscale==0.4.13
+# lightning==2.2.5
+opencv-python==4.10.0.84
+ipdb==0.13.13
+
+# torch==2.3.1
+# torchvision==0.18.1
+# torchaudio==2.3.1
+
+
+einx==0.3.0

@@ -1,0 +1,64 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train LLM (Fixed Args)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_llm.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--new_quant",
+                "--batch_size",
+                "2048",
+                "--max_steps",
+                "5000",
+                "--codebook_bits",
+                "16",
+                "--codebook_dim",
+                "8",
+                "--quantizer_type",
+                "BSQ",
+                "--optimizer",
+                "adamw",
+                "--recon_loss_type",
+                "mse",
+                "--lr",
+                "1e-4",
+                "--use_wandb",
+                "--eval_every",
+                "0",
+                "--lfq_weight",
+                "4",
+                "--image_gan_weight",
+                "0.3",
+                "--discriminator_iter_start",
+                "0",
+                "--decoder_type",
+                "symmetric",
+                "--normalize_data",
+                "--clip_threshold",
+                "0",
+                "--wandb_project",
+                "LLM_MultiVAE_VQ",
+                "--default_root_dir",
+                "./logs/llm_lfq_vq",
+                "--parallel_layers",
+                "1",
+                "--quantizer_type",
+                "Identity"
+            ]
+        },
+        {
+            "name": "Python 调试程序: 包含参数的当前文件",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        }
+    ]
+}
