@@ -64,6 +64,18 @@ Tokenizer with hidden dimension 32
 bash scripts/release/test_img_d32_stage1.sh
 bash scripts/release/test_img_d32_stage2.sh
 ``` 
+
+### LLM Linear Compression (BSQLinear)
+This repo also contains experimental utilities for compressing LLM `nn.Linear` weights via `litebsq.BSQLinear`.
+
+```
+# layer-by-layer distillation training (activations)
+bash scripts/lbl_train_tools.sh
+
+# category-wise weight-VAE training, then Linear -> BSQLinear replacement
+bash scripts/train_linear_by_category.sh
+```
+
 ### 📖 Citation
 If our work assists your research, feel free to give us a star ⭐ or cite us using:
 

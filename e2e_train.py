@@ -1,4 +1,3 @@
-
 import datetime
 import os
 from logging import Logger
@@ -6,7 +5,6 @@ from logging import Logger
 import datasets
 import torch
 import torch.distributed as dist
-from torch import nn
 from transformers import LlamaTokenizerFast, Trainer, default_data_collator
 import transformers
 from llm_models.fsdp_trainer import FSDPTrainer
@@ -48,7 +46,7 @@ def train() -> None:
     # model = prepare_model(ptq_args, model)
     for param in model.parameters():
         param.requires_grad = False
-
+    model.enable_input_require_grads()
     from llm_models.instead_forward import rebuild_llama_forward, rebuild_qwen3_forward
     if 'qwen3' in vae_args.model_path.lower():
         rebuild_qwen3_forward(model)
@@ -57,7 +55,7 @@ def train() -> None:
     transpose_modules = ["v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     from bitvae.models.bsq_linear import insert_bsq_linear
-    model, trainable_parameters = insert_bsq_linear(model, transpose_modules, vae_args)
+    trainable_parameters = insert_bsq_linear(model, transpose_modules, vae_args)
 
     if local_rank == 0:
         log.info("Model init completed for training {}".format(model))
@@ -123,6 +121,10 @@ def train() -> None:
     torch.distributed.barrier()
 
     trainer.train()
+
+    from bitvae.models.bsq_linear import bsq_turn2infra
+    bsq_turn2infra(trainer.model)
+
     if training_args.fsdp != "" and training_args.fsdp != []:
         cpu_state = pt_fsdp_state_dict(trainer.model)
     else:

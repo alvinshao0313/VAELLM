@@ -1,0 +1,29 @@
+torchrun --nnodes=1 --nproc_per_node=1 e2e_train.py \
+--model_path "meta-llama/Llama-2-7b-hf"  \
+--logging_dir "logs" \
+--model_max_length 2048 \
+--fp16 False \
+--bf16 True \
+--log_on_each_node False \
+--per_device_train_batch_size 1 \
+--logging_steps 1 \
+--learning_rate 1e-2 \
+--weight_decay 0. \
+--lr_scheduler_type "cosine" \
+--gradient_checkpointing True \
+--save_safetensors False \
+--max_steps 500 \
+--new_quant \
+--codebook_bits 16 \
+--codebook_dim 8 \
+--quantizer_type BSQ \
+--optimizer adamw \
+--recon_loss_type mse \
+--eval_every 100 \
+--lfq_weight 4 \
+--decoder_type symmetric \
+--normalize_weight \
+--clip_threshold 0 \
+--wandb_project LLM_MultiVAE_VQ \
+--default_root_dir ./logs/llm_lfq_vq \
+--parallel_layers 1 $@
