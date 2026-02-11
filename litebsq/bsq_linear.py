@@ -116,6 +116,22 @@ class BSQLinear(nn.Module):
         self.register_buffer('d_mean', w_flatten.mean(dim=1, keepdim=True).to(weight.dtype))
         self.register_buffer('d_std', w_flatten.std(dim=1, keepdim=True).to(weight.dtype))
 
+    def compute_weight_loss(self):
+        if not getattr(self, "is_train", False):
+            raise RuntimeError("compute_weight_loss() is only valid in training mode.")
+        w_input = self.parallel_weight(self.weight)
+        if self.w_input_batches > 1 and w_input.shape[0] > 1:
+            loss_dict = {}
+            total = w_input.shape[0]
+            chunk_size = (total + self.w_input_batches - 1) // self.w_input_batches
+            for start in range(0, total, chunk_size):
+                _, loss_chunk = self.vae(w_input[start:start + chunk_size], is_train=True)
+                for key, value in loss_chunk.items():
+                    loss_dict[key] = loss_dict.get(key, 0) + value
+            return loss_dict
+        _, loss_dict = self.vae(w_input, is_train=True)
+        return loss_dict
+
     def forward(self, x):
         # 执行线性变换
         if self.is_train:
@@ -147,16 +163,15 @@ class BSQLinear(nn.Module):
         if not self.is_train:
             return out, {}
 
-        with torch.no_grad():
-            orgi_out = F.linear(x, self.weight, self.bias)
-
-        if self.distil_loss_type == 'mse':
+        if self.distil_loss_type == "mse" and self.distil_loss_weight > 0.0:
+            with torch.no_grad():
+                orgi_out = F.linear(x, self.weight, self.bias)
             distil_loss = F.mse_loss(orgi_out, out)
+            loss_dict.update({"distil_loss": distil_loss})
+            loss_dict["loss"] += distil_loss * self.distil_loss_weight
         else:
-            distil_loss = 0.
-
-        loss_dict.update({'distil_loss': distil_loss})
-        loss_dict["loss"] += distil_loss * self.distil_loss_weight
+            # Keep key stable for logging, but avoid extra compute when distillation is disabled.
+            loss_dict.update({"distil_loss": out.new_tensor(0.0)})
         return out, loss_dict  # 输出重建out用于蒸馏
 
 

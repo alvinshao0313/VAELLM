@@ -1,10 +1,11 @@
 import argparse
+import json
 import os
 import sys
 import time
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
@@ -13,7 +14,16 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from train_utils.train_args import process_args_from, create_optimizer
+from train_utils.train_args import (
+    process_cat_train_args,
+    create_optimizer,
+    resolve_skip_layer_matches,
+)
+from train_utils.model_checkpoint_io import (
+    _build_run_output_dir,
+    _safe_path_token,
+    save_model_checkpoint,
+)
 from train_utils.utils import get_logger, set_seed
 
 
@@ -112,6 +122,10 @@ def _clone_namespace(ns, **overrides):
     return argparse.Namespace(**data)
 
 
+def _format_namespace(ns: argparse.Namespace) -> str:
+    return json.dumps(vars(ns), ensure_ascii=False, indent=2, sort_keys=True, default=str)
+
+
 def _fuse_q_scale_linear(linear: nn.Linear, q_scale: float) -> None:
     with torch.no_grad():
         weight = linear.weight.data
@@ -154,7 +168,7 @@ def _fuse_norm_into_decoder(decoder: nn.Module, mean: float, std: float) -> None
 
 
 def _eval_ppl_after_category(model: nn.Module, vae_args, ppl_limit: int, category: str, eval_device: str = "cuda") -> None:
-    from train_utils.llm_eval import calculate_ppl
+    from train_utils.eval_utils import calculate_ppl
 
     log.info("开始类别 %s 的 PPL 评估...", category)
     model.eval()
@@ -199,6 +213,7 @@ def _train_group_vae_and_replace(
     eval_blocks: int,
     output_dir: str,
     intra_parallel: int,
+    skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
     from litebsq.vae_linear import VAELinear
@@ -307,6 +322,7 @@ def _train_group_vae_and_replace(
             vae.eval()
             with torch.no_grad():
                 mse_acc = []
+                top_k_mse_acc = []
                 total = 0
                 for (x_eval_batch,) in eval_loader:
                     if total >= int(eval_blocks):
@@ -315,15 +331,34 @@ def _train_group_vae_and_replace(
                     total += x_eval_batch.shape[0]
                     x_eval = x_eval_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
                     x_recon, _ = vae(x_eval, is_train=False)
-                    mse_acc.append(torch.nn.functional.mse_loss(x_recon.float(), x_eval.float()))
+                    x_eval_f = x_eval.float()
+                    x_recon_f = x_recon.float()
+                    mse_acc.append(torch.nn.functional.mse_loss(x_recon_f, x_eval_f))
+
+                    # 对每个并行模型（P 维）独立选 top-k：
+                    # x_eval/x_recon: [B, P, C] -> [P, B*C]
+                    flat_eval = x_eval_f.permute(1, 0, 2).reshape(x_eval_f.shape[1], -1)
+                    flat_recon = x_recon_f.permute(1, 0, 2).reshape(x_recon_f.shape[1], -1)
+                    k = min(100, flat_eval.shape[1])
+                    _, topk_idx = torch.topk(flat_eval.abs(), k=k, dim=1)
+                    top_eval = torch.gather(flat_eval, dim=1, index=topk_idx)
+                    top_recon = torch.gather(flat_recon, dim=1, index=topk_idx)
+                    top_k_mse_acc.append(torch.nn.functional.mse_loss(top_recon, top_eval))
                 mse = torch.stack(mse_acc).mean() if mse_acc else torch.tensor(0.0)
-            log.info("[%s] eval@step=%d mse=%.6e", group_tag, step + 1, float(mse.detach().cpu().item()))
+                top_k_mse = torch.stack(top_k_mse_acc).mean() if top_k_mse_acc else torch.tensor(0.0)
+            log.info(
+                "[%s] eval@step=%d mse=%.6e top_k_mse(k=100)=%.6e",
+                group_tag,
+                step + 1,
+                float(mse.detach().cpu().item()),
+                float(top_k_mse.detach().cpu().item()),
+            )
             vae.train()
 
-    # 保存分组 VAE，便于复现实验和离线分析。
-    group_dir = os.path.join(output_dir, "vae_by_category", group_tag.replace("/", "_"))
-    os.makedirs(group_dir, exist_ok=True)
-    torch.save(vae.state_dict(), os.path.join(group_dir, "vae_state.pt"))
+    # # 保存分组 VAE，便于复现实验和离线分析。
+    # group_dir = os.path.join(output_dir, "vae_by_category", group_tag.replace("/", "_"))
+    # os.makedirs(group_dir, exist_ok=True)
+    # torch.save(vae.state_dict(), os.path.join(group_dir, "vae_state.pt"))
 
     if not do_convert:
         del vae, stacked_data, per_linear_flat, stacked_flat
@@ -350,6 +385,12 @@ def _train_group_vae_and_replace(
 
     for i, r in enumerate(group_refs):
         old = r.module
+        layer_idx = _extract_layer_idx(r.name)
+        skip_this = bool(
+            skip_layer_keys
+            and layer_idx is not None
+            and (int(layer_idx), str(r.category)) in skip_layer_keys
+        )
         start_idx = i * intra_parallel
         end_idx = start_idx + intra_parallel
         part_bits = []
@@ -361,12 +402,20 @@ def _train_group_vae_and_replace(
             in_features=old.in_features,
             out_features=old.out_features,
             bias=old.bias,
+            original_weight=old.weight,
             vq_weight=part_bits if intra_parallel > 1 else part_bits[0],
             decoder=part_decoders if intra_parallel > 1 else part_decoders[0],
             codebook_dim=codebook_dim,
             transpose=r.transpose,
             parallel_parts=intra_parallel,
+            always_use_original=skip_this,
+            protect_original_weight=skip_this,
         ).to(convert_device)
+        # 替换时预热：后续 LoRA / PPL 前向可直接复用缓存权重，避免重复重构。
+        try:
+            new_linear.prime_decoded_weight_cache(dtype=train_dtype)
+        except Exception as e:
+            log.warning("[%s] cache warmup failed for %s: %s", group_tag, r.name, e)
         # 替换后将模块放回 CPU，降低显存占用。
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
@@ -376,89 +425,32 @@ def _train_group_vae_and_replace(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    if argv is None:
-        argv = sys.argv[1:]
+    global log
+    cat_args, hf_args, training_args, vae_args = process_cat_train_args(argv)
+    set_seed(cat_args.seed)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--category_order", type=str, default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
-    parser.add_argument("--transpose_modules", type=str, default="v_proj,o_proj,gate_proj,up_proj,down_proj")
-    parser.add_argument(
-        "--projection_suffixes",
-        type=str,
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-        help="开启 --only_decoder_projections 时，允许参与训练的投影层后缀列表。",
-    )
-    parser.add_argument(
-        "--only_decoder_projections",
-        action="store_true",
-        default=True,
-        help="仅处理 decoder layers 中的投影层 Linear（推荐）。",
-    )
-    parser.add_argument(
-        "--include_all_linears",
-        action="store_true",
-        default=False,
-        help="覆盖 --only_decoder_projections，改为包含模型中全部 nn.Linear。",
-    )
-    parser.add_argument("--steps_per_category", type=int, default=2000)
-    parser.add_argument("--steps_per_group", type=int, default=None, help="分组模式下覆盖 steps_per_category。")
-    parser.add_argument(
-        "--linear_group_size",
-        type=int,
-        default=32,
-        help="跨层分组大小：每组同时训练多少个同类 Linear。",
-    )
-    parser.add_argument(
-        "--intra_parallel",
-        type=int,
-        default=1,
-        help="层内并行切分数：每个 Linear 再切成多少份并行训练。",
-    )
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--log_every", type=int, default=50)
-    parser.add_argument("--eval_every", type=int, default=0)
-    parser.add_argument("--eval_blocks", type=int, default=256)
-    parser.add_argument("--ppl_limit", type=int, default=-1, help="每类训练后 PPL 评估样本上限，-1 为全量。")
-    parser.add_argument("--lora_after_category", action="store_true", help="每个类别 VAE 训练后，对剩余类别做一次 LoRA 微调并融合。")
-    parser.add_argument("--lora_rank", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=float, default=16.0)
-    parser.add_argument("--lora_dropout", type=float, default=0.0)
-    parser.add_argument("--lora_steps", type=int, default=50)
-    parser.add_argument("--lora_batch_size", type=int, default=2)
-    parser.add_argument("--lora_nsamples", type=int, default=128)
-    parser.add_argument("--lora_lr", type=float, default=1e-4)
-    parser.add_argument("--lora_weight_decay", type=float, default=0.0)
-    parser.add_argument("--lora_log_every", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--train_device", type=str, default="cuda")
-    parser.add_argument("--convert", action="store_true",
-                        help="每个类别训练完成后，将 Linear 替换为压缩后的线性层。")
-    parser.add_argument("--convert_device", type=str, default="cuda")
-    parser.add_argument("--save_model", action="store_true",
-                        help="保存最终模型 state_dict/config/tokenizer（需要 --convert）。")
-    parser.add_argument("--output_dir", type=str, default="./output_linear_by_category")
-    parser.add_argument(
-        "--allow_tail_group",
-        action="store_true",
-        default=True,
-        help="允许处理最后一个不足分组大小的尾部分组。",
-    )
-    args, remaining = parser.parse_known_args(list(argv))
+    os.makedirs(cat_args.output_dir, exist_ok=True)
+    run_output_dir = _build_run_output_dir(cat_args.output_dir, vae_args.model_path)
+    os.environ["LOG_FILE"] = os.path.join(run_output_dir, "linear_by_category.log")
+    log = get_logger("linear_by_category")
+    cat_args.output_dir = run_output_dir
 
-    hf_args, training_args, vae_args = process_args_from(remaining)
-    set_seed(args.seed)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    log.info("Args: script=%s vae=%s training=%s", args, vae_args, training_args)
+    log.info("Run output directory: %s", run_output_dir)
+    log.info(
+        "Args:\nscript=%s\nvae=%s\ntraining=%s",
+        _format_namespace(cat_args),
+        _format_namespace(vae_args),
+        _format_namespace(training_args),
+    )
 
     log.info("Loading model: %s", vae_args.model_path)
     from rotation.model_utils import get_model
 
     model = get_model(vae_args.model_path, hf_args.access_token)
 
-    transpose_modules = _split_csv(args.transpose_modules)
-    projection_suffixes = _split_csv(args.projection_suffixes)
-    only_decoder_projections = bool(args.only_decoder_projections) and not bool(args.include_all_linears)
+    transpose_modules = _split_csv(cat_args.transpose_modules)
+    projection_suffixes = _split_csv(cat_args.projection_suffixes)
+    only_decoder_projections = bool(cat_args.only_decoder_projections) and not bool(cat_args.include_all_linears)
     all_linears = _collect_linears(
         model,
         transpose_modules,
@@ -466,15 +458,36 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         projection_suffixes=projection_suffixes,
     )
     discovered_categories = [r.category for r in all_linears]
-    category_order = _resolve_category_order(args.category_order, discovered_categories)
+    category_order = _resolve_category_order(cat_args.category_order, discovered_categories)
 
     refs_by_cat: Dict[str, List[LinearRef]] = {}
     for r in all_linears:
         refs_by_cat.setdefault(r.category, []).append(r)
+    discovered_skip_keys = []
+    for r in all_linears:
+        li = _extract_layer_idx(r.name)
+        if li is not None:
+            discovered_skip_keys.append((li, r.category))
+    skip_layer_keys, matched, missing = resolve_skip_layer_matches(
+        getattr(cat_args, "skip_layers", ""),
+        discovered_skip_keys,
+    )
+    if skip_layer_keys:
+        if matched:
+            log.info(
+                "skip_layers 生效: %s",
+                ",".join(f"{li}.{cat}" for li, cat in matched),
+            )
+        if missing:
+            log.warning(
+                "skip_layers 未匹配到任何 Linear: %s",
+                ",".join(f"{li}.{cat}" for li, cat in missing),
+            )
 
-    steps_per_group = int(args.steps_per_group) if args.steps_per_group is not None else int(args.steps_per_category)
-    linear_group_size = int(args.linear_group_size)
-    intra_parallel = int(args.intra_parallel)
+    steps_per_group = int(cat_args.steps_per_group) if cat_args.steps_per_group is not None else int(
+        cat_args.steps_per_category)
+    linear_group_size = int(cat_args.linear_group_size)
+    intra_parallel = int(cat_args.intra_parallel)
     if linear_group_size < 1:
         raise ValueError(f"linear_group_size must be >= 1, got {linear_group_size}")
     if intra_parallel < 1:
@@ -514,7 +527,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
         for start in range(0, len(ordered_refs), linear_group_size):
             group_refs = ordered_refs[start:start + linear_group_size]
-            if len(group_refs) < linear_group_size and not args.allow_tail_group:
+            if len(group_refs) < linear_group_size and not cat_args.allow_tail_group:
                 log.info("[%s] tail group size=%d skipped (set --allow_tail_group to include).", cat, len(group_refs))
                 break
             layer_indices = [idx for idx, _ in refs_sorted[start:start + linear_group_size]]
@@ -532,20 +545,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 group_tag=group_tag,
                 vae_args=vae_args,
                 training_args=training_args,
-                train_device=args.train_device,
-                convert_device=args.convert_device,
-                do_convert=bool(args.convert),
+                train_device=cat_args.train_device,
+                convert_device=cat_args.convert_device,
+                do_convert=bool(cat_args.convert),
                 steps=steps_per_group,
-                batch_size=args.batch_size,
-                log_every=args.log_every,
-                eval_every=args.eval_every,
-                eval_blocks=args.eval_blocks,
-                output_dir=args.output_dir,
+                batch_size=cat_args.batch_size,
+                log_every=cat_args.log_every,
+                eval_every=cat_args.eval_every,
+                eval_blocks=cat_args.eval_blocks,
+                output_dir=cat_args.output_dir,
                 intra_parallel=intra_parallel,
+                skip_layer_keys=skip_layer_keys,
             )
 
-        if args.lora_after_category:
+        if cat_args.lora_after_category:
             from train_utils.lora_utils import lora_finetune_remaining_categories
+            log.info("LoRA 微调前评估...")
+            _eval_ppl_after_category(
+                model=model,
+                vae_args=vae_args,
+                ppl_limit=cat_args.ppl_limit,
+                category=cat,
+                eval_device=cat_args.train_device,
+            )
 
             remaining_categories = active_categories[cat_idx + 1:]
             model = lora_finetune_remaining_categories(
@@ -555,42 +577,56 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 transpose_modules=transpose_modules,
                 projection_suffixes=projection_suffixes,
                 only_decoder_projections=only_decoder_projections,
+                cat_args=cat_args,
                 vae_args=vae_args,
                 training_args=training_args,
-                device=args.train_device,
-                seed=args.seed,
-                rank=args.lora_rank,
-                alpha=args.lora_alpha,
-                dropout=args.lora_dropout,
-                steps=args.lora_steps,
-                batch_size=args.lora_batch_size,
-                nsamples=args.lora_nsamples,
-                lr=args.lora_lr,
-                weight_decay=args.lora_weight_decay,
-                log_every=args.lora_log_every,
                 logger=log,
             )
 
         _eval_ppl_after_category(
             model=model,
             vae_args=vae_args,
-            ppl_limit=args.ppl_limit,
+            ppl_limit=cat_args.ppl_limit,
             category=cat,
-            eval_device=args.train_device,
+            eval_device=cat_args.train_device,
         )
+        cat_dir_name = _safe_path_token(cat)
+        cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
+        save_paths = save_model_checkpoint(
+            model,
+            cat_model_dir,
+            base_model_path=vae_args.model_path,
+            tokenizer=None,
+            save_config=True,
+            extra_meta={
+                "stage": "after_category",
+                "category": cat,
+                "category_index": int(cat_idx),
+                "lora_after_category": bool(cat_args.lora_after_category),
+            },
+        )
+        log.info("Saved category checkpoint (%s): %s", cat, save_paths["output_dir"])
 
-    if args.save_model:
-        if not args.convert:
+    if cat_args.save_model:
+        if not cat_args.convert:
             raise ValueError("--save_model requires --convert")
         from transformers import AutoTokenizer
+        from litebsq.vae_linear import clear_model_vae_linear_cache
 
-        model_out = os.path.join(args.output_dir, "final_model")
-        os.makedirs(model_out, exist_ok=True)
-        torch.save(model.state_dict(), os.path.join(model_out, "pytorch_model.bin"))
-        model.config.save_pretrained(model_out)
+        model_out = os.path.join(run_output_dir, "final_model")
         tok = AutoTokenizer.from_pretrained(vae_args.model_path, use_fast=True, token=hf_args.access_token)
-        tok.save_pretrained(model_out)
-        log.info("Saved final model to %s", model_out)
+        cleared = clear_model_vae_linear_cache(model)
+        log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
+        save_paths = save_model_checkpoint(
+            model,
+            model_out,
+            base_model_path=vae_args.model_path,
+            tokenizer=tok,
+            save_config=True,
+            extra_meta={"stage": "final"},
+            unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
+        )
+        log.info("Saved final model to %s", save_paths["output_dir"])
 
     log.info("Done.")
 

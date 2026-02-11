@@ -9,7 +9,7 @@ set -euo pipefail
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 PYTHONPATH="${PYTHONPATH:-.}:." \
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2} \
 python tools/cat_train.py \
   --output_dir "${OUTPUT_DIR:-.result}" \
   --steps_per_category "${STEPS_PER_CATEGORY:-5000}" \
@@ -48,7 +48,7 @@ python tools/cat_train.py \
   --normalize_weight \
   --new_quant \
   --use_checkpoint \
-  --recon_loss_type "${RECON_LOSS_TYPE:-mse}" \
+  --recon_loss_type "${RECON_LOSS_TYPE:-w2_mse}" \
   --l1_weight "${L1_WEIGHT:-1.0}" \
   --lfq_weight "${LFQ_WEIGHT:-4}" \
   --commitment_loss_weight "${COMMITMENT_LOSS_WEIGHT:-0.25}" \

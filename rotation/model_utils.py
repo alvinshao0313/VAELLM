@@ -70,8 +70,9 @@ def get_llama(model_name, hf_token):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    model = transformers.LlamaForCausalLM.from_pretrained(model_name, torch_dtype='auto',
+    model = transformers.LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,
                                                           use_auth_token=hf_token,
+                                                          attn_implementation="sdpa",
                                                           low_cpu_mem_usage=True)
     model.seqlen = 2048
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
@@ -82,7 +83,7 @@ def get_mistral(model_name, hf_token):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    model = transformers.MistralForCausalLM.from_pretrained(model_name, torch_dtype='auto',
+    model = transformers.MistralForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,
                                                             use_auth_token=hf_token,
                                                             low_cpu_mem_usage=True)
     model.seqlen = 2048

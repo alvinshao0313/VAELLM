@@ -16,3 +16,12 @@ labels
 .idea/
 lm-evaluation-harness/
 fast-hadamard-transform/
+.result
+*.pt
+prepares
+*.log
+*.ckpt
+*.tar.gz
+*.pth
+*.bin
+*.h5

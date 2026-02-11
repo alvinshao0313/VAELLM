@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from typing import Dict, Optional
 
 
 class VAELinear(nn.Module):
@@ -17,11 +18,14 @@ class VAELinear(nn.Module):
         in_features: int,
         out_features: int,
         bias,
+        original_weight=None,
         vq_weight,
         decoder,
         codebook_dim: int,
         transpose: bool,
         parallel_parts: int = 1,
+        always_use_original: bool = False,
+        protect_original_weight: bool = False,
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -29,6 +33,8 @@ class VAELinear(nn.Module):
         self.transpose = bool(transpose)
         self.codebook_dim = int(codebook_dim)
         self.parallel_parts = int(parallel_parts)
+        self.always_use_original = bool(always_use_original)
+        self.protect_original_weight = bool(protect_original_weight)
         if self.parallel_parts < 1:
             raise ValueError(f"parallel_parts must be >= 1, got {self.parallel_parts}")
 
@@ -37,6 +43,23 @@ class VAELinear(nn.Module):
         else:
             self.bias = bias
             self.bias.requires_grad = False
+
+        if original_weight is None:
+            self.register_parameter("original_weight", None)
+        else:
+            if isinstance(original_weight, nn.Parameter):
+                self.original_weight = original_weight
+            else:
+                self.original_weight = nn.Parameter(original_weight)
+            self.original_weight.requires_grad = False
+            if tuple(self.original_weight.shape) != (self.out_features, self.in_features):
+                raise ValueError(
+                    f"original_weight shape {tuple(self.original_weight.shape)} != "
+                    f"({self.out_features}, {self.in_features})"
+                )
+        self.temporary = not self.always_use_original
+        self.cache_decoded_weight = True
+        self.register_buffer("_cached_weight", None, persistent=False)
 
         if isinstance(vq_weight, (list, tuple)):
             if len(vq_weight) != self.parallel_parts:
@@ -121,6 +144,118 @@ class VAELinear(nn.Module):
             parts.append(part_flat.view(rows_per_part, self.in_features))
         return torch.cat(parts, dim=0).contiguous().to(dtype=dtype)
 
+    def has_original_linear(self) -> bool:
+        return self.original_weight is not None
+
+    def clear_decoded_weight_cache(self) -> None:
+        self._cached_weight = None
+
+    @torch.no_grad()
+    def prime_decoded_weight_cache(
+        self,
+        dtype: Optional[torch.dtype] = None,
+    ) -> bool:
+        use_original = bool(getattr(self, "always_use_original", False)) or not bool(getattr(self, "temporary", True))
+        if use_original:
+            return False
+
+        target_dtype = dtype
+        if target_dtype is None:
+            param = next(self.parameters(), None)
+            target_dtype = param.dtype if (param is not None and param.is_floating_point()) else torch.float32
+
+        w = self._decode_weight(dtype=target_dtype).detach()
+        self._cached_weight = w
+        return True
+
+    def set_temporary(self, temporary: bool = True) -> None:  # 当 temporary=False 时走原始权重前向。
+        if self.always_use_original:
+            self.temporary = False
+            return
+        self.temporary = bool(temporary)
+
+    def unload_original_linear(self) -> bool:
+        if self.protect_original_weight:
+            return False
+        if self.original_weight is None:
+            return False
+        self.register_parameter("original_weight", None)
+        self.temporary = not self.always_use_original
+        return True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self._decode_weight(dtype=x.dtype)
-        return F.linear(x, w, self.bias)
+        use_original = bool(getattr(self, "always_use_original", False)) or not bool(getattr(self, "temporary", True))
+        if use_original:
+            if self.original_weight is None:
+                raise RuntimeError("VAELinear original_weight has been unloaded, cannot run original linear forward.")
+            weight = self.original_weight if self.original_weight.dtype == x.dtype else self.original_weight.to(
+                dtype=x.dtype)
+            bias = self.bias
+            if bias is not None and bias.dtype != x.dtype:
+                bias = bias.to(dtype=x.dtype)
+            return F.linear(x, weight, bias)
+
+        can_use_cache = bool(getattr(self, "cache_decoded_weight", True))
+        cached = self._cached_weight
+        if (
+            can_use_cache
+            and cached is not None
+            and cached.dtype == x.dtype
+            and cached.device == x.device
+        ):
+            w = cached
+        else:
+            if can_use_cache and torch.is_grad_enabled():
+                with torch.no_grad():
+                    w = self._decode_weight(dtype=x.dtype)
+            else:
+                w = self._decode_weight(dtype=x.dtype)
+            if can_use_cache:
+                self._cached_weight = w.detach()
+
+        bias = self.bias
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(dtype=x.dtype)
+        return F.linear(x, w, bias)
+
+
+def clear_model_vae_linear_cache(model: nn.Module) -> int:
+    cleared = 0
+    for module in model.modules():
+        if isinstance(module, VAELinear):
+            module.clear_decoded_weight_cache()
+            cleared += 1
+    return cleared
+
+
+@torch.no_grad()
+def prime_model_vae_linear_cache(
+    model: nn.Module,
+    dtype: Optional[torch.dtype] = None,
+    clear_existing: bool = False,
+) -> Dict[str, int]:
+    total = 0
+    warmed = 0
+    skipped = 0
+    failed = 0
+
+    for module in model.modules():
+        if not isinstance(module, VAELinear):
+            continue
+        total += 1
+        if clear_existing:
+            module.clear_decoded_weight_cache()
+        try:
+            if module.prime_decoded_weight_cache(dtype=dtype):
+                warmed += 1
+            else:
+                skipped += 1
+        except Exception:
+            failed += 1
+
+    return {
+        "total": int(total),
+        "warmed": int(warmed),
+        "skipped": int(skipped),
+        "failed": int(failed),
+    }

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # 说明：
 # - 默认开启 LoRA 微调（每个类别 VAE 完成后，对后续类别做 LoRA 并融合）。
-# - 下面已尽量对齐你给的 LoRA 超参数。
+# - 基于 catlora_wmse_train.sh，默认使用 top-k reverse KL 的 LoRA 损失。
 # - 当前 tools/cat_train.py 未实现以下参数：gradient_accumulation_steps、
 #   paged_adamw_8bit、warmup_ratio、group_by_length、dataset_text_field。
 
@@ -18,6 +18,8 @@ python tools/cat_train.py \
   --eval_every "${EVAL_EVERY:-100}" \
   --eval_blocks "${EVAL_BLOCKS:-256}" \
   --ppl_limit "${PPL_LIMIT:--1}" \
+  --category_order "${CATEGORY_ORDER:-down_proj,o_proj,gate_proj,up_proj,v_proj,k_proj,q_proj}" \
+  --skip_layers "${SKIP_LAYERS:-1.down_proj}" \
   --lora_after_category \
   --lora_rank "${LORA_RANK:-8}" \
   --lora_alpha "${LORA_ALPHA:-16.0}" \
@@ -28,6 +30,7 @@ python tools/cat_train.py \
   --lora_lr "${LORA_LR:-1e-4}" \
   --lora_weight_decay "${LORA_WEIGHT_DECAY:-0.001}" \
   --lora_log_every "${LORA_LOG_EVERY:-2}" \
+  --lora_loss_type "${LORA_LOSS_TYPE:-r_kl_top_${LORA_TOPK:-1000}}" \
   --train_device "${TRAIN_DEVICE:-cuda}" \
   --convert \
   --convert_device "${CONVERT_DEVICE:-cuda}" \
@@ -48,7 +51,7 @@ python tools/cat_train.py \
   --normalize_weight \
   --new_quant \
   --use_checkpoint \
-  --recon_loss_type "${RECON_LOSS_TYPE:-mse}" \
+  --recon_loss_type "${RECON_LOSS_TYPE:-w_mse}" \
   --l1_weight "${L1_WEIGHT:-1.0}" \
   --lfq_weight "${LFQ_WEIGHT:-4}" \
   --commitment_loss_weight "${COMMITMENT_LOSS_WEIGHT:-0.25}" \

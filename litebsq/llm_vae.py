@@ -524,17 +524,31 @@ class AutoEncoder(nn.Module):
     def _compute_recon_loss(self, x_recon, x):
         if self.recon_loss_type == 'l1':
             return F.l1_loss(x_recon, x)
-        if self.recon_loss_type == 'huber':
+        elif self.recon_loss_type == 'huber':
             return F.huber_loss(x_recon, x, reduction='mean', delta=1.0)
-        if self.recon_loss_type == 'relative_l1':
+        elif self.recon_loss_type == 'relative_l1':
             return (x_recon - x).abs().sum() / (x.abs().sum() + 1e-10)
-        if self.recon_loss_type == 'top_k_mse':
+        elif self.recon_loss_type == 'top_k_mse':
             k = max(1, int(0.1 * x.shape[-1]))
             errors = (x_recon - x).pow(2)
             topk_errors, _ = torch.topk(errors, k, dim=-1)
             return topk_errors.sum()
-        if self.recon_loss_type == 'mse':
+        elif self.recon_loss_type == 'mse':
             return F.mse_loss(x_recon, x)
+        elif self.recon_loss_type == 'cosine':
+            x_recon_flat = x_recon.view(x_recon.size(0), -1)
+            x_flat = x.view(x.size(0), -1)
+            return 1 - F.cosine_similarity(x_recon_flat, x_flat, dim=-1).mean()
+        elif self.recon_loss_type == 'w_mse':
+            # Weighted MSE: 误差较大的维度权重更高
+            errors = (x_recon - x).pow(2)
+            weights = x.abs()
+            return (errors * weights).mean()
+        elif self.recon_loss_type == 'w2_mse':
+            # Weighted MSE: 误差较大的维度权重更高
+            errors = (x_recon - x).pow(2)
+            weights = x.pow(2)
+            return (errors * weights).mean()
         return torch.tensor(0.0, device=x.device)
 
     def forward(self, x, is_train=True):

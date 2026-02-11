@@ -12,10 +12,10 @@ from torch import nn
 from transformers import LlamaTokenizerFast
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
-from litebsq.bsq_linear import bsq_turn2infra
+from litebsq.bsq_linear import BSQLinear, bsq_turn2infra
 from train_utils.train_args import process_all_args, create_optimizer
 from train_utils.utils import get_logger, pt_fsdp_state_dict
-from train_utils.llm_eval import calculate_ppl
+from train_utils.eval_utils import calculate_ppl
 
 log: Logger = get_logger("bsqLLM")
 
@@ -146,6 +146,15 @@ def _format_loss_items(loss_dict: dict) -> str:
     return " ".join(pieces)
 
 
+def _merge_loss_dict(base: Optional[dict], new: dict) -> dict:
+    if base is None:
+        return dict(new)
+    merged = dict(base)
+    for key, value in new.items():
+        merged[key] = merged.get(key, 0) + value
+    return merged
+
+
 def train() -> None:
     lbl_args, hf_args, training_args, vae_args = process_all_args(sys.argv[1:])
     log.info("Args: lbl=%s hf=%s training=%s vae=%s", lbl_args, hf_args, training_args, vae_args)
@@ -192,46 +201,63 @@ def train() -> None:
     if lbl_args.max_layers is not None:
         layer_indices = layer_indices[: lbl_args.max_layers]
 
-    from train_utils.data_utils import get_wikitext2
-    data_loader = get_wikitext2(
-        nsamples=lbl_args.nsamples,
-        seed=0,
-        seqlen=model.seqlen,
-        model=vae_args.model_path,
-    )
+    weight_only = bool(getattr(lbl_args, "weight_only", False))
+    if weight_only:
+        if getattr(lbl_args, "use_output_mse_loss", False):
+            log.warning("`--weight_only` enabled: disabling `--use_output_mse_loss`.")
+            lbl_args.use_output_mse_loss = False
+        if getattr(vae_args, "distil_loss_type", "mse") != "none" or getattr(vae_args, "distil_loss_weight", 1.0) > 0.0:
+            log.warning("`--weight_only` enabled: forcing distil loss off (distil_loss_type=none, distil_loss_weight=0).")
+            vae_args.distil_loss_type = "none"
+            vae_args.distil_loss_weight = 0.0
 
-    # GPTQ 方式
-    model.config.use_cache = False
-    layers = model.model.layers
+    data_loader = None
+    orgi_inps = None
+    orgi_outs = None
+    attention_mask = None
+    position_ids = None
+    if not weight_only:
+        from train_utils.data_utils import get_wikitext2
 
-    model.model.embed_tokens = _to_cuda(model.model.embed_tokens)
-    model.model.norm = _to_cuda(model.model.norm)
-    layers[0] = _to_cuda(layers[0])
+        data_loader = get_wikitext2(
+            nsamples=lbl_args.nsamples,
+            seed=0,
+            seqlen=model.seqlen,
+            model=vae_args.model_path,
+        )
 
-    dtype = next(iter(model.parameters())).dtype
-    orgi_inps = torch.zeros(
-        (lbl_args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device='cpu'
-    )
-    cache = {'i': 0, 'attention_mask': None}
+        # GPTQ 方式
+        model.config.use_cache = False
+        layers = model.model.layers
 
-    layers[0] = Catcher(layers[0], orgi_inps, cache)
-    for batch in data_loader:
-        try:
-            model(batch[0].to('cuda'))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
+        model.model.embed_tokens = _to_cuda(model.model.embed_tokens)
+        model.model.norm = _to_cuda(model.model.norm)
+        layers[0] = _to_cuda(layers[0])
 
-    layers[0] = _to_cpu(layers[0])
-    model.model.embed_tokens = _to_cpu(model.model.embed_tokens)
-    model.model.norm = _to_cpu(model.model.norm)
-    torch.cuda.empty_cache()
+        dtype = next(iter(model.parameters())).dtype
+        orgi_inps = torch.zeros(
+            (lbl_args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device="cpu"
+        )
+        cache = {"i": 0, "attention_mask": None}
 
-    orgi_outs = torch.zeros_like(orgi_inps, device='cpu')
-    attention_mask = cache['attention_mask']
-    position_ids = cache.get('position_ids', None)
-    if position_ids is None:
-        position_ids = torch.arange(0, model.seqlen, device='cpu').unsqueeze(0)
+        layers[0] = Catcher(layers[0], orgi_inps, cache)
+        for batch in data_loader:
+            try:
+                model(batch[0].to("cuda"))
+            except ValueError:
+                pass
+        layers[0] = layers[0].module
+
+        layers[0] = _to_cpu(layers[0])
+        model.model.embed_tokens = _to_cpu(model.model.embed_tokens)
+        model.model.norm = _to_cpu(model.model.norm)
+        torch.cuda.empty_cache()
+
+        orgi_outs = torch.zeros_like(orgi_inps, device="cpu")
+        attention_mask = cache["attention_mask"]
+        position_ids = cache.get("position_ids", None)
+        if position_ids is None:
+            position_ids = torch.arange(0, model.seqlen, device="cpu").unsqueeze(0)
 
     use_amp = training_args.fp16 or training_args.bf16
     use_fp16 = bool(training_args.fp16)
@@ -239,21 +265,29 @@ def train() -> None:
     logging_steps = getattr(training_args, "logging_steps", 1)
     global_step = 0
 
+    steps_per_layer = (
+        lbl_args.steps_per_layer
+        if lbl_args.steps_per_layer is not None
+        else int(lbl_args.nsamples) * int(lbl_args.num_train_epochs)
+    )
+
     for idx in layer_indices:
         layer = _to_cuda(model.model.layers[idx])
 
-        with torch.no_grad():
-            for j in range(lbl_args.nsamples):  # 获取原本第idx层的输出
-                hidden_states = _to_cuda(orgi_inps[j].unsqueeze(0))
-                position_ids_cuda, attention_mask_cuda, position_embeddings = _prepare_layer_inputs(
-                    model, hidden_states, position_ids, attention_mask
-                )
-                orgi_outs[j] = layer(
-                    hidden_states,
-                    attention_mask=attention_mask_cuda,
-                    position_ids=position_ids_cuda,
-                    position_embeddings=position_embeddings,
-                )[0].detach().to('cpu')
+        if not weight_only:
+            assert orgi_inps is not None and orgi_outs is not None
+            with torch.no_grad():
+                for j in range(lbl_args.nsamples):  # 获取原本第idx层的输出
+                    hidden_states = _to_cuda(orgi_inps[j].unsqueeze(0))
+                    position_ids_cuda, attention_mask_cuda, position_embeddings = _prepare_layer_inputs(
+                        model, hidden_states, position_ids, attention_mask
+                    )
+                    orgi_outs[j] = layer(
+                        hidden_states,
+                        attention_mask=attention_mask_cuda,
+                        position_ids=position_ids_cuda,
+                        position_embeddings=position_embeddings,
+                    )[0].detach().to("cpu")
 
         from train_utils.instead_forward import rebuild_llama_forward
         rebuild_llama_forward(layer)
@@ -266,35 +300,21 @@ def train() -> None:
                 vae_args.lr_scheduler,
                 optimizer,
                 num_warmup_steps=vae_args.lr_warmup_steps,
-                num_training_steps=lbl_args.steps_per_layer
-                if lbl_args.steps_per_layer is not None
-                else len(data_loader) * lbl_args.num_train_epochs,
+                num_training_steps=steps_per_layer,
             )
 
-        for epoch in range(lbl_args.num_train_epochs):
-            for j in range(lbl_args.nsamples):
+        if weight_only:
+            bsq_modules = [m for m in layer.modules() if isinstance(m, BSQLinear)]
+            if len(bsq_modules) == 0:
+                raise RuntimeError(f"No BSQLinear modules found in layer {idx}.")
+
+            for step in range(steps_per_layer):
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    hidden_states = _to_cuda(orgi_inps[j].unsqueeze(0))
-                    hidden_states.requires_grad_(True)
-                    position_ids_cuda, attention_mask_cuda, position_embeddings = _prepare_layer_inputs(
-                        model, hidden_states, position_ids, attention_mask
-                    )
-                    (outputs, loss), loss_dict = _compute_layer_loss(
-                        layer,
-                        hidden_states,
-                        attention_mask_cuda,
-                        position_ids_cuda,
-                        position_embeddings,
-                        lbl_args.layer_checkpointing,
-                    )
-                    if lbl_args.use_output_mse_loss:
-                        target_out = orgi_outs[j].unsqueeze(0).to(device=outputs.device, dtype=outputs.dtype)
-                        mse_loss = F.mse_loss(outputs, target_out)
-                        loss = loss + lbl_args.output_mse_loss_weight * mse_loss
-                        if loss_dict is not None:
-                            loss_dict = dict(loss_dict)
-                            loss_dict["train/output_mse_loss"] = mse_loss
-                            loss_dict["loss"] = loss
+                    loss_dict = None
+                    for module in bsq_modules:
+                        loss_dict = _merge_loss_dict(loss_dict, module.compute_weight_loss())
+                    assert loss_dict is not None
+                    loss = loss_dict["loss"]
 
                 optimizer.zero_grad()
                 if use_fp16:
@@ -306,36 +326,88 @@ def train() -> None:
                     optimizer.step()
                 if vae_args.lr_scheduler != "none":
                     lr_scheduler.step()
+
                 global_step += 1
                 if logging_steps > 0 and global_step % logging_steps == 0:
-                    if loss_dict is None:
-                        with torch.no_grad():
-                            _, log_loss_dict = _layer_forward_with_loss_dict(
-                                layer,
-                                hidden_states.detach(),
-                                attention_mask_cuda,
-                                position_ids_cuda,
-                                position_embeddings,
-                            )
-                        loss_dict = dict(log_loss_dict)
-                        if lbl_args.use_output_mse_loss:
-                            loss_dict["train/output_mse_loss"] = mse_loss.detach()
-                            loss_dict["loss"] = loss.detach()
-
                     loss_items = _format_loss_items(loss_dict)
                     log.info(
-                        "layer=%d epoch=%d step=%d loss=%.6f %s",
+                        "layer=%d step=%d loss=%.6f %s",
                         idx,
-                        epoch,
                         global_step,
                         loss.detach().float().item(),
                         loss_items,
                     )
-        orgi_inps = orgi_outs
+        else:
+            for epoch in range(lbl_args.num_train_epochs):
+                for j in range(lbl_args.nsamples):
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        hidden_states = _to_cuda(orgi_inps[j].unsqueeze(0))
+                        hidden_states.requires_grad_(True)
+                        position_ids_cuda, attention_mask_cuda, position_embeddings = _prepare_layer_inputs(
+                            model, hidden_states, position_ids, attention_mask
+                        )
+                        (outputs, loss), loss_dict = _compute_layer_loss(
+                            layer,
+                            hidden_states,
+                            attention_mask_cuda,
+                            position_ids_cuda,
+                            position_embeddings,
+                            lbl_args.layer_checkpointing,
+                        )
+                        if lbl_args.use_output_mse_loss:
+                            target_out = orgi_outs[j].unsqueeze(0).to(device=outputs.device, dtype=outputs.dtype)
+                            mse_loss = F.mse_loss(outputs, target_out)
+                            loss = loss + lbl_args.output_mse_loss_weight * mse_loss
+                            if loss_dict is not None:
+                                loss_dict = dict(loss_dict)
+                                loss_dict["train/output_mse_loss"] = mse_loss
+                                loss_dict["loss"] = loss
+
+                    optimizer.zero_grad()
+                    if use_fp16:
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        optimizer.step()
+                    if vae_args.lr_scheduler != "none":
+                        lr_scheduler.step()
+                    global_step += 1
+                    if logging_steps > 0 and global_step % logging_steps == 0:
+                        if loss_dict is None:
+                            with torch.no_grad():
+                                _, log_loss_dict = _layer_forward_with_loss_dict(
+                                    layer,
+                                    hidden_states.detach(),
+                                    attention_mask_cuda,
+                                    position_ids_cuda,
+                                    position_embeddings,
+                                )
+                            loss_dict = dict(log_loss_dict)
+                            if lbl_args.use_output_mse_loss:
+                                loss_dict["train/output_mse_loss"] = mse_loss.detach()
+                                loss_dict["loss"] = loss.detach()
+
+                        loss_items = _format_loss_items(loss_dict)
+                        log.info(
+                            "layer=%d epoch=%d step=%d loss=%.6f %s",
+                            idx,
+                            epoch,
+                            global_step,
+                            loss.detach().float().item(),
+                            loss_items,
+                        )
+            orgi_inps = orgi_outs
+
+        # Convert trained BSQLinear modules to inference mode while still on GPU (much faster than CPU).
+        bsq_turn2infra(layer)
         layer = _to_cpu(layer)
         model.model.layers[idx] = layer
-        bsq_turn2infra(layer)
-        _eval_ppl(model, vae_args, f"layer {idx}")
+        torch.cuda.empty_cache()
+
+        if not bool(getattr(lbl_args, "skip_ppl_eval", False)):
+            _eval_ppl(model, vae_args, f"layer {idx}")
 
     if training_args.fsdp != "" and training_args.fsdp != []:
         cpu_state = pt_fsdp_state_dict(model)
