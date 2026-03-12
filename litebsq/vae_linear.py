@@ -24,6 +24,10 @@ class VAELinear(nn.Module):
         codebook_dim: int,
         transpose: bool,
         parallel_parts: int = 1,
+        parallel_rows: Optional[int] = None,
+        parallel_cols: Optional[int] = None,
+        restore_row_indices: Optional[torch.Tensor] = None,
+        restore_col_indices: Optional[torch.Tensor] = None,
         always_use_original: bool = False,
         protect_original_weight: bool = False,
     ):
@@ -37,6 +41,75 @@ class VAELinear(nn.Module):
         self.protect_original_weight = bool(protect_original_weight)
         if self.parallel_parts < 1:
             raise ValueError(f"parallel_parts must be >= 1, got {self.parallel_parts}")
+        if parallel_rows is None and parallel_cols is None:
+            parallel_rows = self.parallel_parts
+            parallel_cols = 1
+        elif parallel_rows is None:
+            parallel_cols = int(parallel_cols)
+            if parallel_cols < 1:
+                raise ValueError(f"parallel_cols must be >= 1, got {parallel_cols}")
+            if self.parallel_parts % parallel_cols != 0:
+                raise ValueError(
+                    f"parallel_parts={self.parallel_parts} not divisible by parallel_cols={parallel_cols}"
+                )
+            parallel_rows = self.parallel_parts // parallel_cols
+        elif parallel_cols is None:
+            parallel_rows = int(parallel_rows)
+            if parallel_rows < 1:
+                raise ValueError(f"parallel_rows must be >= 1, got {parallel_rows}")
+            if self.parallel_parts % parallel_rows != 0:
+                raise ValueError(
+                    f"parallel_parts={self.parallel_parts} not divisible by parallel_rows={parallel_rows}"
+                )
+            parallel_cols = self.parallel_parts // parallel_rows
+
+        self.parallel_rows = int(parallel_rows)
+        self.parallel_cols = int(parallel_cols)
+        if self.parallel_rows < 1 or self.parallel_cols < 1:
+            raise ValueError(
+                f"parallel_rows/parallel_cols must be >= 1, got ({self.parallel_rows}, {self.parallel_cols})"
+            )
+        if self.parallel_rows * self.parallel_cols != self.parallel_parts:
+            raise ValueError(
+                f"parallel_rows*parallel_cols mismatch: {self.parallel_rows}*{self.parallel_cols} != {self.parallel_parts}"
+            )
+
+        split_rows = self.in_features if self.transpose else self.out_features
+        split_cols = self.out_features if self.transpose else self.in_features
+        if split_rows % self.parallel_rows != 0:
+            raise ValueError(
+                f"split_rows={split_rows} not divisible by parallel_rows={self.parallel_rows}"
+            )
+        if split_cols % self.parallel_cols != 0:
+            raise ValueError(
+                f"split_cols={split_cols} not divisible by parallel_cols={self.parallel_cols}"
+            )
+        if restore_row_indices is None:
+            self.register_buffer("restore_row_indices", None, persistent=True)
+        else:
+            restore_idx = restore_row_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+            if restore_idx.ndim != 1:
+                raise ValueError(
+                    f"restore_row_indices must be 1D, got shape={tuple(restore_idx.shape)}"
+                )
+            if int(restore_idx.numel()) != int(split_rows):
+                raise ValueError(
+                    f"restore_row_indices size {int(restore_idx.numel())} != split_rows {int(split_rows)}"
+                )
+            self.register_buffer("restore_row_indices", restore_idx, persistent=True)
+        if restore_col_indices is None:
+            self.register_buffer("restore_col_indices", None, persistent=True)
+        else:
+            restore_col_idx = restore_col_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+            if restore_col_idx.ndim != 1:
+                raise ValueError(
+                    f"restore_col_indices must be 1D, got shape={tuple(restore_col_idx.shape)}"
+                )
+            if int(restore_col_idx.numel()) != int(split_cols):
+                raise ValueError(
+                    f"restore_col_indices size {int(restore_col_idx.numel())} != split_cols {int(split_cols)}"
+                )
+            self.register_buffer("restore_col_indices", restore_col_idx, persistent=True)
 
         if bias is None:
             self.register_parameter("bias", None)
@@ -111,38 +184,61 @@ class VAELinear(nn.Module):
         w_blocks = decoder(vq_weight.to(dtype=decode_dtype))
         return w_blocks.permute(1, 0, 2).contiguous().view(-1)
 
+    def _restore_split_row_order(self, w_split: torch.Tensor) -> torch.Tensor:
+        restore_idx = getattr(self, "restore_row_indices", None)
+        if restore_idx is None:
+            return w_split
+        if int(restore_idx.numel()) != int(w_split.shape[0]):
+            raise ValueError(
+                f"restore_row_indices size {int(restore_idx.numel())} != decoded split rows {int(w_split.shape[0])}"
+            )
+        if restore_idx.device != w_split.device:
+            restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
+        return w_split.index_select(0, restore_idx)
+
+    def _restore_split_col_order(self, w_split: torch.Tensor) -> torch.Tensor:
+        restore_idx = getattr(self, "restore_col_indices", None)
+        if restore_idx is None:
+            return w_split
+        if int(restore_idx.numel()) != int(w_split.shape[1]):
+            raise ValueError(
+                f"restore_col_indices size {int(restore_idx.numel())} != decoded split cols {int(w_split.shape[1])}"
+            )
+        if restore_idx.device != w_split.device:
+            restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
+        return w_split.index_select(1, restore_idx)
+
     def _decode_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        split_rows = self.in_features if self.transpose else self.out_features
+        split_cols = self.out_features if self.transpose else self.in_features
         if not self._multi_parts:
             w_flat = self._decode_single_flat(self.decoder, self.vq_weight, dtype=dtype)
+            w_split = w_flat.view(split_rows, split_cols)
+            w_split = self._restore_split_row_order(w_split)
+            w_split = self._restore_split_col_order(w_split)
             if self.transpose:
-                return w_flat.view(self.in_features, self.out_features).t().contiguous().to(dtype=dtype)
-            return w_flat.view(self.out_features, self.in_features).contiguous().to(dtype=dtype)
+                return w_split.t().contiguous().to(dtype=dtype)
+            return w_split.contiguous().to(dtype=dtype)
 
-        if self.transpose:
-            if self.in_features % self.parallel_parts != 0:
-                raise ValueError(
-                    f"in_features={self.in_features} not divisible by parallel_parts={self.parallel_parts}"
-                )
-            rows_per_part = self.in_features // self.parallel_parts
-            parts = []
-            for idx, decoder in enumerate(self.decoders):
-                vq_weight = getattr(self, f"vq_weight_{idx}")
-                part_flat = self._decode_single_flat(decoder, vq_weight, dtype=dtype)
-                parts.append(part_flat.view(rows_per_part, self.out_features))
-            w_t = torch.cat(parts, dim=0)
-            return w_t.t().contiguous().to(dtype=dtype)
-
-        if self.out_features % self.parallel_parts != 0:
-            raise ValueError(
-                f"out_features={self.out_features} not divisible by parallel_parts={self.parallel_parts}"
-            )
-        rows_per_part = self.out_features // self.parallel_parts
+        rows_per_part = split_rows // self.parallel_rows
+        cols_per_part = split_cols // self.parallel_cols
         parts = []
         for idx, decoder in enumerate(self.decoders):
             vq_weight = getattr(self, f"vq_weight_{idx}")
             part_flat = self._decode_single_flat(decoder, vq_weight, dtype=dtype)
-            parts.append(part_flat.view(rows_per_part, self.in_features))
-        return torch.cat(parts, dim=0).contiguous().to(dtype=dtype)
+            parts.append(part_flat.view(rows_per_part, cols_per_part))
+
+        row_blocks = []
+        for row_idx in range(self.parallel_rows):
+            start = row_idx * self.parallel_cols
+            end = start + self.parallel_cols
+            row_blocks.append(torch.cat(parts[start:end], dim=1))
+        w_split = torch.cat(row_blocks, dim=0)
+        w_split = self._restore_split_row_order(w_split)
+        w_split = self._restore_split_col_order(w_split)
+        if self.transpose:
+            return w_split.t().contiguous().to(dtype=dtype)
+        return w_split.contiguous().to(dtype=dtype)
 
     def has_original_linear(self) -> bool:
         return self.original_weight is not None

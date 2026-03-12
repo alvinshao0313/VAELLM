@@ -6,52 +6,68 @@ set -euo pipefail
 # - 下面已尽量对齐你给的 LoRA 超参数。
 # - 当前 tools/cat_train.py 未实现以下参数：gradient_accumulation_steps、
 #   paged_adamw_8bit、warmup_ratio、group_by_length、dataset_text_field。
+# - 可用 LORA_SCHEDULE 传入按类别覆盖的 JSON，例如：
+#   {"q_proj":{"rank":8,"alpha":16,"steps":1000,"loss_type":"sft","use_dora":false},
+#    "k_proj":{"rank":128,"alpha":256,"steps":2000,"loss_type":"r_kl_top_1000","use_dora":true}}
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 PYTHONPATH="${PYTHONPATH:-.}:." \
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3} \
 python tools/cat_train.py \
+  --save_model \
   --output_dir "${OUTPUT_DIR:-.result}" \
   --steps_per_category "${STEPS_PER_CATEGORY:-5000}" \
   --batch_size "${BATCH_SIZE:-2048}" \
   --log_every "${LOG_EVERY:-50}" \
-  --eval_every "${EVAL_EVERY:-100}" \
+  --eval_every "${EVAL_EVERY:-1000}" \
   --eval_blocks "${EVAL_BLOCKS:-256}" \
   --ppl_limit "${PPL_LIMIT:--1}" \
   --skip_layers "${SKIP_LAYERS:-1.down_proj}" \
-  --transpose_modules "${TRANSPOSE_MODULES:-"k_proj"}" \
-  --projection_suffixes "${PROJECTION_SUFFIXES:-"down_proj"}" \
-  --lora_rank "${LORA_RANK:-8}" \
-  --lora_alpha "${LORA_ALPHA:-16.0}" \
+  --lora_after_category \
+  --lora_rank "${LORA_RANK:-64}" \
+  --lora_alpha "${LORA_ALPHA:-128.0}" \
   --lora_dropout "${LORA_DROPOUT:-0.0}" \
-  --lora_steps "${LORA_STEPS:-1000}" \
+  --lora_steps "${LORA_STEPS:-2000}" \
   --lora_batch_size "${LORA_BATCH_SIZE:-2}" \
   --lora_nsamples "${LORA_NSAMPLES:-2048}" \
-  --lora_tune_norm \
-  --lora_tune_lm_head \
   --lora_lr "${LORA_LR:-1e-4}" \
   --lora_weight_decay "${LORA_WEIGHT_DECAY:-0.001}" \
   --lora_log_every "${LORA_LOG_EVERY:-2}" \
+  --lora_loss_type "${LORA_LOSS_TYPE:-r_kl_top_${LORA_TOPK:-1000}}" \
+  --lora_use_dora "${LORA_USE_DORA:-true}" \
+  --lora_tune_bias "${LORA_TUNE_BIAS:-false}" \
+  --lora_bias_categories "${LORA_BIAS_CATEGORIES:-o_proj,down_proj}" \
+  --lora_schedule "${LORA_SCHEDULE:-}" \
   --train_device "${TRAIN_DEVICE:-cuda}" \
   --convert \
   --convert_device "${CONVERT_DEVICE:-cuda}" \
   --linear_group_size "${LINEAR_GROUP_SIZE:-32}" \
-  --intra_parallel "${INTRA_PARALLEL:-1}" \
+  --intra_parallel "${INTRA_PARALLEL:-{\"q_proj\": 8, \"k_proj\": 8, \"v_proj\": 32, \"o_proj\": 32, \"gate_proj\": 64, \"up_proj\": 64, \"down_proj\": 64}}" \
+  --intra_part_sort_mode "${INTRA_PART_SORT_MODE:-row_l2}" \
   --codebook_bits "${CODEBOOK_BITS:-16}" \
   --codebook_dim "${CODEBOOK_DIM:-8}" \
-  --base_ch "${BASE_CH:-128}" \
+  --base_ch "${BASE_CH:-256}" \
   --num_res_blocks "${NUM_RES_BLOCKS:-1}" \
   --quantizer_type "${QUANTIZER_TYPE:-BSQ}" \
   --gamma0 "${GAMMA0:-1.0}" \
   --gamma "${GAMMA:-1.0}" \
   --zeta "${ZETA:-1.0}" \
   --inv_temperature "${INV_TEMPERATURE:-100.0}" \
-  --norm_type "${NORM_TYPE:-group}" \
-  --decoder_type "${DECODER_TYPE:-symmetric}" \
+  --norm_type "${NORM_TYPE:-layer}" \
+  --decoder_type "${DECODER_TYPE:-asymmetric}" \
+  --decoder_base_ch "${DECODER_BASE_CH:-32}" \
+  --decoder_num_res_blocks "${DECODER_NUM_RES_BLOCKS:-1}" \
   --normalize_weight \
   --new_quant \
   --use_checkpoint \
-  --recon_loss_type "${RECON_LOSS_TYPE:-w_mse}" \
+  --recon_loss_type "${RECON_LOSS_TYPE:-wa_mse}" \
+  --wa_mse_act_mode "${WA_MSE_ACT_MODE:-dynamic}" \
+  --wa_mse_calib_dataset "${WA_MSE_CALIB_DATASET:-wikitext2}" \
+  --wa_mse_calib_nsamples "${WA_MSE_CALIB_NSAMPLES:-512}" \
+  --wa_mse_calib_seqlen "${WA_MSE_CALIB_SEQLEN:-512}" \
+  --wa_mse_calib_seed "${WA_MSE_CALIB_SEED:-0}" \
+  --wa_mse_calib_device "${WA_MSE_CALIB_DEVICE:-}" \
+  --wa_mse_calib_log_every "${WA_MSE_CALIB_LOG_EVERY:-0}" \
   --l1_weight "${L1_WEIGHT:-1.0}" \
   --lfq_weight "${LFQ_WEIGHT:-4}" \
   --commitment_loss_weight "${COMMITMENT_LOSS_WEIGHT:-0.25}" \
@@ -64,7 +80,6 @@ python tools/cat_train.py \
   --weight_decay "${WEIGHT_DECAY:-0.0}" \
   --lr_scheduler "${LR_SCHEDULER:-linear}" \
   --lr_warmup_steps "${LR_WARMUP_STEPS:-0}" \
-  --max_steps "${MAX_STEPS:-1000}" \
   --max_grad_norm "${MAX_GRAD_NORM:-0.3}" \
   --model_max_length "${MAX_SEQ_LENGTH:-2048}" \
   --num_train_epochs "${NUM_TRAIN_EPOCHS:-1}" \

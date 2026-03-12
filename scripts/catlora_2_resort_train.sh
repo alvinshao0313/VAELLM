@@ -18,6 +18,7 @@ python tools/cat_train.py \
   --eval_every "${EVAL_EVERY:-100}" \
   --eval_blocks "${EVAL_BLOCKS:-256}" \
   --ppl_limit "${PPL_LIMIT:--1}" \
+  --category_order "${CATEGORY_ORDER:-"down_proj,o_proj,gate_proj,up_proj,v_proj,k_proj,q_proj"}" \
   --skip_layers "${SKIP_LAYERS:-1.down_proj}" \
   --lora_after_category \
   --lora_rank "${LORA_RANK:-8}" \

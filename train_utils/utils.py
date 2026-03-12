@@ -11,10 +11,15 @@
 import logging
 import os
 import random
-from typing import Optional
+import argparse
+import json
+import re
+from dataclasses import dataclass
+from typing import List, Optional, Sequence
 
 import numpy as np
 import torch
+from torch import nn
 from torch.distributed.fsdp import (
     FullStateDictConfig,
 )
@@ -174,3 +179,107 @@ def get_global_rank() -> int:
         return int(os.environ["RANK"])
 
     return 0
+
+
+def split_csv(value: Optional[str]) -> List[str]:
+    if value is None:
+        return []
+    value = value.strip()
+    if not value:
+        return []
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
+def format_intra_parallel_desc(row_parts: int, col_parts: int) -> str:
+    row_parts = int(row_parts)
+    col_parts = int(col_parts)
+    if col_parts == 1:
+        return str(row_parts)
+    return f"[{row_parts},{col_parts}]"
+
+
+def resolve_category_order(order: str, discovered: Sequence[str]) -> List[str]:
+    if order.strip().lower() == "auto":
+        return sorted(set(discovered))
+    requested = split_csv(order)
+    if "others" in requested:
+        known = [c for c in requested if c != "others"]
+        rest = sorted([c for c in set(discovered) if c not in set(known)])
+        return known + rest
+    return requested
+
+
+@dataclass(frozen=True)
+class LinearRef:
+    name: str
+    module: nn.Linear
+    category: str
+    transpose: bool
+
+
+def is_decoder_layer_projection(name: str, projection_suffixes: Sequence[str]) -> bool:
+    # Llama/Mistral/Qwen: "model.layers.{i}.<...>.<proj>"
+    # OPT: "model.decoder.layers.{i}.<...>.<proj>"
+    in_decoder_layers = (
+        ".model.layers." in name
+        or name.startswith("model.layers.")
+        or ".model.decoder.layers." in name
+        or name.startswith("model.decoder.layers.")
+    )
+    if not in_decoder_layers:
+        return False
+    return any(name.endswith(f".{sfx}") or name.endswith(sfx) for sfx in projection_suffixes)
+
+
+def collect_linears(
+    model: nn.Module,
+    transpose_modules: Sequence[str],
+    *,
+    only_decoder_projections: bool,
+    projection_suffixes: Sequence[str],
+) -> List[LinearRef]:
+    transpose_set = set(transpose_modules)
+    suffix_set = set(projection_suffixes)
+    out: List[LinearRef] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        category = name.split(".")[-1]
+        if only_decoder_projections:
+            if category not in suffix_set:
+                continue
+            if not is_decoder_layer_projection(name, projection_suffixes):
+                continue
+        out.append(
+            LinearRef(
+                name=name,
+                module=module,
+                category=category,
+                transpose=(category in transpose_set),
+            )
+        )
+    return out
+
+
+_LAYER_IDX_PATTERNS = [
+    re.compile(r"(?:^|\.)(?:model\.)?layers\.(\d+)\."),
+    re.compile(r"(?:^|\.)(?:model\.)?decoder\.layers\.(\d+)\."),
+]
+
+
+def extract_layer_idx(name: str) -> Optional[int]:
+    for pat in _LAYER_IDX_PATTERNS:
+        m = pat.search(name)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def clone_namespace(ns, **overrides):
+    data = dict(vars(ns))
+    data.update(overrides)
+    return argparse.Namespace(**data)
+
+
+def format_namespace(ns: argparse.Namespace) -> str:
+    return json.dumps(vars(ns), ensure_ascii=False, indent=2, sort_keys=True, default=str)

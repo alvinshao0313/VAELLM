@@ -320,14 +320,17 @@ class Decoder(nn.Module):
         super().__init__()
         self.in_dim = in_dim
         self.use_checkpoint = use_checkpoint
-        self.decoder_type = decoder_type
+        self.decoder_type = str(decoder_type).strip().lower()
         self.num_models = num_models
         self.out_dim = out_dim
+        self.hidden_dim = hidden_dim
+        self.num_res_blocks = num_res_blocks
+        self.norm_type = norm_type
         self._q_scale_fused = False
 
         if self.decoder_type == 'linear':
             self.linear = ParallelLinear(in_dim, out_dim, num_models=num_models)
-        elif self.decoder_type == 'symmetric':
+        elif self.decoder_type in {'symmetric', 'asymmetric'}:
             # 1. Input Projection
             self.linear_in = ParallelLinear(in_dim, hidden_dim, num_models=num_models)
 
@@ -368,7 +371,7 @@ class Decoder(nn.Module):
         q_scale = 1. / math.sqrt(self.in_dim)
         if self.decoder_type == 'linear':
             self.linear.fuse_q_scale(q_scale)
-        elif self.decoder_type == 'symmetric':
+        elif self.decoder_type in {'symmetric', 'asymmetric'}:
             self.linear_in.fuse_q_scale(q_scale)
         self._q_scale_fused = True
 
@@ -408,7 +411,7 @@ class Decoder(nn.Module):
             if self.decoder_type == 'linear':
                 # linear: ParallelLinear
                 new_decoder.linear = self.linear.get_sub_linear(model_idx)
-            elif self.decoder_type == 'symmetric':
+            elif self.decoder_type in {'symmetric', 'asymmetric'}:
                 # 1. Input Projection
                 new_decoder.linear_in = self.linear_in.get_sub_linear(model_idx)
 
@@ -448,12 +451,33 @@ class AutoEncoder(nn.Module):
         # out_channels (Latent Dim) = codebook_bits
         # 例如 codebook_bits=16
         self.latent_dim = args.codebook_bits
+        decoder_type = str(getattr(args, 'decoder_type', 'linear')).strip().lower()
+        encoder_hidden_dim = int(getattr(args, 'base_ch', 128))
+        encoder_num_res_blocks = int(getattr(args, 'num_res_blocks', 1))
+        decoder_hidden_dim = int(getattr(args, 'decoder_base_ch', encoder_hidden_dim))
+        decoder_num_res_blocks = int(getattr(args, 'decoder_num_res_blocks', encoder_num_res_blocks))
+
+        if decoder_type != "asymmetric":
+            # 兼容历史行为：linear/symmetric 时默认与 encoder 结构一致。
+            decoder_hidden_dim = int(encoder_hidden_dim)
+            decoder_num_res_blocks = int(encoder_num_res_blocks)
+
+        if encoder_hidden_dim < 1 or decoder_hidden_dim < 1:
+            raise ValueError(
+                f"encoder/decoder hidden dim must be >=1, got "
+                f"encoder={encoder_hidden_dim}, decoder={decoder_hidden_dim}"
+            )
+        if encoder_num_res_blocks < 0 or decoder_num_res_blocks < 0:
+            raise ValueError(
+                f"encoder/decoder num_res_blocks must be >=0, got "
+                f"encoder={encoder_num_res_blocks}, decoder={decoder_num_res_blocks}"
+            )
 
         # 2. 初始化 Encoder (并行版)
         self.encoder = Encoder(
             in_dim=self.chunk_size,
-            hidden_dim=args.base_ch,
-            num_res_blocks=args.num_res_blocks,
+            hidden_dim=encoder_hidden_dim,
+            num_res_blocks=encoder_num_res_blocks,
             out_dim=self.latent_dim,
             norm_type=getattr(args, 'norm_type', 'group'),
             use_checkpoint=args.use_checkpoint,
@@ -464,10 +488,10 @@ class AutoEncoder(nn.Module):
         self.decoder = Decoder(
             in_dim=self.latent_dim,
             out_dim=self.chunk_size,
-            hidden_dim=args.base_ch,
-            num_res_blocks=args.num_res_blocks,
+            hidden_dim=decoder_hidden_dim,
+            num_res_blocks=decoder_num_res_blocks,
             norm_type=getattr(args, 'norm_type', 'group'),
-            decoder_type=getattr(args, 'decoder_type', 'linear'),
+            decoder_type=decoder_type,
             use_checkpoint=args.use_checkpoint,
             num_models=num_models
         )
@@ -521,7 +545,7 @@ class AutoEncoder(nn.Module):
             return z, bit_indices, aux_loss
         return quant_ret.quantized, quant_ret.bit_indices, quant_ret.entropy_aux_loss
 
-    def _compute_recon_loss(self, x_recon, x):
+    def _compute_recon_loss(self, x_recon, x, act_max=None):
         if self.recon_loss_type == 'l1':
             return F.l1_loss(x_recon, x)
         elif self.recon_loss_type == 'huber':
@@ -549,9 +573,22 @@ class AutoEncoder(nn.Module):
             errors = (x_recon - x).pow(2)
             weights = x.pow(2)
             return (errors * weights).mean()
+        elif self.recon_loss_type == 'wa_mse':
+            if act_max is None:
+                raise ValueError("recon_loss_type=wa_mse requires act_max tensor.")
+            if act_max.shape != x.shape:
+                raise ValueError(
+                    f"wa_mse shape mismatch: act_max={tuple(act_max.shape)} vs x={tuple(x.shape)}"
+                )
+            x_f = x.float()
+            x_recon_f = x_recon.float()
+            act_f = act_max.float()
+            errors = (x_recon_f - x_f).pow(2)
+            weights = x_f.abs() * act_f
+            return (errors * weights).mean()
         return torch.tensor(0.0, device=x.device)
 
-    def forward(self, x, is_train=True):
+    def forward(self, x, global_step=None, is_train=True, act_max=None):
         """
         x: 输入张量, 形状为 [Batch, num_models, chunk_size]
         """
@@ -570,7 +607,7 @@ class AutoEncoder(nn.Module):
         if not is_train:
             return x_recon, bit_indices
 
-        recon_loss = self._compute_recon_loss(x_recon, x)
+        recon_loss = self._compute_recon_loss(x_recon, x, act_max=act_max)
 
         target_recon_loss = recon_loss * self.l1_weight * self.num_models
 
@@ -597,14 +634,14 @@ class MultiLayerVAE(nn.Module):
         # 这个 AutoEncoder 内部会处理 [Batch, num_models, chunk_size] 的数据流
         self.model = AutoEncoder(args, num_models=self.num_models)
 
-    def forward(self, x, global_step=None, is_train=True):
+    def forward(self, x, is_train=True, act_max=None):
         """
         x: [Batch, num_models, chunk_size]
         """
         # 直接调用并行化的模型
         # returns: (x_recon, x_orig, x_recon_disp, loss_dict) or (x_recon, vq_output)
         if is_train:
-            x_recon, _, loss_dict = self.model(x, is_train=True)
+            x_recon, _, loss_dict = self.model(x, is_train=True, act_max=act_max)
 
             recon_loss = loss_dict["train/recon_loss"]
             commit_loss = loss_dict["train/commitment_loss"]

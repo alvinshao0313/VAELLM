@@ -73,7 +73,7 @@ def _decoder_to_spec(decoder: Decoder) -> Dict[str, Any]:
         hidden_dim = 128
         num_res_blocks = 2
         norm_type = "group"
-    elif decoder.decoder_type == "symmetric":
+    elif decoder.decoder_type in {"symmetric", "asymmetric"}:
         hidden_dim = int(decoder.linear_in.out_features)
         num_res_blocks = int(len(decoder.blocks))
         norm_type = str(decoder.norm_out.norm_type)
@@ -135,6 +135,20 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
             )
 
         decoder_specs = [_decoder_to_spec(dec) for dec in decoders]
+        restore_idx = getattr(module, "restore_row_indices", None)
+        restore_spec = None
+        if isinstance(restore_idx, torch.Tensor):
+            restore_spec = {
+                "shape": list(restore_idx.shape),
+                "dtype": _dtype_to_name(restore_idx.dtype),
+            }
+        restore_col_idx = getattr(module, "restore_col_indices", None)
+        restore_col_spec = None
+        if isinstance(restore_col_idx, torch.Tensor):
+            restore_col_spec = {
+                "shape": list(restore_col_idx.shape),
+                "dtype": _dtype_to_name(restore_col_idx.dtype),
+            }
         specs.append(
             {
                 "name": name,
@@ -143,12 +157,16 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "codebook_dim": int(module.codebook_dim),
                 "transpose": bool(module.transpose),
                 "parallel_parts": int(module.parallel_parts),
+                "parallel_rows": int(getattr(module, "parallel_rows", int(module.parallel_parts))),
+                "parallel_cols": int(getattr(module, "parallel_cols", 1)),
                 "has_bias": bool(module.bias is not None),
                 "has_original_weight": bool(module.original_weight is not None),
                 "always_use_original": bool(getattr(module, "always_use_original", False)),
                 "protect_original_weight": bool(getattr(module, "protect_original_weight", False)),
                 "vq_weights": vq_specs,
                 "decoders": decoder_specs,
+                "restore_row_indices": restore_spec,
+                "restore_col_indices": restore_col_spec,
             }
         )
     return specs
@@ -270,6 +288,22 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
         else:
             vq_payload = vq_placeholders
             decoder_payload = decoders
+        restore_payload = None
+        restore_spec = spec.get("restore_row_indices")
+        if isinstance(restore_spec, dict):
+            shape = tuple(int(v) for v in restore_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] restore_row_indices shape must be 1D, got {shape}")
+            restore_dtype = _name_to_dtype(str(restore_spec.get("dtype", "int64")))
+            restore_payload = torch.zeros(shape, dtype=restore_dtype, device=device)
+        restore_col_payload = None
+        restore_col_spec = spec.get("restore_col_indices")
+        if isinstance(restore_col_spec, dict):
+            shape = tuple(int(v) for v in restore_col_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] restore_col_indices shape must be 1D, got {shape}")
+            restore_dtype = _name_to_dtype(str(restore_col_spec.get("dtype", "int64")))
+            restore_col_payload = torch.zeros(shape, dtype=restore_dtype, device=device)
 
         new_module = VAELinear(
             in_features=int(spec["in_features"]),
@@ -285,6 +319,10 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             codebook_dim=int(spec["codebook_dim"]),
             transpose=bool(spec["transpose"]),
             parallel_parts=parallel_parts,
+            parallel_rows=int(spec.get("parallel_rows", parallel_parts)),
+            parallel_cols=int(spec.get("parallel_cols", 1)),
+            restore_row_indices=restore_payload,
+            restore_col_indices=restore_col_payload,
             always_use_original=bool(spec.get("always_use_original", False)),
             protect_original_weight=bool(spec.get("protect_original_weight", False)),
         )
@@ -296,6 +334,39 @@ def _torch_load_state_dict(path: str, map_location: str):
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def _materialize_missing_bias_params_from_state_dict(model: nn.Module, state_dict: Dict[str, Any]) -> int:
+    created = 0
+    for key, value in state_dict.items():
+        if not key.endswith(".bias"):
+            continue
+        if not isinstance(value, torch.Tensor):
+            continue
+        module_name = key[:-len(".bias")]
+        try:
+            module = _get_module_by_name(model, module_name)
+        except Exception:
+            continue
+        if not hasattr(module, "bias"):
+            continue
+        old_bias = getattr(module, "bias")
+        if old_bias is not None:
+            continue
+        weight = getattr(module, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            device = weight.device
+            dtype = weight.dtype
+        else:
+            device = value.device
+            dtype = value.dtype
+        setattr(
+            module,
+            "bias",
+            nn.Parameter(torch.zeros(tuple(value.shape), dtype=dtype, device=device)),
+        )
+        created += 1
+    return created
 
 
 def load_checkpoint_into_model(
@@ -319,6 +390,7 @@ def load_checkpoint_into_model(
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)
     state_dict = _torch_load_state_dict(state_dict_path, map_location=map_location)
+    _materialize_missing_bias_params_from_state_dict(model, state_dict)
 
     load_result = model.load_state_dict(state_dict, strict=strict)
     model.eval()

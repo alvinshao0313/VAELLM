@@ -1,10 +1,6 @@
-import argparse
-import json
 import os
 import sys
 import time
-import re
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -17,113 +13,40 @@ if _REPO_ROOT not in sys.path:
 from train_utils.train_args import (
     process_cat_train_args,
     create_optimizer,
+    resolve_intra_parallel_for_category,
     resolve_skip_layer_matches,
+)
+from train_utils.cat_data_prep import (
+    LinearPrepRef,
+    gather_wa_mse_act_max_batch,
+    load_activation_weight_dict,
+    prepare_group_weight_data,
+    resolve_intra_parallel,
+)
+from train_utils.activation_utils import (
+    ActivationCalibrationCache,
+    collect_act_max_for_linears,
 )
 from train_utils.model_checkpoint_io import (
     _build_run_output_dir,
     _safe_path_token,
     save_model_checkpoint,
 )
-from train_utils.utils import get_logger, set_seed
+from train_utils.utils import (
+    LinearRef,
+    clone_namespace as _clone_namespace,
+    collect_linears as _collect_linears,
+    extract_layer_idx as _extract_layer_idx,
+    format_intra_parallel_desc as _format_intra_parallel_desc,
+    format_namespace as _format_namespace,
+    get_logger,
+    resolve_category_order as _resolve_category_order,
+    set_seed,
+    split_csv as _split_csv,
+)
 
 
 log = get_logger("linear_by_category")
-
-
-def _split_csv(value: Optional[str]) -> List[str]:
-    if value is None:
-        return []
-    value = value.strip()
-    if not value:
-        return []
-    return [p.strip() for p in value.split(",") if p.strip()]
-
-
-def _resolve_category_order(order: str, discovered: Sequence[str]) -> List[str]:
-    if order.strip().lower() == "auto":
-        return sorted(set(discovered))
-    requested = _split_csv(order)
-    if "others" in requested:
-        known = [c for c in requested if c != "others"]
-        rest = sorted([c for c in set(discovered) if c not in set(known)])
-        return known + rest
-    return requested
-
-
-@dataclass(frozen=True)
-class LinearRef:
-    name: str
-    module: nn.Linear
-    category: str
-    transpose: bool
-
-
-def _is_decoder_layer_projection(name: str, projection_suffixes: Sequence[str]) -> bool:
-    # Llama/Mistral/Qwen 结构示例: "model.layers.{i}.<...>.<proj>"
-    # OPT 结构示例: "model.decoder.layers.{i}.<...>.<proj>"
-    in_decoder_layers = (
-        ".model.layers." in name
-        or name.startswith("model.layers.")
-        or ".model.decoder.layers." in name
-        or name.startswith("model.decoder.layers.")
-    )
-    if not in_decoder_layers:
-        return False
-    return any(name.endswith(f".{sfx}") or name.endswith(sfx) for sfx in projection_suffixes)
-
-
-def _collect_linears(
-    model: nn.Module,
-    transpose_modules: Sequence[str],
-    *,
-    only_decoder_projections: bool,
-    projection_suffixes: Sequence[str],
-) -> List[LinearRef]:
-    transpose_set = set(transpose_modules)
-    suffix_set = set(projection_suffixes)
-    out: List[LinearRef] = []
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
-            continue
-        category = name.split(".")[-1]
-        if only_decoder_projections:
-            if category not in suffix_set:
-                continue
-            if not _is_decoder_layer_projection(name, projection_suffixes):
-                continue
-        out.append(
-            LinearRef(
-                name=name,
-                module=module,
-                category=category,
-                transpose=(category in transpose_set),
-            )
-        )
-    return out
-
-
-_LAYER_IDX_PATTERNS = [
-    re.compile(r"(?:^|\.)(?:model\.)?layers\.(\d+)\."),
-    re.compile(r"(?:^|\.)(?:model\.)?decoder\.layers\.(\d+)\."),
-]
-
-
-def _extract_layer_idx(name: str) -> Optional[int]:
-    for pat in _LAYER_IDX_PATTERNS:
-        m = pat.search(name)
-        if m:
-            return int(m.group(1))
-    return None
-
-
-def _clone_namespace(ns, **overrides):
-    data = dict(vars(ns))
-    data.update(overrides)
-    return argparse.Namespace(**data)
-
-
-def _format_namespace(ns: argparse.Namespace) -> str:
-    return json.dumps(vars(ns), ensure_ascii=False, indent=2, sort_keys=True, default=str)
 
 
 def _fuse_q_scale_linear(linear: nn.Linear, q_scale: float) -> None:
@@ -144,7 +67,7 @@ def _fuse_q_scale_into_decoder(decoder: nn.Module) -> None:
     decoder_type = str(getattr(decoder, "decoder_type"))
     if decoder_type == "linear":
         _fuse_q_scale_linear(decoder.linear, q_scale)
-    elif decoder_type == "symmetric":
+    elif decoder_type in {"symmetric", "asymmetric"}:
         _fuse_q_scale_linear(decoder.linear_in, q_scale)
 
 
@@ -152,7 +75,7 @@ def _fuse_norm_into_decoder(decoder: nn.Module, mean: float, std: float) -> None
     decoder_type = str(getattr(decoder, "decoder_type"))
     if decoder_type == "linear":
         last = decoder.linear
-    elif decoder_type == "symmetric":
+    elif decoder_type in {"symmetric", "asymmetric"}:
         last = decoder.linear_out
     else:
         raise ValueError(f"Unsupported decoder_type={decoder_type} for norm fusion")
@@ -181,21 +104,6 @@ def _eval_ppl_after_category(model: nn.Module, vae_args, ppl_limit: int, categor
     log.info("类别 %s 训练后 PPL: %.2f", category, float(ppl_result.get("wiki_ppl", float("nan"))))
 
 
-def _split_linear_into_parts(weight: torch.Tensor, transpose: bool, num_parts: int) -> torch.Tensor:
-    """
-    将单个 linear 权重切分为 num_parts 个子块，返回形状 [num_parts, -1]。
-    切分规则与 BSQLinear 一致：先按 transpose 选择方向，再沿第 0 维均分。
-    """
-    w = weight.detach().float()
-    if transpose:
-        w = w.t()
-    if w.shape[0] % num_parts != 0:
-        raise ValueError(
-            f"weight dim0={w.shape[0]} not divisible by num_parts={num_parts} (transpose={transpose})"
-        )
-    return w.reshape(num_parts, w.shape[0] // num_parts, w.shape[1]).reshape(num_parts, -1)
-
-
 def _train_group_vae_and_replace(
     *,
     model: nn.Module,
@@ -212,8 +120,11 @@ def _train_group_vae_and_replace(
     eval_every: int,
     eval_blocks: int,
     output_dir: str,
-    intra_parallel: int,
+    intra_parallel,
+    intra_part_sort_mode: str,
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
+    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]] = None,
+    wa_mse_runtime: Optional[Dict[str, object]] = None,
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
     from litebsq.vae_linear import VAELinear
@@ -227,48 +138,83 @@ def _train_group_vae_and_replace(
     else:
         train_dtype = torch.float32
 
-    if intra_parallel < 1:
-        raise ValueError(f"intra_parallel must be >= 1, got {intra_parallel}")
-    num_linear = len(group_refs)
-    num_models = num_linear * intra_parallel
+    use_wa_mse_loss = str(getattr(vae_args, "recon_loss_type", "")).lower() == "wa_mse"
+    row_parts, col_parts = resolve_intra_parallel(intra_parallel)
+    parts_per_linear = int(row_parts) * int(col_parts)
+    effective_activation_weight = activation_weight_by_linear
+    if use_wa_mse_loss and wa_mse_runtime is not None:
+        if bool(wa_mse_runtime.get("dynamic", False)):
+            calib_device = str(wa_mse_runtime.get("device") or train_device)
+            linear_items = [(r.name, r.module) for r in group_refs]
+            dynamic_act_max, new_cache = collect_act_max_for_linears(
+                model=model,
+                linear_items=linear_items,
+                model_path=str(wa_mse_runtime["model_path"]),
+                access_token=wa_mse_runtime.get("access_token"),
+                dataset=str(wa_mse_runtime.get("dataset", "wikitext2")),
+                nsamples=int(wa_mse_runtime.get("nsamples", 512)),
+                seqlen=int(wa_mse_runtime.get("seqlen", 512)),
+                seed=int(wa_mse_runtime.get("seed", 0)),
+                device=calib_device,
+                cache=wa_mse_runtime.get("cache"),  # type: ignore[arg-type]
+                log_every=int(wa_mse_runtime.get("log_every", 0)),
+                logger=log,
+            )
+            wa_mse_runtime["cache"] = new_cache
+            effective_activation_weight = dynamic_act_max
+            log.info(
+                "[%s] refreshed act_max from current model (linears=%d, dataset=%s, nsamples=%d, seqlen=%d).",
+                group_tag,
+                len(dynamic_act_max),
+                str(wa_mse_runtime.get("dataset", "wikitext2")),
+                int(wa_mse_runtime.get("nsamples", 512)),
+                int(wa_mse_runtime.get("seqlen", 512)),
+            )
+        elif effective_activation_weight is None:
+            static_dict = wa_mse_runtime.get("static_dict")
+            if isinstance(static_dict, dict):
+                effective_activation_weight = static_dict
+
+    prep_refs = [
+        LinearPrepRef(
+            name=r.name,
+            weight=r.module.weight,
+            in_features=int(r.module.in_features),
+            out_features=int(r.module.out_features),
+            transpose=bool(r.transpose),
+        )
+        for r in group_refs
+    ]
+    prep_result = prepare_group_weight_data(
+        group_refs=prep_refs,
+        intra_parallel=(row_parts, col_parts),
+        codebook_dim=int(getattr(vae_args, "codebook_dim")),
+        batch_size=int(batch_size),
+        normalize_weight=bool(getattr(vae_args, "normalize_weight", False)),
+        recon_loss_type=str(getattr(vae_args, "recon_loss_type", "")),
+        activation_weight_by_linear=effective_activation_weight,
+        train_device=train_device,
+        intra_part_sort_mode=str(intra_part_sort_mode),
+    )
+    num_models = int(prep_result.num_models)
     group_vae_args = _clone_namespace(vae_args, parallel_layers=num_models)
     vae = MultiLayerVAE(group_vae_args).to(train_device)
-
-    # 1) 组内权重堆叠与预处理：
-    #    每个 linear 先切成 intra_parallel 份，再拼成 [num_linear * intra_parallel, N]。
-    split_list = []
-    for r in group_refs:
-        split_parts = _split_linear_into_parts(r.module.weight, r.transpose, intra_parallel).cpu()
-        split_list.append(split_parts)
-    per_linear_flat = torch.stack(split_list, dim=0)  # [num_linear, intra_parallel, N]
-    stacked_flat = per_linear_flat.reshape(num_models, -1)  # [num_models, N]
-
-    d_mean = stacked_flat.mean(dim=1, keepdim=True)
-    d_std = stacked_flat.std(dim=1, keepdim=True)
-    if bool(getattr(group_vae_args, "normalize_weight", False)):
-        stacked_flat = (stacked_flat - d_mean) / (d_std + 1e-6)
-
-    codebook_dim = int(getattr(group_vae_args, "codebook_dim"))
-    numel = stacked_flat.shape[1]
-    if numel % codebook_dim != 0:
-        raise ValueError(f"[{group_tag}] flatten_len={numel} not divisible by codebook_dim={codebook_dim}")
-
-    stacked_data = stacked_flat.view(num_models, -1, codebook_dim).permute(1, 0, 2).contiguous()
-    # stacked_data 形状: [N_blocks, P, codebook_dim]
-    train_loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(stacked_data),
-        batch_size=int(batch_size),
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-    )
-    eval_loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(stacked_data),
-        batch_size=int(batch_size),
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
+    codebook_dim = int(prep_result.codebook_dim)
+    d_mean = prep_result.d_mean
+    d_std = prep_result.d_std
+    stacked_data = prep_result.stacked_data
+    train_loader = prep_result.train_loader
+    eval_loader = prep_result.eval_loader
+    use_wa_mse = bool(prep_result.use_wa_mse)
+    part_metas = prep_result.part_metas
+    split_metas = prep_result.split_metas
+    if len(split_metas) != len(group_refs):
+        raise RuntimeError(
+            f"[{group_tag}] split metadata mismatch: len(split_metas)={len(split_metas)} "
+            f"vs len(group_refs)={len(group_refs)}"
+        )
+    if use_wa_mse:
+        log.info("[%s] wa_mse enabled with online act_max gather.", group_tag)
 
     # 2) 训练当前分组对应的 VAE。
     optimizer = create_optimizer(vae.parameters(), group_vae_args, group_vae_args.lr)
@@ -288,14 +234,23 @@ def _train_group_vae_and_replace(
     train_iter = iter(train_loader)
     for step in range(int(steps)):
         try:
-            (x_batch,) = next(train_iter)
+            x_batch, block_idx_batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            (x_batch,) = next(train_iter)
+            x_batch, block_idx_batch = next(train_iter)
 
         x = x_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
+        act_max_batch = None
+        if use_wa_mse:
+            act_max_batch = gather_wa_mse_act_max_batch(
+                block_idx_batch=block_idx_batch,
+                part_metas=part_metas,
+                codebook_dim=codebook_dim,
+                train_device=train_device,
+                target_dtype=train_dtype,
+            )
         optimizer.zero_grad(set_to_none=True)
-        _, loss_dict = vae(x, is_train=True)
+        _, loss_dict = vae(x, is_train=True, act_max=act_max_batch)
         loss = loss_dict["loss"]
         loss.backward()
         optimizer.step()
@@ -324,7 +279,7 @@ def _train_group_vae_and_replace(
                 mse_acc = []
                 top_k_mse_acc = []
                 total = 0
-                for (x_eval_batch,) in eval_loader:
+                for x_eval_batch, _eval_idx_batch in eval_loader:
                     if total >= int(eval_blocks):
                         break
                     x_eval_batch = x_eval_batch[: max(0, int(eval_blocks) - total)]
@@ -361,7 +316,7 @@ def _train_group_vae_and_replace(
     # torch.save(vae.state_dict(), os.path.join(group_dir, "vae_state.pt"))
 
     if not do_convert:
-        del vae, stacked_data, per_linear_flat, stacked_flat
+        del vae, stacked_data
         torch.cuda.empty_cache()
         return
 
@@ -369,7 +324,7 @@ def _train_group_vae_and_replace(
     vae.eval()
     bit_chunks: List[torch.Tensor] = []
     with torch.no_grad():
-        for (x_in_batch,) in eval_loader:
+        for x_in_batch, _eval_idx_batch in eval_loader:
             x_in = x_in_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
             _, bit_idx = vae(x_in, is_train=False)  # [B, P, latent_dim]，布尔索引
             bit_chunks.append(bit_idx.detach().to("cpu"))
@@ -385,14 +340,25 @@ def _train_group_vae_and_replace(
 
     for i, r in enumerate(group_refs):
         old = r.module
+        split_meta = split_metas[i]
+        if str(split_meta.linear_name) != str(r.name):
+            raise RuntimeError(
+                f"[{group_tag}] split metadata order mismatch at idx={i}: "
+                f"meta={split_meta.linear_name}, ref={r.name}"
+            )
+        if int(split_meta.parallel_rows) * int(split_meta.parallel_cols) != int(parts_per_linear):
+            raise RuntimeError(
+                f"[{group_tag}] split parts mismatch at idx={i}: "
+                f"meta={split_meta.parallel_rows}x{split_meta.parallel_cols}, expected={parts_per_linear}"
+            )
         layer_idx = _extract_layer_idx(r.name)
         skip_this = bool(
             skip_layer_keys
             and layer_idx is not None
             and (int(layer_idx), str(r.category)) in skip_layer_keys
         )
-        start_idx = i * intra_parallel
-        end_idx = start_idx + intra_parallel
+        start_idx = i * parts_per_linear
+        end_idx = start_idx + parts_per_linear
         part_bits = []
         part_decoders = []
         for model_idx in range(start_idx, end_idx):
@@ -403,11 +369,15 @@ def _train_group_vae_and_replace(
             out_features=old.out_features,
             bias=old.bias,
             original_weight=old.weight,
-            vq_weight=part_bits if intra_parallel > 1 else part_bits[0],
-            decoder=part_decoders if intra_parallel > 1 else part_decoders[0],
+            vq_weight=part_bits if parts_per_linear > 1 else part_bits[0],
+            decoder=part_decoders if parts_per_linear > 1 else part_decoders[0],
             codebook_dim=codebook_dim,
             transpose=r.transpose,
-            parallel_parts=intra_parallel,
+            parallel_parts=parts_per_linear,
+            parallel_rows=row_parts,
+            parallel_cols=col_parts,
+            restore_row_indices=split_meta.restore_row_indices,
+            restore_col_indices=split_meta.restore_col_indices,
             always_use_original=skip_this,
             protect_original_weight=skip_this,
         ).to(convert_device)
@@ -420,7 +390,7 @@ def _train_group_vae_and_replace(
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
 
-    del vae, stacked_data, per_linear_flat, stacked_flat, full_bits, decoders
+    del vae, stacked_data, full_bits, decoders
     torch.cuda.empty_cache()
 
 
@@ -447,7 +417,51 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     from rotation.model_utils import get_model
 
     model = get_model(vae_args.model_path, hf_args.access_token)
+    intra_part_sort_mode = str(getattr(cat_args, "intra_part_sort_mode", "row_l2")).strip().lower()
+    intra_parallel_raw = getattr(cat_args, "intra_parallel", 1)
+    if isinstance(intra_parallel_raw, dict):
+        log.info(
+            "intra_parallel category overrides enabled: keys=%s",
+            ",".join(sorted(str(k) for k in intra_parallel_raw.keys())),
+        )
+    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]] = None
+    wa_mse_runtime: Optional[Dict[str, object]] = None
+    act_path = getattr(cat_args, "activation_weight_path", None)
+    if act_path:
+        activation_weight_by_linear = load_activation_weight_dict(str(act_path))
+        log.info(
+            "Loaded static activation abs-max dict: %s (entries=%d)",
+            act_path,
+            len(activation_weight_by_linear),
+        )
 
+    if str(getattr(vae_args, "recon_loss_type", "")).lower() == "wa_mse":
+        wa_mse_runtime = {
+            "dynamic": str(getattr(cat_args, "wa_mse_act_mode", "dynamic")).strip().lower() == "dynamic",
+            "cache": None,  # type: Optional[ActivationCalibrationCache]
+            "dataset": str(getattr(cat_args, "wa_mse_calib_dataset", "wikitext2")),
+            "nsamples": int(getattr(cat_args, "wa_mse_calib_nsamples", 512)),
+            "seqlen": int(getattr(cat_args, "wa_mse_calib_seqlen", 512)),
+            "seed": int(getattr(cat_args, "wa_mse_calib_seed", 0)),
+            "device": str(getattr(cat_args, "wa_mse_calib_device", "")).strip() or str(cat_args.train_device),
+            "log_every": int(getattr(cat_args, "wa_mse_calib_log_every", 0)),
+            "model_path": str(vae_args.model_path),
+            "access_token": hf_args.access_token,
+            "static_dict": activation_weight_by_linear,
+        }
+        if not bool(wa_mse_runtime["dynamic"]) and activation_weight_by_linear is None:
+            raise ValueError(
+                "wa_mse requires either --wa_mse_act_mode dynamic or --activation_weight_path in static mode."
+            )
+        if bool(wa_mse_runtime["dynamic"]):
+            log.info(
+                "wa_mse dynamic act_max enabled: dataset=%s nsamples=%d seqlen=%d seed=%d device=%s",
+                str(wa_mse_runtime["dataset"]),
+                int(wa_mse_runtime["nsamples"]),
+                int(wa_mse_runtime["seqlen"]),
+                int(wa_mse_runtime["seed"]),
+                str(wa_mse_runtime["device"]),
+            )
     transpose_modules = _split_csv(cat_args.transpose_modules)
     projection_suffixes = _split_csv(cat_args.projection_suffixes)
     only_decoder_projections = bool(cat_args.only_decoder_projections) and not bool(cat_args.include_all_linears)
@@ -487,21 +501,65 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     steps_per_group = int(cat_args.steps_per_group) if cat_args.steps_per_group is not None else int(
         cat_args.steps_per_category)
     linear_group_size = int(cat_args.linear_group_size)
-    intra_parallel = int(cat_args.intra_parallel)
     if linear_group_size < 1:
         raise ValueError(f"linear_group_size must be >= 1, got {linear_group_size}")
-    if intra_parallel < 1:
-        raise ValueError(f"intra_parallel must be >= 1, got {intra_parallel}")
-    if int(getattr(vae_args, "parallel_layers", 1)) != 1:
-        log.warning("检测到 --parallel_layers=%d，但当前脚本不再使用该参数；请使用 --intra_parallel。", int(vae_args.parallel_layers))
-    log.info(
-        "并行配置: linear_group_size=%d, intra_parallel=%d, total_num_models=%d",
-        linear_group_size,
-        intra_parallel,
-        linear_group_size * intra_parallel,
-    )
 
     active_categories = [c for c in category_order if c in refs_by_cat]
+    category_intra_parallel: Dict[str, Tuple[int, int]] = {}
+    for cat in active_categories:
+        category_intra_parallel[cat] = resolve_intra_parallel_for_category(intra_parallel_raw, cat)
+
+    sort_needs_act = (
+        intra_part_sort_mode == "act_row_l2"
+        and any((int(rp) * int(cp)) > 1 for rp, cp in category_intra_parallel.values())
+    )
+    if sort_needs_act and activation_weight_by_linear is None and wa_mse_runtime is None:
+        raise ValueError(
+            "intra_part_sort_mode=act_row_l2 requires activation vectors. "
+            "Please provide --activation_weight_path."
+        )
+
+    unique_parallel = sorted(set(category_intra_parallel.values()))
+    if int(getattr(vae_args, "parallel_layers", 1)) != 1:
+        log.warning("检测到 --parallel_layers=%d，但当前脚本不再使用该参数；请使用 --intra_parallel。", int(vae_args.parallel_layers))
+    if unique_parallel:
+        if len(unique_parallel) == 1:
+            intra_row_parts, intra_col_parts = unique_parallel[0]
+            intra_parts_per_linear = int(intra_row_parts) * int(intra_col_parts)
+            intra_parallel_desc = _format_intra_parallel_desc(intra_row_parts, intra_col_parts)
+            log.info(
+                "并行配置: linear_group_size=%d, intra_parallel=%s (rows=%d, cols=%d), intra_part_sort_mode=%s, total_num_models=%d",
+                linear_group_size,
+                intra_parallel_desc,
+                intra_row_parts,
+                intra_col_parts,
+                intra_part_sort_mode,
+                linear_group_size * intra_parts_per_linear,
+            )
+        else:
+            per_cat_desc = ",".join(
+                f"{cat}:{_format_intra_parallel_desc(*category_intra_parallel[cat])}"
+                for cat in active_categories
+            )
+            models_per_group_values = sorted(
+                linear_group_size * int(rp) * int(cp)
+                for rp, cp in unique_parallel
+            )
+            log.info(
+                "并行配置: linear_group_size=%d, intra_parallel=per_category{%s}, intra_part_sort_mode=%s, total_num_models_per_group=[%d,%d]",
+                linear_group_size,
+                per_cat_desc,
+                intra_part_sort_mode,
+                models_per_group_values[0],
+                models_per_group_values[-1],
+            )
+    lora_round_idx = 0
+    lora_schedule = getattr(cat_args, "lora_schedule", None)
+    if isinstance(lora_schedule, dict) and lora_schedule:
+        log.info(
+            "LoRA category schedule enabled. keys=%s",
+            ",".join(sorted(str(k) for k in lora_schedule.keys())),
+        )
     for cat_idx, cat in enumerate(active_categories):
         if cat not in refs_by_cat:
             continue
@@ -510,7 +568,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if not refs:
             continue
 
-        log.info("=== Category: %s (%d linears) ===", cat, len(refs))
+        cat_row_parts, cat_col_parts = category_intra_parallel[cat]
+        cat_parts_per_linear = int(cat_row_parts) * int(cat_col_parts)
+        cat_intra_parallel_desc = _format_intra_parallel_desc(cat_row_parts, cat_col_parts)
+        log.info(
+            "=== Category: %s (%d linears, intra_parallel=%s rows=%d cols=%d) ===",
+            cat,
+            len(refs),
+            cat_intra_parallel_desc,
+            cat_row_parts,
+            cat_col_parts,
+        )
 
         refs_sorted = []
         missing = 0
@@ -533,11 +601,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             layer_indices = [idx for idx, _ in refs_sorted[start:start + linear_group_size]]
             group_tag = f"{cat}.L{layer_indices[0]}-{layer_indices[-1]}"
             log.info(
-                "---- Group: %s (linears=%d, intra_parallel=%d, num_models=%d) ----",
+                "---- Group: %s (linears=%d, intra_parallel=%s, num_models=%d) ----",
                 group_tag,
                 len(group_refs),
-                intra_parallel,
-                len(group_refs) * intra_parallel,
+                cat_intra_parallel_desc,
+                len(group_refs) * cat_parts_per_linear,
             )
             _train_group_vae_and_replace(
                 model=model,
@@ -554,8 +622,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 eval_every=cat_args.eval_every,
                 eval_blocks=cat_args.eval_blocks,
                 output_dir=cat_args.output_dir,
-                intra_parallel=intra_parallel,
+                intra_parallel=(cat_row_parts, cat_col_parts),
+                intra_part_sort_mode=intra_part_sort_mode,
                 skip_layer_keys=skip_layer_keys,
+                activation_weight_by_linear=activation_weight_by_linear,
+                wa_mse_runtime=wa_mse_runtime,
             )
 
         if cat_args.lora_after_category:
@@ -581,7 +652,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 vae_args=vae_args,
                 training_args=training_args,
                 logger=log,
+                lora_round_idx=lora_round_idx,
+                after_category=cat,
             )
+            lora_round_idx += 1
 
         _eval_ppl_after_category(
             model=model,
@@ -590,22 +664,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             category=cat,
             eval_device=cat_args.train_device,
         )
-        cat_dir_name = _safe_path_token(cat)
-        cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
-        save_paths = save_model_checkpoint(
-            model,
-            cat_model_dir,
-            base_model_path=vae_args.model_path,
-            tokenizer=None,
-            save_config=True,
-            extra_meta={
-                "stage": "after_category",
-                "category": cat,
-                "category_index": int(cat_idx),
-                "lora_after_category": bool(cat_args.lora_after_category),
-            },
-        )
-        log.info("Saved category checkpoint (%s): %s", cat, save_paths["output_dir"])
+        # cat_dir_name = _safe_path_token(cat)
+        # cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
+        # save_paths = save_model_checkpoint(
+        #     model,
+        #     cat_model_dir,
+        #     base_model_path=vae_args.model_path,
+        #     tokenizer=None,
+        #     save_config=True,
+        #     extra_meta={
+        #         "stage": "after_category",
+        #         "category": cat,
+        #         "category_index": int(cat_idx),
+        #         "lora_after_category": bool(cat_args.lora_after_category),
+        #     },
+        # )
+        # log.info("Saved category checkpoint (%s): %s", cat, save_paths["output_dir"])
 
     if cat_args.save_model:
         if not cat_args.convert:

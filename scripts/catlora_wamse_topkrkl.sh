@@ -9,7 +9,7 @@ set -euo pipefail
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 PYTHONPATH="${PYTHONPATH:-.}:." \
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2} \
 python tools/cat_train.py \
   --output_dir "${OUTPUT_DIR:-.result}" \
   --steps_per_category "${STEPS_PER_CATEGORY:-5000}" \
@@ -19,7 +19,7 @@ python tools/cat_train.py \
   --eval_blocks "${EVAL_BLOCKS:-256}" \
   --ppl_limit "${PPL_LIMIT:--1}" \
   --skip_layers "${SKIP_LAYERS:-1.down_proj}" \
-  --transpose_modules "${TRANSPOSE_MODULES:-"k_proj"}" \
+  --transpose_modules "${TRANSPOSE_MODULES:-"q_proj"}" \
   --projection_suffixes "${PROJECTION_SUFFIXES:-"down_proj"}" \
   --lora_rank "${LORA_RANK:-8}" \
   --lora_alpha "${LORA_ALPHA:-16.0}" \
@@ -27,11 +27,10 @@ python tools/cat_train.py \
   --lora_steps "${LORA_STEPS:-1000}" \
   --lora_batch_size "${LORA_BATCH_SIZE:-2}" \
   --lora_nsamples "${LORA_NSAMPLES:-2048}" \
-  --lora_tune_norm \
-  --lora_tune_lm_head \
   --lora_lr "${LORA_LR:-1e-4}" \
   --lora_weight_decay "${LORA_WEIGHT_DECAY:-0.001}" \
   --lora_log_every "${LORA_LOG_EVERY:-2}" \
+  --lora_loss_type "${LORA_LOSS_TYPE:-sft}" \
   --train_device "${TRAIN_DEVICE:-cuda}" \
   --convert \
   --convert_device "${CONVERT_DEVICE:-cuda}" \
@@ -51,7 +50,14 @@ python tools/cat_train.py \
   --normalize_weight \
   --new_quant \
   --use_checkpoint \
-  --recon_loss_type "${RECON_LOSS_TYPE:-w_mse}" \
+  --recon_loss_type "${RECON_LOSS_TYPE:-wa_mse}" \
+  --wa_mse_act_mode "${WA_MSE_ACT_MODE:-dynamic}" \
+  --wa_mse_calib_dataset "${WA_MSE_CALIB_DATASET:-wikitext2}" \
+  --wa_mse_calib_nsamples "${WA_MSE_CALIB_NSAMPLES:-512}" \
+  --wa_mse_calib_seqlen "${WA_MSE_CALIB_SEQLEN:-512}" \
+  --wa_mse_calib_seed "${WA_MSE_CALIB_SEED:-0}" \
+  --wa_mse_calib_device "${WA_MSE_CALIB_DEVICE:-}" \
+  --wa_mse_calib_log_every "${WA_MSE_CALIB_LOG_EVERY:-0}" \
   --l1_weight "${L1_WEIGHT:-1.0}" \
   --lfq_weight "${LFQ_WEIGHT:-4}" \
   --commitment_loss_weight "${COMMITMENT_LOSS_WEIGHT:-0.25}" \
