@@ -108,8 +108,8 @@
 
 | 参数 | 默认值 | 功能 | 备注 |
 |---|---:|---|---|
-| `--codebook_bits` | `16` | latent bit 维度 | 不是“码本个数”而是 bit 数 |
-| `--codebook_dim` | `8` | 权重切块大小（chunk size） | 每块长度必须整除 |
+| `--codebook_bits` | `16` | latent bit 维度 | 支持整数或按类别 JSON dict（`category > default > *`） |
+| `--codebook_dim` | `8` | 权重切块大小（chunk size） | 支持整数或按类别 JSON dict（`category > default > *`）；每块长度必须整除 |
 | `--base_ch` | `128` | 编解码器共享基础通道数 | encoder 恒定使用它；decoder 在 `linear/symmetric` 下也使用它 |
 | `--num_res_blocks` | `1` | 编解码器共享残差块数量 | encoder 恒定使用它；decoder 在 `linear/symmetric` 下也使用它 |
 | `--decoder_base_ch` | `None` | decoder hidden dim | 仅 `decoder_type=asymmetric` 时可独立设置；缺省回退到 `base_ch` |
@@ -163,7 +163,7 @@
 6. 切分可整除性必须满足：
    - 若该类别在 `transpose_modules` 中：`in_features % row_parts == 0` 且 `out_features % col_parts == 0`
    - 否则：`out_features % row_parts == 0` 且 `in_features % col_parts == 0`
-7. 切分后每个 part 的展平长度必须能被 `codebook_dim` 整除。
+7. 切分后每个 part 的展平长度必须能被该类别生效的 `codebook_dim` 整除。
 
 ## 6. 关键复杂参数详解
 
@@ -213,7 +213,31 @@
 
 同时支持别名键：`r/lora_rank`、`lora_alpha`、`lora_steps`、`lora_batch_size`、`lora_nsamples`、`lora_lr` 等。
 
-### 6.3 输出目录实际结构
+### 6.3 `--codebook_bits` / `--codebook_dim`（按类别覆盖）
+
+两者都支持两种写法：
+
+1. 标量整数（全类别共用）
+2. JSON dict（按类别覆盖）
+
+示例：
+
+```bash
+--codebook_bits 32 \
+--codebook_dim 16
+```
+
+```bash
+--codebook_bits '{"default":32,"q_proj":24,"k_proj":24}' \
+--codebook_dim '{"default":16,"q_proj":8,"down_proj":32}'
+```
+
+dict 模式下：
+
+- 命中优先级：`category` > `default` > `*`
+- 若某类别未命中且没有 `default/*`，会直接报错
+
+### 6.4 输出目录实际结构
 
 `--output_dir` 是根目录，真实运行目录会自动生成为：
 

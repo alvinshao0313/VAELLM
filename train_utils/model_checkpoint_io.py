@@ -3,7 +3,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -369,6 +369,46 @@ def _materialize_missing_bias_params_from_state_dict(model: nn.Module, state_dic
     return created
 
 
+def _remap_legacy_parallel_linear_state_dict_keys(
+    state_dict: Dict[str, Any],
+    model_state_keys: Sequence[str],
+) -> Tuple[Dict[str, Any], int]:
+    """Map legacy Linear keys to current ParallelLinear key layout.
+
+    Older checkpoints may store decoder keys like:
+      *.linear_in.weight / *.linear_in.bias
+    while current modules expect:
+      *.linear_in.linear.weight / *.linear_in.linear.bias  (num_models=1)
+    or:
+      *.linear_in.conv.weight / *.linear_in.conv.bias      (num_models>1)
+    """
+
+    key_set = set(model_state_keys)
+    remapped: Dict[str, Any] = {}
+    converted = 0
+
+    for key, value in state_dict.items():
+        target_key = key
+
+        if (key.endswith(".weight") or key.endswith(".bias")) and key.count(".") >= 1:
+            stem, suffix = key.rsplit(".", 1)
+            cand_linear = f"{stem}.linear.{suffix}"
+            cand_conv = f"{stem}.conv.{suffix}"
+
+            # Only remap when original key is no longer expected by model.
+            if key not in key_set:
+                if cand_linear in key_set:
+                    target_key = cand_linear
+                    converted += 1
+                elif cand_conv in key_set:
+                    target_key = cand_conv
+                    converted += 1
+
+        remapped[target_key] = value
+
+    return remapped, converted
+
+
 def load_checkpoint_into_model(
     model: nn.Module,
     model_dir: str,
@@ -390,6 +430,8 @@ def load_checkpoint_into_model(
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)
     state_dict = _torch_load_state_dict(state_dict_path, map_location=map_location)
+    model_state_keys = tuple(model.state_dict().keys())
+    state_dict, _remap_count = _remap_legacy_parallel_linear_state_dict_keys(state_dict, model_state_keys)
     _materialize_missing_bias_params_from_state_dict(model, state_dict)
 
     load_result = model.load_state_dict(state_dict, strict=strict)

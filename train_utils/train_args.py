@@ -234,6 +234,81 @@ def _parse_lora_schedule(value):
     return out
 
 
+def _parse_positive_int_like(value, *, arg_name: str) -> int:
+    if isinstance(value, bool):
+        raise argparse.ArgumentTypeError(f"Invalid {arg_name} value '{value}'. Expected positive integer.")
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(f"Invalid {arg_name} value '{value}'. Expected positive integer.") from e
+    if out < 1:
+        raise argparse.ArgumentTypeError(f"{arg_name} must be >= 1, got {out}.")
+    return int(out)
+
+
+def _parse_positive_int_or_category_schedule(value, *, arg_name: str):
+    if value is None:
+        raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
+
+    if isinstance(value, int):
+        return _parse_positive_int_like(value, arg_name=arg_name)
+
+    parsed_obj = None
+    if isinstance(value, dict):
+        parsed_obj = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
+        if raw.startswith("{") and raw.endswith("}"):
+            try:
+                parsed_obj = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid {arg_name} dict '{value}'. "
+                    "Please pass valid JSON, for example: "
+                    '\'{"default":16,"q_proj":24}\'.'
+                ) from e
+        else:
+            return _parse_positive_int_like(raw, arg_name=arg_name)
+
+    if not isinstance(parsed_obj, dict):
+        raise argparse.ArgumentTypeError(
+            f"Invalid {arg_name} value '{value}'. "
+            "JSON form must be an object/dict."
+        )
+    if not parsed_obj:
+        raise argparse.ArgumentTypeError(f"{arg_name} dict cannot be empty.")
+
+    out: Dict[str, int] = {}
+    for k, v in parsed_obj.items():
+        key = str(k).strip()
+        if not key:
+            raise argparse.ArgumentTypeError(
+                f"Invalid {arg_name} key in '{value}': key cannot be empty."
+            )
+        out[key] = _parse_positive_int_like(v, arg_name=f"{arg_name}[{key}]")
+    return out
+
+
+def _resolve_category_override(value, category: str, *, arg_name: str):
+    if isinstance(value, dict):
+        category_key = str(category)
+        if category_key in value:
+            return value[category_key]
+        if "default" in value:
+            return value["default"]
+        if "*" in value:
+            return value["*"]
+        keys = sorted(str(k) for k in value.keys())
+        raise ValueError(
+            f"{arg_name} dict does not contain category '{category_key}', "
+            "and missing fallback key 'default' or '*'. "
+            f"Available keys: {keys}"
+        )
+    return value
+
+
 def _parse_intra_parallel(value: str):
     def _parse_positive_int(token, *, raw_value: str) -> int:
         try:
@@ -359,23 +434,18 @@ def resolve_intra_parallel_for_category(
     value,
     category: str,
 ) -> Tuple[int, int]:
-    if isinstance(value, dict):
-        category_key = str(category)
-        if category_key in value:
-            selected = value[category_key]
-        elif "default" in value:
-            selected = value["default"]
-        elif "*" in value:
-            selected = value["*"]
-        else:
-            keys = sorted(str(k) for k in value.keys())
-            raise ValueError(
-                f"intra_parallel dict does not contain category '{category_key}', "
-                "and missing fallback key 'default' or '*'. "
-                f"Available keys: {keys}"
-            )
-        return resolve_intra_parallel(selected)
-    return resolve_intra_parallel(value)
+    selected = _resolve_category_override(value, category, arg_name="intra_parallel")
+    return resolve_intra_parallel(selected)
+
+
+def resolve_codebook_int_for_category(
+    value,
+    category: str,
+    *,
+    arg_name: str,
+) -> int:
+    selected = _resolve_category_override(value, category, arg_name=arg_name)
+    return _parse_positive_int_like(selected, arg_name=arg_name)
 
 
 def resolve_lora_schedule_for_category(
@@ -491,8 +561,16 @@ def add_llm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
 def add_model_specific_args(parent_parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
-    parser.add_argument("--codebook_bits", type=int, default=16)  # 2^16 -> 16 bits
-    parser.add_argument("--codebook_dim", type=int, default=8)  # 这时候它代表 Input Chunk Size
+    parser.add_argument(
+        "--codebook_bits",
+        type=lambda v: _parse_positive_int_or_category_schedule(v, arg_name="--codebook_bits"),
+        default=16,
+    )  # 2^16 -> 16 bits
+    parser.add_argument(
+        "--codebook_dim",
+        type=lambda v: _parse_positive_int_or_category_schedule(v, arg_name="--codebook_dim"),
+        default=8,
+    )  # 这时候它代表 Input Chunk Size
 
     parser.add_argument("--base_ch", type=int, default=128)
     parser.add_argument("--num_res_blocks", type=int, default=1)

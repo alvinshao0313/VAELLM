@@ -31,6 +31,7 @@ from train_utils.model_checkpoint_io import (
 from train_utils.train_args import (
     build_cat_train_parser,
     process_args_from,
+    resolve_codebook_int_for_category,
     resolve_intra_parallel_for_category,
     resolve_skip_layer_matches,
 )
@@ -38,6 +39,13 @@ from train_utils.utils import get_logger, set_seed
 
 
 log = get_logger("linear_by_schedule")
+
+
+def _clone_namespace(ns, **overrides):
+    out = argparse.Namespace(**vars(ns))
+    for key, value in overrides.items():
+        setattr(out, key, value)
+    return out
 
 
 def _format_intra_parallel_desc(row_parts: int, col_parts: int) -> str:
@@ -419,8 +427,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cat_args.steps_per_category)
     intra_parallel_raw = getattr(cat_args, "intra_parallel", 1)
     category_intra_parallel: Dict[str, Tuple[int, int]] = {}
+    category_codebook: Dict[str, Tuple[int, int]] = {}
     for cat in schedule_categories:
         category_intra_parallel[cat] = resolve_intra_parallel_for_category(intra_parallel_raw, cat)
+        category_codebook[cat] = (
+            resolve_codebook_int_for_category(
+                getattr(vae_args, "codebook_bits"),
+                cat,
+                arg_name="codebook_bits",
+            ),
+            resolve_codebook_int_for_category(
+                getattr(vae_args, "codebook_dim"),
+                cat,
+                arg_name="codebook_dim",
+            ),
+        )
 
     unique_parallel = sorted(set(category_intra_parallel.values()))
     if int(getattr(vae_args, "parallel_layers", 1)) != 1:
@@ -447,6 +468,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "并行配置: intra_parallel=per_category{%s}",
                 per_cat_desc,
             )
+    unique_codebook = sorted(set(category_codebook.values()))
+    if unique_codebook:
+        if len(unique_codebook) == 1:
+            cb_bits, cb_dim = unique_codebook[0]
+            log.info("codebook 配置: bits=%d, dim=%d", cb_bits, cb_dim)
+        else:
+            per_cat_cb_desc = ",".join(
+                f"{cat}:[bits={category_codebook[cat][0]},dim={category_codebook[cat][1]}]"
+                for cat in schedule_categories
+            )
+            log.info("codebook 配置: per_category{%s}", per_cat_cb_desc)
 
     stage_counter = 0
     lora_round_idx = 0
@@ -480,6 +512,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     f" 实际配置: {stage_parallel_detail}"
                 )
             stage_row_parts, stage_col_parts = next(iter(stage_parallel_set))
+            stage_codebook_set = {category_codebook[cat] for cat in cat_group}
+            if len(stage_codebook_set) != 1:
+                stage_codebook_detail = ",".join(
+                    f"{cat}:[bits={category_codebook[cat][0]},dim={category_codebook[cat][1]}]"
+                    for cat in cat_group
+                )
+                raise ValueError(
+                    f"[{group_tag}] 当前 stage 中并行训练的类别必须共享同一 codebook 配置。"
+                    f" 实际配置: {stage_codebook_detail}"
+                )
+            stage_codebook_bits, stage_codebook_dim = next(iter(stage_codebook_set))
+            stage_vae_args = _clone_namespace(
+                vae_args,
+                codebook_bits=int(stage_codebook_bits),
+                codebook_dim=int(stage_codebook_dim),
+            )
             stage_parts_per_linear = int(stage_row_parts) * int(stage_col_parts)
             stage_intra_parallel_desc = _format_intra_parallel_desc(stage_row_parts, stage_col_parts)
 
@@ -505,20 +553,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 group_refs=group_refs,
                 group_tag=group_tag,
                 intra_parallel=(stage_row_parts, stage_col_parts),
-                codebook_dim=int(getattr(vae_args, "codebook_dim")),
+                codebook_dim=int(stage_codebook_dim),
             )
             log.info(
-                "---- Stage: %s (linears=%d, intra_parallel=%s, num_models=%d) ----",
+                "---- Stage: %s (linears=%d, intra_parallel=%s, codebook_bits=%d, codebook_dim=%d, num_models=%d) ----",
                 group_tag,
                 len(group_refs),
                 stage_intra_parallel_desc,
+                int(stage_codebook_bits),
+                int(stage_codebook_dim),
                 len(group_refs) * stage_parts_per_linear,
             )
             _train_group_vae_and_replace(
                 model=model,
                 group_refs=group_refs,
                 group_tag=group_tag,
-                vae_args=vae_args,
+                vae_args=stage_vae_args,
                 training_args=training_args,
                 train_device=cat_args.train_device,
                 convert_device=cat_args.convert_device,

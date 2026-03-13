@@ -13,6 +13,7 @@ if _REPO_ROOT not in sys.path:
 from train_utils.train_args import (
     process_cat_train_args,
     create_optimizer,
+    resolve_codebook_int_for_category,
     resolve_intra_parallel_for_category,
     resolve_skip_layer_matches,
 )
@@ -506,8 +507,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     active_categories = [c for c in category_order if c in refs_by_cat]
     category_intra_parallel: Dict[str, Tuple[int, int]] = {}
+    category_codebook: Dict[str, Tuple[int, int]] = {}
     for cat in active_categories:
         category_intra_parallel[cat] = resolve_intra_parallel_for_category(intra_parallel_raw, cat)
+        category_codebook[cat] = (
+            resolve_codebook_int_for_category(
+                getattr(vae_args, "codebook_bits"),
+                cat,
+                arg_name="codebook_bits",
+            ),
+            resolve_codebook_int_for_category(
+                getattr(vae_args, "codebook_dim"),
+                cat,
+                arg_name="codebook_dim",
+            ),
+        )
 
     sort_needs_act = (
         intra_part_sort_mode == "act_row_l2"
@@ -553,6 +567,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 models_per_group_values[0],
                 models_per_group_values[-1],
             )
+    unique_codebook = sorted(set(category_codebook.values()))
+    if unique_codebook:
+        if len(unique_codebook) == 1:
+            cb_bits, cb_dim = unique_codebook[0]
+            log.info("codebook 配置: bits=%d, dim=%d", cb_bits, cb_dim)
+        else:
+            per_cat_cb_desc = ",".join(
+                f"{cat}:[bits={category_codebook[cat][0]},dim={category_codebook[cat][1]}]"
+                for cat in active_categories
+            )
+            log.info("codebook 配置: per_category{%s}", per_cat_cb_desc)
     lora_round_idx = 0
     lora_schedule = getattr(cat_args, "lora_schedule", None)
     if isinstance(lora_schedule, dict) and lora_schedule:
@@ -569,15 +594,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             continue
 
         cat_row_parts, cat_col_parts = category_intra_parallel[cat]
+        cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
+        cat_vae_args = _clone_namespace(
+            vae_args,
+            codebook_bits=int(cat_codebook_bits),
+            codebook_dim=int(cat_codebook_dim),
+        )
         cat_parts_per_linear = int(cat_row_parts) * int(cat_col_parts)
         cat_intra_parallel_desc = _format_intra_parallel_desc(cat_row_parts, cat_col_parts)
         log.info(
-            "=== Category: %s (%d linears, intra_parallel=%s rows=%d cols=%d) ===",
+            "=== Category: %s (%d linears, intra_parallel=%s rows=%d cols=%d, codebook_bits=%d, codebook_dim=%d) ===",
             cat,
             len(refs),
             cat_intra_parallel_desc,
             cat_row_parts,
             cat_col_parts,
+            int(cat_codebook_bits),
+            int(cat_codebook_dim),
         )
 
         refs_sorted = []
@@ -611,7 +644,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 model=model,
                 group_refs=group_refs,
                 group_tag=group_tag,
-                vae_args=vae_args,
+                vae_args=cat_vae_args,
                 training_args=training_args,
                 train_device=cat_args.train_device,
                 convert_device=cat_args.convert_device,
