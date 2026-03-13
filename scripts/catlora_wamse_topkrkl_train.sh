@@ -17,7 +17,6 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 PYTHONPATH="${PYTHONPATH:-.}:." \
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1} \
 python tools/cat_train.py \
-  --save_model \
   --output_dir "${OUTPUT_DIR:-.result}" \
   --steps_per_category "${STEPS_PER_CATEGORY:-5000}" \
   --category_order "${CATEGORY_ORDER:-'q_proj'}" \
