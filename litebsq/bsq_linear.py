@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from litebsq.llm_vae import MultiLayerVAE
 from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalLM, LlamaDecoderLayer
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Model, Qwen3ForCausalLM, Qwen3DecoderLayer
@@ -105,7 +106,10 @@ class BSQLinear(nn.Module):
                     _, vq_w = self.vae(w_input, is_train=False)
             self.register_buffer('vq_weight', vq_w)
             self.decoder = self.vae.model.decoder
-            self.decoder._fuse_q_scale()
+            in_dim = int(getattr(self.decoder, "in_dim"))
+            use_new_quant = bool(getattr(self.vae.args, "new_quant", False))
+            q_scale = (1.0 / math.sqrt(in_dim)) if use_new_quant else 1.0
+            self.decoder._fuse_q_scale(q_scale=q_scale)
             del self.vae, self.weight
 
     def _normalize_weight(self, weight):

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 import torch
 from torch import nn
@@ -7,6 +8,7 @@ from datasets import load_dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from trl import DataCollatorForCompletionOnlyLM, SFTTrainer
 from transformers import AutoTokenizer, TrainingArguments
+from litebsq.vae_linear import VAELinear
 from train_utils.train_args import resolve_lora_schedule_for_category
 
 
@@ -59,7 +61,12 @@ class CustomSFTTrainer(SFTTrainer):
         @torch.no_grad()
         def get_ori_outputs():
             set_temporary(False)
-            with peft_model_for_teacher.disable_adapter():
+            adapter_context = (
+                peft_model_for_teacher.disable_adapter()
+                if hasattr(peft_model_for_teacher, "disable_adapter")
+                else nullcontext()
+            )
+            with adapter_context:
                 outputs = model(**teacher_inputs, output_hidden_states=False)
             return outputs
 
@@ -257,6 +264,39 @@ def _ensure_linear_bias_param(module: nn.Linear) -> bool:
     return True
 
 
+def _collect_protected_outlier_trainables(
+    model: nn.Module,
+) -> Tuple[List[Tuple[str, VAELinear]], List[Tuple[str, nn.Parameter]]]:
+    protected_modules: List[Tuple[str, VAELinear]] = []
+    protected_params: List[Tuple[str, nn.Parameter]] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, VAELinear):
+            continue
+        if bool(getattr(module, "always_use_original", False)):
+            continue
+        if not module.has_protected_outliers():
+            continue
+        protected_modules.append((name, module))
+        for attr_name in ("protected_input_weight", "protected_output_weight"):
+            param = getattr(module, attr_name, None)
+            if isinstance(param, nn.Parameter) and int(param.numel()) > 0:
+                protected_params.append((f"{name}.{attr_name}", param))
+    return protected_modules, protected_params
+
+
+def _set_protected_outlier_trainable_state(
+    protected_modules: Sequence[Tuple[str, VAELinear]],
+    protected_params: Sequence[Tuple[str, nn.Parameter]],
+    *,
+    trainable: bool,
+) -> None:
+    for _name, module in protected_modules:
+        module.cache_decoded_weight = not bool(trainable)
+        module.clear_decoded_weight_cache()
+    for _name, param in protected_params:
+        param.requires_grad = bool(trainable)
+
+
 def _resolve_lora_runtime_config(
     *,
     cat_args,
@@ -305,6 +345,7 @@ def lora_finetune_remaining_categories(
     tune_norm = bool(getattr(cat_args, "lora_tune_norm", False))
     tune_lm_head = bool(getattr(cat_args, "lora_tune_lm_head", False))
     tune_bias = bool(getattr(cat_args, "lora_tune_bias", False))
+    tune_protected_outliers = bool(getattr(cat_args, "lora_tune_protected_outliers", False))
     bias_categories = _parse_name_list(getattr(cat_args, "lora_bias_categories", []))
     lora_loss_type = str(getattr(cat_args, "lora_loss_type", "sft"))
     use_dora = bool(getattr(cat_args, "lora_use_dora", True))
@@ -326,6 +367,9 @@ def lora_finetune_remaining_categories(
         tune_norm = bool(lora_overrides.get("tune_norm", tune_norm))
         tune_lm_head = bool(lora_overrides.get("tune_lm_head", tune_lm_head))
         tune_bias = bool(lora_overrides.get("tune_bias", tune_bias))
+        tune_protected_outliers = bool(
+            lora_overrides.get("tune_protected_outliers", tune_protected_outliers)
+        )
         if "bias_categories" in lora_overrides:
             bias_categories = _parse_name_list(lora_overrides.get("bias_categories", []))
         lora_loss_type = str(lora_overrides.get("loss_type", lora_loss_type))
@@ -347,6 +391,20 @@ def lora_finetune_remaining_categories(
         only_decoder_projections=only_decoder_projections,
         projection_suffixes=projection_suffixes,
     )
+    protected_modules, protected_params = _collect_protected_outlier_trainables(model)
+    protected_module_count = int(len(protected_modules))
+    protected_param_count = int(len(protected_params))
+    protected_param_numel = int(sum(int(param.numel()) for _, param in protected_params))
+    if tune_protected_outliers:
+        if protected_param_count > 0:
+            logger.info(
+                "LoRA: protected outlier 训练已启用，模块=%d，参数张量=%d，总元素=%d",
+                protected_module_count,
+                protected_param_count,
+                protected_param_numel,
+            )
+        else:
+            logger.info("LoRA: --lora_tune_protected_outliers 已开启，但当前模型没有可训练 protected outlier。")
     target_names = [r.name for r in current_linears if r.category in remaining_set]
     lm_head_module = None
     if tune_lm_head:
@@ -361,7 +419,7 @@ def lora_finetune_remaining_categories(
                 type(lm_head_module).__name__,
             )
             lm_head_module = None
-    if not target_names and not tune_norm:
+    if not target_names and not tune_norm and not (tune_protected_outliers and protected_param_count > 0):
         logger.info("LoRA: 没有可微调的剩余 Linear，跳过。")
         return model
 
@@ -410,17 +468,22 @@ def lora_finetune_remaining_categories(
             if _ensure_linear_bias_param(linear):
                 created_bias_count += 1
 
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=int(rank),
-        lora_alpha=float(alpha),
-        lora_dropout=float(dropout),
-        target_modules=sorted(set(target_names)),
-        inference_mode=False,
-        bias="none",
-        use_dora=bool(use_dora),
-    )
-    model = get_peft_model(model, lora_config)
+    unique_target_names = sorted(set(target_names))
+    lora_config = None
+    if unique_target_names:
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=int(rank),
+            lora_alpha=float(alpha),
+            lora_dropout=float(dropout),
+            target_modules=unique_target_names,
+            inference_mode=False,
+            bias="none",
+            use_dora=bool(use_dora),
+        )
+        model = get_peft_model(model, lora_config)
+    else:
+        logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
 
     bias_trainable_count = 0
     if tune_bias:
@@ -444,19 +507,29 @@ def lora_finetune_remaining_categories(
                 norm_trainable_count += 1
         logger.info("LoRA: 已额外解冻 norm 参数，数量=%d", norm_trainable_count)
 
+    if protected_param_count > 0:
+        _set_protected_outlier_trainable_state(
+            protected_modules,
+            protected_params,
+            trainable=bool(tune_protected_outliers),
+        )
+
     resolved_lora_loss = str(lora_loss_type).strip().lower() if lora_loss_type is not None else "sft"
     use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"}
     if use_custom_trainer:
         logger.info(
-            "LoRA: 使用 CustomSFTTrainer 微调，loss_type=%s，use_dora=%s，tune_norm=%s，tune_lm_head=%s，tune_bias=%s，目标类别=%s，目标模块=%d，bias模块=%d，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
+            "LoRA: 使用 CustomSFTTrainer 微调，loss_type=%s，use_dora=%s，tune_norm=%s，tune_lm_head=%s，tune_bias=%s，tune_protected_outliers=%s，目标类别=%s，目标模块=%d，bias模块=%d，protected模块=%d，protected参数=%d，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
             resolved_lora_loss,
             str(use_dora).lower(),
             str(tune_norm).lower(),
             str(tune_lm_head).lower(),
             str(tune_bias).lower(),
+            str(tune_protected_outliers).lower(),
             ",".join(remaining_categories),
-            len(set(target_names)),
+            len(unique_target_names),
             int(bias_trainable_count),
+            int(protected_module_count),
+            int(protected_param_count),
             int(rank),
             float(alpha),
             int(steps),
@@ -467,14 +540,17 @@ def lora_finetune_remaining_categories(
         )
     else:
         logger.info(
-            "LoRA: 使用 SFTTrainer 微调，use_dora=%s，tune_norm=%s，tune_lm_head=%s，tune_bias=%s，目标类别=%s，目标模块=%d，bias模块=%d，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
+            "LoRA: 使用 SFTTrainer 微调，use_dora=%s，tune_norm=%s，tune_lm_head=%s，tune_bias=%s，tune_protected_outliers=%s，目标类别=%s，目标模块=%d，bias模块=%d，protected模块=%d，protected参数=%d，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
             str(use_dora).lower(),
             str(tune_norm).lower(),
             str(tune_lm_head).lower(),
             str(tune_bias).lower(),
+            str(tune_protected_outliers).lower(),
             ",".join(remaining_categories),
-            len(set(target_names)),
+            len(unique_target_names),
             int(bias_trainable_count),
+            int(protected_module_count),
+            int(protected_param_count),
             int(rank),
             float(alpha),
             int(steps),
@@ -492,6 +568,14 @@ def lora_finetune_remaining_categories(
     train_ds = train_ds.filter(lambda rec: rec["text"] is not None and len(rec["text"]) > 0)
     if len(train_ds) == 0:
         logger.warning("LoRA: 数据集为空，跳过。")
+        model, _merged_count = merge_all_lora(model)
+        if protected_param_count > 0:
+            merged_protected_modules, merged_protected_params = _collect_protected_outlier_trainables(model)
+            _set_protected_outlier_trainable_state(
+                merged_protected_modules,
+                merged_protected_params,
+                trainable=False,
+            )
         return model
 
     if "validation" in dataset_dict:
@@ -542,10 +626,11 @@ def lora_finetune_remaining_categories(
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         args=sft_args,
-        peft_config=lora_config,
         dataset_text_field="text",
         max_seq_length=int(getattr(training_args, "model_max_length", 2048)),
     )
+    if lora_config is not None:
+        trainer_kwargs["peft_config"] = lora_config
     if use_custom_trainer:
         trainer = CustomSFTTrainer(
             **trainer_kwargs,
@@ -556,6 +641,13 @@ def lora_finetune_remaining_categories(
     trainer.train()
 
     model, merged_count = merge_all_lora(trainer.model)
+    if protected_param_count > 0:
+        merged_protected_modules, merged_protected_params = _collect_protected_outlier_trainables(model)
+        _set_protected_outlier_trainable_state(
+            merged_protected_modules,
+            merged_protected_params,
+            trainable=False,
+        )
     model.to("cpu")
     torch.cuda.empty_cache()
     logger.info("LoRA: 微调完成并融合，融合模块数量=%d", merged_count)

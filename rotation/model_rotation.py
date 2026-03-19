@@ -74,17 +74,16 @@ def register_rotate_hook(model, args):
     return rotate_handles
 
 
-def prepare_model(model, args):
+def prepare_model(model, args=None):
     if model.config.tie_word_embeddings:  # 断开权重共享 针对 Llama-3.2
         logging.info("Tying word embeddings is not supported for rotation, disabling it.")
         separate_embeddings_and_lm_head(model)
 
     rotation_utils.fuse_layer_norms(model)
-    rotation_utils.rotate_model(model, args)
+    rotation_utils.rotate_model(model)
     rotation_utils.cleanup_memory(verbos=True)
-    rotate_handles = register_rotate_hook(model, args)
 
-    return model, rotate_handles
+    return model
 
 
 def prepare_model4eval(model, args):

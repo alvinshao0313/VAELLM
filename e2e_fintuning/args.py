@@ -1,0 +1,216 @@
+import argparse
+import os
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
+
+from transformers import HfArgumentParser
+
+from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_like, _parse_lora_loss_type
+
+
+_DEFAULT_RUN_ROOT = ".result/e2e_fintuning"
+
+
+@dataclass
+class E2EFinetuneArguments:
+    student_checkpoint_dir: str
+    run_root_dir: str = _DEFAULT_RUN_ROOT
+    teacher_model_path: Optional[str] = None
+    finetune_mode: str = "full"
+    loss_type: str = "sft"
+    distill_temperature: float = 1.0
+    distill_alpha: float = 0.5
+    decoder_layers: str = "all"
+    train_protected_outliers: bool = False
+    vae_lora_rank: int = 8
+    vae_lora_alpha: float = 16.0
+    vae_lora_dropout: float = 0.0
+    prewarm_frozen_vae: bool = True
+    prewarm_log_every: int = 32
+    skip_ppl_eval: bool = False
+    ppl_seqlen: int = 2048
+    ppl_limit: int = -1
+    dataset_name: Optional[str] = None
+    dataset_config_name: Optional[str] = None
+    train_split: str = "train"
+    eval_split: str = "validation"
+    train_file: Optional[str] = None
+    eval_file: Optional[str] = None
+    text_field: str = "text"
+    max_train_samples: Optional[int] = None
+    max_eval_samples: Optional[int] = None
+    packing_block_size: Optional[int] = None
+    save_tokenizer: bool = False
+    unload_vae_original_weights_on_save: bool = False
+    decoder_layer_ids: Optional[List[int]] = field(default=None, init=False)
+
+
+def parse_decoder_layers(value: Optional[str]) -> Optional[List[int]]:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "all", "*"}:
+        return None
+
+    out = set()
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = [p.strip() for p in token.split("-", 1)]
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid --decoder_layers token '{token}'. Expected <idx> or <begin>-<end>."
+                )
+            begin = int(parts[0])
+            end = int(parts[1])
+            if begin < 0 or end < 0 or end < begin:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid --decoder_layers range '{token}'. Expected non-negative begin <= end."
+                )
+            out.update(range(begin, end + 1))
+            continue
+
+        idx = int(token)
+        if idx < 0:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --decoder_layers token '{token}'. Expected non-negative layer index."
+            )
+        out.add(idx)
+
+    if not out:
+        raise argparse.ArgumentTypeError("--decoder_layers cannot be empty.")
+    return sorted(out)
+
+
+def needs_teacher(loss_type: str) -> bool:
+    norm = str(loss_type or "").strip().lower()
+    return norm not in {"", "sft", "origin"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="End-to-end LFQ finetuning for VAELinear checkpoints.")
+    parser.add_argument("--student_checkpoint_dir", type=str, required=True)
+    parser.add_argument("--run_root_dir", type=str, default=_DEFAULT_RUN_ROOT)
+    parser.add_argument("--teacher_model_path", type=str, default=None)
+    parser.add_argument(
+        "--finetune_mode",
+        type=str,
+        choices=("full", "vae_lora", "hybrid"),
+        default="full",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=_parse_lora_loss_type,
+        default="sft",
+        help="Reuse LoRA distillation loss semantics: sft/origin/kl/rkl/mse/kd/kl_top[_K]/r_kl_top[_K].",
+    )
+    parser.add_argument("--distill_temperature", type=float, default=1.0)
+    parser.add_argument("--distill_alpha", type=float, default=0.5)
+    parser.add_argument("--decoder_layers", type=str, default="all")
+    parser.add_argument(
+        "--train_protected_outliers",
+        type=lambda v: _parse_bool_like(v, arg_name="--train_protected_outliers"),
+        default=False,
+    )
+    parser.add_argument("--vae_lora_rank", type=int, default=8)
+    parser.add_argument("--vae_lora_alpha", type=float, default=16.0)
+    parser.add_argument("--vae_lora_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--prewarm_frozen_vae",
+        type=lambda v: _parse_bool_like(v, arg_name="--prewarm_frozen_vae"),
+        default=True,
+    )
+    parser.add_argument("--prewarm_log_every", type=int, default=32)
+    parser.add_argument(
+        "--skip_ppl_eval",
+        type=lambda v: _parse_bool_like(v, arg_name="--skip_ppl_eval"),
+        default=False,
+    )
+    parser.add_argument("--ppl_seqlen", type=int, default=2048)
+    parser.add_argument("--ppl_limit", type=int, default=-1)
+    parser.add_argument("--dataset_name", type=str, default=None)
+    parser.add_argument("--dataset_config_name", type=str, default=None)
+    parser.add_argument("--train_split", type=str, default="train")
+    parser.add_argument("--eval_split", type=str, default="validation")
+    parser.add_argument("--train_file", type=str, default=None)
+    parser.add_argument("--eval_file", type=str, default=None)
+    parser.add_argument("--text_field", type=str, default="text")
+    parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_eval_samples", type=int, default=None)
+    parser.add_argument("--packing_block_size", type=int, default=None)
+    parser.add_argument(
+        "--save_tokenizer",
+        type=lambda v: _parse_bool_like(v, arg_name="--save_tokenizer"),
+        default=False,
+    )
+    parser.add_argument(
+        "--unload_vae_original_weights_on_save",
+        type=lambda v: _parse_bool_like(v, arg_name="--unload_vae_original_weights_on_save"),
+        default=False,
+    )
+    return parser
+
+
+def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -> None:
+    use_hf_dataset = bool(str(args.dataset_name or "").strip())
+    use_local_files = bool(str(args.train_file or "").strip())
+    if use_hf_dataset == use_local_files:
+        parser.error(
+            "Choose exactly one data source mode: either --dataset_name or --train_file."
+        )
+    if use_hf_dataset and (args.train_file or args.eval_file):
+        parser.error("--train_file/--eval_file cannot be combined with --dataset_name.")
+    if use_local_files:
+        train_file = os.path.abspath(str(args.train_file))
+        if not os.path.exists(train_file):
+            parser.error(f"--train_file does not exist: {train_file}")
+        if args.eval_file:
+            eval_file = os.path.abspath(str(args.eval_file))
+            if not os.path.exists(eval_file):
+                parser.error(f"--eval_file does not exist: {eval_file}")
+
+
+def _validate_numeric_inputs(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -> None:
+    if float(args.distill_temperature) <= 0.0:
+        parser.error("--distill_temperature must be > 0.")
+    if float(args.distill_alpha) < 0.0 or float(args.distill_alpha) > 1.0:
+        parser.error("--distill_alpha must satisfy 0 <= alpha <= 1.")
+    if int(args.vae_lora_rank) < 1:
+        parser.error("--vae_lora_rank must be >= 1.")
+    if float(args.vae_lora_alpha) <= 0.0:
+        parser.error("--vae_lora_alpha must be > 0.")
+    if float(args.vae_lora_dropout) < 0.0 or float(args.vae_lora_dropout) >= 1.0:
+        parser.error("--vae_lora_dropout must satisfy 0 <= dropout < 1.")
+    if int(args.prewarm_log_every) < 1:
+        parser.error("--prewarm_log_every must be >= 1.")
+    if int(args.ppl_seqlen) < 1:
+        parser.error("--ppl_seqlen must be >= 1.")
+    if int(args.ppl_limit) == 0 or int(args.ppl_limit) < -1:
+        parser.error("--ppl_limit must be -1 or >= 1.")
+    if args.max_train_samples is not None and int(args.max_train_samples) < 1:
+        parser.error("--max_train_samples must be >= 1 when provided.")
+    if args.max_eval_samples is not None and int(args.max_eval_samples) < 1:
+        parser.error("--max_eval_samples must be >= 1 when provided.")
+    if args.packing_block_size is not None and int(args.packing_block_size) < 1:
+        parser.error("--packing_block_size must be >= 1 when provided.")
+
+
+def validate_args(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -> None:
+    _validate_dataset_inputs(parser, args)
+    _validate_numeric_inputs(parser, args)
+    if str(args.finetune_mode) == "vae_lora" and bool(args.train_protected_outliers):
+        parser.error("--train_protected_outliers is not supported with --finetune_mode vae_lora; use hybrid instead.")
+    args.decoder_layer_ids = parse_decoder_layers(args.decoder_layers)
+
+
+def parse_args(
+    argv: Optional[Sequence[str]] = None,
+) -> Tuple[E2EFinetuneArguments, HFArguments, TrainingArguments]:
+    parser = build_parser()
+    e2e_ns, remaining = parser.parse_known_args(argv)
+    e2e_args = E2EFinetuneArguments(**vars(e2e_ns))
+    validate_args(parser, e2e_args)
+
+    hf_parser = HfArgumentParser((HFArguments, TrainingArguments))
+    hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=list(remaining))
+    return e2e_args, hf_args, training_args

@@ -147,6 +147,8 @@ _LORA_SCHEDULE_KEY_ALIASES = {
     "lora_tune_lm_head": "tune_lm_head",
     "tune_bias": "tune_bias",
     "lora_tune_bias": "tune_bias",
+    "tune_protected_outliers": "tune_protected_outliers",
+    "lora_tune_protected_outliers": "tune_protected_outliers",
     "bias_categories": "bias_categories",
     "lora_bias_categories": "bias_categories",
     "loss_type": "loss_type",
@@ -184,7 +186,7 @@ def _normalize_lora_schedule_item(*, key: str, value):
         return out
     if key in {"lr", "weight_decay"}:
         return float(value)
-    if key in {"tune_norm", "tune_lm_head", "tune_bias", "use_dora"}:
+    if key in {"tune_norm", "tune_lm_head", "tune_bias", "tune_protected_outliers", "use_dora"}:
         return _parse_bool_like(value, arg_name=f"lora_schedule.{key}")
     if key == "bias_categories":
         return _parse_csv_like_names(value, arg_name="lora_schedule.bias_categories")
@@ -246,6 +248,146 @@ def _parse_positive_int_like(value, *, arg_name: str) -> int:
     return int(out)
 
 
+def _parse_non_negative_int_like(value, *, arg_name: str) -> int:
+    if isinstance(value, bool):
+        raise argparse.ArgumentTypeError(f"Invalid {arg_name} value '{value}'. Expected non-negative integer.")
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(
+            f"Invalid {arg_name} value '{value}'. Expected non-negative integer."
+        ) from e
+    if out < 0:
+        raise argparse.ArgumentTypeError(f"{arg_name} must be >= 0, got {out}.")
+    return int(out)
+
+
+def _parse_ratio_like(value, *, arg_name: str) -> float:
+    if isinstance(value, bool):
+        raise argparse.ArgumentTypeError(f"Invalid {arg_name} value '{value}'. Expected float.")
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(f"Invalid {arg_name} value '{value}'. Expected float.") from e
+    if out < 0.0 or out >= 1.0:
+        raise argparse.ArgumentTypeError(f"{arg_name} must satisfy 0.0 <= value < 1.0, got {out}.")
+    return float(out)
+
+
+def _parse_stage_list_or_scalar(
+    value,
+    *,
+    arg_name: str,
+    item_parser,
+):
+    if isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw = str(value).strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid {arg_name} list '{value}'. Expected valid JSON list."
+                ) from e
+            if not isinstance(parsed, list):
+                raise argparse.ArgumentTypeError(
+                    f"Invalid {arg_name} value '{value}'. JSON form must be a list."
+                )
+            raw_items = parsed
+        else:
+            return item_parser(value)
+
+    if len(raw_items) == 0:
+        raise argparse.ArgumentTypeError(f"{arg_name} list cannot be empty.")
+    return [item_parser(v) for v in raw_items]
+
+
+def _parse_choice_like(value, *, arg_name: str, choices: Sequence[str]) -> str:
+    raw = str(value).strip().lower()
+    allowed = {str(c).strip().lower() for c in choices}
+    if raw not in allowed:
+        raise argparse.ArgumentTypeError(
+            f"Invalid {arg_name} value '{value}'. Supported: {','.join(sorted(allowed))}."
+        )
+    return raw
+
+
+def _parse_choice_or_stage_list(value, *, arg_name: str, choices: Sequence[str]):
+    return _parse_stage_list_or_scalar(
+        value,
+        arg_name=arg_name,
+        item_parser=lambda v: _parse_choice_like(v, arg_name=arg_name, choices=choices),
+    )
+
+
+def _parse_dual_choice_or_scalar(
+    value,
+    *,
+    arg_name: str,
+    choices: Sequence[str],
+):
+    def _parse_single(item):
+        return _parse_choice_like(item, arg_name=arg_name, choices=choices)
+
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        if len(items) == 0:
+            raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
+        if len(items) == 1:
+            return _parse_single(items[0])
+        if len(items) == 2:
+            return (_parse_single(items[0]), _parse_single(items[1]))
+        raise argparse.ArgumentTypeError(
+            f"Invalid {arg_name} value '{value}'. "
+            "Expected one mode or two modes (row_mode,col_mode)."
+        )
+
+    raw = str(value).strip()
+    if not raw:
+        raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
+    raw = raw.replace("，", ",")
+    if "," not in raw:
+        return _parse_single(raw)
+    items = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(items) != 2:
+        raise argparse.ArgumentTypeError(
+            f"Invalid {arg_name} value '{value}'. "
+            "Expected one mode or two comma-separated modes (row_mode,col_mode)."
+        )
+    return (_parse_single(items[0]), _parse_single(items[1]))
+
+
+def _parse_dual_choice_or_stage_list(
+    value,
+    *,
+    arg_name: str,
+    choices: Sequence[str],
+):
+    return _parse_stage_list_or_scalar(
+        value,
+        arg_name=arg_name,
+        item_parser=lambda v: _parse_dual_choice_or_scalar(v, arg_name=arg_name, choices=choices),
+    )
+
+
+def _parse_positive_int_or_stage_list(value, *, arg_name: str):
+    return _parse_stage_list_or_scalar(
+        value,
+        arg_name=arg_name,
+        item_parser=lambda v: _parse_positive_int_like(v, arg_name=arg_name),
+    )
+
+
+def _parse_non_negative_int_or_stage_list(value, *, arg_name: str):
+    return _parse_stage_list_or_scalar(
+        value,
+        arg_name=arg_name,
+        item_parser=lambda v: _parse_non_negative_int_like(v, arg_name=arg_name),
+    )
+
+
 def _parse_positive_int_or_category_schedule(value, *, arg_name: str):
     if value is None:
         raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
@@ -289,6 +431,32 @@ def _parse_positive_int_or_category_schedule(value, *, arg_name: str):
             )
         out[key] = _parse_positive_int_like(v, arg_name=f"{arg_name}[{key}]")
     return out
+
+
+def _parse_positive_int_or_category_schedule_or_stage_list(value, *, arg_name: str):
+    return _parse_stage_list_or_scalar(
+        value,
+        arg_name=arg_name,
+        item_parser=lambda v: _parse_positive_int_or_category_schedule(v, arg_name=arg_name),
+    )
+
+
+def resolve_stage_value(value, stage_idx: int, *, arg_name: str):
+    if not isinstance(value, (list, tuple)):
+        return value
+    values = list(value)
+    if len(values) == 0:
+        raise ValueError(f"{arg_name} list cannot be empty.")
+    idx = int(stage_idx)
+    if idx < 0:
+        raise ValueError(f"{arg_name} stage_idx must be >=0, got {idx}")
+    if len(values) == 1:
+        return values[0]
+    if idx >= len(values):
+        raise ValueError(
+            f"{arg_name} list length {len(values)} is smaller than required stage index {idx}."
+        )
+    return values[idx]
 
 
 def _resolve_category_override(value, category: str, *, arg_name: str):
@@ -480,6 +648,17 @@ def _resolve_positive_int(value, *, default: int, arg_name: str, allow_zero: boo
 
 
 def resolve_autoencoder_arch_args(args) -> None:
+    dynamic_fields = (
+        "base_ch",
+        "num_res_blocks",
+        "decoder_type",
+        "decoder_base_ch",
+        "decoder_num_res_blocks",
+    )
+    if any(isinstance(getattr(args, k, None), (list, tuple)) for k in dynamic_fields):
+        # Stage-wise overrides are resolved later (e.g. in cat_train per residual stage).
+        return
+
     shared_base_ch = _resolve_positive_int(
         getattr(args, "base_ch", 128),
         default=128,
@@ -538,10 +717,13 @@ def add_llm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--normalize_weight", action="store_true",
                         help="Normalize weight (z-score) before training")
 
-    parser.add_argument("--recon_loss_type", type=str, default='mse',
-                        choices=['mse', 'l1', 'huber',
-                                 'relative_l1', 'top_k_mse', 'cosine', 'w_mse', 'w2_mse', 'wa_mse'],
-                        help="Type of reconstruction loss to use")
+    recon_loss_choices = ['mse', 'l1', 'huber', 'relative_l1', 'top_k_mse', 'cosine', 'w_mse', 'w2_mse', 'wa_mse']
+    parser.add_argument(
+        "--recon_loss_type",
+        type=lambda v: _parse_choice_or_stage_list(v, arg_name="--recon_loss_type", choices=recon_loss_choices),
+        default='mse',
+        help="Type of reconstruction loss to use. Supports scalar or JSON list for residual stages.",
+    )
     parser.add_argument("--distil_loss_type", type=str, default='mse',
                         choices=['mse', 'none'],
                         help="Type of distillation loss to use between original and reconstructed weights")
@@ -563,28 +745,42 @@ def add_model_specific_args(parent_parser: argparse.ArgumentParser) -> argparse.
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
     parser.add_argument(
         "--codebook_bits",
-        type=lambda v: _parse_positive_int_or_category_schedule(v, arg_name="--codebook_bits"),
+        type=lambda v: _parse_positive_int_or_category_schedule_or_stage_list(v, arg_name="--codebook_bits"),
         default=16,
     )  # 2^16 -> 16 bits
     parser.add_argument(
         "--codebook_dim",
-        type=lambda v: _parse_positive_int_or_category_schedule(v, arg_name="--codebook_dim"),
+        type=lambda v: _parse_positive_int_or_category_schedule_or_stage_list(v, arg_name="--codebook_dim"),
         default=8,
     )  # 这时候它代表 Input Chunk Size
+    parser.add_argument(
+        "--residual_stages",
+        type=lambda v: _parse_positive_int_like(v, arg_name="--residual_stages"),
+        default=1,
+        help="Number of residual quantization stages. 1 keeps the original single-stage behavior.",
+    )
 
-    parser.add_argument("--base_ch", type=int, default=128)
-    parser.add_argument("--num_res_blocks", type=int, default=1)
+    parser.add_argument(
+        "--base_ch",
+        type=lambda v: _parse_positive_int_or_stage_list(v, arg_name="--base_ch"),
+        default=128,
+    )
+    parser.add_argument(
+        "--num_res_blocks",
+        type=lambda v: _parse_non_negative_int_or_stage_list(v, arg_name="--num_res_blocks"),
+        default=1,
+    )
     parser.add_argument(
         "--decoder_base_ch",
         "--decoder_hidden_dim",
         dest="decoder_base_ch",
-        type=int,
+        type=lambda v: _parse_positive_int_or_stage_list(v, arg_name="--decoder_base_ch"),
         default=None,
         help="Decoder hidden dim for --decoder_type asymmetric. Default: --base_ch",
     )
     parser.add_argument(
         "--decoder_num_res_blocks",
-        type=int,
+        type=lambda v: _parse_non_negative_int_or_stage_list(v, arg_name="--decoder_num_res_blocks"),
         default=None,
         help="Decoder residual blocks for --decoder_type asymmetric. Default: --num_res_blocks",
     )
@@ -596,8 +792,20 @@ def add_model_specific_args(parent_parser: argparse.ArgumentParser) -> argparse.
     parser.add_argument("--zeta", type=float, default=1.0)
     parser.add_argument("--inv_temperature", type=float, default=100.0)
 
-    parser.add_argument("--norm_type", type=str, default='group', choices=['group', 'batch', 'layer', 'no'])
-    parser.add_argument("--decoder_type", type=str, default='linear', choices=['linear', 'symmetric', 'asymmetric'])
+    parser.add_argument(
+        "--norm_type",
+        type=lambda v: _parse_choice_or_stage_list(v, arg_name="--norm_type", choices=['group', 'batch', 'layer', 'no']),
+        default='group',
+    )
+    parser.add_argument(
+        "--decoder_type",
+        type=lambda v: _parse_choice_or_stage_list(
+            v,
+            arg_name="--decoder_type",
+            choices=['linear', 'symmetric', 'asymmetric'],
+        ),
+        default='linear',
+    )
 
     # Multi-Layer Training
     parser.add_argument("--parallel_layers", type=int, default=32, help="Number of layers to train in parallel")
@@ -682,8 +890,17 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         default=False,
         help="覆盖 --only_decoder_projections，改为包含模型中全部 nn.Linear。",
     )
-    parser.add_argument("--steps_per_category", type=int, default=2000)
-    parser.add_argument("--steps_per_group", type=int, default=None, help="分组模式下覆盖 steps_per_category。")
+    parser.add_argument(
+        "--steps_per_category",
+        type=lambda v: _parse_positive_int_or_stage_list(v, arg_name="--steps_per_category"),
+        default=2000,
+    )
+    parser.add_argument(
+        "--steps_per_group",
+        type=lambda v: _parse_positive_int_or_stage_list(v, arg_name="--steps_per_group"),
+        default=None,
+        help="分组模式下覆盖 steps_per_category。支持标量或 JSON list（按 residual stage）。",
+    )
     parser.add_argument(
         "--skip_layers",
         type=str,
@@ -710,15 +927,19 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--intra_part_sort_mode",
-        type=str,
-        default="row_l2",
-        choices=["none", "row_l2", "act_row_l2"],
+        type=lambda v: _parse_dual_choice_or_stage_list(
+            v,
+            arg_name="--intra_part_sort_mode",
+            choices=["none", "l2", "act_l2"],
+        ),
+        default="l2",
         help=(
-            "intra_parallel>1 时切分前的排序模式："
-            "row_l2=按行L2范数排序，"
-            "act_row_l2=先乘act_max再按行L2范数排序，"
+            "intra_parallel>1 时切分前的排序模式（转置后生效）："
+            "支持单值 mode（两维同模式）或双值 row_mode,col_mode（两维独立）。"
+            "可选模式：l2=按启用维度的L2范数排序并按codebook_dim蛇形交错分配，"
+            "act_l2=先乘act_max再按启用维度的L2范数排序并按codebook_dim蛇形交错分配，"
             "none=不排序。"
-            "当 intra_parallel 为两个整数时，会在第二维也按同一模式排序后再切分。"
+            "示例：l2,l2 或 l2,none。"
         ),
     )
     parser.add_argument("--batch_size", type=int, default=256)
@@ -730,6 +951,19 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to activation abs-max dict (*.pt) for --recon_loss_type wa_mse.",
+    )
+    parser.add_argument(
+        "--outlier_protect_ratio",
+        type=lambda v: _parse_ratio_like(v, arg_name="--outlier_protect_ratio"),
+        default=0.0,
+        help="Protect top floor(channel_dim * ratio) channels from VAE compression using act-weighted weight norms.",
+    )
+    parser.add_argument(
+        "--outlier_protect_axis",
+        type=str,
+        choices=["input", "output"],
+        default="input",
+        help="Choose whether outlier protection preserves input channels or output channels.",
     )
     parser.add_argument(
         "--wa_mse_act_mode",
@@ -804,6 +1038,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="LoRA 微调时是否额外训练选中 Linear 的 bias（支持 true/false）。默认 false。",
     )
     parser.add_argument(
+        "--lora_tune_protected_outliers",
+        type=lambda v: _parse_bool_like(v, arg_name="--lora_tune_protected_outliers"),
+        default=False,
+        help="LoRA 微调时是否额外训练 VAELinear 中被保护的 outlier 权重切片（支持 true/false）。默认 false。",
+    )
+    parser.add_argument(
         "--lora_bias_categories",
         type=lambda v: _parse_csv_like_names(v, arg_name="--lora_bias_categories"),
         default=[],
@@ -834,6 +1074,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train_device", type=str, default="cuda")
+    parser.add_argument(
+        "--rot_llm",
+        action="store_true",
+        default=False,
+        help="在 VAE 压缩前先对基座 LLM 执行一次离线旋转融合。",
+    )
     parser.add_argument("--convert", action="store_true",
                         help="每个类别训练完成后，将 Linear 替换为压缩后的线性层。")
     parser.add_argument("--convert_device", type=str, default="cuda")

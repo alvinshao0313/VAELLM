@@ -25,17 +25,19 @@
 | `--projection_suffixes` | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | 仅 decoder 投影模式下允许的后缀 | 与 `--only_decoder_projections` 联动 |
 | `--only_decoder_projections` | `True` | 只收集 decoder layers 中投影层 `nn.Linear` | 当前实现是 `store_true + default=True`，CLI 无法显式关掉 |
 | `--include_all_linears` | `False` | 覆盖上项，改为收集模型里全部 `nn.Linear` | 开启后会忽略“只看投影层”的过滤 |
-| `--steps_per_category` | `2000` | 每个类别训练步数 | 若设置 `--steps_per_group`，则被覆盖 |
-| `--steps_per_group` | `None` | 每个分组训练步数 | 优先级高于 `steps_per_category` |
+| `--steps_per_category` | `2000` | 每个类别训练步数 | 支持标量或 JSON list（按 residual stage） |
+| `--steps_per_group` | `None` | 每个分组训练步数 | 优先级高于 `steps_per_category`；支持标量或 JSON list |
 | `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式：`layer_idx.category`，例如 `0.down_proj,30.q_proj` |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
 | `--intra_parallel` | `1` | 单个 Linear 的层内切分 | 支持 `n` / `a,b` / JSON dict（按类别覆盖） |
-| `--intra_part_sort_mode` | `row_l2` | 切分前排序方式 | `none`/`row_l2`/`act_row_l2` |
+| `--intra_part_sort_mode` | `l2` | 切分前排序方式 | 支持单值 `mode` 或双值 `row_mode,col_mode`（也支持按 stage 的 JSON list）；`none`/`l2`/`act_l2` |
 | `--batch_size` | `256` | VAE 训练和评估 DataLoader batch 大小 | 作用于“块数据”而非 token |
 | `--log_every` | `50` | 每多少 step 打印一次训练日志 | `<=0` 等价不打印 |
 | `--eval_every` | `0` | 每多少 step 做一次 VAE 评估 | `0` 代表不做中间评估 |
 | `--eval_blocks` | `256` | 每次中间评估最多评估多少块 | 与 `eval_every` 联动 |
-| `--activation_weight_path` | `None` | 激活 abs-max 字典文件（`.pt`）路径 | `wa_mse`、`act_row_l2` 常用 |
+| `--activation_weight_path` | `None` | 激活 abs-max 字典文件（`.pt`）路径 | `wa_mse`、`act_l2` 常用 |
+| `--outlier_protect_ratio` | `0.0` | 保护 top `floor(channel_dim * ratio)` 个通道不参与 VAE 压缩 | `>0` 时依赖 activation 向量；范围 `[0,1)` |
+| `--outlier_protect_axis` | `input` | 选择保护 `input` 还是 `output` channel | `input` 会裁输入通道；`output` 会裁输出通道 |
 | `--wa_mse_act_mode` | `dynamic` | `wa_mse` 的 `act_max` 来源 | `dynamic` 每组重算；`static` 使用上面的路径 |
 | `--wa_mse_calib_dataset` | `wikitext2` | `dynamic` 重算时校准集 | 传给激活采样流程 |
 | `--wa_mse_calib_nsamples` | `512` | `dynamic` 校准样本数 | 仅 `dynamic` 有效 |
@@ -57,6 +59,7 @@
 | `--lora_tune_norm` | `False` | LoRA 时额外解冻 norm 参数 | 可被 `lora_schedule` 覆盖 |
 | `--lora_tune_lm_head` | `False` | LoRA 时把 `lm_head` 加入目标模块 | 可被 `lora_schedule` 覆盖 |
 | `--lora_tune_bias` | `False` | LoRA 时额外训练选中 Linear 的 bias | 可被 `lora_schedule` 覆盖 |
+| `--lora_tune_protected_outliers` | `False` | LoRA 时额外训练 `VAELinear` 中被保护的 outlier 权重切片 | 可被 `lora_schedule` 覆盖 |
 | `--lora_bias_categories` | `[]` | 允许训练 bias 的 Linear 类别列表（逗号分隔或 JSON 列表） | 为空表示全部 LoRA 目标 Linear |
 | `--lora_loss_type` | `sft` | LoRA loss 类型 | 支持：`sft/origin/rkl/kl/mse/kd/r_kl_top[_K]/kl_top[_K]` |
 | `--lora_use_dora` | `True` | LoRA 是否启用 DoRA | 解析 true/false 字符串 |
@@ -92,7 +95,7 @@
 |---|---:|---|---|
 | `--model_path` | `meta-llama/Llama-2-7b-hf` | 基座模型路径或 HF ID | 会用于加载模型、PPL、LoRA tokenizer |
 | `--normalize_weight` | `False` | 切块前做 z-score 标准化 | 转换时会把均值方差融合回 decoder |
-| `--recon_loss_type` | `mse` | 重建损失类型 | 支持 `mse/l1/huber/relative_l1/top_k_mse/cosine/w_mse/w2_mse/wa_mse` |
+| `--recon_loss_type` | `mse` | 重建损失类型 | 支持标量或 JSON list；可选 `mse/l1/huber/relative_l1/top_k_mse/cosine/w_mse/w2_mse/wa_mse` |
 | `--distil_loss_type` | `mse` | 蒸馏损失类型 | 当前 `cat_train.py` 主流程未使用 |
 | `--distil_loss_weight` | `1.0` | 蒸馏损失权重 | 当前 `cat_train.py` 主流程未使用 |
 | `--l1_weight` | `1.0` | 重建损失系数 | 在 `llm_vae` 中参与总损失 |
@@ -108,19 +111,20 @@
 
 | 参数 | 默认值 | 功能 | 备注 |
 |---|---:|---|---|
-| `--codebook_bits` | `16` | latent bit 维度 | 支持整数或按类别 JSON dict（`category > default > *`） |
-| `--codebook_dim` | `8` | 权重切块大小（chunk size） | 支持整数或按类别 JSON dict（`category > default > *`）；每块长度必须整除 |
-| `--base_ch` | `128` | 编解码器共享基础通道数 | encoder 恒定使用它；decoder 在 `linear/symmetric` 下也使用它 |
-| `--num_res_blocks` | `1` | 编解码器共享残差块数量 | encoder 恒定使用它；decoder 在 `linear/symmetric` 下也使用它 |
-| `--decoder_base_ch` | `None` | decoder hidden dim | 仅 `decoder_type=asymmetric` 时可独立设置；缺省回退到 `base_ch` |
-| `--decoder_num_res_blocks` | `None` | decoder 残差块数 | 仅 `decoder_type=asymmetric` 时可独立设置；缺省回退到 `num_res_blocks` |
+| `--codebook_bits` | `16` | latent bit 维度 | 支持标量整数、按类别 JSON dict，或按 stage 的 JSON list（元素可为前两种） |
+| `--codebook_dim` | `8` | 权重切块大小（chunk size） | 支持标量整数、按类别 JSON dict，或按 stage 的 JSON list（元素可为前两种） |
+| `--residual_stages` | `1` | 残差量化阶数 | `1` 为原单阶流程；`>1` 时采用逐阶残差量化（每阶完整训练步数） |
+| `--base_ch` | `128` | 编解码器共享基础通道数 | 支持标量或 JSON list（按 stage）；encoder 恒定使用它 |
+| `--num_res_blocks` | `1` | 编解码器共享残差块数量 | 支持标量或 JSON list（按 stage）；encoder 恒定使用它 |
+| `--decoder_base_ch` | `None` | decoder hidden dim | 支持标量或 JSON list；仅 `decoder_type=asymmetric` 独立生效，默认回退 `base_ch` |
+| `--decoder_num_res_blocks` | `None` | decoder 残差块数 | 支持标量或 JSON list；仅 `decoder_type=asymmetric` 独立生效，默认回退 `num_res_blocks` |
 | `--quantizer_type` | `BSQ` | 量化器类型 | 当前主要支持 `BSQ` |
 | `--gamma0` | `1.0` | BSQ 超参 | 传入 BSQ |
 | `--gamma` | `1.0` | BSQ 超参 | 传入 BSQ |
 | `--zeta` | `1.0` | BSQ 超参 | 传入 BSQ |
 | `--inv_temperature` | `100.0` | BSQ 温度倒数 | 传入 BSQ |
-| `--norm_type` | `group` | 归一化层类型 | `group/batch/layer/no` |
-| `--decoder_type` | `linear` | decoder 结构类型 | `linear/symmetric/asymmetric`；仅 `asymmetric` 会启用 `decoder_*` 独立配置 |
+| `--norm_type` | `group` | 归一化层类型 | 支持标量或 JSON list；`group/batch/layer/no` |
+| `--decoder_type` | `linear` | decoder 结构类型 | 支持标量或 JSON list；`linear/symmetric/asymmetric` |
 | `--parallel_layers` | `32` | 并行模型数 | `cat_train.py` 会忽略并给出 warning（实际用 `--intra_parallel`） |
 
 ## 4. HuggingFace 参数（`hf_args` + `training_args`）
@@ -157,13 +161,14 @@
 2. 当 `--recon_loss_type wa_mse` 时：
    - `--wa_mse_act_mode dynamic`：每组动态采集 act_max。
    - `--wa_mse_act_mode static`：必须提供 `--activation_weight_path`。
-3. 当 `--intra_part_sort_mode act_row_l2` 且切分份数 `>1` 时，需要 activation 向量来源（通常是 `--activation_weight_path` 或 `wa_mse` 动态流程）。
-4. `--skip_layers` 格式必须是 `<layer_idx>.<category>`，否则解析失败。
-5. `--intra_parallel` 若用 JSON dict，必须命中当前类别或提供 `default` / `*` 兜底键。
-6. 切分可整除性必须满足：
+3. 当 `--outlier_protect_ratio > 0` 时，必须存在 activation 向量来源（`--activation_weight_path` 或可复用的 `wa_mse` dynamic act_max）；`--outlier_protect_axis input/output` 都使用输入激活对权重做加权打分；保护后若破坏 `intra_parallel` 或 `codebook_dim` 可整除性，会直接报错。
+4. 当 `--intra_part_sort_mode` 在任一启用维度上使用 `act_l2`（例如 `act_l2,none` 且该维切分份数 `>1`）时，需要 activation 向量来源（通常是 `--activation_weight_path` 或 `wa_mse` 动态流程）。
+5. `--skip_layers` 格式必须是 `<layer_idx>.<category>`，否则解析失败。
+6. `--intra_parallel` 若用 JSON dict，必须命中当前类别或提供 `default` / `*` 兜底键。
+7. 切分可整除性必须满足：
    - 若该类别在 `transpose_modules` 中：`in_features % row_parts == 0` 且 `out_features % col_parts == 0`
    - 否则：`out_features % row_parts == 0` 且 `in_features % col_parts == 0`
-7. 切分后每个 part 的展平长度必须能被该类别生效的 `codebook_dim` 整除。
+8. 切分后每个 part 的展平长度必须能被该类别生效的 `codebook_dim` 整除。
 
 ## 6. 关键复杂参数详解
 
@@ -207,18 +212,20 @@
 - `tune_norm`（bool）
 - `tune_lm_head`（bool）
 - `tune_bias`（bool）
+- `tune_protected_outliers`（bool）
 - `bias_categories`（string/list）
 - `loss_type`（与 `--lora_loss_type` 同集合）
 - `use_dora`（bool）
 
-同时支持别名键：`r/lora_rank`、`lora_alpha`、`lora_steps`、`lora_batch_size`、`lora_nsamples`、`lora_lr` 等。
+同时支持别名键：`r/lora_rank`、`lora_alpha`、`lora_steps`、`lora_batch_size`、`lora_nsamples`、`lora_lr`、`lora_tune_protected_outliers` 等。
 
-### 6.3 `--codebook_bits` / `--codebook_dim`（按类别覆盖）
+### 6.3 `--codebook_bits` / `--codebook_dim`（按类别 + 按 stage）
 
-两者都支持两种写法：
+两者都支持三种写法：
 
 1. 标量整数（全类别共用）
 2. JSON dict（按类别覆盖）
+3. JSON list（按 residual stage 覆盖；每个元素可为标量整数或 JSON dict）
 
 示例：
 
@@ -237,6 +244,14 @@ dict 模式下：
 - 命中优先级：`category` > `default` > `*`
 - 若某类别未命中且没有 `default/*`，会直接报错
 
+按 stage 示例（2 阶）：
+
+```bash
+--residual_stages 2 \
+--codebook_bits '[16,{"default":12,"q_proj":14}]' \
+--codebook_dim '[16,8]'
+```
+
 ### 6.4 输出目录实际结构
 
 `--output_dir` 是根目录，真实运行目录会自动生成为：
@@ -244,6 +259,23 @@ dict 模式下：
 `<output_dir>/<safe_model_name>_<YYYYmmdd_HHMMSS>/`
 
 例如：`./output_linear_by_category/meta-llama__Llama-2-7b-hf_20260303_103000/`。
+
+### 6.5 `--residual_stages`（多阶残差量化）
+
+- 默认 `1`，保持当前单阶行为。
+- 当设置为 `N>1` 时，训练流程为逐阶残差：第 1 阶重构后计算残差，第 2..N 阶继续量化残差。
+- 当前实现中每一阶都会使用完整步数；可通过 `--steps_per_category`/`--steps_per_group` 的 JSON list 做按阶覆盖。
+- 结构/损失参数可按阶覆盖：`codebook_bits/codebook_dim/base_ch/num_res_blocks/decoder_base_ch/decoder_num_res_blocks/norm_type/decoder_type/recon_loss_type/intra_part_sort_mode`。
+- 当 `--normalize_weight` 开启时，会对“每一阶当前 residual”分别计算 `(mean,std)` 做标准化训练，并在该阶 decoder 内融合回去。
+- 当 `intra_part_sort_mode` 按阶给出不同值时，切分排序仅在 stage1（stage0 索引）执行，后续 stage 复用同一切分顺序。
+
+`intra_part_sort_mode` 补充说明（转置后执行）：
+
+- 单值：`l2` 等价于 `l2,l2`（两维同模式）。
+- 双值：`l2,none` 表示第一维排序、第二维不排序；`none,l2` 则相反。
+- `l2/act_l2` 会先按该维 L2 分数降序，再按 `codebook_dim` 宽度做蛇形交错分配，分散高分通道。
+- 即使 `--intra_parallel 1`，只要模式不是 `none,none` 也会执行对应维度排序。
+- 按阶覆盖：可传 JSON list；若某阶需要双值，可写成嵌套形式，例如 `[['l2','none'], 'l2']`。
 
 ## 7. 快速示例
 
@@ -270,12 +302,26 @@ python tools/cat_train.py \
   --intra_parallel 2,1 \
   --codebook_bits 16 \
   --codebook_dim 8 \
+  --residual_stages 1 \
   --recon_loss_type mse \
   --train_device cuda \
   --bf16 True
 ```
 
-### 7.3 `wa_mse + dynamic act_max`
+### 7.3 两阶残差量化示例
+
+```bash
+python tools/cat_train.py \
+  --model_path meta-llama/Llama-2-7b-hf \
+  --convert \
+  --steps_per_category 2000 \
+  --codebook_bits 16 \
+  --codebook_dim 8 \
+  --residual_stages 2 \
+  --train_device cuda
+```
+
+### 7.4 `wa_mse + dynamic act_max`
 
 ```bash
 python tools/cat_train.py \

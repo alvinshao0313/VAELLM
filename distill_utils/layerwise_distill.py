@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -11,7 +11,7 @@ from distill_utils.layerwise_distill_args import build_parser, parse_layer_indic
 from distill_utils.layerwise_distill_runtime import (
     collect_calib_inputs,
     resolve_checkpoint_dir,
-    resolve_device,
+    resolve_distill_device,
 )
 from distill_utils.layerwise_distill_trainer import distill_layers
 from litebsq.vae_linear import clear_model_vae_linear_cache
@@ -25,6 +25,85 @@ from train_utils.utils import get_logger, set_seed
 
 
 log = get_logger("layerwise_distill")
+
+
+def _split_csv(value: Optional[str]) -> Sequence[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _init_wandb_run(
+    *,
+    args,
+    run_output_dir: str,
+    student_ckpt_dir: str,
+    teacher_model_path: str,
+    layer_indices: Sequence[int],
+    meta: Dict[str, Any],
+):
+    project = str(getattr(args, "wandb_project", "") or "").strip()
+    if not project:
+        return None
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "wandb logging requested via --wandb_project, but the `wandb` package is not installed in the current environment."
+        ) from exc
+
+    config = dict(vars(args))
+    config.update(
+        {
+            "run_output_dir": run_output_dir,
+            "resolved_student_checkpoint_dir": student_ckpt_dir,
+            "resolved_teacher_model_path": str(teacher_model_path),
+            "resolved_layer_indices": list(layer_indices),
+            "resolved_target_layer_count": len(layer_indices),
+            "converted_module_count": meta.get("converted_module_count"),
+        }
+    )
+    run_name = str(getattr(args, "wandb_name", "") or "").strip() or os.path.basename(run_output_dir)
+    wandb_run = wandb.init(
+        project=project,
+        entity=str(getattr(args, "wandb_entity", "") or "").strip() or None,
+        name=run_name,
+        group=str(getattr(args, "wandb_group", "") or "").strip() or None,
+        tags=list(_split_csv(getattr(args, "wandb_tags", None))) or None,
+        mode=str(getattr(args, "wandb_mode", "online") or "online"),
+        dir=run_output_dir,
+        config=config,
+    )
+    if wandb_run is None:
+        return None
+
+    wandb_run.define_metric("train/global_step")
+    for pattern in (
+        "loss/*",
+        "eval/*",
+        "layer/*",
+        "system/*",
+        "train/layer_step",
+        "train/layer_id",
+        "train/layer_order",
+        "train/lr",
+    ):
+        wandb_run.define_metric(pattern, step_metric="train/global_step")
+
+    wandb_run.summary["run_output_dir"] = run_output_dir
+    wandb_run.summary["student_checkpoint_dir"] = student_ckpt_dir
+    wandb_run.summary["teacher_model_path"] = str(teacher_model_path)
+    wandb_run.summary["target_layer_count"] = len(layer_indices)
+    wandb_run.log(
+        {
+            "train/global_step": 0,
+            "layer/target_count": len(layer_indices),
+            "system/converted_module_count": float(meta.get("converted_module_count", 0) or 0),
+        }
+    )
+    return wandb_run
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -60,21 +139,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     teacher_model_path = args.teacher_model_path or meta.get("base_model_path")
     if not teacher_model_path:
         raise ValueError("teacher_model_path is missing. Pass --teacher_model_path or include base_model_path in checkpoint meta.")
+    args.model_path = str(teacher_model_path)
 
     log.info("Loading teacher model from: %s", teacher_model_path)
     model_t = get_model(teacher_model_path, args.access_token)
 
-    student_device = resolve_device(args.student_device)
-    teacher_device = resolve_device(args.teacher_device)
-    if student_device != args.student_device:
-        log.warning("student_device fallback: %s -> %s", args.student_device, student_device)
-    if teacher_device != args.teacher_device:
-        log.warning("teacher_device fallback: %s -> %s", args.teacher_device, teacher_device)
-    args.student_device = student_device
-    args.teacher_device = teacher_device
+    distill_device = resolve_distill_device(args.distill_device)
+    if distill_device != args.distill_device:
+        log.warning("distill_device fallback: %s -> %s", args.distill_device, distill_device)
+    args.distill_device = distill_device
 
-    model_q.to(student_device)
-    model_t.to(teacher_device)
+    model_q.to("cpu")
+    model_t.to("cpu")
     model_q.eval()
     model_t.eval()
     if hasattr(model_q, "config"):
@@ -113,47 +189,69 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         str(layer_indices[-1] if layer_indices else None),
     )
 
-    distill_layers(
-        model_q=model_q,
-        model_t=model_t,
-        layers_q=layers_q,
-        layers_t=layers_t,
-        layer_indices=layer_indices,
-        calib_inputs=calib_inputs,
+    wandb_run = _init_wandb_run(
         args=args,
-        log=log,
+        run_output_dir=run_output_dir,
+        student_ckpt_dir=student_ckpt_dir,
+        teacher_model_path=str(teacher_model_path),
+        layer_indices=layer_indices,
+        meta=meta,
     )
 
-    if bool(args.save_model):
-        log.info("Saving distilled checkpoint...")
-        model_out = os.path.join(run_output_dir, "final_model")
-        tokenizer = None
-        if bool(args.save_tokenizer):
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                teacher_model_path,
-                use_fast=True,
-                token=args.access_token,
-            )
-
-        cleared = clear_model_vae_linear_cache(model_q)
-        log.info("Cleared decoded cache for %d VAELinear modules before save.", cleared)
-        save_paths = save_model_checkpoint(
-            model_q,
-            model_out,
-            base_model_path=str(teacher_model_path),
-            tokenizer=tokenizer,
-            save_config=True,
-            extra_meta={
-                "stage": "layerwise_distill",
-                "source_checkpoint_dir": student_ckpt_dir,
-            },
-            unload_vae_original_weights=bool(args.unload_vae_original_weights_on_save),
+    try:
+        distill_layers(
+            model_q=model_q,
+            model_t=model_t,
+            layers_q=layers_q,
+            layers_t=layers_t,
+            layer_indices=layer_indices,
+            calib_inputs=calib_inputs,
+            args=args,
+            log=log,
+            wandb_run=wandb_run,
         )
-        log.info("Saved distilled model to %s", save_paths["output_dir"])
 
-    log.info("Layer-wise distillation finished.")
+        if bool(args.save_model):
+            log.info("Saving distilled checkpoint...")
+            model_out = os.path.join(run_output_dir, "final_model")
+            tokenizer = None
+            if bool(args.save_tokenizer):
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    teacher_model_path,
+                    use_fast=True,
+                    token=args.access_token,
+                )
+
+            cleared = clear_model_vae_linear_cache(model_q)
+            log.info("Cleared decoded cache for %d VAELinear modules before save.", cleared)
+            save_paths = save_model_checkpoint(
+                model_q,
+                model_out,
+                base_model_path=str(teacher_model_path),
+                tokenizer=tokenizer,
+                save_config=True,
+                extra_meta={
+                    "stage": "layerwise_distill",
+                    "source_checkpoint_dir": student_ckpt_dir,
+                },
+                unload_vae_original_weights=bool(args.unload_vae_original_weights_on_save),
+            )
+            log.info("Saved distilled model to %s", save_paths["output_dir"])
+            if wandb_run is not None:
+                wandb_run.summary["saved_model_dir"] = save_paths["output_dir"]
+
+        if wandb_run is not None:
+            wandb_run.summary["status"] = "finished"
+        log.info("Layer-wise distillation finished.")
+    except BaseException:
+        if wandb_run is not None:
+            wandb_run.summary["status"] = "failed"
+        raise
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":

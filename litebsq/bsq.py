@@ -131,7 +131,7 @@ class BSQ(nn.Module):
             probs = count
         return -(probs * torch.log(probs + 1e-8)).sum(dim=dim)
 
-    def forward(self, x, return_loss_breakdown=False, mask=None, entropy_weight=0.1):
+    def forward(self, x, return_loss_breakdown=False, mask=None, entropy_weight=None):
         is_img_or_video = x.ndim >= 4
         should_transpose = default(self.channel_first, is_img_or_video)
 
@@ -157,7 +157,7 @@ class BSQ(nn.Module):
                 quantized = self.quantize_new(x)
             else:
                 quantized = self.quantize(x)
-                q_scale = 1.0 / (self.codebook_dims ** 0.5)
+                q_scale = 1.0
                 quantized = q_scale * quantized
 
             bit_indices = (quantized > 0).bool()
@@ -190,6 +190,9 @@ class BSQ(nn.Module):
 
         if not self.keep_num_codebooks_dim:
             bit_indices = rearrange(bit_indices, '... 1 d -> ... d')
+
+        if entropy_weight is None:
+            entropy_weight = self.entropy_loss_weight
 
         aux_loss = commit_loss * self.commitment_loss_weight + \
             (self.zeta * entropy_penalty / self.inv_temperature) * entropy_weight

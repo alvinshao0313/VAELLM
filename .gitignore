@@ -25,3 +25,6 @@ prepares
 *.pth
 *.bin
 *.h5
+AGENTS.md
+tests/
+.pytest_cache/

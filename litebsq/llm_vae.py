@@ -365,14 +365,34 @@ class Decoder(nn.Module):
             return self.linear_out(h)
 
     @torch.no_grad()
-    def _fuse_q_scale(self):
+    def _fuse_q_scale(self, q_scale: float = None):
         if self._q_scale_fused:
             return
-        q_scale = 1. / math.sqrt(self.in_dim)
+        if q_scale is None:
+            q_scale = 1. / math.sqrt(self.in_dim)
+        else:
+            q_scale = float(q_scale)
+
+        def _fuse_linear_or_parallel(layer):
+            # ParallelLinear has native fuse_q_scale; sub-decoder paths may hold plain nn.Linear.
+            if hasattr(layer, "fuse_q_scale"):
+                layer.fuse_q_scale(q_scale)
+                return
+            if isinstance(layer, nn.Linear):
+                weight = layer.weight.data
+                bias_delta = -q_scale * weight.sum(dim=1)
+                weight.mul_(q_scale * 2.0)
+                if layer.bias is not None:
+                    layer.bias.data.add_(bias_delta)
+                else:
+                    layer.bias = nn.Parameter(bias_delta)
+                return
+            raise TypeError(f"Unsupported layer type for q_scale fusion: {type(layer)}")
+
         if self.decoder_type == 'linear':
-            self.linear.fuse_q_scale(q_scale)
+            _fuse_linear_or_parallel(self.linear)
         elif self.decoder_type in {'symmetric', 'asymmetric'}:
-            self.linear_in.fuse_q_scale(q_scale)
+            _fuse_linear_or_parallel(self.linear_in)
         self._q_scale_fused = True
 
     def get_sub_decoder(self, model_idx: int):
@@ -408,6 +428,7 @@ class Decoder(nn.Module):
         )
 
         with torch.no_grad():
+            new_decoder._q_scale_fused = bool(self._q_scale_fused)
             if self.decoder_type == 'linear':
                 # linear: ParallelLinear
                 new_decoder.linear = self.linear.get_sub_linear(model_idx)

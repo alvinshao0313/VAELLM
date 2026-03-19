@@ -207,7 +207,7 @@ def rotate_mlp_input(layer, Q, model_type, **kwargs):
         W.weight.data = W.weight.data.to(device="cpu", dtype=dtype)
 
 
-def rotate_mlp_output(layer, Q, model_type, args, **kwargs):
+def rotate_mlp_output(layer, Q, model_type):
     # Rotate the MLP output weights and bias.
     if model_type in model_utils.SAME_TYPE_MODELS:
         W = layer.mlp.down_proj
@@ -217,19 +217,7 @@ def rotate_mlp_output(layer, Q, model_type, args, **kwargs):
         raise ValueError(f'Unknown model type {model_type}')
     dtype = W.weight.data.dtype
     W_ = W.weight.data.to(device="cuda:0", dtype=torch.float64)
-    W.weight.data = torch.matmul(Q.T, W_)
-    if not args.online_down_had:
-        pass
-    elif args.rotate_mode == 'hadamard':
-        # apply exact (inverse) hadamard on the weights of mlp output
-        apply_exact_had_to_linear(W, had_dim=-1, output=False)
-    elif args.rotate_mode == 'group_hadamard':
-        W_ = W.weight.data.to(device="cuda:0", dtype=torch.float32)
-        init_shape = W_.shape
-        had_dim = args.had_dim
-        W.weight.data = hadamard_transform(W_.reshape(-1, init_shape[-1] // had_dim,
-                                                      had_dim), scale=1 / math.sqrt(had_dim)).reshape(init_shape)
-    W.weight.data = W.weight.data.to(device="cpu", dtype=dtype)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
     if W.bias is not None:
         b = W.bias.data.to(device="cuda:0", dtype=torch.float64)
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
@@ -241,8 +229,6 @@ def matmul_hadU_cuda_had(X, hadK, transpose=False):
     It reshapes X and applies Walsh-Hadamard transform to the last dimension.
     Then, it will multiply the retult by another hadamard matrix.
     '''
-    from fast_hadamard_transform import hadamard_transform
-    from rotation.hadamard_utils import get_had172
     n = X.shape[-1]
     K = hadK.shape[-1]
 
@@ -254,19 +240,6 @@ def matmul_hadU_cuda_had(X, hadK, transpose=False):
     return input.to(X.device).to(X.dtype).reshape(
         X.shape)
 
-# def rotate_faster_down_proj(layer, model_type, hardK):
-#    from fast_hadamard_transform import hadamard_transform
-#    if model_type == model_utils.LLAMA_MODEL:
-#        W = layer.mlp.down_proj
-#    elif model_type == model_utils.QWEN2_MODEL:
-#        W = layer.mlp.down_proj
-#    else:
-#        raise ValueError(f'Faster MLP is onlu supported for LLaMa models!')
-#
-#    dtype = W.weight.data.dtype
-#    W.weight.data = matmul_hadU_cuda_had(W.weight.data.float().cuda(), hardK)
-#    W.weight.data = W.weight.data.to(device="cpu", dtype=dtype)
-
 
 def rotate_head(model, Q: torch.Tensor) -> None:
     # Rotate the head.
@@ -276,7 +249,7 @@ def rotate_head(model, Q: torch.Tensor) -> None:
     W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
 
-def rotate_ov_proj(layer, model_type, head_num, head_dim, args, **kwargs):
+def rotate_ov_proj(layer, model_type, head_num, head_dim, **kwargs):
     v_proj = layer.self_attn.v_proj
     if model_type in model_utils.SAME_TYPE_MODELS:
         o_proj = layer.self_attn.o_proj
@@ -284,17 +257,13 @@ def rotate_ov_proj(layer, model_type, head_num, head_dim, args, **kwargs):
         o_proj = layer.self_attn.out_proj
     else:
         raise ValueError(f'Unknown model type {model_type}')
-    if args.online_partial_had:
-        apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
-        apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
-    else:
-        assert kwargs.get('Q2', None) is not None, "Q2 must be specified for group hadamard mode"
-        Q2 = kwargs['Q2']
-        apply_multi_head_rotate(v_proj, Q2, head_dim, head_num, output=True, **kwargs)
-        apply_multi_head_rotate(o_proj, Q2, head_dim, head_num, output=False, **kwargs)
+    assert kwargs.get('Q2', None) is not None, "Q2 must be specified for group hadamard mode"
+    Q2 = kwargs['Q2']
+    apply_multi_head_rotate(v_proj, Q2, head_dim, head_num, output=True)
+    apply_multi_head_rotate(o_proj, Q2, head_dim, head_num, output=False)
 
 
-def apply_multi_head_rotate(module, Q, head_dim, head_num, output=False, **kwargs):
+def apply_multi_head_rotate(module, Q, head_dim, head_num, output=False):
     assert isinstance(module, torch.nn.Linear)
     W_ = module.weight.data
     dtype = W_.dtype
@@ -310,7 +279,6 @@ def apply_multi_head_rotate(module, Q, head_dim, head_num, output=False, **kwarg
         W_ = W_.transpose(0, 1).reshape(transposed_shape).t()
         if module.bias is not None:
             b = module.bias.data.to(device="cuda:0", dtype=torch.float64)
-            # b = b[kwargs['sorting_idx']] if kwargs.get('reflow', False) else b
             b_ = b.reshape(head_num, head_dim)
             b_ = torch.matmul(b_, Q)
             b_ = b_.reshape(-1)
@@ -325,22 +293,16 @@ def apply_multi_head_rotate(module, Q, head_dim, head_num, output=False, **kwarg
 
 
 @torch.inference_mode()
-def rotate_model(model, args):
+def rotate_model(model):
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
     head_dim = model_dim // num_heads
     kv_head = config.num_key_value_heads
 
-    kwargs = {'had_dim': args.had_dim} if args.rotate_mode == 'group_hadamard' else {}
-    if args.r1_path is not None:
-        logging.info(f"Loading R1 from {args.r1_path}")
-        Q1 = torch.load(args.r1_path, map_location=torch.device('cuda:0'))['R1'].to(dtype=torch.float64)
-    else:
-        Q1 = get_orthogonal_matrix(model.config.hidden_size, args.rotate_mode, device="cuda:0", **kwargs)
+    Q1 = get_orthogonal_matrix(model.config.hidden_size, 'hadamard', device="cuda:0")
 
-    Q2 = get_orthogonal_matrix(head_dim, args.rotate_mode, device="cuda:0", **
-                               kwargs) if not args.online_partial_had else None
+    Q2 = get_orthogonal_matrix(head_dim, 'hadamard', device="cuda:0")
 
     model_type = model_utils.model_type_extractor(model)
     rotate_embeddings(model, Q1)
@@ -352,9 +314,8 @@ def rotate_model(model, args):
         rotate_attention_inputs(layers[idx], Q1, model_type)
         rotate_attention_output(layers[idx], Q1, model_type)
         rotate_mlp_input(layers[idx], Q1, model_type,)
-        rotate_mlp_output(layers[idx], Q1, model_type, args,)
-        rotate_ov_proj(layers[idx], model_type, kv_head, head_dim, args,
-                       **{'Q2': Q2, })
+        rotate_mlp_output(layers[idx], Q1, model_type)
+        rotate_ov_proj(layers[idx], model_type, kv_head, head_dim, **{'Q2': Q2, })
 
 
 @torch.inference_mode

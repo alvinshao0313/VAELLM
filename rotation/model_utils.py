@@ -250,7 +250,7 @@ def replace_modules(
             else:  # layernorm_fusion.fuse_modules case where layernorms are fused
                 new_module = new_module_factory(module)
         elif len(list(module.children())) > 0:
-            replace_modules(module, type_to_replace, new_module_factory, replace_layers)
+            replace_modules(module, type_to_replace, new_module_factory, replace_layers, expect_list)
 
         if new_module is not None:
             setattr(root, name, new_module)
