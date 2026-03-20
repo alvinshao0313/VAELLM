@@ -139,6 +139,7 @@ def run(args, hf_args, training_args):
     selection = select_e2e_trainables(
         model,
         decoder_layer_ids=decoder_layer_ids,
+        target_module_names=args.target_module_names,
         train_protected_outliers=bool(args.train_protected_outliers),
         finetune_mode=str(args.finetune_mode),
         vae_lora_rank=int(args.vae_lora_rank),
@@ -222,6 +223,7 @@ def run(args, hf_args, training_args):
         "source_checkpoint_dir": student_checkpoint_dir,
         "teacher_source": teacher_source,
         "target_decoder_layers": list(selection.decoder_layer_ids),
+        "target_module_names": None if args.target_module_names is None else list(args.target_module_names),
         "train_protected_outliers": bool(args.train_protected_outliers),
         "loss_type": str(args.loss_type),
         "finetune_mode": str(args.finetune_mode),

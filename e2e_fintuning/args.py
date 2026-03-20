@@ -9,6 +9,19 @@ from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_l
 
 
 _DEFAULT_RUN_ROOT = ".result/e2e_fintuning"
+_TARGET_MODULE_ALIASES = {
+    "q": "q_proj",
+    "query": "q_proj",
+    "k": "k_proj",
+    "key": "k_proj",
+    "v": "v_proj",
+    "value": "v_proj",
+    "o": "o_proj",
+    "out": "o_proj",
+    "gate": "gate_proj",
+    "up": "up_proj",
+    "down": "down_proj",
+}
 
 
 @dataclass
@@ -21,6 +34,7 @@ class E2EFinetuneArguments:
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
     decoder_layers: str = "all"
+    target_modules: str = "all"
     train_protected_outliers: bool = False
     vae_lora_rank: int = 8
     vae_lora_alpha: float = 16.0
@@ -43,6 +57,7 @@ class E2EFinetuneArguments:
     save_tokenizer: bool = False
     unload_vae_original_weights_on_save: bool = False
     decoder_layer_ids: Optional[List[int]] = field(default=None, init=False)
+    target_module_names: Optional[List[str]] = field(default=None, init=False)
 
 
 def parse_decoder_layers(value: Optional[str]) -> Optional[List[int]]:
@@ -82,6 +97,28 @@ def parse_decoder_layers(value: Optional[str]) -> Optional[List[int]]:
     return sorted(out)
 
 
+def parse_target_modules(value: Optional[str]) -> Optional[List[str]]:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "all", "*"}:
+        return None
+
+    out = []
+    seen = set()
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        normalized = _TARGET_MODULE_ALIASES.get(token, token)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+
+    if not out:
+        raise argparse.ArgumentTypeError("--target_modules cannot be empty.")
+    return out
+
+
 def needs_teacher(loss_type: str) -> bool:
     norm = str(loss_type or "").strip().lower()
     return norm not in {"", "sft", "origin"}
@@ -107,6 +144,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--distill_alpha", type=float, default=0.5)
     parser.add_argument("--decoder_layers", type=str, default="all")
+    parser.add_argument(
+        "--target_modules",
+        type=str,
+        default="all",
+        help="Comma-separated module categories to finetune, e.g. down_proj or down,q_proj. Default: all.",
+    )
     parser.add_argument(
         "--train_protected_outliers",
         type=lambda v: _parse_bool_like(v, arg_name="--train_protected_outliers"),
@@ -201,6 +244,7 @@ def validate_args(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -
     if str(args.finetune_mode) == "vae_lora" and bool(args.train_protected_outliers):
         parser.error("--train_protected_outliers is not supported with --finetune_mode vae_lora; use hybrid instead.")
     args.decoder_layer_ids = parse_decoder_layers(args.decoder_layers)
+    args.target_module_names = parse_target_modules(args.target_modules)
 
 
 def parse_args(

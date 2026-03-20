@@ -1,4 +1,4 @@
-from e2e_fintuning.args import E2EFinetuneArguments, parse_args, parse_decoder_layers
+from e2e_fintuning.args import E2EFinetuneArguments, parse_args, parse_decoder_layers, parse_target_modules
 from e2e_fintuning.lora import LoRAVAELinear
 from e2e_fintuning.runtime import run
 
@@ -7,5 +7,6 @@ __all__ = [
     "LoRAVAELinear",
     "parse_args",
     "parse_decoder_layers",
+    "parse_target_modules",
     "run",
 ]

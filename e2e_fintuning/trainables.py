@@ -134,6 +134,7 @@ def select_e2e_trainables(
     model: nn.Module,
     *,
     decoder_layer_ids: Sequence[int],
+    target_module_names: Optional[Sequence[str]] = None,
     train_protected_outliers: bool,
     finetune_mode: str,
     vae_lora_rank: int,
@@ -143,6 +144,9 @@ def select_e2e_trainables(
     _freeze_all(model)
 
     selected_layers: Set[int] = {int(idx) for idx in decoder_layer_ids}
+    selected_module_names: Optional[Set[str]] = None
+    if target_module_names is not None:
+        selected_module_names = {str(name).strip().lower() for name in target_module_names if str(name).strip()}
     full_trainable_params: List[Tuple[str, nn.Parameter]] = []
     lora_trainable_params: List[Tuple[str, nn.Parameter]] = []
     protected_param_names: List[str] = []
@@ -155,10 +159,16 @@ def select_e2e_trainables(
     refs = list(iter_named_vae_module_refs(model))
     for ref in refs:
         layer_idx = extract_layer_idx(ref.name)
+        module_category = str(ref.name).rsplit(".", 1)[-1].lower()
         module = ref.module
         base_layer = ref.base_layer
 
         if layer_idx not in selected_layers:
+            base_layer.cache_decoded_weight = True
+            base_layer.clear_decoded_weight_cache()
+            frozen_cacheable_vae_modules.append(ref.name)
+            continue
+        if selected_module_names is not None and module_category not in selected_module_names:
             base_layer.cache_decoded_weight = True
             base_layer.clear_decoded_weight_cache()
             frozen_cacheable_vae_modules.append(ref.name)
