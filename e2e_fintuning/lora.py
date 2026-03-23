@@ -5,7 +5,7 @@ from typing import Iterator, Optional
 import torch
 from torch import nn
 
-from litebsq.bsq_linear import set_module_by_name
+from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 
 

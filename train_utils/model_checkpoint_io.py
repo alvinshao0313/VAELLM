@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from litebsq.bsq_linear import set_module_by_name
+from litebsq.misc import set_module_by_name
 from litebsq.llm_vae import Decoder
 from litebsq.vae_linear import VAELinear
 from rotation.model_utils import get_model
@@ -40,6 +40,44 @@ def _build_run_output_dir(root_output_dir: str, model_path: str) -> str:
         suffix += 1
     os.makedirs(run_dir, exist_ok=False)
     return run_dir
+
+
+def resolve_checkpoint_dir(path: str) -> str:
+    abs_path = os.path.abspath(path)
+    if os.path.isfile(abs_path):
+        if os.path.basename(abs_path) == META_FILENAME:
+            return os.path.dirname(abs_path)
+        raise FileNotFoundError(f"Expected {META_FILENAME} file, got: {abs_path}")
+
+    if not os.path.isdir(abs_path):
+        raise FileNotFoundError(f"Path does not exist: {abs_path}")
+
+    direct_meta = os.path.join(abs_path, META_FILENAME)
+    if os.path.exists(direct_meta):
+        return abs_path
+
+    final_model_meta = os.path.join(abs_path, "final_model", META_FILENAME)
+    if os.path.exists(final_model_meta):
+        return os.path.join(abs_path, "final_model")
+
+    candidates: List[str] = []
+    for child in os.listdir(abs_path):
+        child_dir = os.path.join(abs_path, child)
+        if not os.path.isdir(child_dir):
+            continue
+        if os.path.exists(os.path.join(child_dir, META_FILENAME)):
+            candidates.append(child_dir)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return candidates[0]
+
+    raise FileNotFoundError(
+        f"Cannot find checkpoint metadata under: {abs_path}. "
+        f"Please pass a directory containing {META_FILENAME}."
+    )
 
 
 def _dtype_to_name(dtype: torch.dtype) -> str:
@@ -77,16 +115,12 @@ def _decoder_to_spec(decoder: Decoder) -> Dict[str, Any]:
     if not isinstance(decoder, Decoder):
         raise TypeError(f"Expected Decoder, got {type(decoder)}")
 
-    if decoder.decoder_type == "linear":
-        hidden_dim = 128
-        num_res_blocks = 2
-        norm_type = "group"
-    elif decoder.decoder_type in {"symmetric", "asymmetric"}:
-        hidden_dim = int(decoder.linear_in.out_features)
-        num_res_blocks = int(len(decoder.blocks))
-        norm_type = str(decoder.norm_out.norm_type)
-    else:
+    if decoder.decoder_type not in {"linear", "symmetric", "asymmetric"}:
         raise ValueError(f"Unsupported decoder_type: {decoder.decoder_type}")
+
+    hidden_dim = int(getattr(decoder, "hidden_dim"))
+    num_res_blocks = int(getattr(decoder, "num_res_blocks"))
+    norm_type = str(getattr(decoder, "norm_type"))
 
     first_param = next(decoder.parameters(), None)
     param_dtype = _dtype_to_name(first_param.dtype) if first_param is not None else "float32"

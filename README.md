@@ -65,14 +65,14 @@ bash scripts/release/test_img_d32_stage1.sh
 bash scripts/release/test_img_d32_stage2.sh
 ``` 
 
-### LLM Linear Compression (BSQLinear)
-This repo also contains experimental utilities for compressing LLM `nn.Linear` weights via `litebsq.BSQLinear`.
+### LLM Linear Compression
+This repo contains utilities for category-wise LLM `nn.Linear` compression via `tools/cat_train.py` and `litebsq.VAELinear`.
 
 ```
 # layer-by-layer distillation training (activations)
 bash scripts/lbl_train_tools.sh
 
-# category-wise weight-VAE training, then Linear -> BSQLinear replacement
+# category-wise weight-VAE training, then Linear -> VAELinear replacement
 bash scripts/train_linear_by_category.sh
 ```
 

@@ -2,6 +2,9 @@ import os
 import sys
 import time
 import math
+import json
+import argparse
+from dataclasses import asdict, is_dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
@@ -11,20 +14,20 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from train_utils.train_args import (
+from train_utils.train_args import create_optimizer
+from train_utils.cat_train_args import (
+    ResolvedCategoryRuntimeConfig,
     process_cat_train_args,
-    create_optimizer,
-    resolve_autoencoder_arch_args,
-    resolve_codebook_int_for_category,
-    resolve_intra_parallel_for_category,
-    resolve_stage_value,
+    resolve_category_runtime_configs,
+    resolve_lora_runtime_config,
     resolve_skip_layer_matches,
 )
+from litebsq.vae_args import apply_autoencoder_arch_defaults
+from litebsq.misc import set_module_by_name
 from train_utils.cat_data_prep import (
     LinearPrepRef,
     format_intra_part_sort_mode,
     gather_wa_mse_act_max_batch,
-    load_activation_weight_dict,
     normalize_intra_part_sort_mode,
     prepare_group_weight_data,
     resolve_intra_parallel,
@@ -33,9 +36,12 @@ from train_utils.activation_utils import (
     ActivationCalibrationCache,
     collect_act_max_for_linears,
 )
+from train_utils.cat_arg_overrides import validate_category_keys
 from train_utils.model_checkpoint_io import (
+    META_FILENAME,
     _build_run_output_dir,
-    _safe_path_token,
+    load_model_checkpoint,
+    resolve_checkpoint_dir,
     save_model_checkpoint,
 )
 from train_utils.utils import (
@@ -53,6 +59,94 @@ from train_utils.utils import (
 
 
 log = get_logger("linear_by_category")
+
+
+def _to_jsonable(value):
+    if hasattr(value, "to_jsonable") and callable(getattr(value, "to_jsonable")):
+        return value.to_jsonable()
+    if hasattr(value, "value") and not isinstance(value, (str, bytes, bytearray)):
+        return _to_jsonable(value.value)
+    if is_dataclass(value):
+        return {k: _to_jsonable(v) for k, v in asdict(value).items()}
+    if isinstance(value, argparse.Namespace):
+        return {k: _to_jsonable(v) for k, v in vars(value).items()}
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    return value
+
+
+def _save_normalized_cat_train_snapshot(
+    *,
+    run_output_dir: str,
+    cat_args,
+    vae_args,
+    training_args,
+    resolved_category_cfgs: Dict[str, ResolvedCategoryRuntimeConfig],
+) -> str:
+    snapshot_path = os.path.join(run_output_dir, "normalized_cat_train_args.json")
+    payload = {
+        "cat_args": _to_jsonable(cat_args),
+        "vae_args": _to_jsonable(vae_args),
+        "training_args": _to_jsonable(training_args),
+        "resolved_category_runtime": {
+            category: _to_jsonable(cfg)
+            for category, cfg in resolved_category_cfgs.items()
+        },
+    }
+    with open(snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    return snapshot_path
+
+
+def _load_model_for_cat_train(*, cat_args, hf_args, vae_args) -> nn.Module:
+    if getattr(cat_args, "resume_from_checkpoint", None):
+        if bool(getattr(cat_args, "rot_llm", False)):
+            raise ValueError("--resume_from_checkpoint cannot be combined with --rot_llm because the checkpoint already contains model weights to resume from.")
+
+        checkpoint_dir = resolve_checkpoint_dir(str(cat_args.resume_from_checkpoint))
+        meta_path = os.path.join(checkpoint_dir, META_FILENAME)
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+
+        base_model_path = meta.get("base_model_path")
+        if base_model_path is None:
+            base_model_path = getattr(vae_args, "model_path", None)
+        if not base_model_path:
+            raise ValueError(
+                f"Cannot determine base model path for resumed checkpoint: {checkpoint_dir}. "
+                "Please save checkpoints with base_model_path metadata or pass --model_path."
+            )
+
+        log.info("Resuming from checkpoint: %s", checkpoint_dir)
+        log.info("Resume base model path: %s", str(base_model_path))
+        model, load_meta, load_result = load_model_checkpoint(
+            checkpoint_dir,
+            access_token=hf_args.access_token,
+            base_model_path=str(base_model_path),
+            map_location="cpu",
+            strict=True,
+        )
+        vae_args.model_path = str(load_meta.get("base_model_path") or base_model_path)
+        log.info(
+            "Checkpoint loaded. missing_keys=%d unexpected_keys=%d converted_module_count=%s",
+            len(getattr(load_result, "missing_keys", [])),
+            len(getattr(load_result, "unexpected_keys", [])),
+            str(load_meta.get("converted_module_count")),
+        )
+        return model
+
+    log.info("Loading model: %s", vae_args.model_path)
+    from rotation.model_utils import get_model
+
+    model = get_model(vae_args.model_path, hf_args.access_token)
+    if bool(getattr(cat_args, "rot_llm", False)):
+        from rotation.model_rotation import prepare_model
+
+        log.info("Applying offline LLM rotation fusion before VAE compression.")
+        model = prepare_model(model)
+    return model
 
 
 def _fuse_q_scale_linear(linear: nn.Linear, q_scale: float) -> None:
@@ -141,13 +235,6 @@ def _reshape_blocks_for_codebook_dim(
     return flat.view(num_models, -1, target_dim).permute(1, 0, 2).contiguous()
 
 
-def _contains_stage_choice(value, target: str) -> bool:
-    target_norm = str(target).strip().lower()
-    if isinstance(value, (list, tuple)):
-        return any(str(v).strip().lower() == target_norm for v in value)
-    return str(value).strip().lower() == target_norm
-
-
 def _compute_stage_norm_stats(
     stage_data: torch.Tensor,
     *,
@@ -209,28 +296,24 @@ def _train_group_vae_and_replace(
     model: nn.Module,
     group_refs: Sequence[LinearRef],
     group_tag: str,
+    runtime_cfg: ResolvedCategoryRuntimeConfig,
     vae_args,
     training_args,
     train_device: str,
     convert_device: str,
     do_convert: bool,
-    steps: Union[int, Sequence[int]],
     batch_size: int,
     log_every: int,
     eval_every: int,
     eval_blocks: int,
     output_dir: str,
-    intra_parallel,
-    intra_part_sort_mode: Union[str, Sequence[str]],
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
-    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]] = None,
-    wa_mse_runtime: Optional[Dict[str, object]] = None,
-    outlier_protect_ratio: float = 0.0,
+    activation_runtime: Optional[Dict[str, object]] = None,
+    outlier_protect_count: int = 0,
     outlier_protect_axis: str = "input",
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
     from litebsq.vae_linear import VAELinear
-    from litebsq.bsq_linear import set_module_by_name
 
     # 根据训练参数选择输入精度。
     if bool(getattr(training_args, "bf16", False)):
@@ -240,62 +323,60 @@ def _train_group_vae_and_replace(
     else:
         train_dtype = torch.float32
 
-    residual_stages = int(getattr(vae_args, "residual_stages", 1))
+    residual_stages = int(runtime_cfg.residual_stages)
     if residual_stages < 1:
         raise ValueError(f"residual_stages must be >= 1, got {residual_stages}")
     if len(group_refs) == 0:
         raise ValueError(f"[{group_tag}] group_refs cannot be empty.")
-    group_category = str(group_refs[0].category)
 
-    stage0_sort_mode = resolve_stage_value(intra_part_sort_mode, 0, arg_name="--intra_part_sort_mode")
-    stage0_codebook_dim = resolve_codebook_int_for_category(
-        resolve_stage_value(getattr(vae_args, "codebook_dim"), 0, arg_name="--codebook_dim"),
-        group_category,
-        arg_name="codebook_dim",
-    )
-    stage0_recon_loss = str(
-        resolve_stage_value(getattr(vae_args, "recon_loss_type", "mse"), 0, arg_name="--recon_loss_type")
-    ).strip().lower()
-    use_wa_mse_loss = any(
-        str(resolve_stage_value(getattr(vae_args, "recon_loss_type", "mse"), i, arg_name="--recon_loss_type")).strip().lower()
-        == "wa_mse"
-        for i in range(residual_stages)
-    )
-    row_parts, col_parts = resolve_intra_parallel(intra_parallel)
+    stage0_sort_mode = runtime_cfg.intra_part_sort_mode
+    stage0_codebook_dim = int(runtime_cfg.codebook_dim)
+    stage0_recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
+    use_wa_mse_loss = stage0_recon_loss == "wa_mse"
+    row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
     parts_per_linear = int(row_parts) * int(col_parts)
-    effective_activation_weight = activation_weight_by_linear
-    if use_wa_mse_loss and wa_mse_runtime is not None:
-        if bool(wa_mse_runtime.get("dynamic", False)):
-            calib_device = str(wa_mse_runtime.get("device") or train_device)
-            linear_items = [(r.name, r.module) for r in group_refs]
-            dynamic_act_max, new_cache = collect_act_max_for_linears(
-                model=model,
-                linear_items=linear_items,
-                model_path=str(wa_mse_runtime["model_path"]),
-                access_token=wa_mse_runtime.get("access_token"),
-                dataset=str(wa_mse_runtime.get("dataset", "wikitext2")),
-                nsamples=int(wa_mse_runtime.get("nsamples", 512)),
-                seqlen=int(wa_mse_runtime.get("seqlen", 512)),
-                seed=int(wa_mse_runtime.get("seed", 0)),
-                device=calib_device,
-                cache=wa_mse_runtime.get("cache"),  # type: ignore[arg-type]
-                log_every=int(wa_mse_runtime.get("log_every", 0)),
-                logger=log,
+    row_sort_mode, col_sort_mode = normalize_intra_part_sort_mode(
+        stage0_sort_mode,
+        arg_name="--intra_part_sort_mode",
+    )
+    needs_dynamic_activation = (
+        use_wa_mse_loss
+        or row_sort_mode == "act_l2"
+        or col_sort_mode == "act_l2"
+        or int(outlier_protect_count) > 0
+    )
+    effective_activation_weight: Optional[Dict[str, torch.Tensor]] = None
+    if needs_dynamic_activation:
+        if activation_runtime is None:
+            raise ValueError(
+                f"[{group_tag}] dynamic activation runtime is required for wa_mse, act_l2, or outlier protection."
             )
-            wa_mse_runtime["cache"] = new_cache
-            effective_activation_weight = dynamic_act_max
-            log.info(
-                "[%s] refreshed act_max from current model (linears=%d, dataset=%s, nsamples=%d, seqlen=%d).",
-                group_tag,
-                len(dynamic_act_max),
-                str(wa_mse_runtime.get("dataset", "wikitext2")),
-                int(wa_mse_runtime.get("nsamples", 512)),
-                int(wa_mse_runtime.get("seqlen", 512)),
-            )
-        elif effective_activation_weight is None:
-            static_dict = wa_mse_runtime.get("static_dict")
-            if isinstance(static_dict, dict):
-                effective_activation_weight = static_dict
+        calib_device = str(activation_runtime.get("device") or train_device)
+        linear_items = [(r.name, r.module) for r in group_refs]
+        dynamic_act_max, new_cache = collect_act_max_for_linears(
+            model=model,
+            linear_items=linear_items,
+            model_path=str(activation_runtime["model_path"]),
+            access_token=activation_runtime.get("access_token"),
+            dataset=str(activation_runtime.get("dataset", "wikitext2")),
+            nsamples=int(activation_runtime.get("nsamples", 512)),
+            seqlen=int(activation_runtime.get("seqlen", 512)),
+            seed=int(activation_runtime.get("seed", 0)),
+            device=calib_device,
+            cache=activation_runtime.get("cache"),  # type: ignore[arg-type]
+            log_every=int(activation_runtime.get("log_every", 0)),
+            logger=log,
+        )
+        activation_runtime["cache"] = new_cache
+        effective_activation_weight = dynamic_act_max
+        log.info(
+            "[%s] refreshed dynamic activation stats (linears=%d, dataset=%s, nsamples=%d, seqlen=%d).",
+            group_tag,
+            len(dynamic_act_max),
+            str(activation_runtime.get("dataset", "wikitext2")),
+            int(activation_runtime.get("nsamples", 512)),
+            int(activation_runtime.get("seqlen", 512)),
+        )
 
     prep_refs = [
         LinearPrepRef(
@@ -318,19 +399,16 @@ def _train_group_vae_and_replace(
         activation_weight_by_linear=effective_activation_weight,
         train_device=train_device,
         intra_part_sort_mode=stage0_sort_mode,
-        outlier_protect_ratio=float(outlier_protect_ratio),
+        outlier_protect_count=int(outlier_protect_count),
         outlier_protect_axis=str(outlier_protect_axis),
     )
     num_models = int(prep_result.num_models)
-    group_vae_args = _clone_namespace(vae_args, parallel_layers=num_models)
     stacked_data = prep_result.stacked_data
     use_wa_mse = bool(prep_result.use_wa_mse)
     part_metas = prep_result.part_metas
     split_metas = prep_result.split_metas
-    if float(outlier_protect_ratio) > 0.0:
+    if int(outlier_protect_count) > 0:
         per_linear_protected = []
-        zero_protected = []
-        any_protected = False
         for ref, meta in zip(group_refs, split_metas):
             if str(outlier_protect_axis) == "output":
                 protected_idx = meta.protected_output_indices
@@ -339,29 +417,16 @@ def _train_group_vae_and_replace(
                 protected_idx = meta.protected_input_indices
                 total_channels = int(ref.module.in_features)
             protected_count = int(protected_idx.numel()) if isinstance(protected_idx, torch.Tensor) else 0
-            any_protected = any_protected or protected_count > 0
             per_linear_protected.append(
                 f"{ref.name}:{protected_count}/{total_channels}"
             )
-            if protected_count == 0:
-                zero_protected.append(ref.name)
         log.info(
-            "[%s] outlier protection axis=%s ratio=%.6f protected_channels=%s",
+            "[%s] outlier protection axis=%s count=%d protected_channels=%s",
             group_tag,
             str(outlier_protect_axis),
-            float(outlier_protect_ratio),
+            int(outlier_protect_count),
             ",".join(per_linear_protected),
         )
-        if zero_protected:
-            log.info(
-                "[%s] outlier protection skipped due to floor(...) == 0 for %d/%d linears: %s",
-                group_tag,
-                len(zero_protected),
-                len(split_metas),
-                ",".join(zero_protected),
-            )
-        if not any_protected:
-            log.info("[%s] outlier protection produced no protected channels in this group.", group_tag)
     if len(split_metas) != len(group_refs):
         raise RuntimeError(
             f"[{group_tag}] split metadata mismatch: len(split_metas)={len(split_metas)} "
@@ -375,56 +440,40 @@ def _train_group_vae_and_replace(
     all_stage_decoders: List[List[nn.Module]] = []
     all_stage_codebook_dims: List[int] = []
 
+    shared_stage_args = _clone_namespace(
+        vae_args,
+        parallel_layers=num_models,
+        residual_stages=int(runtime_cfg.residual_stages),
+        codebook_bits=int(runtime_cfg.codebook_bits),
+        codebook_dim=int(runtime_cfg.codebook_dim),
+        base_ch=int(runtime_cfg.base_ch),
+        num_res_blocks=int(runtime_cfg.num_res_blocks),
+        norm_type=str(runtime_cfg.norm_type),
+        decoder_type=str(runtime_cfg.decoder_type),
+        decoder_base_ch=(
+            None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch)
+        ),
+        decoder_num_res_blocks=(
+            None if runtime_cfg.decoder_num_res_blocks is None else int(runtime_cfg.decoder_num_res_blocks)
+        ),
+        recon_loss_type=str(runtime_cfg.recon_loss_type),
+    )
+    apply_autoencoder_arch_defaults(shared_stage_args)
+
     for stage_idx in range(residual_stages):
         stage_tag = f"{group_tag}/stage{stage_idx + 1}"
-        stage_steps = int(resolve_stage_value(steps, stage_idx, arg_name="--steps_per_category/--steps_per_group"))
-        stage_codebook_bits = resolve_codebook_int_for_category(
-            resolve_stage_value(getattr(group_vae_args, "codebook_bits"), stage_idx, arg_name="--codebook_bits"),
-            group_category,
-            arg_name="codebook_bits",
-        )
-        stage_codebook_dim = resolve_codebook_int_for_category(
-            resolve_stage_value(getattr(group_vae_args, "codebook_dim"), stage_idx, arg_name="--codebook_dim"),
-            group_category,
-            arg_name="codebook_dim",
-        )
+        stage_steps = int(runtime_cfg.steps)
+        stage_codebook_bits = int(runtime_cfg.codebook_bits)
+        stage_codebook_dim = int(runtime_cfg.codebook_dim)
         residual_data = _reshape_blocks_for_codebook_dim(residual_data, codebook_dim=int(stage_codebook_dim))
-        stage_recon_loss = str(
-            resolve_stage_value(getattr(group_vae_args, "recon_loss_type", "mse"),
-                                stage_idx, arg_name="--recon_loss_type")
-        ).strip().lower()
-        stage_base_ch = int(resolve_stage_value(
-            getattr(group_vae_args, "base_ch", 128), stage_idx, arg_name="--base_ch"))
-        stage_num_res_blocks = int(
-            resolve_stage_value(getattr(group_vae_args, "num_res_blocks", 1), stage_idx, arg_name="--num_res_blocks")
-        )
-        stage_norm_type = str(
-            resolve_stage_value(getattr(group_vae_args, "norm_type", "group"), stage_idx, arg_name="--norm_type")
-        ).strip().lower()
-        stage_decoder_type = str(
-            resolve_stage_value(getattr(group_vae_args, "decoder_type", "linear"), stage_idx, arg_name="--decoder_type")
-        ).strip().lower()
-        stage_decoder_base_ch = resolve_stage_value(
-            getattr(group_vae_args, "decoder_base_ch", None), stage_idx, arg_name="--decoder_base_ch"
-        )
-        stage_decoder_num_res_blocks = resolve_stage_value(
-            getattr(group_vae_args, "decoder_num_res_blocks", None), stage_idx, arg_name="--decoder_num_res_blocks"
-        )
-        stage_vae_args = _clone_namespace(
-            group_vae_args,
-            codebook_bits=int(stage_codebook_bits),
-            codebook_dim=int(stage_codebook_dim),
-            base_ch=int(stage_base_ch),
-            num_res_blocks=int(stage_num_res_blocks),
-            norm_type=stage_norm_type,
-            decoder_type=stage_decoder_type,
-            decoder_base_ch=None if stage_decoder_base_ch is None else int(stage_decoder_base_ch),
-            decoder_num_res_blocks=(
-                None if stage_decoder_num_res_blocks is None else int(stage_decoder_num_res_blocks)
-            ),
-            recon_loss_type=stage_recon_loss,
-        )
-        resolve_autoencoder_arch_args(stage_vae_args)
+        stage_recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
+        stage_base_ch = int(runtime_cfg.base_ch)
+        stage_num_res_blocks = int(runtime_cfg.num_res_blocks)
+        stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
+        stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
+        stage_decoder_base_ch = runtime_cfg.decoder_base_ch
+        stage_decoder_num_res_blocks = runtime_cfg.decoder_num_res_blocks
+        stage_vae_args = _clone_namespace(shared_stage_args)
 
         if bool(getattr(stage_vae_args, "normalize_weight", False)):
             stage_norm_mean, stage_norm_scale = _compute_stage_norm_stats(residual_data)
@@ -764,91 +813,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         _format_namespace(training_args),
     )
 
-    log.info("Loading model: %s", vae_args.model_path)
-    from rotation.model_utils import get_model
-
-    model = get_model(vae_args.model_path, hf_args.access_token)
-    if bool(getattr(cat_args, "rot_llm", False)):
-        from rotation.model_rotation import prepare_model
-
-        log.info("Applying offline LLM rotation fusion before VAE compression.")
-        model = prepare_model(model)
-    intra_part_sort_mode = getattr(cat_args, "intra_part_sort_mode", "l2")
-    stage0_intra_part_sort_mode = resolve_stage_value(
-        intra_part_sort_mode,
-        0,
-        arg_name="--intra_part_sort_mode",
-    )
-    stage0_row_sort_mode, stage0_col_sort_mode = normalize_intra_part_sort_mode(
-        stage0_intra_part_sort_mode,
-        arg_name="--intra_part_sort_mode",
-    )
-    stage0_sort_mode_desc = format_intra_part_sort_mode((stage0_row_sort_mode, stage0_col_sort_mode))
-    if isinstance(intra_part_sort_mode, (list, tuple)):
-        stage_modes = [format_intra_part_sort_mode(v) for v in intra_part_sort_mode]
-        if len(set(stage_modes)) > 1:
-            log.warning(
-                "--intra_part_sort_mode provided as multi-stage list (%s). "
-                "当前实现的分块排序在 stage0 固化，后续 stage 将沿用 stage0 排序。",
-                ",".join(stage_modes),
-            )
-    intra_parallel_raw = getattr(cat_args, "intra_parallel", 1)
-    if isinstance(intra_parallel_raw, dict):
-        log.info(
-            "intra_parallel category overrides enabled: keys=%s",
-            ",".join(sorted(str(k) for k in intra_parallel_raw.keys())),
-        )
-    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]] = None
-    wa_mse_runtime: Optional[Dict[str, object]] = None
-    outlier_protect_ratio = float(getattr(cat_args, "outlier_protect_ratio", 0.0))
+    model = _load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
+    activation_runtime: Optional[Dict[str, object]] = None
     outlier_protect_axis = str(getattr(cat_args, "outlier_protect_axis", "input")).strip().lower()
-    act_path = getattr(cat_args, "activation_weight_path", None)
-    if act_path:
-        activation_weight_by_linear = load_activation_weight_dict(str(act_path))
-        log.info(
-            "Loaded static activation abs-max dict: %s (entries=%d)",
-            act_path,
-            len(activation_weight_by_linear),
-        )
-
-    if _contains_stage_choice(getattr(vae_args, "recon_loss_type", ""), "wa_mse"):
-        wa_mse_runtime = {
-            "dynamic": str(getattr(cat_args, "wa_mse_act_mode", "dynamic")).strip().lower() == "dynamic",
-            "cache": None,  # type: Optional[ActivationCalibrationCache]
-            "dataset": str(getattr(cat_args, "wa_mse_calib_dataset", "wikitext2")),
-            "nsamples": int(getattr(cat_args, "wa_mse_calib_nsamples", 512)),
-            "seqlen": int(getattr(cat_args, "wa_mse_calib_seqlen", 512)),
-            "seed": int(getattr(cat_args, "wa_mse_calib_seed", 0)),
-            "device": str(getattr(cat_args, "wa_mse_calib_device", "")).strip() or str(cat_args.train_device),
-            "log_every": int(getattr(cat_args, "wa_mse_calib_log_every", 0)),
-            "model_path": str(vae_args.model_path),
-            "access_token": hf_args.access_token,
-            "static_dict": activation_weight_by_linear,
-        }
-        if not bool(wa_mse_runtime["dynamic"]) and activation_weight_by_linear is None:
-            raise ValueError(
-                "wa_mse requires either --wa_mse_act_mode dynamic or --activation_weight_path in static mode."
-            )
-        if bool(wa_mse_runtime["dynamic"]):
-            log.info(
-                "wa_mse dynamic act_max enabled: dataset=%s nsamples=%d seqlen=%d seed=%d device=%s",
-                str(wa_mse_runtime["dataset"]),
-                int(wa_mse_runtime["nsamples"]),
-                int(wa_mse_runtime["seqlen"]),
-                int(wa_mse_runtime["seed"]),
-                str(wa_mse_runtime["device"]),
-            )
-    if outlier_protect_ratio > 0.0:
-        has_reusable_dynamic_act = bool(wa_mse_runtime and bool(wa_mse_runtime.get("dynamic", False)))
-        if activation_weight_by_linear is None and not has_reusable_dynamic_act:
-            raise ValueError(
-                "outlier_protect_ratio requires activation vectors. "
-                "Please provide --activation_weight_path or enable a wa_mse dynamic act_max source."
-            )
-        log.info("Outlier protection enabled: axis=%s ratio=%.6f", outlier_protect_axis, outlier_protect_ratio)
     transpose_modules = _split_csv(cat_args.transpose_modules)
     projection_suffixes = _split_csv(cat_args.projection_suffixes)
-    only_decoder_projections = bool(cat_args.only_decoder_projections) and not bool(cat_args.include_all_linears)
+    only_decoder_projections = not bool(cat_args.include_all_linears)
     all_linears = _collect_linears(
         model,
         transpose_modules,
@@ -877,48 +847,105 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 ",".join(f"{li}.{cat}" for li, cat in matched),
             )
         if missing:
-            log.warning(
-                "skip_layers 未匹配到任何 Linear: %s",
-                ",".join(f"{li}.{cat}" for li, cat in missing),
+            raise ValueError(
+                "skip_layers contains unknown layer/category pairs: "
+                + ",".join(f"{li}.{cat}" for li, cat in missing)
             )
 
-    steps_per_group = cat_args.steps_per_group if cat_args.steps_per_group is not None else cat_args.steps_per_category
     linear_group_size = int(cat_args.linear_group_size)
     if linear_group_size < 1:
         raise ValueError(f"linear_group_size must be >= 1, got {linear_group_size}")
 
     active_categories = [c for c in category_order if c in refs_by_cat]
-    category_intra_parallel: Dict[str, Tuple[int, int]] = {}
-    category_codebook: Dict[str, Tuple[int, int]] = {}
-    for cat in active_categories:
-        category_intra_parallel[cat] = resolve_intra_parallel_for_category(intra_parallel_raw, cat)
-        stage0_codebook_bits = resolve_stage_value(getattr(vae_args, "codebook_bits"), 0, arg_name="--codebook_bits")
-        stage0_codebook_dim = resolve_stage_value(getattr(vae_args, "codebook_dim"), 0, arg_name="--codebook_dim")
-        category_codebook[cat] = (
-            resolve_codebook_int_for_category(
-                stage0_codebook_bits,
-                cat,
-                arg_name="codebook_bits",
-            ),
-            resolve_codebook_int_for_category(
-                stage0_codebook_dim,
-                cat,
-                arg_name="codebook_dim",
-            ),
+    if not active_categories:
+        raise ValueError("No active categories discovered for training.")
+
+    resolved_category_cfgs = resolve_category_runtime_configs(cat_args, vae_args, active_categories)
+    lora_tables = (
+        (cat_args.lora_rank, "--lora_rank"),
+        (cat_args.lora_alpha, "--lora_alpha"),
+        (cat_args.lora_dropout, "--lora_dropout"),
+        (cat_args.lora_steps, "--lora_steps"),
+        (cat_args.lora_batch_size, "--lora_batch_size"),
+        (cat_args.lora_nsamples, "--lora_nsamples"),
+        (cat_args.lora_lr, "--lora_lr"),
+        (cat_args.lora_weight_decay, "--lora_weight_decay"),
+        (cat_args.lora_log_every, "--lora_log_every"),
+        (cat_args.lora_loss_type, "--lora_loss_type"),
+        (cat_args.lora_use_dora, "--lora_use_dora"),
+    )
+    for table, arg_name in lora_tables:
+        validate_category_keys(table, active_categories, arg_name)
+
+    category_intra_parallel: Dict[str, Tuple[int, int]] = {
+        cat: tuple(resolved_category_cfgs[cat].intra_parallel) for cat in active_categories
+    }
+    category_codebook: Dict[str, Tuple[int, int]] = {
+        cat: (
+            int(resolved_category_cfgs[cat].codebook_bits),
+            int(resolved_category_cfgs[cat].codebook_dim),
+        )
+        for cat in active_categories
+    }
+    category_outlier_protect_count: Dict[str, int] = {
+        cat: int(resolved_category_cfgs[cat].outlier_protect_count) for cat in active_categories
+    }
+    category_sort_modes: Dict[str, Tuple[str, str]] = {
+        cat: normalize_intra_part_sort_mode(
+            resolved_category_cfgs[cat].intra_part_sort_mode,
+            arg_name="--intra_part_sort_mode",
+        )
+        for cat in active_categories
+    }
+    category_sort_mode_desc: Dict[str, str] = {
+        cat: format_intra_part_sort_mode(category_sort_modes[cat]) for cat in active_categories
+    }
+    unique_sort_mode_desc = sorted(set(category_sort_mode_desc.values()))
+
+    any_wa_mse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip().lower() == "wa_mse" for cat in active_categories)
+    any_outlier_protect = any(count > 0 for count in category_outlier_protect_count.values())
+    sort_needs_act = any(
+        row_mode == "act_l2" or col_mode == "act_l2"
+        for row_mode, col_mode in category_sort_modes.values()
+    )
+    if any_wa_mse or any_outlier_protect or sort_needs_act:
+        activation_runtime = {
+            "cache": None,  # type: Optional[ActivationCalibrationCache]
+            "dataset": str(getattr(cat_args, "wa_mse_calib_dataset", "wikitext2")),
+            "nsamples": int(getattr(cat_args, "wa_mse_calib_nsamples", 512)),
+            "seqlen": int(getattr(cat_args, "wa_mse_calib_seqlen", 512)),
+            "seed": int(getattr(cat_args, "wa_mse_calib_seed", 0)),
+            "device": str(getattr(cat_args, "wa_mse_calib_device", "")).strip() or str(cat_args.train_device),
+            "log_every": int(getattr(cat_args, "wa_mse_calib_log_every", 0)),
+            "model_path": str(vae_args.model_path),
+            "access_token": hf_args.access_token,
+        }
+        enabled_features: List[str] = []
+        if any_wa_mse:
+            enabled_features.append("wa_mse")
+        if any_outlier_protect:
+            enabled_features.append("outlier_protect")
+        if sort_needs_act:
+            enabled_features.append("act_l2_sort")
+        log.info(
+            "Dynamic activation recalibration enabled for %s: dataset=%s nsamples=%d seqlen=%d seed=%d device=%s",
+            ",".join(enabled_features),
+            str(activation_runtime["dataset"]),
+            int(activation_runtime["nsamples"]),
+            int(activation_runtime["seqlen"]),
+            int(activation_runtime["seed"]),
+            str(activation_runtime["device"]),
         )
 
-    sort_needs_act = bool(category_intra_parallel) and (
-        stage0_row_sort_mode == "act_l2" or stage0_col_sort_mode == "act_l2"
-    )
-    if sort_needs_act and activation_weight_by_linear is None and wa_mse_runtime is None:
-        raise ValueError(
-            "intra_part_sort_mode requires activation vectors when enabled dimension uses act_l2. "
-            "Please provide --activation_weight_path."
+    if any_outlier_protect:
+        enabled_counts = ",".join(
+            f"{cat}:{count}"
+            for cat, count in category_outlier_protect_count.items()
+            if count > 0
         )
+        log.info("Outlier protection enabled: axis=%s count_by_category=%s", outlier_protect_axis, enabled_counts)
 
     unique_parallel = sorted(set(category_intra_parallel.values()))
-    if int(getattr(vae_args, "parallel_layers", 1)) != 1:
-        log.warning("检测到 --parallel_layers=%d，但当前脚本不再使用该参数；请使用 --intra_parallel。", int(vae_args.parallel_layers))
     if unique_parallel:
         if len(unique_parallel) == 1:
             intra_row_parts, intra_col_parts = unique_parallel[0]
@@ -930,7 +957,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 intra_parallel_desc,
                 intra_row_parts,
                 intra_col_parts,
-                stage0_sort_mode_desc,
+                unique_sort_mode_desc[0] if len(unique_sort_mode_desc) == 1 else f"per_category{{{','.join(f'{cat}:{category_sort_mode_desc[cat]}' for cat in active_categories)}}}",
                 linear_group_size * intra_parts_per_linear,
             )
         else:
@@ -943,10 +970,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 for rp, cp in unique_parallel
             )
             log.info(
-                "并行配置: linear_group_size=%d, intra_parallel=per_category{%s}, intra_part_sort_mode=%s, total_num_models_per_group=[%d,%d]",
+                "并行配置: linear_group_size=%d, intra_parallel=per_category{%s}, intra_part_sort_mode=per_category{%s}, total_num_models_per_group=[%d,%d]",
                 linear_group_size,
                 per_cat_desc,
-                stage0_sort_mode_desc,
+                ",".join(f"{cat}:{category_sort_mode_desc[cat]}" for cat in active_categories),
                 models_per_group_values[0],
                 models_per_group_values[-1],
             )
@@ -961,12 +988,38 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 for cat in active_categories
             )
             log.info("codebook 配置: per_category{%s}", per_cat_cb_desc)
+    unique_residual_stages = sorted(set(int(resolved_category_cfgs[cat].residual_stages) for cat in active_categories))
+    if len(unique_residual_stages) == 1:
+        log.info("residual_stages 配置: %d", unique_residual_stages[0])
+    else:
+        per_cat_stage_desc = ",".join(
+            f"{cat}:{int(resolved_category_cfgs[cat].residual_stages)}"
+            for cat in active_categories
+        )
+        log.info("residual_stages 配置: per_category{%s}", per_cat_stage_desc)
+
+    snapshot_path = _save_normalized_cat_train_snapshot(
+        run_output_dir=run_output_dir,
+        cat_args=cat_args,
+        vae_args=vae_args,
+        training_args=training_args,
+        resolved_category_cfgs=resolved_category_cfgs,
+    )
+    log.info("Saved normalized parameter snapshot: %s", snapshot_path)
     lora_round_idx = 0
-    lora_schedule = getattr(cat_args, "lora_schedule", None)
-    if isinstance(lora_schedule, dict) and lora_schedule:
+    any_lora_after_overrides = any(table.is_override_enabled() for table, _ in lora_tables)
+    if any_lora_after_overrides:
         log.info(
-            "LoRA category schedule enabled. keys=%s",
-            ",".join(sorted(str(k) for k in lora_schedule.keys())),
+            "LoRA after-category overrides enabled: keys=%s",
+            ",".join(
+                sorted(
+                    {
+                        key
+                        for table, _arg_name in lora_tables
+                        for key in table.by_after_category.keys()
+                    }
+                )
+            ),
         )
     for cat_idx, cat in enumerate(active_categories):
         if cat not in refs_by_cat:
@@ -976,20 +1029,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if not refs:
             continue
 
+        cat_cfg = resolved_category_cfgs[cat]
         cat_row_parts, cat_col_parts = category_intra_parallel[cat]
         cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
-        cat_vae_args = _clone_namespace(vae_args)
         cat_parts_per_linear = int(cat_row_parts) * int(cat_col_parts)
         cat_intra_parallel_desc = _format_intra_parallel_desc(cat_row_parts, cat_col_parts)
         log.info(
-            "=== Category: %s (%d linears, intra_parallel=%s rows=%d cols=%d, codebook_bits=%d, codebook_dim=%d) ===",
+            "=== Category: %s (%d linears, residual_stages=%d, intra_parallel=%s rows=%d cols=%d, codebook_bits=%d, codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
             cat,
             len(refs),
+            int(cat_cfg.residual_stages),
             cat_intra_parallel_desc,
             cat_row_parts,
             cat_col_parts,
             int(cat_codebook_bits),
             int(cat_codebook_dim),
+            str(cat_cfg.recon_loss_type),
+            category_sort_mode_desc[cat],
+            int(cat_cfg.steps),
         )
 
         refs_sorted = []
@@ -1023,23 +1080,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 model=model,
                 group_refs=group_refs,
                 group_tag=group_tag,
-                vae_args=cat_vae_args,
+                runtime_cfg=cat_cfg,
+                vae_args=vae_args,
                 training_args=training_args,
                 train_device=cat_args.train_device,
                 convert_device=cat_args.convert_device,
                 do_convert=bool(cat_args.convert),
-                steps=steps_per_group,
                 batch_size=cat_args.batch_size,
                 log_every=cat_args.log_every,
                 eval_every=cat_args.eval_every,
                 eval_blocks=cat_args.eval_blocks,
                 output_dir=cat_args.output_dir,
-                intra_parallel=(cat_row_parts, cat_col_parts),
-                intra_part_sort_mode=intra_part_sort_mode,
                 skip_layer_keys=skip_layer_keys,
-                activation_weight_by_linear=activation_weight_by_linear,
-                wa_mse_runtime=wa_mse_runtime,
-                outlier_protect_ratio=outlier_protect_ratio,
+                activation_runtime=activation_runtime,
+                outlier_protect_count=category_outlier_protect_count[cat],
                 outlier_protect_axis=outlier_protect_axis,
             )
             # _eval_ppl_after_category(

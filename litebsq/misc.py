@@ -2,7 +2,6 @@
 
 import torch
 import torch.distributed as dist
-import imageio
 import os
 import random
 
@@ -15,6 +14,14 @@ import torch.optim as optim
 from contextlib import contextmanager
 
 ptdtype = {None: torch.float32, 'fp32': torch.float32, 'bf16': torch.bfloat16}
+
+
+def set_module_by_name(model, name, new_module):
+    module = model
+    parts = str(name).split(".")
+    for part in parts[:-1]:
+        module = getattr(module, part)
+    setattr(module, parts[-1], new_module)
 
 
 def rank_zero_only(fn):

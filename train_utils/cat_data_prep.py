@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -373,32 +372,12 @@ def split_linear_into_parts(
     return parts
 
 
-def load_activation_weight_dict(path: str) -> Dict[str, torch.Tensor]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"activation_weight_path does not exist: {path}")
-    obj = torch.load(path, map_location="cpu")
-    if not isinstance(obj, dict):
-        raise TypeError(f"Expected dict in {path}, got {type(obj)}")
-
-    out: Dict[str, torch.Tensor] = {}
-    for name, value in obj.items():
-        if not isinstance(name, str):
-            raise TypeError(f"Activation dict key must be str, got {type(name)}")
-        tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value)
-        if tensor.ndim != 1:
-            raise ValueError(
-                f"Activation vector for {name} must be 1D, got shape={tuple(tensor.shape)}"
-            )
-        out[name] = tensor.detach().to(dtype=torch.float32, device="cpu").contiguous()
-    return out
-
-
 def _prepare_linear_weight_for_outlier_protection(
     *,
     weight: torch.Tensor,
     linear_name: str,
     activation_weight: Optional[torch.Tensor],
-    outlier_protect_ratio: float,
+    outlier_protect_count: int,
     outlier_protect_axis: str,
 ) -> PreparedLinearWeight:
     axis = str(outlier_protect_axis).strip().lower()
@@ -415,8 +394,10 @@ def _prepare_linear_weight_for_outlier_protection(
                 f"got {int(act_cpu.numel())}, expected in_features={original_in_features}"
             )
 
-    ratio = float(outlier_protect_ratio)
-    if ratio <= 0.0:
+    protect_count = int(outlier_protect_count)
+    if protect_count < 0:
+        raise ValueError(f"{linear_name}: outlier_protect_count must be >= 0, got {protect_count}.")
+    if protect_count == 0:
         return PreparedLinearWeight(
             split_weight=weight,
             compressed_in_features=original_in_features,
@@ -430,31 +411,19 @@ def _prepare_linear_weight_for_outlier_protection(
 
     if act_cpu is None:
         raise ValueError(
-            f"{linear_name}: outlier_protect_ratio={ratio} requires activation vector."
+            f"{linear_name}: outlier_protect_count={protect_count} requires activation vector."
         )
 
-    protect_count = int(original_in_features * ratio)
-    if axis == "output":
-        protect_count = int(original_out_features * ratio)
-    if protect_count <= 0:
-        return PreparedLinearWeight(
-            split_weight=weight,
-            compressed_in_features=original_in_features,
-            compressed_out_features=original_out_features,
-            activation_weight=act_cpu,
-            protected_input_indices=None,
-            protected_input_weight=None,
-            protected_output_indices=None,
-            protected_output_weight=None,
-        )
     if axis == "input" and protect_count >= original_in_features:
         raise ValueError(
-            f"{linear_name}: outlier_protect_ratio={ratio} protects {protect_count} channels, "
+            f"{linear_name}: outlier_protect_count={protect_count} "
+            f"protects too many input channels, "
             f"which is not smaller than in_features={original_in_features}."
         )
     if axis == "output" and protect_count >= original_out_features:
         raise ValueError(
-            f"{linear_name}: outlier_protect_ratio={ratio} protects {protect_count} channels, "
+            f"{linear_name}: outlier_protect_count={protect_count} "
+            f"protects too many output channels, "
             f"which is not smaller than out_features={original_out_features}."
         )
 
@@ -709,16 +678,16 @@ def prepare_group_weight_data(
     activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
     train_device: str,
     intra_part_sort_mode: Union[str, Sequence[str]] = "l2",
-    outlier_protect_ratio: float = 0.0,
+    outlier_protect_count: int = 0,
     outlier_protect_axis: str = "input",
 ) -> GroupDataPrepResult:
     row_parts, col_parts = resolve_intra_parallel(intra_parallel)
     parts_per_linear = int(row_parts) * int(col_parts)
     num_linear = len(group_refs)
     num_models = num_linear * parts_per_linear
-    outlier_ratio = float(outlier_protect_ratio)
-    if outlier_ratio < 0.0 or outlier_ratio >= 1.0:
-        raise ValueError(f"outlier_protect_ratio must satisfy 0.0 <= value < 1.0, got {outlier_ratio}")
+    protect_count = int(outlier_protect_count)
+    if protect_count < 0:
+        raise ValueError(f"outlier_protect_count must be >= 0, got {protect_count}")
 
     row_sort_mode, col_sort_mode = normalize_intra_part_sort_mode(
         intra_part_sort_mode,
@@ -729,11 +698,11 @@ def prepare_group_weight_data(
         row_sort_mode == "act_l2"
         or col_sort_mode == "act_l2"
     )
-    needs_activation = requires_act or use_wa_mse or outlier_ratio > 0.0
+    needs_activation = requires_act or use_wa_mse or protect_count > 0
     if needs_activation and activation_weight_by_linear is None:
         raise ValueError(
             "Activation vectors are required by outlier protection, wa_mse, or intra_part_sort_mode=act_l2. "
-            "Please provide --activation_weight_path or use wa_mse dynamic act_max."
+            "No activation source was provided for the current group."
         )
 
     split_list = []
@@ -754,7 +723,7 @@ def prepare_group_weight_data(
             weight=r.weight,
             linear_name=r.name,
             activation_weight=act_for_linear,
-            outlier_protect_ratio=outlier_ratio,
+            outlier_protect_count=protect_count,
             outlier_protect_axis=outlier_protect_axis,
         )
         act_for_sort = prepared_weight.activation_weight if requires_act else None
@@ -836,7 +805,7 @@ def prepare_group_weight_data(
     part_metas: List[WAMSEPartMeta] = []
     if use_wa_mse:
         if not wa_mse_activation_weight_by_linear:
-            raise ValueError("recon_loss_type=wa_mse requires --activation_weight_path.")
+            raise ValueError("recon_loss_type=wa_mse requires activation vectors for the current group.")
         part_metas = _build_wa_mse_part_metas(
             group_refs=wa_mse_group_refs,
             intra_parallel=(row_parts, col_parts),
