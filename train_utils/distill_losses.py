@@ -1,0 +1,173 @@
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+
+
+DEFAULT_DUAL_SCALE_EPS = 1e-6
+
+
+def build_distill_token_mask(
+    *,
+    labels: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    reference_logits: torch.Tensor,
+) -> torch.Tensor:
+    if reference_logits.ndim < 3:
+        raise ValueError(
+            f"reference_logits must have shape [B, L, V], got ndim={reference_logits.ndim}"
+        )
+
+    expected_shape = tuple(int(dim) for dim in reference_logits.shape[:2])
+    mask_tensor: Optional[torch.Tensor] = None
+
+    if isinstance(labels, torch.Tensor):
+        mask_tensor = labels.ne(-100)
+    elif isinstance(attention_mask, torch.Tensor):
+        mask_tensor = attention_mask.ne(0)
+
+    if mask_tensor is None:
+        return torch.ones(
+            expected_shape,
+            dtype=torch.float32,
+            device=reference_logits.device,
+        )
+
+    if tuple(int(dim) for dim in mask_tensor.shape) != expected_shape:
+        raise ValueError(
+            f"mask shape mismatch: expected {expected_shape}, got {tuple(mask_tensor.shape)}"
+        )
+
+    return mask_tensor.to(device=reference_logits.device, dtype=torch.float32)
+
+
+def _dual_scale_logits(logits: torch.Tensor, eps: float) -> torch.Tensor:
+    logits_fp32 = logits.float()
+    scale = logits_fp32.std(dim=-1, keepdim=True, unbiased=False)
+    return logits_fp32 / (scale + float(eps))
+
+
+def _masked_token_kl_mean(
+    *,
+    student_log_prob: torch.Tensor,
+    teacher_prob: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    token_kl = F.kl_div(student_log_prob, teacher_prob, reduction="none").sum(dim=-1)
+    if mask is None:
+        denom = torch.tensor(
+            float(token_kl.numel()),
+            dtype=token_kl.dtype,
+            device=token_kl.device,
+        ).clamp_min(1.0)
+        return token_kl.sum() / denom
+
+    mask_fp32 = mask.to(device=token_kl.device, dtype=token_kl.dtype)
+    denom = mask_fp32.sum().clamp_min(1.0)
+    return (token_kl * mask_fp32).sum() / denom
+
+
+def compute_dual_kl_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    eps: float = DEFAULT_DUAL_SCALE_EPS,
+) -> torch.Tensor:
+    teacher_scaled = _dual_scale_logits(teacher_logits, eps=float(eps))
+    student_scaled = _dual_scale_logits(student_logits, eps=float(eps))
+    return _masked_token_kl_mean(
+        student_log_prob=F.log_softmax(student_scaled, dim=-1),
+        teacher_prob=F.softmax(teacher_scaled, dim=-1),
+        mask=mask,
+    )
+
+
+def compute_dual_rkl_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    eps: float = DEFAULT_DUAL_SCALE_EPS,
+) -> torch.Tensor:
+    teacher_scaled = _dual_scale_logits(teacher_logits, eps=float(eps))
+    student_scaled = _dual_scale_logits(student_logits, eps=float(eps))
+    return _masked_token_kl_mean(
+        student_log_prob=F.log_softmax(teacher_scaled, dim=-1),
+        teacher_prob=F.softmax(student_scaled, dim=-1),
+        mask=mask,
+    )
+
+
+def compute_dual_kl_topk_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    k: int,
+    post_attn: bool = False,
+    eps: float = DEFAULT_DUAL_SCALE_EPS,
+) -> torch.Tensor:
+    resolved_k = int(k)
+    if resolved_k <= 0:
+        raise ValueError(f"k must be > 0, got {resolved_k}")
+
+    teacher_logits_fp32 = teacher_logits.float()
+    student_scaled = _dual_scale_logits(student_logits, eps=float(eps))
+    teacher_scaled = _dual_scale_logits(teacher_logits_fp32, eps=float(eps))
+
+    resolved_k = min(resolved_k, int(teacher_logits_fp32.shape[-1]))
+    _, indices = teacher_logits_fp32.topk(resolved_k, dim=-1, sorted=False)
+    if bool(post_attn):
+        top_teacher_prob = F.softmax(teacher_scaled, dim=-1).gather(-1, indices)
+        top_student_log_prob = F.log_softmax(student_scaled, dim=-1).gather(-1, indices)
+        return _masked_token_kl_mean(
+            student_log_prob=top_student_log_prob,
+            teacher_prob=top_teacher_prob,
+            mask=mask,
+        )
+
+    top_teacher_scaled = teacher_scaled.gather(-1, indices)
+    top_student_scaled = student_scaled.gather(-1, indices)
+    return _masked_token_kl_mean(
+        student_log_prob=F.log_softmax(top_student_scaled, dim=-1),
+        teacher_prob=F.softmax(top_teacher_scaled, dim=-1),
+        mask=mask,
+    )
+
+
+def compute_dual_rkl_topk_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    k: int,
+    post_attn: bool = False,
+    eps: float = DEFAULT_DUAL_SCALE_EPS,
+) -> torch.Tensor:
+    resolved_k = int(k)
+    if resolved_k <= 0:
+        raise ValueError(f"k must be > 0, got {resolved_k}")
+
+    student_logits_fp32 = student_logits.float()
+    student_scaled = _dual_scale_logits(student_logits_fp32, eps=float(eps))
+    teacher_scaled = _dual_scale_logits(teacher_logits, eps=float(eps))
+
+    resolved_k = min(resolved_k, int(student_logits_fp32.shape[-1]))
+    _, indices = student_logits_fp32.topk(resolved_k, dim=-1, sorted=False)
+    if bool(post_attn):
+        top_student_prob = F.softmax(student_scaled, dim=-1).gather(-1, indices)
+        top_teacher_log_prob = F.log_softmax(teacher_scaled, dim=-1).gather(-1, indices)
+        return _masked_token_kl_mean(
+            student_log_prob=top_teacher_log_prob,
+            teacher_prob=top_student_prob,
+            mask=mask,
+        )
+
+    top_student_scaled = student_scaled.gather(-1, indices)
+    top_teacher_scaled = teacher_scaled.gather(-1, indices)
+    return _masked_token_kl_mean(
+        student_log_prob=F.log_softmax(top_teacher_scaled, dim=-1),
+        teacher_prob=F.softmax(top_student_scaled, dim=-1),
+        mask=mask,
+    )

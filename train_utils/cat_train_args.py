@@ -62,6 +62,8 @@ class NormalizedCatArgs:
     lora_lr: OverrideTable[float]
     lora_weight_decay: OverrideTable[float]
     lora_log_every: OverrideTable[int]
+    lora_temperature: OverrideTable[float]
+    lora_loss_alpha: OverrideTable[float]
     lora_loss_type: OverrideTable[str]
     lora_use_dora: OverrideTable[bool]
     seed: int
@@ -88,6 +90,10 @@ class CatTrainHFTrainingArguments:
     lora_warmup_ratio: float = field(default=0.3)
     lora_group_by_length: bool = field(default=True)
     lora_lr_scheduler_type: str = field(default="linear")
+    lora_post_attn: bool = field(
+        default=False,
+        metadata={"help": "For *_top LoRA distillation losses, compute KL on gathered full-vocab probabilities instead of renormalizing within the top-k subset."},
+    )
     fp16: bool = field(default=False)
     bf16: bool = field(default=False)
 
@@ -122,6 +128,8 @@ class ResolvedLoraRuntimeConfig:
     lr: float
     weight_decay: float
     log_every: int
+    temperature: float
+    loss_alpha: float
     loss_type: str
     use_dora: bool
 
@@ -166,6 +174,13 @@ def resolve_skip_layer_matches(
     matched = sorted(requested & discovered_set)
     missing = sorted(requested - discovered_set)
     return requested, matched, missing
+
+
+def _parse_lora_loss_alpha_text(raw: str, *, arg_name: str) -> float:
+    value = parse_float_text(raw, arg_name=arg_name, min_value=0.0, inclusive_min=True)
+    if value > 1.0:
+        raise argparse.ArgumentTypeError(f"{arg_name} must be <= 1.0, got {value}.")
+    return float(value)
 
 
 def _make_override_spec(
@@ -367,11 +382,23 @@ _LORA_LOG_EVERY_SPEC = _make_positive_int_override_spec(
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=1,after:q_proj=10",
 )
+_LORA_TEMPERATURE_SPEC = _make_override_spec(
+    arg_name="--lora_temperature",
+    parse_value=lambda raw: parse_float_text(raw, arg_name="--lora_temperature", min_value=0.0, inclusive_min=False),
+    allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=1.0,after:q_proj=2.0",
+)
+_LORA_LOSS_ALPHA_SPEC = _make_override_spec(
+    arg_name="--lora_loss_alpha",
+    parse_value=lambda raw: _parse_lora_loss_alpha_text(raw, arg_name="--lora_loss_alpha"),
+    allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=0.5,after:q_proj=0.3",
+)
 _LORA_LOSS_TYPE_SPEC = _make_override_spec(
     arg_name="--lora_loss_type",
     parse_value=lambda raw: _parse_lora_loss_type(str(raw)),
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=sft,after:q_proj=r_kl_top_1000",
+    example="default=sft,after:q_proj=dual_kl_top_1000",
 )
 _LORA_USE_DORA_SPEC = _make_override_spec(
     arg_name="--lora_use_dora",
@@ -464,6 +491,8 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         lora_lr=_parse_cat_override(raw_args.lora_lr, spec=_LORA_LR_SPEC),
         lora_weight_decay=_parse_cat_override(raw_args.lora_weight_decay, spec=_LORA_WEIGHT_DECAY_SPEC),
         lora_log_every=_parse_cat_override(raw_args.lora_log_every, spec=_LORA_LOG_EVERY_SPEC),
+        lora_temperature=_parse_cat_override(raw_args.lora_temperature, spec=_LORA_TEMPERATURE_SPEC),
+        lora_loss_alpha=_parse_cat_override(raw_args.lora_loss_alpha, spec=_LORA_LOSS_ALPHA_SPEC),
         lora_loss_type=_parse_cat_override(raw_args.lora_loss_type, spec=_LORA_LOSS_TYPE_SPEC),
         lora_use_dora=_parse_cat_override(raw_args.lora_use_dora, spec=_LORA_USE_DORA_SPEC),
         seed=int(raw_args.seed),
@@ -550,6 +579,8 @@ def resolve_lora_runtime_config(cat_args: NormalizedCatArgs, after_category: Opt
         lr=float(resolve_after_category_value(cat_args.lora_lr, after_category)),
         weight_decay=float(resolve_after_category_value(cat_args.lora_weight_decay, after_category)),
         log_every=int(resolve_after_category_value(cat_args.lora_log_every, after_category)),
+        temperature=float(resolve_after_category_value(cat_args.lora_temperature, after_category)),
+        loss_alpha=float(resolve_after_category_value(cat_args.lora_loss_alpha, after_category)),
         loss_type=str(resolve_after_category_value(cat_args.lora_loss_type, after_category)),
         use_dora=bool(resolve_after_category_value(cat_args.lora_use_dora, after_category)),
     )
@@ -600,6 +631,8 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_lr", type=str, default="default=1e-4", help=f"after_category 覆盖参数。示例：{_LORA_LR_SPEC.example}")
     parser.add_argument("--lora_weight_decay", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_LORA_WEIGHT_DECAY_SPEC.example}")
     parser.add_argument("--lora_log_every", type=str, default="default=1", help=f"after_category 覆盖参数。示例：{_LORA_LOG_EVERY_SPEC.example}")
+    parser.add_argument("--lora_temperature", type=str, default="default=1.0", help=f"after_category 覆盖参数。示例：{_LORA_TEMPERATURE_SPEC.example}")
+    parser.add_argument("--lora_loss_alpha", type=str, default="default=0.5", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_ALPHA_SPEC.example}")
     parser.add_argument("--lora_loss_type", type=str, default="default=sft", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_TYPE_SPEC.example}")
     parser.add_argument("--lora_use_dora", type=str, default="default=true", help=f"after_category 覆盖参数。示例：{_LORA_USE_DORA_SPEC.example}")
     parser.add_argument("--seed", type=int, default=0)

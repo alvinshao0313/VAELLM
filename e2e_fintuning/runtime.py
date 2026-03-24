@@ -226,6 +226,7 @@ def run(args, hf_args, training_args):
         "target_module_names": None if args.target_module_names is None else list(args.target_module_names),
         "train_protected_outliers": bool(args.train_protected_outliers),
         "loss_type": str(args.loss_type),
+        "post_attn": bool(args.post_attn),
         "finetune_mode": str(args.finetune_mode),
         "prewarm_frozen_vae": bool(args.prewarm_frozen_vae),
     }

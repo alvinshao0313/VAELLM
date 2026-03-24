@@ -11,6 +11,13 @@ from trl import DataCollatorForCompletionOnlyLM, SFTTrainer
 from transformers import AutoTokenizer, TrainingArguments
 from litebsq.vae_linear import VAELinear
 from train_utils.cat_train_args import resolve_lora_runtime_config
+from train_utils.distill_losses import (
+    build_distill_token_mask,
+    compute_dual_kl_loss,
+    compute_dual_kl_topk_loss,
+    compute_dual_rkl_loss,
+    compute_dual_rkl_topk_loss,
+)
 
 
 class CustomSFTTrainer(SFTTrainer):
@@ -26,7 +33,13 @@ class CustomSFTTrainer(SFTTrainer):
         teacher_inputs = dict(inputs)
         teacher_inputs.pop("labels", None)
         student_inputs = dict(inputs)
-        if loss_type != "kd":
+        uses_ce_loss = (
+            loss_type == "kd"
+            or loss_type == "dual_kd"
+            or loss_type.startswith("kd_top")
+            or loss_type.startswith("dual_kd_top")
+        )
+        if not uses_ce_loss:
             student_inputs.pop("labels", None)
         full_inputs = dict(inputs)
 
@@ -58,6 +71,9 @@ class CustomSFTTrainer(SFTTrainer):
             if not suffix:
                 return default_k
             return max(1, int(suffix))
+
+        def use_post_attn() -> bool:
+            return bool(getattr(args, "lora_post_attn", False))
 
         @torch.no_grad()
         def get_ori_outputs():
@@ -102,6 +118,23 @@ class CustomSFTTrainer(SFTTrainer):
                 )
                 return (loss, outputs) if return_outputs else loss
 
+            if loss_type == "dual_rkl":
+                ori_logits = get_ori_outputs().logits
+                set_temporary(True)
+                outputs = model(**student_inputs)
+                logits = outputs.logits
+                token_mask = build_distill_token_mask(
+                    labels=full_inputs.get("labels"),
+                    attention_mask=full_inputs.get("attention_mask"),
+                    reference_logits=logits,
+                )
+                loss = compute_dual_rkl_loss(
+                    student_logits=logits,
+                    teacher_logits=ori_logits,
+                    mask=token_mask,
+                )
+                return (loss, outputs) if return_outputs else loss
+
             if loss_type == "kl":
                 ori_logits = get_ori_outputs().logits
                 set_temporary(True)
@@ -130,6 +163,26 @@ class CustomSFTTrainer(SFTTrainer):
                 )
                 return (loss, outputs) if return_outputs else loss
 
+            if loss_type.startswith("dual_r_kl_top"):
+                k = parse_k("dual_r_kl_top", default_k=1000)
+                ori_logits = get_ori_outputs().logits
+                set_temporary(True)
+                outputs = model(**student_inputs)
+                logits = outputs.logits
+                token_mask = build_distill_token_mask(
+                    labels=full_inputs.get("labels"),
+                    attention_mask=full_inputs.get("attention_mask"),
+                    reference_logits=logits,
+                )
+                loss = compute_dual_rkl_topk_loss(
+                    student_logits=logits,
+                    teacher_logits=ori_logits,
+                    mask=token_mask,
+                    k=k,
+                    post_attn=use_post_attn(),
+                )
+                return (loss, outputs) if return_outputs else loss
+
             if loss_type.startswith("kl_top"):
                 k = parse_k("kl_top", default_k=1000)
                 ori_logits = get_ori_outputs().logits
@@ -138,7 +191,7 @@ class CustomSFTTrainer(SFTTrainer):
                 logits = outputs.logits
                 k = min(k, int(ori_logits.shape[-1]))
                 top_ori_logits, indices = ori_logits.topk(k, dim=-1, sorted=False)
-                if bool(getattr(args, "post_attn", False)):
+                if use_post_attn():
                     ref = F.softmax(ori_logits, dim=-1).gather(-1, indices).flatten(0, -2)
                     can = F.log_softmax(logits, dim=-1).gather(-1, indices).flatten(0, -2)
                     loss = F.kl_div(can, ref, reduction="batchmean")
@@ -148,7 +201,31 @@ class CustomSFTTrainer(SFTTrainer):
                         F.log_softmax(top_logits, dim=-1).flatten(0, -2),
                         F.softmax(top_ori_logits, dim=-1).flatten(0, -2),
                         reduction="batchmean",
+                )
+                return (loss, outputs) if return_outputs else loss
+
+            if loss_type.startswith("kd_top"):
+                k = parse_k("kd_top", default_k=1000)
+                ori_logits = get_ori_outputs().logits
+                set_temporary(True)
+                outputs = model(**full_inputs)
+                logits = outputs.logits
+                T, alpha = self.temperature, self.loss_alpha
+                ori_loss = outputs["loss"]
+                k = min(k, int(ori_logits.shape[-1]))
+                top_ori_logits, indices = ori_logits.topk(k, dim=-1, sorted=False)
+                if use_post_attn():
+                    ref = F.softmax(ori_logits / T, dim=-1).gather(-1, indices).flatten(0, -2)
+                    can = F.log_softmax(logits / T, dim=-1).gather(-1, indices).flatten(0, -2)
+                    distill_loss = F.kl_div(can, ref, reduction="batchmean")
+                else:
+                    top_logits = logits.gather(-1, indices)
+                    distill_loss = F.kl_div(
+                        F.log_softmax(top_logits / T, dim=-1).flatten(0, -2),
+                        F.softmax(top_ori_logits / T, dim=-1).flatten(0, -2),
+                        reduction="batchmean",
                     )
+                loss = ori_loss * (1 - alpha) + distill_loss * (alpha * T * T)
                 return (loss, outputs) if return_outputs else loss
 
             if loss_type == "mse":
@@ -176,9 +253,90 @@ class CustomSFTTrainer(SFTTrainer):
                 loss = ori_loss * (1 - alpha) + distill_loss * (alpha * T * T)
                 return (loss, outputs) if return_outputs else loss
 
+            if loss_type == "dual_kl":
+                ori_logits = get_ori_outputs().logits
+                set_temporary(True)
+                outputs = model(**student_inputs)
+                logits = outputs.logits
+                token_mask = build_distill_token_mask(
+                    labels=full_inputs.get("labels"),
+                    attention_mask=full_inputs.get("attention_mask"),
+                    reference_logits=logits,
+                )
+                loss = compute_dual_kl_loss(
+                    student_logits=logits,
+                    teacher_logits=ori_logits,
+                    mask=token_mask,
+                )
+                return (loss, outputs) if return_outputs else loss
+
+            if loss_type.startswith("dual_kl_top"):
+                k = parse_k("dual_kl_top", default_k=1000)
+                ori_logits = get_ori_outputs().logits
+                set_temporary(True)
+                outputs = model(**student_inputs)
+                logits = outputs.logits
+                token_mask = build_distill_token_mask(
+                    labels=full_inputs.get("labels"),
+                    attention_mask=full_inputs.get("attention_mask"),
+                    reference_logits=logits,
+                )
+                loss = compute_dual_kl_topk_loss(
+                    student_logits=logits,
+                    teacher_logits=ori_logits,
+                    mask=token_mask,
+                    k=k,
+                    post_attn=use_post_attn(),
+                )
+                return (loss, outputs) if return_outputs else loss
+
+            if loss_type.startswith("dual_kd_top"):
+                k = parse_k("dual_kd_top", default_k=1000)
+                ori_logits = get_ori_outputs().logits
+                set_temporary(True)
+                outputs = model(**full_inputs)
+                logits = outputs.logits
+                ori_loss = outputs["loss"]
+                token_mask = build_distill_token_mask(
+                    labels=full_inputs.get("labels"),
+                    attention_mask=full_inputs.get("attention_mask"),
+                    reference_logits=logits,
+                )
+                distill_loss = compute_dual_kl_topk_loss(
+                    student_logits=logits,
+                    teacher_logits=ori_logits,
+                    mask=token_mask,
+                    k=k,
+                    post_attn=use_post_attn(),
+                )
+                alpha = self.loss_alpha
+                loss = ori_loss * (1 - alpha) + distill_loss * alpha
+                return (loss, outputs) if return_outputs else loss
+
+            if loss_type == "dual_kd":
+                ori_logits = get_ori_outputs().logits
+                set_temporary(True)
+                outputs = model(**full_inputs)
+                logits = outputs.logits
+                ori_loss = outputs["loss"]
+                token_mask = build_distill_token_mask(
+                    labels=full_inputs.get("labels"),
+                    attention_mask=full_inputs.get("attention_mask"),
+                    reference_logits=logits,
+                )
+                distill_loss = compute_dual_kl_loss(
+                    student_logits=logits,
+                    teacher_logits=ori_logits,
+                    mask=token_mask,
+                )
+                alpha = self.loss_alpha
+                loss = ori_loss * (1 - alpha) + distill_loss * alpha
+                return (loss, outputs) if return_outputs else loss
+
             raise ValueError(
                 f"Unsupported lora loss type: {loss_type}. "
-                f"Supported: sft/origin, rkl, kl, r_kl_top[_K], kl_top[_K], mse, kd."
+                f"Supported: sft/origin, rkl, dual_rkl, kl, r_kl_top[_K], dual_r_kl_top[_K], "
+                f"kl_top[_K], kd_top[_K], dual_kl, dual_kd, dual_kl_top[_K], dual_kd_top[_K], mse, kd."
             )
         finally:
             restore_temporary()
@@ -334,6 +492,8 @@ def lora_finetune_remaining_categories(
     lr = float(runtime_cfg.lr)
     weight_decay = float(runtime_cfg.weight_decay)
     log_every = int(runtime_cfg.log_every)
+    lora_temperature = float(runtime_cfg.temperature)
+    lora_loss_alpha = float(runtime_cfg.loss_alpha)
     lora_loss_type = str(runtime_cfg.loss_type)
     use_dora = bool(runtime_cfg.use_dora)
 
@@ -396,6 +556,11 @@ def lora_finetune_remaining_categories(
             int(base_seed),
             int(round_idx),
             int(seed),
+        )
+        logger.info(
+            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f",
+            float(lora_loss_alpha),
+            float(lora_temperature),
         )
     else:
         logger.info(
@@ -480,6 +645,8 @@ def lora_finetune_remaining_categories(
         trainer = CustomSFTTrainer(
             **trainer_kwargs,
             loss_type=resolved_lora_loss,
+            temperature=lora_temperature,
+            loss_alpha=lora_loss_alpha,
         )
     else:
         trainer = SFTTrainer(**trainer_kwargs)

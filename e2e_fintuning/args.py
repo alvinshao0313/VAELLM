@@ -33,6 +33,7 @@ class E2EFinetuneArguments:
     loss_type: str = "sft"
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
+    post_attn: bool = False
     decoder_layers: str = "all"
     target_modules: str = "all"
     train_protected_outliers: bool = False
@@ -139,10 +140,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--loss_type",
         type=_parse_lora_loss_type,
         default="sft",
-        help="Reuse LoRA distillation loss semantics: sft/origin/kl/rkl/mse/kd/kl_top[_K]/r_kl_top[_K].",
+        help="Reuse LoRA distillation loss semantics: sft/origin/kl/rkl/dual_rkl/mse/kd/kd_top[_K]/dual_kd_top[_K]/dual_kl/dual_kd/kl_top[_K]/r_kl_top[_K]/dual_r_kl_top[_K]/dual_kl_top[_K]. dual_* kd ignores distill_temperature.",
     )
     parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--distill_alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--post_attn",
+        type=lambda v: _parse_bool_like(v, arg_name="--post_attn"),
+        default=False,
+        help="For *_top distillation losses, compute KL on gathered full-vocab probabilities instead of renormalizing within the top-k subset.",
+    )
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument(
         "--target_modules",

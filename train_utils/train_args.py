@@ -28,17 +28,41 @@ class TrainingArguments(transformers.TrainingArguments):
 
 def _parse_lora_loss_type(value: str) -> str:
     raw = str(value).strip().lower()
-    static_choices = {"sft", "origin", "rkl", "kl", "mse", "kd", "r_kl_top", "kl_top"}
+    static_choices = {
+        "sft",
+        "origin",
+        "rkl",
+        "dual_rkl",
+        "kl",
+        "mse",
+        "kd",
+        "kd_top",
+        "dual_kd_top",
+        "dual_kl",
+        "dual_kd",
+        "r_kl_top",
+        "dual_r_kl_top",
+        "kl_top",
+        "dual_kl_top",
+    }
     if raw in static_choices:
         return raw
-    for prefix in ("r_kl_top_", "kl_top_"):
+    for prefix in (
+        "dual_r_kl_top_",
+        "r_kl_top_",
+        "kd_top_",
+        "dual_kd_top_",
+        "kl_top_",
+        "dual_kl_top_",
+    ):
         if raw.startswith(prefix):
             k = raw[len(prefix):]
             if k.isdigit() and int(k) > 0:
                 return raw
     raise argparse.ArgumentTypeError(
-        "Invalid --lora_loss_type. Supported: sft, origin, rkl, kl, mse, kd, "
-        "r_kl_top[_K], kl_top[_K] (K must be a positive integer)."
+        "Invalid --lora_loss_type. Supported: sft, origin, rkl, dual_rkl, kl, mse, kd, kd_top[_K], "
+        "dual_kd_top[_K], dual_kl, dual_kd, r_kl_top[_K], dual_r_kl_top[_K], kl_top[_K], "
+        "dual_kl_top[_K] (K must be a positive integer)."
     )
 
 

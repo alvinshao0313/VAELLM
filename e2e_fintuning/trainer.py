@@ -7,6 +7,13 @@ from torch import nn
 from transformers import Trainer
 
 from e2e_fintuning.lora import LoRAVAELinear, iter_named_vae_module_refs
+from train_utils.distill_losses import (
+    build_distill_token_mask,
+    compute_dual_kl_loss,
+    compute_dual_kl_topk_loss,
+    compute_dual_rkl_loss,
+    compute_dual_rkl_topk_loss,
+)
 from train_utils.fsdp_trainer import FSDPTrainer
 
 
@@ -59,12 +66,21 @@ def set_model_temporary(model: nn.Module, temporary: bool) -> None:
         module.set_temporary(bool(temporary))
 
 
+def _get_output_logits(outputs) -> torch.Tensor:
+    if hasattr(outputs, "logits"):
+        return outputs.logits
+    if isinstance(outputs, dict) and "logits" in outputs:
+        return outputs["logits"]
+    raise AttributeError("Model outputs do not contain `logits`.")
+
+
 def compute_e2e_loss_from_logits(
     *,
     loss_type: str,
     student_logits: torch.Tensor,
     teacher_logits: Optional[torch.Tensor] = None,
     ce_loss: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
     alpha: float = 0.5,
     post_attn: bool = False,
@@ -83,11 +99,23 @@ def compute_e2e_loss_from_logits(
             F.softmax(student_logits.flatten(0, -2), dim=-1),
             reduction="batchmean",
         )
+    if norm == "dual_rkl":
+        return compute_dual_rkl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+        )
     if norm == "kl":
         return F.kl_div(
             F.log_softmax(student_logits.flatten(0, -2), dim=-1),
             F.softmax(teacher_logits.flatten(0, -2), dim=-1),
             reduction="batchmean",
+        )
+    if norm == "dual_kl":
+        return compute_dual_kl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
         )
     if norm.startswith("r_kl_top"):
         k = _parse_topk(norm, prefix="r_kl_top", default_k=1000)
@@ -98,6 +126,15 @@ def compute_e2e_loss_from_logits(
             F.log_softmax(top_teacher.flatten(0, -2), dim=-1),
             F.softmax(top_student.flatten(0, -2), dim=-1),
             reduction="batchmean",
+        )
+    if norm.startswith("dual_r_kl_top"):
+        k = _parse_topk(norm, prefix="dual_r_kl_top", default_k=1000)
+        return compute_dual_rkl_topk_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+            k=k,
+            post_attn=bool(post_attn),
         )
     if norm.startswith("kl_top"):
         k = _parse_topk(norm, prefix="kl_top", default_k=1000)
@@ -113,6 +150,34 @@ def compute_e2e_loss_from_logits(
             F.softmax(top_teacher.flatten(0, -2), dim=-1),
             reduction="batchmean",
         )
+    if norm.startswith("kd_top"):
+        if ce_loss is None:
+            raise ValueError(f"loss_type={norm} requires ce_loss.")
+        k = _parse_topk(norm, prefix="kd_top", default_k=1000)
+        k = min(int(k), int(teacher_logits.shape[-1]))
+        top_teacher, indices = teacher_logits.topk(k, dim=-1, sorted=False)
+        temperature = float(temperature)
+        if bool(post_attn):
+            ref = F.softmax(teacher_logits / temperature, dim=-1).gather(-1, indices).flatten(0, -2)
+            can = F.log_softmax(student_logits / temperature, dim=-1).gather(-1, indices).flatten(0, -2)
+            kd_loss = F.kl_div(can, ref, reduction="batchmean")
+        else:
+            top_student = student_logits.gather(-1, indices)
+            kd_loss = F.kl_div(
+                F.log_softmax((top_student / temperature).flatten(0, -2), dim=-1),
+                F.softmax((top_teacher / temperature).flatten(0, -2), dim=-1),
+                reduction="batchmean",
+            )
+        return ce_loss * (1.0 - float(alpha)) + kd_loss * (float(alpha) * temperature * temperature)
+    if norm.startswith("dual_kl_top"):
+        k = _parse_topk(norm, prefix="dual_kl_top", default_k=1000)
+        return compute_dual_kl_topk_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+            k=k,
+            post_attn=bool(post_attn),
+        )
     if norm == "mse":
         return F.mse_loss(student_logits, teacher_logits)
     if norm == "kd":
@@ -125,10 +190,32 @@ def compute_e2e_loss_from_logits(
             reduction="batchmean",
         )
         return ce_loss * (1.0 - float(alpha)) + kd_loss * (float(alpha) * temperature * temperature)
+    if norm == "dual_kd":
+        if ce_loss is None:
+            raise ValueError("loss_type=dual_kd requires ce_loss.")
+        kd_loss = compute_dual_kl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+        )
+        return ce_loss * (1.0 - float(alpha)) + kd_loss * float(alpha)
+    if norm.startswith("dual_kd_top"):
+        if ce_loss is None:
+            raise ValueError(f"loss_type={norm} requires ce_loss.")
+        k = _parse_topk(norm, prefix="dual_kd_top", default_k=1000)
+        kd_loss = compute_dual_kl_topk_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+            k=k,
+            post_attn=bool(post_attn),
+        )
+        return ce_loss * (1.0 - float(alpha)) + kd_loss * float(alpha)
 
     raise ValueError(
         f"Unsupported e2e loss type: {loss_type}. "
-        "Supported: sft/origin, kl, rkl, mse, kd, kl_top[_K], r_kl_top[_K]."
+        "Supported: sft/origin, kl, rkl, dual_rkl, mse, kd, kd_top[_K], dual_kd_top[_K], "
+        "dual_kl, dual_kd, kl_top[_K], r_kl_top[_K], dual_r_kl_top[_K], dual_kl_top[_K]."
     )
 
 
@@ -262,25 +349,40 @@ class _E2ELossMixin:
         teacher_inputs = dict(inputs)
         teacher_inputs.pop("labels", None)
         student_inputs = dict(inputs)
-        if loss_type != "kd":
+        if not (
+            loss_type in {"kd", "dual_kd"}
+            or loss_type.startswith("kd_top")
+            or loss_type.startswith("dual_kd_top")
+        ):
             student_inputs.pop("labels", None)
         full_inputs = dict(inputs)
 
         teacher_outputs = self._compute_teacher_outputs(model, teacher_inputs)
         if self.teacher_model is None:
             set_model_temporary(unwrapped_model, True)
-        if loss_type == "kd":
+        if (
+            loss_type in {"kd", "dual_kd"}
+            or loss_type.startswith("kd_top")
+            or loss_type.startswith("dual_kd_top")
+        ):
             outputs = model(**full_inputs)
             ce_loss = outputs["loss"]
         else:
             outputs = model(**student_inputs)
             ce_loss = None
+        logits = _get_output_logits(outputs)
+        token_mask = build_distill_token_mask(
+            labels=inputs.get("labels"),
+            attention_mask=inputs.get("attention_mask"),
+            reference_logits=logits,
+        )
 
         loss = compute_e2e_loss_from_logits(
             loss_type=loss_type,
-            student_logits=outputs.logits,
-            teacher_logits=teacher_outputs.logits,
+            student_logits=logits,
+            teacher_logits=_get_output_logits(teacher_outputs),
             ce_loss=ce_loss,
+            mask=token_mask,
             temperature=self.distill_temperature,
             alpha=self.distill_alpha,
             post_attn=bool(getattr(self.args, "post_attn", False)),

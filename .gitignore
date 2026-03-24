@@ -28,3 +28,4 @@ prepares
 AGENTS.md
 tests/
 .pytest_cache/
+eval_log/

@@ -15,7 +15,12 @@ if _REPO_ROOT not in sys.path:
 META_FILENAME = "checkpoint_meta.json"
 
 
-def _build_logger(log_dir: str) -> Tuple[logging.Logger, str]:
+def _json_dump(path: str, payload: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+
+
+def _build_logger(log_dir: str) -> Tuple[logging.Logger, str, str]:
     os.makedirs(log_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     log_path = os.path.join(log_dir, f"cat_eval_{ts}.log")
@@ -33,7 +38,25 @@ def _build_logger(log_dir: str) -> Tuple[logging.Logger, str]:
     fh.setFormatter(fmt)
     logger.addHandler(sh)
     logger.addHandler(fh)
-    return logger, log_path
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    has_same_file = False
+    for handler in root_logger.handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        try:
+            if os.path.abspath(handler.baseFilename) == os.path.abspath(log_path):
+                has_same_file = True
+                break
+        except Exception:
+            continue
+    if not has_same_file:
+        root_fh = logging.FileHandler(log_path)
+        root_fh.setFormatter(fmt)
+        root_logger.addHandler(root_fh)
+
+    return logger, ts, log_path
 
 
 def _resolve_checkpoint_dir(path: str) -> str:
@@ -72,6 +95,125 @@ def _resolve_checkpoint_dir(path: str) -> str:
         f"Cannot find checkpoint metadata under: {abs_path}. "
         f"Please pass a directory containing {META_FILENAME}."
     )
+
+
+def _read_checkpoint_meta(checkpoint_dir: str) -> Dict[str, Any]:
+    meta_path = os.path.join(str(checkpoint_dir), META_FILENAME)
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Missing meta file: {meta_path}")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _resolve_checkpoint_loader(meta: Dict[str, Any]) -> str:
+    adapter_modules = meta.get("adapter_modules")
+    adapter_module_count = int(meta.get("adapter_module_count", 0) or 0)
+    extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
+    stage = str(extra_meta.get("stage", "")).strip().lower()
+    if adapter_module_count > 0:
+        return "e2e"
+    if isinstance(adapter_modules, list) and len(adapter_modules) > 0:
+        return "e2e"
+    if stage == "e2e_fintuning":
+        return "e2e"
+    return "cat"
+
+
+def _resolve_eval_device(requested_device: str, logger: logging.Logger) -> str:
+    device = str(requested_device)
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("CUDA not available, fallback eval_device to cpu.")
+        return "cpu"
+    return device
+
+
+def _prepare_model_for_eval(
+    model: torch.nn.Module,
+    device: str,
+    logger: logging.Logger,
+    prepared: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    cached = prepared.get(device)
+    if cached is not None:
+        logger.info(
+            "[warmup] Reuse prepared model on %s: total=%d warmed=%d skipped=%d failed=%d duration_sec=%.2f",
+            device,
+            int(cached.get("total", 0)),
+            int(cached.get("warmed", 0)),
+            int(cached.get("skipped", 0)),
+            int(cached.get("failed", 0)),
+            float(cached.get("duration_sec", 0.0)),
+        )
+        return cached
+
+    logger.info("[warmup] Moving model to %s ...", device)
+    model.to(device)
+
+    from litebsq.vae_linear import prime_model_vae_linear_cache
+
+    start_time = time.time()
+    stats = prime_model_vae_linear_cache(model)
+    duration_sec = float(time.time() - start_time)
+    result = {
+        **stats,
+        "device": device,
+        "duration_sec": duration_sec,
+    }
+    prepared[device] = result
+    logger.info(
+        "[warmup] VAELinear cache primed on %s in %.2fs: total=%d warmed=%d skipped=%d failed=%d",
+        device,
+        duration_sec,
+        int(stats.get("total", 0)),
+        int(stats.get("warmed", 0)),
+        int(stats.get("skipped", 0)),
+        int(stats.get("failed", 0)),
+    )
+    return result
+
+
+def _build_compact_eval_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    evals = summary.get("evals", {}) if isinstance(summary.get("evals"), dict) else {}
+    compact: Dict[str, Any] = {
+        "checkpoint_dir": summary.get("checkpoint_dir"),
+        "base_model_path": summary.get("base_model_path"),
+        "checkpoint_loader": summary.get("checkpoint_loader"),
+        "evals": {},
+    }
+
+    cache_warmup = evals.get("cache_warmup")
+    if isinstance(cache_warmup, dict):
+        compact["evals"]["cache_warmup"] = cache_warmup
+
+    ppl = evals.get("ppl")
+    if isinstance(ppl, dict):
+        compact["evals"]["ppl"] = ppl
+
+    linear_mse = evals.get("linear_mse")
+    if isinstance(linear_mse, dict):
+        compact["evals"]["linear_mse"] = {
+            "num_vae_linear": linear_mse.get("num_vae_linear"),
+            "num_compared": linear_mse.get("num_compared"),
+            "num_skipped": linear_mse.get("num_skipped"),
+            "avg_mse": linear_mse.get("avg_mse"),
+            "avg_topk_mse": linear_mse.get("avg_topk_mse"),
+            "max_mse": linear_mse.get("max_mse"),
+            "max_topk_mse": linear_mse.get("max_topk_mse"),
+        }
+
+    lm_eval = evals.get("lm_eval")
+    if isinstance(lm_eval, dict):
+        compact["evals"]["lm_eval"] = {
+            "tasks": lm_eval.get("tasks"),
+            "num_fewshot": lm_eval.get("num_fewshot"),
+            "batch_size": lm_eval.get("batch_size"),
+            "limit": lm_eval.get("limit"),
+            "task_metrics": lm_eval.get("task_metrics"),
+            "task_metric_keys": lm_eval.get("task_metric_keys"),
+            "summary_rows": lm_eval.get("summary_rows"),
+        }
+
+    return compact
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = build_parser().parse_args(argv)
-    logger, log_path = _build_logger(args.eval_log_dir)
+    logger, eval_run_ts, log_path = _build_logger(args.eval_log_dir)
     logger.info("Eval log file: %s", log_path)
     logger.info("Input args:\n%s", json.dumps(vars(args), ensure_ascii=False, indent=2))
 
@@ -133,22 +275,37 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     ckpt_dir = _resolve_checkpoint_dir(args.checkpoint_dir)
     logger.info("Resolved checkpoint directory: %s", ckpt_dir)
+    meta_preview = _read_checkpoint_meta(ckpt_dir)
+    checkpoint_loader = _resolve_checkpoint_loader(meta_preview)
 
     logger.info("Loading evaluated model from checkpoint...")
-    from train_utils.model_checkpoint_io import load_model_checkpoint
+    if checkpoint_loader == "e2e":
+        from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint
 
-    model, meta, load_result = load_model_checkpoint(
-        ckpt_dir,
-        access_token=args.access_token,
-        base_model_path=args.base_model_path,
-        map_location=args.map_location,
-        strict=args.strict,
-    )
+        model, meta, load_result = load_e2e_model_checkpoint(
+            ckpt_dir,
+            access_token=args.access_token,
+            base_model_path=args.base_model_path,
+            map_location=args.map_location,
+            strict=args.strict,
+        )
+    else:
+        from train_utils.model_checkpoint_io import load_model_checkpoint
+
+        model, meta, load_result = load_model_checkpoint(
+            ckpt_dir,
+            access_token=args.access_token,
+            base_model_path=args.base_model_path,
+            map_location=args.map_location,
+            strict=args.strict,
+        )
     logger.info(
-        "Checkpoint loaded. missing_keys=%d unexpected_keys=%d converted_module_count=%s",
+        "Checkpoint loaded via %s loader. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
+        checkpoint_loader,
         len(getattr(load_result, "missing_keys", [])),
         len(getattr(load_result, "unexpected_keys", [])),
         str(meta.get("converted_module_count")),
+        str(meta.get("adapter_module_count", 0)),
     )
 
     base_model_path = args.base_model_path or meta.get("base_model_path")
@@ -160,8 +317,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     summary: Dict[str, Any] = {
         "checkpoint_dir": ckpt_dir,
         "base_model_path": base_model_path,
+        "checkpoint_loader": checkpoint_loader,
         "evals": {},
     }
+    prepared_eval_devices: Dict[str, Dict[str, Any]] = {}
 
     if args.eval_linear_mse:
         logger.info("Loading reference model for linear MSE comparison...")
@@ -192,14 +351,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             torch.cuda.empty_cache()
 
     if args.eval_ppl:
-        device = args.eval_device
-        if device.startswith("cuda") and not torch.cuda.is_available():
-            logger.warning("CUDA not available, fallback eval_device to cpu.")
-            device = "cpu"
+        device = _resolve_eval_device(args.eval_device, logger)
         from train_utils.eval_utils import calculate_ppl
 
         logger.info("[ppl] Run via train_utils.eval_utils.calculate_ppl")
-        model.to(device)
+        warmup_result = _prepare_model_for_eval(model, device, logger, prepared_eval_devices)
+        summary["evals"].setdefault("cache_warmup", warmup_result)
         ppl_args = argparse.Namespace(
             model_path=tokenizer_name,
             seqlen=int(args.ppl_seqlen),
@@ -210,15 +367,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         summary["evals"]["ppl"] = ppl_result
 
     if args.eval_lm_eval:
-        device = args.eval_device
-        if device.startswith("cuda") and not torch.cuda.is_available():
-            logger.warning("CUDA not available, fallback eval_device to cpu.")
-            device = "cpu"
+        device = _resolve_eval_device(args.eval_device, logger)
         from transformers import AutoTokenizer
         from train_utils.eval_utils import run_lm_eval
 
         logger.info("[lm_eval] Run via train_utils.eval_utils.run_lm_eval")
-        model.to(device)
+        warmup_result = _prepare_model_for_eval(model, device, logger, prepared_eval_devices)
+        summary["evals"].setdefault("cache_warmup", warmup_result)
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             use_fast=False,
@@ -231,12 +386,21 @@ def main(argv: Optional[List[str]] = None) -> None:
             batch_size=str(args.lm_batch_size),
             lm_limit=args.lm_limit,
             model_path=tokenizer_name,
+            eval_log_dir=args.eval_log_dir,
+            eval_run_ts=eval_run_ts,
         )
         lm_result = run_lm_eval(model, tokenizer, lm_args)
         logger.info("[lm_eval] Tasks done: %s", ",".join(lm_result.get("tasks", [])))
+        summary_table = str(lm_result.get("summary_table", "")).strip()
+        if summary_table:
+            logger.info("[lm_eval] Summary table:\n%s", summary_table)
         summary["evals"]["lm_eval"] = lm_result
 
-    logger.info("Evaluation summary:\n%s", json.dumps(summary, ensure_ascii=False, indent=2))
+    summary_path = os.path.join(args.eval_log_dir, f"cat_eval_summary_{eval_run_ts}.json")
+    _json_dump(summary_path, summary)
+    compact_summary = _build_compact_eval_summary(summary)
+    logger.info("Evaluation summary:\n%s", json.dumps(compact_summary, ensure_ascii=False, indent=2))
+    logger.info("Saved evaluation summary: %s", summary_path)
     logger.info("All evaluations completed.")
 
 

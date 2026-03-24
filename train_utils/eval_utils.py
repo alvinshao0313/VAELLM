@@ -1,18 +1,22 @@
 import argparse
+import json
 import logging
 import math
 import os
-import pprint
 import sys
 import time
 import random
 import numpy as np
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from rotation.model_rotation import prepare_model4eval, prepare_model
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from rotation.model_utils import get_model
 from litebsq.vae_linear import VAELinear
 
@@ -31,6 +35,110 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def _build_logger(log_dir: str) -> Tuple[str, str]:
+    os.makedirs(log_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    log_path = os.path.join(log_dir, f"eval_utils_{ts}.log")
+
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            try:
+                if os.path.abspath(handler.baseFilename) == os.path.abspath(log_path):
+                    return ts, log_path
+            except Exception:
+                continue
+
+    fmt = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+    )
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    root_logger.addHandler(fh)
+    return ts, log_path
+
+
+def _json_dump(path: str, payload: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+
+
+def _format_metric_percent(metric: Optional[float]) -> str:
+    if metric is None:
+        return "N/A"
+    return f"{metric * 100:.2f}"
+
+
+def _format_markdown_table(headers: List[str], rows: List[List[str]]) -> str:
+    sep = ["---"] * len(headers)
+    table_rows = [headers, sep, *rows]
+    return "\n".join("| " + " | ".join(row) + " |" for row in table_rows)
+
+
+def _compute_weighted_group_metric(
+    *,
+    group_name: str,
+    results: Dict[str, Dict[str, Any]],
+) -> Tuple[str, Optional[float]]:
+    weighted_sum = 0.0
+    total_weight = 0
+    metric_key = "n/a"
+    for task_name, task_result in results.items():
+        if not task_name.startswith(f"{group_name}_"):
+            continue
+        one_metric_key, one_metric = _pick_task_metric(task_result)
+        if one_metric is None:
+            continue
+        weight = int(task_result.get("samples", 0) or 0)
+        if weight <= 0:
+            continue
+        metric_key = one_metric_key
+        weighted_sum += one_metric * weight
+        total_weight += weight
+    if total_weight <= 0:
+        return "n/a", None
+    return metric_key, weighted_sum / total_weight
+
+
+def _resolve_task_metric(
+    *,
+    task_name: str,
+    results: Dict[str, Dict[str, Any]],
+    groups: Dict[str, Dict[str, Any]],
+) -> Tuple[str, Optional[float]]:
+    if task_name in groups:
+        return _pick_task_metric(groups[task_name])
+    if task_name in results:
+        return _pick_task_metric(results[task_name])
+    if task_name == "mmlu":
+        return _compute_weighted_group_metric(group_name="mmlu", results=results)
+    return "n/a", None
+
+
+def _build_lm_eval_summary_rows(
+    task_names: List[str],
+    results: Dict[str, Dict[str, Any]],
+    groups: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for task_name in task_names:
+        metric_key, metric_val = _resolve_task_metric(
+            task_name=task_name,
+            results=results,
+            groups=groups,
+        )
+        rows.append(
+            {
+                "task": task_name,
+                "metric_key": metric_key,
+                "metric": metric_val,
+                "score_percent": _format_metric_percent(metric_val),
+            }
+        )
+    return rows
 
 
 def set_seed(seed):
@@ -372,40 +480,77 @@ def run_lm_eval(model, tokenizer, args):
             limit=lm_limit,
         )
 
-    results_dict = results['results']
-    logging.info(pprint.pformat(results_dict))
+    results_dict = results.get("results", {})
+    groups_dict = results.get("groups", {})
+    logger.info("LM-Eval task keys: %s", ",".join(sorted(results_dict.keys())))
+    if groups_dict:
+        logger.info("LM-Eval group keys: %s", ",".join(sorted(groups_dict.keys())))
 
     metric_vals = {}
     task_metric_keys = {}
-    for task, result in results_dict.items():
-        key, metric = _pick_task_metric(result)
+    summary_rows = _build_lm_eval_summary_rows(
+        task_names=task_names,
+        results=results_dict,
+        groups=groups_dict,
+    )
+    for row in summary_rows:
+        task = str(row["task"])
+        key = str(row["metric_key"])
+        metric = row["metric"]
         task_metric_keys[task] = key
         metric_vals[task] = metric
 
-    try:
-        acc_avg = calculate_avg_accuracy(task_names, results_dict)
-        metric_vals['average'] = float(acc_avg)
-    except Exception as e:
-        logger.warning(f"Could not calculate average accuracy: {e}")
-
     for task, result in metric_vals.items():
         if result is None:
-            logging.info(f'Task {task} metric: N/A')
+            logger.info(f'Task {task} metric: N/A')
         else:
-            logging.info(f'Task {task} acc: {result * 100 :.2f}')
+            logger.info(f'Task {task} acc: {result * 100 :.2f}')
 
-    return {
+    table_headers = ["Task", "Metric", "Score(%)"]
+    table_rows = [
+        [str(row["task"]), str(row["metric_key"]), str(row["score_percent"])]
+        for row in summary_rows
+    ]
+    summary_table = _format_markdown_table(table_headers, table_rows)
+    logger.info("LM-Eval summary table:\n%s", summary_table)
+
+    artifact_payload = {
         "tasks": task_names,
         "num_fewshot": int(getattr(args, "num_fewshot", 0)),
         "batch_size": batch_size,
         "limit": lm_limit,
+        "summary_rows": summary_rows,
+        "summary_table": summary_table,
         "task_metric_keys": task_metric_keys,
         "task_metrics": metric_vals,
         "raw_results": results_dict,
+        "group_results": groups_dict,
+        "configs": results.get("configs", {}),
+        "versions": results.get("versions", {}),
+        "higher_is_better": results.get("higher_is_better", {}),
+        "n_shot": results.get("n-shot", {}),
+        "n_samples": results.get("n-samples", {}),
+    }
+
+    eval_log_dir = getattr(args, "eval_log_dir", None)
+    eval_run_ts = getattr(args, "eval_run_ts", None)
+    if isinstance(eval_log_dir, str) and eval_log_dir.strip():
+        ts = str(eval_run_ts or time.strftime("%Y%m%d_%H%M%S", time.localtime()))
+        json_path = os.path.join(eval_log_dir, f"lm_eval_results_{ts}.json")
+        table_path = os.path.join(eval_log_dir, f"lm_eval_summary_{ts}.md")
+        _json_dump(json_path, artifact_payload)
+        with open(table_path, "w", encoding="utf-8") as handle:
+            handle.write(summary_table)
+            handle.write("\n")
+        logger.info("Saved LM-Eval artifacts: json=%s table=%s", json_path, table_path)
+
+    return {
+        **artifact_payload,
     }
 
 
 def evaluate_model(model, tokenizer, args):
+    summary: Dict[str, Any] = {}
     # Ensure model is on GPU
     if model.device.type == 'cpu':
         logger.info("Moving model to CUDA...")
@@ -414,13 +559,16 @@ def evaluate_model(model, tokenizer, args):
     # ============================ Evaluation
     if args.eval_mse:
         calculate_mse_per_weight(model, args)
+        summary["mse"] = True
 
     if args.eval_ppl:
-        calculate_ppl(model, args)
+        summary["ppl"] = calculate_ppl(model, args)
 
     # LM Eval Harness
     if args.tasks:
-        run_lm_eval(model, tokenizer, args)
+        summary["lm_eval"] = run_lm_eval(model, tokenizer, args)
+
+    return summary
 
 
 def main():
@@ -433,24 +581,18 @@ def main():
     parser.add_argument('--eval_mse', action='store_true', help='Evaluate MSE against reference model')
     parser.add_argument('--ref_model_path', type=str, default=None, help='Path to reference model for MSE evaluation')
 
-    # Rotation and Hadamard Transform
-    parser.add_argument('--rotate_vqmodel', action='store_true', default=False)
-    parser.add_argument('--rotate', action='store_true', default=False)
-    parser.add_argument('--rotate_mode', type=str, default='hadamard',
-                        choices=['hadamard', 'group_hadamard', 'identity'])
-    parser.add_argument('--online_partial_had', action='store_true', default=False)
-    parser.add_argument('--online_down_had', action='store_true', default=True)
-    parser.add_argument('--r1_path', type=str, default=None,
-                        help='''Path to the R1 rotation matrix. Deafult is None.
-                        If not specified, R1 will generated as "rotate_mode".''')
-
     # LM Eval args
     parser.add_argument('--tasks', type=str, default=None,
                         help='Comma separated list of tasks for lm-eval (e.g. piqa,arc_easy)')
     parser.add_argument('--num_fewshot', type=int, default=0, help='Number of few-shot examples')
     parser.add_argument('--batch_size', type=str, default='auto', help='Batch size for eval')
+    parser.add_argument('--eval_log_dir', type=str, default='./eval_log', help='Directory to store evaluation logs and summaries')
 
     args = parser.parse_args()
+    eval_run_ts, log_path = _build_logger(args.eval_log_dir)
+    args.eval_run_ts = eval_run_ts
+    logger.info("Eval log file: %s", log_path)
+    logger.info("Input args:\n%s", json.dumps(vars(args), ensure_ascii=False, indent=2, default=str))
 
     set_seed(args.seed)
 
@@ -464,12 +606,11 @@ def main():
     device_map = "auto" if torch.cuda.is_available() else "cpu"
 
     model = get_model(args.model_path)
-    if args.rotate_vqmodel:
-        model, _ = prepare_model4eval(model, args)
-    if args.rotate:
-        model, _ = prepare_model(model, args)
 
-    evaluate_model(model, tokenizer, args)
+    summary = evaluate_model(model, tokenizer, args)
+    summary_path = os.path.join(args.eval_log_dir, f"eval_summary_{eval_run_ts}.json")
+    _json_dump(summary_path, summary)
+    logger.info("Saved evaluation summary: %s", summary_path)
 
     logger.info("Evaluation Complete.")
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=3
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
@@ -12,7 +12,7 @@ export CUDA_VISIBLE_DEVICES=0
 # --rot_llm
 # --unload_vae_original_weights_on_final_save
 
-conda run -n bitvae python tools/cat_train.py \
+python tools/cat_train.py \
   --model_path "meta-llama/Llama-2-7b-hf" \
   --output_dir ".result" \
   --seed "0" \
@@ -35,7 +35,7 @@ conda run -n bitvae python tools/cat_train.py \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
   --intra_part_sort_mode "default=none" \
-  --outlier_protect_count "default=0" \
+  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=64,cat:o_proj=32,cat:gate_proj=32,cat:up_proj=32,cat:down_proj=128" \
   --outlier_protect_axis "input" \
   --wa_mse_calib_dataset "wikitext2" \
   --wa_mse_calib_nsamples "512" \
@@ -74,20 +74,23 @@ conda run -n bitvae python tools/cat_train.py \
   --use_checkpoint \
   --new_quant \
   --lora_after_category \
-  --lora_rank "default=8" \
-  --lora_alpha "default=16.0" \
+  --lora_rank "default=32" \
+  --lora_alpha "default=64.0" \
   --lora_dropout "default=0.0" \
-  --lora_steps "default=2000" \
+  --lora_steps "default=3000" \
   --lora_batch_size "default=2" \
   --lora_nsamples "default=10000000" \
   --lora_lr "default=1e-4" \
   --lora_weight_decay "default=0.001" \
   --lora_log_every "default=2" \
-  --lora_loss_type "default=sft" \
+  --lora_post_attn "false" \
+  --lora_temperature "default=1.0" \
+  --lora_loss_alpha "default=0.5" \
+  --lora_loss_type "default=dual_kl_top_1000" \
   --lora_use_dora "default=false" \
   --lora_gradient_accumulation_steps "1" \
   --lora_optim "adamw_torch" \
-  --lora_max_grad_norm "0.3" \
+  --lora_max_grad_norm "0.333" \
   --lora_warmup_ratio "0.3" \
   --lora_group_by_length "true" \
   --lora_lr_scheduler_type "linear" \
