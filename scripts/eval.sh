@@ -3,14 +3,14 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=4
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
 # --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa"
 
 python tools/cat_eval.py \
-  --checkpoint_dir ".result/e2e_vae_lora/final_model_20260324_054038/final_model" \
+  --checkpoint_dir ".result/e2e_vae_lora_redpajama/final_model_20260324_103747/final_model" \
   --eval_ppl \
   --eval_lm_eval \
   --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \

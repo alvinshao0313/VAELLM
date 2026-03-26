@@ -29,14 +29,12 @@ class E2EFinetuneArguments:
     student_checkpoint_dir: str
     run_root_dir: str = _DEFAULT_RUN_ROOT
     teacher_model_path: Optional[str] = None
-    finetune_mode: str = "full"
     loss_type: str = "sft"
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
     post_attn: bool = False
     decoder_layers: str = "all"
     target_modules: str = "all"
-    train_protected_outliers: bool = False
     vae_lora_rank: int = 8
     vae_lora_alpha: float = 16.0
     vae_lora_dropout: float = 0.0
@@ -54,7 +52,6 @@ class E2EFinetuneArguments:
     text_field: str = "text"
     max_train_samples: Optional[int] = None
     max_eval_samples: Optional[int] = None
-    packing_block_size: Optional[int] = None
     save_tokenizer: bool = False
     unload_vae_original_weights_on_save: bool = False
     decoder_layer_ids: Optional[List[int]] = field(default=None, init=False)
@@ -131,12 +128,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run_root_dir", type=str, default=_DEFAULT_RUN_ROOT)
     parser.add_argument("--teacher_model_path", type=str, default=None)
     parser.add_argument(
-        "--finetune_mode",
-        type=str,
-        choices=("full", "vae_lora", "hybrid"),
-        default="full",
-    )
-    parser.add_argument(
         "--loss_type",
         type=_parse_lora_loss_type,
         default="sft",
@@ -156,11 +147,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="all",
         help="Comma-separated module categories to finetune, e.g. down_proj or down,q_proj. Default: all.",
-    )
-    parser.add_argument(
-        "--train_protected_outliers",
-        type=lambda v: _parse_bool_like(v, arg_name="--train_protected_outliers"),
-        default=False,
     )
     parser.add_argument("--vae_lora_rank", type=int, default=8)
     parser.add_argument("--vae_lora_alpha", type=float, default=16.0)
@@ -187,7 +173,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text_field", type=str, default="text")
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_eval_samples", type=int, default=None)
-    parser.add_argument("--packing_block_size", type=int, default=None)
     parser.add_argument(
         "--save_tokenizer",
         type=lambda v: _parse_bool_like(v, arg_name="--save_tokenizer"),
@@ -241,15 +226,11 @@ def _validate_numeric_inputs(parser: argparse.ArgumentParser, args: E2EFinetuneA
         parser.error("--max_train_samples must be >= 1 when provided.")
     if args.max_eval_samples is not None and int(args.max_eval_samples) < 1:
         parser.error("--max_eval_samples must be >= 1 when provided.")
-    if args.packing_block_size is not None and int(args.packing_block_size) < 1:
-        parser.error("--packing_block_size must be >= 1 when provided.")
 
 
 def validate_args(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -> None:
     _validate_dataset_inputs(parser, args)
     _validate_numeric_inputs(parser, args)
-    if str(args.finetune_mode) == "vae_lora" and bool(args.train_protected_outliers):
-        parser.error("--train_protected_outliers is not supported with --finetune_mode vae_lora; use hybrid instead.")
     args.decoder_layer_ids = parse_decoder_layers(args.decoder_layers)
     args.target_module_names = parse_target_modules(args.target_modules)
 

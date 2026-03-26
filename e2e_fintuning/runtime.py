@@ -23,6 +23,9 @@ from train_utils.model_checkpoint_io import _build_run_output_dir, unload_vae_or
 from train_utils.utils import get_logger, pt_fsdp_state_dict
 
 
+_E2E_FINETUNE_MODE = "vae_lora"
+
+
 def _unwrap_model(trainer, model):
     if getattr(trainer, "accelerator", None) is None:
         return model
@@ -140,26 +143,22 @@ def run(args, hf_args, training_args):
         model,
         decoder_layer_ids=decoder_layer_ids,
         target_module_names=args.target_module_names,
-        train_protected_outliers=bool(args.train_protected_outliers),
-        finetune_mode=str(args.finetune_mode),
         vae_lora_rank=int(args.vae_lora_rank),
         vae_lora_alpha=float(args.vae_lora_alpha),
         vae_lora_dropout=float(args.vae_lora_dropout),
     )
     if not selection.trainable_params:
         raise RuntimeError("No trainable parameters found for requested decoder layers.")
-    setattr(model, "_e2e_finetune_mode", str(args.finetune_mode))
+    setattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
     log.info(
-        "Selected trainables: mode=%s layers=%s modules=%d full_tensors=%d lora_tensors=%d total_params=%d cacheable=%d non_cacheable=%d protected=%d",
-        selection.finetune_mode,
+        "Selected trainables: mode=%s layers=%s modules=%d adapters=%d lora_tensors=%d total_params=%d cacheable=%d",
+        _E2E_FINETUNE_MODE,
         selection.decoder_layer_ids,
         len(selection.target_modules),
-        len(selection.full_trainable_params),
+        len(selection.adapter_modules),
         len(selection.lora_trainable_params),
         selection.trainable_param_count,
         len(selection.frozen_cacheable_vae_modules),
-        len(selection.non_cacheable_vae_modules),
-        len(selection.protected_param_names),
     )
 
     tokenizer = build_tokenizer(str(base_model_path), access_token=hf_args.access_token)
@@ -169,7 +168,7 @@ def run(args, hf_args, training_args):
     train_dataset, eval_dataset, data_info = build_datasets(args, training_args, tokenizer)
     if len(train_dataset) < 1:
         raise ValueError(
-            "Packed training dataset is empty. Increase input text volume or lower --packing_block_size."
+            "Packed training dataset is empty. Increase input text volume or lower --model_max_length."
         )
     if eval_dataset is not None and len(eval_dataset) < 1:
         eval_dataset = None
@@ -211,7 +210,7 @@ def run(args, hf_args, training_args):
     trainer.train()
 
     final_model = _unwrap_model(trainer, trainer.model)
-    setattr(final_model, "_e2e_finetune_mode", str(args.finetune_mode))
+    setattr(final_model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
     _ensure_student_mode(final_model)
     clear_model_vae_linear_cache(final_model)
     if teacher_model is not None:
@@ -224,10 +223,9 @@ def run(args, hf_args, training_args):
         "teacher_source": teacher_source,
         "target_decoder_layers": list(selection.decoder_layer_ids),
         "target_module_names": None if args.target_module_names is None else list(args.target_module_names),
-        "train_protected_outliers": bool(args.train_protected_outliers),
         "loss_type": str(args.loss_type),
         "post_attn": bool(args.post_attn),
-        "finetune_mode": str(args.finetune_mode),
+        "finetune_mode": _E2E_FINETUNE_MODE,
         "prewarm_frozen_vae": bool(args.prewarm_frozen_vae),
     }
 

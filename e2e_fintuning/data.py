@@ -124,8 +124,7 @@ def _tokenize_and_pack(dataset: Dataset, tokenizer, *, block_size: int) -> Datas
 
 
 def build_datasets(args, training_args, tokenizer):
-    block_size = int(args.packing_block_size or min(int(training_args.model_max_length), 2048))
-    block_size = min(block_size, int(training_args.model_max_length))
+    block_size = int(training_args.model_max_length)
 
     train_raw, eval_raw = _load_raw_datasets(args)
     train_raw = _apply_sample_limit(train_raw, args.max_train_samples)

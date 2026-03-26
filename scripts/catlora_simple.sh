@@ -13,7 +13,7 @@ export CUDA_VISIBLE_DEVICES=3
 # --unload_vae_original_weights_on_final_save
 
 python tools/cat_train.py \
-  --model_path "meta-llama/Llama-2-7b-hf" \
+  --model_path "Qwen/Qwen3-8B" \
   --output_dir ".result" \
   --seed "0" \
   --train_device "cuda" \
@@ -22,7 +22,7 @@ python tools/cat_train.py \
   --save_model \
   --allow_tail_group "true" \
   --category_order "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
-  --transpose_modules "v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "1.down_proj" \
   --linear_group_size "32" \
@@ -35,7 +35,7 @@ python tools/cat_train.py \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
   --intra_part_sort_mode "default=none" \
-  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=64,cat:o_proj=32,cat:gate_proj=32,cat:up_proj=32,cat:down_proj=128" \
+  --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
   --wa_mse_calib_dataset "wikitext2" \
   --wa_mse_calib_nsamples "512" \
@@ -86,7 +86,7 @@ python tools/cat_train.py \
   --lora_post_attn "false" \
   --lora_temperature "default=1.0" \
   --lora_loss_alpha "default=0.5" \
-  --lora_loss_type "default=dual_kl_top_1000" \
+  --lora_loss_type "default=kl_top_1000" \
   --lora_use_dora "default=false" \
   --lora_gradient_accumulation_steps "1" \
   --lora_optim "adamw_torch" \

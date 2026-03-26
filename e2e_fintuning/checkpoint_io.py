@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
-from e2e_fintuning.lora import LoRAVAELinear, ensure_lora_vae_linear, iter_named_vae_module_refs
+from e2e_fintuning.lora import ensure_lora_vae_linear, iter_named_vae_module_refs
 from rotation.model_utils import get_model
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
@@ -21,6 +21,9 @@ from train_utils.model_checkpoint_io import (
     unload_vae_original_linear_weights,
 )
 from train_utils.utils import extract_layer_idx
+
+
+_E2E_FINETUNE_MODE = "vae_lora"
 
 
 def _tensor_spec(tensor: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
@@ -120,7 +123,7 @@ def _collect_e2e_module_specs(model: nn.Module):
                 "alpha": float(ref.adapter.lora_alpha),
                 "dropout": float(ref.adapter.lora_dropout_p),
                 "target_layer": extract_layer_idx(ref.name),
-                "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", "unknown")),
+                "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
             }
         )
     return converted_modules, adapter_modules
