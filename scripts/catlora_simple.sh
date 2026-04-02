@@ -20,17 +20,18 @@ python tools/cat_train.py \
   --convert \
   --convert_device "cuda" \
   --save_model \
+  --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --category_order "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --category_order "q_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "1.down_proj" \
-  --linear_group_size "32" \
+  --linear_group_size "36" \
   --steps_per_category "default=5000" \
   --steps_per_group "default=none" \
   --batch_size "2048" \
   --log_every "50" \
-  --eval_every "1000" \
+  --eval_every "0" \
   --eval_blocks "256" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
@@ -88,6 +89,7 @@ python tools/cat_train.py \
   --lora_loss_alpha "default=0.5" \
   --lora_loss_type "default=kl_top_1000" \
   --lora_use_dora "default=false" \
+  --lora_hif4_act "false" \
   --lora_gradient_accumulation_steps "1" \
   --lora_optim "adamw_torch" \
   --lora_max_grad_norm "0.333" \

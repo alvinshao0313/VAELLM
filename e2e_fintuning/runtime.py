@@ -3,20 +3,25 @@ import os
 import argparse
 
 import torch
+from torch import nn
 
 from transformers import default_data_collator
 
 from distill_utils.layerwise_distill_runtime import resolve_checkpoint_dir
 from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
 from e2e_fintuning.data import build_datasets, build_tokenizer
-from e2e_fintuning.trainables import resolve_target_layer_ids, select_e2e_trainables
+from e2e_fintuning.lora import merge_and_unload_extra_lora_modules, merge_extra_lora_state_dict
+from e2e_fintuning.peft_proxy import convert_peft_vae_proxy_modules_to_lora, ensure_peft_vae_proxy_lora
+from e2e_fintuning.trainables import resolve_target_layer_ids, select_e2e_trainables_peft_proxy
 from e2e_fintuning.trainer import (
     E2EFinetuneTrainer,
     E2EFSDPFinetuneTrainer,
-    model_requires_external_teacher,
+    register_lora_hif4_act_hooks,
+    remove_lora_hif4_act_hooks,
     set_model_temporary,
 )
 from litebsq.vae_linear import clear_model_vae_linear_cache
+from rotation.common import separate_embeddings_and_lm_head
 from rotation.model_utils import get_layers, get_model
 from train_utils.eval_utils import calculate_ppl
 from train_utils.model_checkpoint_io import _build_run_output_dir, unload_vae_original_linear_weights
@@ -41,17 +46,23 @@ def _ensure_student_mode(model) -> None:
     set_model_temporary(model, True)
 
 
+def _embedding_and_lm_head_are_tied(model: nn.Module) -> bool:
+    embedding = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+    lm_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+    if not isinstance(embedding, nn.Embedding) or not isinstance(lm_head, nn.Linear):
+        return False
+    return embedding.weight.data_ptr() == lm_head.weight.data_ptr()
+
+
 def _load_teacher_if_needed(*, model, args, hf_args, meta, log):
     if args.loss_type in {"sft", "origin"}:
         return None, "student"
-    if not model_requires_external_teacher(model):
-        return None, "student_original_weights"
 
     teacher_model_path = args.teacher_model_path or meta.get("base_model_path")
     if not teacher_model_path:
         raise ValueError(
-            "Teacher is required because current checkpoint lacks original weights, "
-            "but neither --teacher_model_path nor checkpoint meta base_model_path is available."
+            "当前 e2e 蒸馏已强制使用外部 teacher，"
+            "但既没有 --teacher_model_path，也无法从 checkpoint meta 里解析 base_model_path。"
         )
 
     log.info("Loading external teacher model from %s", teacher_model_path)
@@ -62,6 +73,56 @@ def _load_teacher_if_needed(*, model, args, hf_args, meta, log):
     for param in teacher_model.parameters():
         param.requires_grad = False
     return teacher_model, "external_teacher"
+
+
+def _normalize_module_names(names):
+    if names is None:
+        return None
+    values = [str(name).strip().lower() for name in names if str(name).strip()]
+    return sorted(values) if values else None
+
+
+def _validate_resume_checkpoint_config(*, args, meta, decoder_layer_ids) -> None:
+    extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
+    if str(extra_meta.get("stage", "")).strip().lower() != "e2e_fintuning":
+        raise ValueError("resume checkpoint 缺少有效的 e2e_fintuning stage 元信息。")
+
+    expected_layers = extra_meta.get("target_decoder_layers")
+    if expected_layers is not None:
+        expected_layers = [int(idx) for idx in expected_layers]
+        current_layers = [int(idx) for idx in decoder_layer_ids]
+        if expected_layers != current_layers:
+            raise ValueError(
+                f"resume checkpoint 的 target_decoder_layers={expected_layers} 与当前参数 {current_layers} 不一致。"
+            )
+
+    expected_modules = _normalize_module_names(extra_meta.get("target_module_names"))
+    current_modules = _normalize_module_names(args.target_module_names)
+    if expected_modules != current_modules:
+        raise ValueError(
+            f"resume checkpoint 的 target_module_names={expected_modules} 与当前参数 {current_modules} 不一致。"
+        )
+
+    if "vae_lora_rank" in extra_meta and int(extra_meta["vae_lora_rank"]) != int(args.vae_lora_rank):
+        raise ValueError(
+            f"resume checkpoint 的 vae_lora_rank={extra_meta['vae_lora_rank']} 与当前参数 {args.vae_lora_rank} 不一致。"
+        )
+    if "vae_lora_alpha" in extra_meta and float(extra_meta["vae_lora_alpha"]) != float(args.vae_lora_alpha):
+        raise ValueError(
+            f"resume checkpoint 的 vae_lora_alpha={extra_meta['vae_lora_alpha']} 与当前参数 {args.vae_lora_alpha} 不一致。"
+        )
+    if "vae_lora_dropout" in extra_meta and float(extra_meta["vae_lora_dropout"]) != float(args.vae_lora_dropout):
+        raise ValueError(
+            f"resume checkpoint 的 vae_lora_dropout={extra_meta['vae_lora_dropout']} 与当前参数 {args.vae_lora_dropout} 不一致。"
+        )
+    if "lora_embedding" in extra_meta and bool(extra_meta["lora_embedding"]) != bool(args.lora_embedding):
+        raise ValueError(
+            f"resume checkpoint 的 lora_embedding={extra_meta['lora_embedding']} 与当前参数 {args.lora_embedding} 不一致。"
+        )
+    if "lora_lm_head" in extra_meta and bool(extra_meta["lora_lm_head"]) != bool(args.lora_lm_head):
+        raise ValueError(
+            f"resume checkpoint 的 lora_lm_head={extra_meta['lora_lm_head']} 与当前参数 {args.lora_lm_head} 不一致。"
+        )
 
 
 def _eval_final_ppl(*, model, args, model_path: str, output_dir: str, log):
@@ -103,25 +164,34 @@ def _eval_final_ppl(*, model, args, model_path: str, output_dir: str, log):
     }
 
 
+def _collect_trainable_params(model: nn.Module):
+    return [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+
+
 def run(args, hf_args, training_args):
     student_checkpoint_dir = resolve_checkpoint_dir(args.student_checkpoint_dir)
     run_output_dir = _build_run_output_dir(args.run_root_dir, os.path.basename(student_checkpoint_dir))
     os.environ["LOG_FILE"] = os.path.join(run_output_dir, "e2e_fintuning.log")
     log = get_logger("e2e_fintuning")
+    resume_from_checkpoint = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
 
     log.info("Run output directory: %s", run_output_dir)
     log.info("Input e2e args:\n%s", json.dumps(vars(args), ensure_ascii=False, indent=2))
     log.info("Resolved student checkpoint directory: %s", student_checkpoint_dir)
+    if resume_from_checkpoint:
+        log.info("Resuming Trainer state from checkpoint: %s", resume_from_checkpoint)
 
+    load_checkpoint_dir = resume_from_checkpoint or student_checkpoint_dir
     model, meta, load_result = load_e2e_model_checkpoint(
-        student_checkpoint_dir,
+        load_checkpoint_dir,
         access_token=hf_args.access_token,
-        base_model_path=args.teacher_model_path,
+        base_model_path=None if resume_from_checkpoint else args.teacher_model_path,
         map_location="cpu",
         strict=True,
     )
     log.info(
-        "Student checkpoint loaded. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
+        "Student checkpoint loaded from %s. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
+        load_checkpoint_dir,
         len(getattr(load_result, "missing_keys", [])),
         len(getattr(load_result, "unexpected_keys", [])),
         str(meta.get("converted_module_count")),
@@ -136,28 +206,51 @@ def run(args, hf_args, training_args):
         model.config.use_cache = False
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
+    if bool(args.lora_embedding) or bool(args.lora_lm_head):
+        if _embedding_and_lm_head_are_tied(model):
+            log.info("Detected tied word embeddings; separating embedding and lm_head before LoRA wrapping.")
+            separate_embeddings_and_lm_head(model)
 
     layers = list(get_layers(model))
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(layers))
-    selection = select_e2e_trainables(
+    if resume_from_checkpoint:
+        _validate_resume_checkpoint_config(
+            args=args,
+            meta=meta,
+            decoder_layer_ids=decoder_layer_ids,
+        )
+    selection = select_e2e_trainables_peft_proxy(
         model,
         decoder_layer_ids=decoder_layer_ids,
         target_module_names=args.target_module_names,
         vae_lora_rank=int(args.vae_lora_rank),
         vae_lora_alpha=float(args.vae_lora_alpha),
         vae_lora_dropout=float(args.vae_lora_dropout),
+        lora_embedding=bool(args.lora_embedding),
+        lora_lm_head=bool(args.lora_lm_head),
     )
-    if not selection.trainable_params:
+    injected_proxy_count = 0
+    if selection.peft_proxy_modules:
+        injected_proxy_count = ensure_peft_vae_proxy_lora(
+            model,
+            rank=int(args.vae_lora_rank),
+            alpha=float(args.vae_lora_alpha),
+            dropout=float(args.vae_lora_dropout),
+            use_rslora=False,
+        )
+    trainable_params = _collect_trainable_params(model)
+    if not trainable_params:
         raise RuntimeError("No trainable parameters found for requested decoder layers.")
     setattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
     log.info(
-        "Selected trainables: mode=%s layers=%s modules=%d adapters=%d lora_tensors=%d total_params=%d cacheable=%d",
+        "Selected trainables: mode=%s layers=%s modules=%d adapters=%d peft_proxy=%d trainable_tensors=%d total_params=%d cacheable=%d",
         _E2E_FINETUNE_MODE,
         selection.decoder_layer_ids,
         len(selection.target_modules),
         len(selection.adapter_modules),
-        len(selection.lora_trainable_params),
-        selection.trainable_param_count,
+        injected_proxy_count,
+        len(trainable_params),
+        int(sum(int(param.numel()) for _name, param in trainable_params)),
         len(selection.frozen_cacheable_vae_modules),
     )
 
@@ -204,20 +297,12 @@ def run(args, hf_args, training_args):
         teacher_model=teacher_model,
         distill_temperature=args.distill_temperature,
         distill_alpha=args.distill_alpha,
+        post_attn=bool(args.post_attn),
+        lora_hif4_act=bool(args.lora_hif4_act),
         prewarm_frozen_vae=bool(args.prewarm_frozen_vae),
         prewarm_log_every=int(args.prewarm_log_every),
     )
-    trainer.train()
-
-    final_model = _unwrap_model(trainer, trainer.model)
-    setattr(final_model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
-    _ensure_student_mode(final_model)
-    clear_model_vae_linear_cache(final_model)
-    if teacher_model is not None:
-        teacher_model.to("cpu")
-
-    final_dir = os.path.join(run_output_dir, "final_model")
-    extra_meta = {
+    checkpoint_extra_meta = {
         "stage": "e2e_fintuning",
         "source_checkpoint_dir": student_checkpoint_dir,
         "teacher_source": teacher_source,
@@ -225,13 +310,59 @@ def run(args, hf_args, training_args):
         "target_module_names": None if args.target_module_names is None else list(args.target_module_names),
         "loss_type": str(args.loss_type),
         "post_attn": bool(args.post_attn),
+        "lora_embedding": bool(args.lora_embedding),
+        "lora_lm_head": bool(args.lora_lm_head),
+        "lora_hif4_act": bool(args.lora_hif4_act),
         "finetune_mode": _E2E_FINETUNE_MODE,
         "prewarm_frozen_vae": bool(args.prewarm_frozen_vae),
+        "vae_lora_rank": int(args.vae_lora_rank),
+        "vae_lora_alpha": float(args.vae_lora_alpha),
+        "vae_lora_dropout": float(args.vae_lora_dropout),
     }
+    trainer._e2e_base_model_path = str(base_model_path)
+    trainer._e2e_checkpoint_extra_meta = checkpoint_extra_meta
+    hif4_act_handles = []
+    if trainer.lora_hif4_act_controller is not None:
+        hif4_act_handles = register_lora_hif4_act_hooks(trainer.model, trainer.lora_hif4_act_controller)
+        if not hif4_act_handles:
+            raise RuntimeError("启用 --lora_hif4_act 失败：未找到可注册 hook 的逻辑线性层。")
+        trainer.lora_hif4_act_controller.enabled = True
+        log.info("Registered %d HiFloat4 activation hooks for e2e LoRA training.", len(hif4_act_handles))
+    try:
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint or None)
+    finally:
+        if trainer.lora_hif4_act_controller is not None:
+            trainer.lora_hif4_act_controller.enabled = False
+        remove_lora_hif4_act_hooks(hif4_act_handles)
 
+    final_model = _unwrap_model(trainer, trainer.model)
+    setattr(final_model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
+    _ensure_student_mode(final_model)
+    converted_proxy_count = convert_peft_vae_proxy_modules_to_lora(final_model)
+    if converted_proxy_count > 0:
+        log.info("Converted %d PEFT VAELinear proxy modules back to LoRAVAELinear before final save.", converted_proxy_count)
+    merged_extra_lora_count = 0
+    merged_state_dict = None
     if _uses_fsdp(training_args):
         if bool(args.unload_vae_original_weights_on_save):
             unload_vae_original_linear_weights(final_model)
+        merged_state_dict, merged_extra_lora_count = merge_extra_lora_state_dict(
+            final_model,
+            pt_fsdp_state_dict(trainer.model),
+        )
+        final_model, _ = merge_and_unload_extra_lora_modules(final_model)
+    else:
+        final_model, merged_extra_lora_count = merge_and_unload_extra_lora_modules(final_model)
+    clear_model_vae_linear_cache(final_model)
+    if teacher_model is not None:
+        teacher_model.to("cpu")
+    if merged_extra_lora_count > 0:
+        log.info("Merged and unloaded %d embedding/lm_head LoRA modules before final save.", merged_extra_lora_count)
+
+    final_dir = os.path.join(run_output_dir, "final_model")
+    extra_meta = dict(checkpoint_extra_meta)
+
+    if _uses_fsdp(training_args):
         save_paths = save_e2e_model_checkpoint(
             final_model,
             final_dir,
@@ -239,7 +370,7 @@ def run(args, hf_args, training_args):
             tokenizer=tokenizer if bool(args.save_tokenizer) else None,
             save_config=True,
             extra_meta=extra_meta,
-            state_dict=pt_fsdp_state_dict(trainer.model),
+            state_dict=merged_state_dict,
         )
     else:
         save_paths = save_e2e_model_checkpoint(

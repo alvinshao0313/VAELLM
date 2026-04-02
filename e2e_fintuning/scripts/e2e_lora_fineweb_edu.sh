@@ -21,6 +21,9 @@ torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
+  --lora_embedding false \
+  --lora_lm_head false \
+  --lora_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \
   --skip_ppl_eval false \

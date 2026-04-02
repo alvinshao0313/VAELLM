@@ -293,16 +293,16 @@ def apply_multi_head_rotate(module, Q, head_dim, head_num, output=False):
 
 
 @torch.inference_mode()
-def rotate_model(model):
+def rotate_model(model, rot_block_size=0):
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
     head_dim = model_dim // num_heads
     kv_head = config.num_key_value_heads
 
-    Q1 = get_orthogonal_matrix(model.config.hidden_size, 'hadamard', device="cuda:0")
+    Q1 = get_orthogonal_matrix(model.config.hidden_size, 'group_hadamard', device="cuda:0", had_dim=rot_block_size)
 
-    Q2 = get_orthogonal_matrix(head_dim, 'hadamard', device="cuda:0")
+    # Q2 = get_orthogonal_matrix(head_dim, 'hadamard', device="cuda:0")
 
     model_type = model_utils.model_type_extractor(model)
     rotate_embeddings(model, Q1)
@@ -315,7 +315,7 @@ def rotate_model(model):
         rotate_attention_output(layers[idx], Q1, model_type)
         rotate_mlp_input(layers[idx], Q1, model_type,)
         rotate_mlp_output(layers[idx], Q1, model_type)
-        rotate_ov_proj(layers[idx], model_type, kv_head, head_dim, **{'Q2': Q2, })
+        # rotate_ov_proj(layers[idx], model_type, kv_head, head_dim, **{'Q2': Q2, })
 
 
 @torch.inference_mode

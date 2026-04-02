@@ -5,6 +5,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from transformers import HfArgumentParser
 
+from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME
 from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_like, _parse_lora_loss_type
 
 
@@ -28,6 +29,7 @@ _TARGET_MODULE_ALIASES = {
 class E2EFinetuneArguments:
     student_checkpoint_dir: str
     run_root_dir: str = _DEFAULT_RUN_ROOT
+    resume_from_checkpoint: Optional[str] = None
     teacher_model_path: Optional[str] = None
     loss_type: str = "sft"
     distill_temperature: float = 1.0
@@ -38,6 +40,9 @@ class E2EFinetuneArguments:
     vae_lora_rank: int = 8
     vae_lora_alpha: float = 16.0
     vae_lora_dropout: float = 0.0
+    lora_embedding: bool = False
+    lora_lm_head: bool = False
+    lora_hif4_act: bool = False
     prewarm_frozen_vae: bool = True
     prewarm_log_every: int = 32
     skip_ppl_eval: bool = False
@@ -126,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="End-to-end LFQ finetuning for VAELinear checkpoints.")
     parser.add_argument("--student_checkpoint_dir", type=str, required=True)
     parser.add_argument("--run_root_dir", type=str, default=_DEFAULT_RUN_ROOT)
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Optional e2e trainer checkpoint dir to resume from, e.g. trainer_state/checkpoint-10000.",
+    )
     parser.add_argument("--teacher_model_path", type=str, default=None)
     parser.add_argument(
         "--loss_type",
@@ -151,6 +162,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vae_lora_rank", type=int, default=8)
     parser.add_argument("--vae_lora_alpha", type=float, default=16.0)
     parser.add_argument("--vae_lora_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora_embedding",
+        type=lambda v: _parse_bool_like(v, arg_name="--lora_embedding"),
+        default=False,
+        help="Enable LoRA finetuning for token embedding during e2e LoRA finetuning.",
+    )
+    parser.add_argument(
+        "--lora_lm_head",
+        type=lambda v: _parse_bool_like(v, arg_name="--lora_lm_head"),
+        default=False,
+        help="Enable LoRA finetuning for lm_head during e2e LoRA finetuning.",
+    )
+    parser.add_argument(
+        "--lora_hif4_act",
+        type=lambda v: _parse_bool_like(v, arg_name="--lora_hif4_act"),
+        default=False,
+        help="Enable HiFloat4 activation pseudo-quantization for student linear inputs during e2e LoRA finetuning.",
+    )
     parser.add_argument(
         "--prewarm_frozen_vae",
         type=lambda v: _parse_bool_like(v, arg_name="--prewarm_frozen_vae"),
@@ -231,6 +260,32 @@ def _validate_numeric_inputs(parser: argparse.ArgumentParser, args: E2EFinetuneA
 def validate_args(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -> None:
     _validate_dataset_inputs(parser, args)
     _validate_numeric_inputs(parser, args)
+    resume_path = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
+    if resume_path:
+        resume_path = os.path.abspath(resume_path)
+        if not os.path.isdir(resume_path):
+            parser.error(f"--resume_from_checkpoint must be a directory: {resume_path}")
+        trainer_state_path = os.path.join(resume_path, "trainer_state.json")
+        model_state_path = os.path.join(resume_path, STATE_DICT_FILENAME)
+        meta_path = os.path.join(resume_path, META_FILENAME)
+        if not os.path.exists(trainer_state_path):
+            parser.error(
+                "--resume_from_checkpoint must point to an e2e trainer checkpoint dir "
+                f"containing trainer_state.json: {resume_path}"
+            )
+        if not os.path.exists(model_state_path):
+            parser.error(
+                "--resume_from_checkpoint must point to a compact e2e checkpoint dir "
+                f"containing {STATE_DICT_FILENAME}: {resume_path}"
+            )
+        if not os.path.exists(meta_path):
+            parser.error(
+                "--resume_from_checkpoint must point to a compact e2e checkpoint dir "
+                f"containing {META_FILENAME}: {resume_path}"
+            )
+        args.resume_from_checkpoint = resume_path
+    else:
+        args.resume_from_checkpoint = None
     args.decoder_layer_ids = parse_decoder_layers(args.decoder_layers)
     args.target_module_names = parse_target_modules(args.target_modules)
 

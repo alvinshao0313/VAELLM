@@ -23,6 +23,18 @@ def _record_to_text(record: Dict[str, object], text_field: str) -> Optional[str]
         if text:
             return text
 
+    question = str(record.get("question", "") or "").strip()
+    response = str(record.get("response", "") or "").strip()
+    system_prompt = str(record.get("system_prompt", "") or "").strip()
+    if question and response:
+        if system_prompt:
+            return (
+                f"### System:\n{system_prompt}\n\n"
+                f"### User:\n{question}\n\n"
+                f"### Assistant:\n{response}"
+            )
+        return f"### User:\n{question}\n\n### Assistant:\n{response}"
+
     instruction = str(record.get("instruction", "") or "").strip()
     input_text = str(record.get("input", "") or "").strip()
     output_text = str(record.get("output", "") or "").strip()

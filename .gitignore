@@ -29,3 +29,19 @@ AGENTS.md
 tests/
 .pytest_cache/
 eval_log/
+
+# HiFloat4 generated files
+HiFloat4/**/.DS_Store
+HiFloat4/**/__pycache__/
+HiFloat4/**/*.pyc
+HiFloat4/**/*.pyo
+HiFloat4/**/*.so
+HiFloat4/**/*.o
+HiFloat4/**/*.a
+HiFloat4/**/*.dylib
+HiFloat4/**/*.dll
+HiFloat4/**/build/
+HiFloat4/**/dist/
+HiFloat4/**/*.egg-info/
+HiFloat4/**/*.log
+HiFloat4/**/.ipynb_checkpoints/

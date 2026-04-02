@@ -6,6 +6,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 # 说明：
 # - e2e 蒸馏链路里，与 cat_train 的 --lora_post_attn / --lora_temperature / --lora_loss_alpha
 #   对应的参数分别是 --post_attn / --distill_temperature / --distill_alpha。
+# - e2e LoRA 训练里，与 cat_train 对齐的激活量化开关是 --lora_hif4_act。
 # - 以下仍保持未显式设置的可选参数：
 #   --teacher_model_path（默认从 student checkpoint meta 推断）
 #   --dataset_config_name（当前数据集无需 config）
@@ -28,6 +29,9 @@ torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
+  --lora_embedding false \
+  --lora_lm_head false \
+  --lora_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \
   --skip_ppl_eval false \

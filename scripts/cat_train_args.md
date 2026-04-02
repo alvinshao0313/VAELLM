@@ -158,6 +158,7 @@
 | `--lora_log_every` | `default=1` | LoRA 日志间隔 | after-category override |
 | `--lora_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override |
+| `--lora_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
 | `--seed` | `0` | 全流程随机种子 | LoRA 每轮会叠加轮次偏移 |
 | `--train_device` | `cuda` | VAE 训练与评估设备 | 例如 `cuda` / `cuda:0` / `cpu` |
 | `--rot_llm` | `False` | 压缩前先做一次离线旋转融合 | 调用 rotation 流程 |
@@ -260,6 +261,7 @@
 | `--lora_group_by_length` | LoRA `TrainingArguments` | LoRA 按长度分组 |
 | `--lora_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型 |
 | `--lora_model_max_length` | LoRA trainer | LoRA 样本最大长度 |
+| `--lora_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |
 
 ## 6. 关键运行时语义
 
@@ -444,6 +446,7 @@ python tools/cat_train.py \
   --lora_after_category \
   --lora_rank default=8,after:q_proj=16 \
   --lora_steps default=50,after:q_proj=200 \
+  --lora_hif4_act false \
   --lora_use_dora default=true,after:q_proj=false
 ```
 

@@ -77,6 +77,14 @@ def _to_jsonable(value):
     return value
 
 
+def _resolve_rot_block_size(codebook_dim_value) -> int:
+    if hasattr(codebook_dim_value, "has_default"):
+        if not bool(getattr(codebook_dim_value, "has_default", False)):
+            raise ValueError("--rot_llm requires --codebook_dim to provide a default value.")
+        return int(getattr(codebook_dim_value, "default"))
+    return int(codebook_dim_value)
+
+
 def _save_normalized_cat_train_snapshot(
     *,
     run_output_dir: str,
@@ -103,7 +111,8 @@ def _save_normalized_cat_train_snapshot(
 def _load_model_for_cat_train(*, cat_args, hf_args, vae_args) -> nn.Module:
     if getattr(cat_args, "resume_from_checkpoint", None):
         if bool(getattr(cat_args, "rot_llm", False)):
-            raise ValueError("--resume_from_checkpoint cannot be combined with --rot_llm because the checkpoint already contains model weights to resume from.")
+            raise ValueError(
+                "--resume_from_checkpoint cannot be combined with --rot_llm because the checkpoint already contains model weights to resume from.")
 
         checkpoint_dir = resolve_checkpoint_dir(str(cat_args.resume_from_checkpoint))
         meta_path = os.path.join(checkpoint_dir, META_FILENAME)
@@ -144,8 +153,10 @@ def _load_model_for_cat_train(*, cat_args, hf_args, vae_args) -> nn.Module:
     if bool(getattr(cat_args, "rot_llm", False)):
         from rotation.model_rotation import prepare_model
 
+        rot_block_size = _resolve_rot_block_size(getattr(vae_args, "codebook_dim", 32))
         log.info("Applying offline LLM rotation fusion before VAE compression.")
-        model = prepare_model(model)
+        log.info("Rotation block size resolved from --codebook_dim default: %d", rot_block_size)
+        model = prepare_model(model, rot_block_size=rot_block_size)
     return model
 
 
@@ -797,6 +808,8 @@ def _train_group_vae_and_replace(
 def main(argv: Optional[Sequence[str]] = None) -> None:
     global log
     cat_args, hf_args, training_args, vae_args = process_cat_train_args(argv)
+    if bool(getattr(training_args, "lora_hif4_act", False)) and not bool(cat_args.lora_after_category):
+        raise ValueError("--lora_hif4_act 仅在 LoRA 阶段生效，因此必须同时开启 --lora_after_category。")
     set_seed(cat_args.seed)
 
     os.makedirs(cat_args.output_dir, exist_ok=True)
@@ -904,7 +917,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     }
     unique_sort_mode_desc = sorted(set(category_sort_mode_desc.values()))
 
-    any_wa_mse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip().lower() == "wa_mse" for cat in active_categories)
+    any_wa_mse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip(
+    ).lower() == "wa_mse" for cat in active_categories)
     any_outlier_protect = any(count > 0 for count in category_outlier_protect_count.values())
     sort_needs_act = any(
         row_mode == "act_l2" or col_mode == "act_l2"
@@ -959,7 +973,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 intra_parallel_desc,
                 intra_row_parts,
                 intra_col_parts,
-                unique_sort_mode_desc[0] if len(unique_sort_mode_desc) == 1 else f"per_category{{{','.join(f'{cat}:{category_sort_mode_desc[cat]}' for cat in active_categories)}}}",
+                unique_sort_mode_desc[0] if len(
+                    unique_sort_mode_desc) == 1 else f"per_category{{{','.join(f'{cat}:{category_sort_mode_desc[cat]}' for cat in active_categories)}}}",
                 linear_group_size * intra_parts_per_linear,
             )
         else:

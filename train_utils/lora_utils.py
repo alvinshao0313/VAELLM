@@ -1,4 +1,5 @@
 import os
+import sys
 from contextlib import nullcontext
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 import torch
@@ -20,12 +21,136 @@ from train_utils.distill_losses import (
 )
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_HIF4_GPU_ROOT = os.path.join(_REPO_ROOT, "HiFloat4", "hif4_gpu")
+_PEFT_LORA_LINEAR_TYPE = None
+_HIF4_ACT_QUANTIZER: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+
+
+class _LoraHif4ActController:
+    def __init__(self, quantize: Callable[[torch.Tensor], torch.Tensor]):
+        self.quantize = quantize
+        self.enabled = False
+
+
+def _get_peft_lora_linear_type():
+    global _PEFT_LORA_LINEAR_TYPE
+    if _PEFT_LORA_LINEAR_TYPE is not None:
+        return _PEFT_LORA_LINEAR_TYPE
+    from peft.tuners.lora.layer import Linear as PeftLoraLinear
+
+    _PEFT_LORA_LINEAR_TYPE = PeftLoraLinear
+    return _PEFT_LORA_LINEAR_TYPE
+
+
+def _is_peft_lora_linear(module: nn.Module) -> bool:
+    peft_linear_type = _get_peft_lora_linear_type()
+    return isinstance(module, peft_linear_type)
+
+
+def _iter_parent_names(name: str):
+    parts = [part for part in str(name).split(".") if part]
+    for idx in range(len(parts) - 1, 0, -1):
+        yield ".".join(parts[:idx])
+
+
+def _load_lora_hif4_act_quantizer() -> Callable[[torch.Tensor], torch.Tensor]:
+    global _HIF4_ACT_QUANTIZER
+    if _HIF4_ACT_QUANTIZER is not None:
+        return _HIF4_ACT_QUANTIZER
+    if not os.path.isdir(_HIF4_GPU_ROOT):
+        raise ImportError(
+            "启用 --lora_hif4_act 失败：未找到 HiFloat4 GPU 目录。"
+            f" 期望路径: {_HIF4_GPU_ROOT}"
+        )
+    if _HIF4_GPU_ROOT not in sys.path:
+        sys.path.insert(0, _HIF4_GPU_ROOT)
+    try:
+        from quant_cy import QType, quant_func
+    except Exception as exc:
+        raise ImportError(
+            "启用 --lora_hif4_act 失败：无法导入 HiFloat4 quant_cy。"
+            f" 请确认已构建 {_HIF4_GPU_ROOT}/build.sh。原始错误: {exc}"
+        ) from exc
+
+    quant_type = QType("hifx4").dim(-1)
+
+    def quantize(x: torch.Tensor) -> torch.Tensor:
+        return quant_func(x, quant_type, force_py=False, force_fp32=True)
+
+    _HIF4_ACT_QUANTIZER = quantize
+    return _HIF4_ACT_QUANTIZER
+
+
+def _collect_lora_hif4_act_modules(model: nn.Module) -> List[Tuple[str, nn.Module]]:
+    module_map = dict(model.named_modules())
+    targets: List[Tuple[str, nn.Module]] = []
+    for name, module in module_map.items():
+        if not name:
+            continue
+        if isinstance(module, VAELinear) or _is_peft_lora_linear(module):
+            targets.append((name, module))
+            continue
+        if not isinstance(module, nn.Linear):
+            continue
+        if any(
+            isinstance(module_map[parent_name], VAELinear) or _is_peft_lora_linear(module_map[parent_name])
+            for parent_name in _iter_parent_names(name)
+        ):
+            continue
+        targets.append((name, module))
+    return targets
+
+
+def _make_lora_hif4_act_pre_hook(controller: _LoraHif4ActController):
+    def hook(_module, args, kwargs):
+        if not controller.enabled or not args:
+            return None
+        x = args[0]
+        if not isinstance(x, torch.Tensor) or not x.is_floating_point():
+            return None
+        new_args = (controller.quantize(x),) + tuple(args[1:])
+        return new_args, kwargs
+
+    return hook
+
+
+def _register_lora_hif4_act_hooks(
+    model: nn.Module,
+    controller: _LoraHif4ActController,
+) -> List[torch.utils.hooks.RemovableHandle]:
+    handles: List[torch.utils.hooks.RemovableHandle] = []
+    seen: Set[int] = set()
+    hook = _make_lora_hif4_act_pre_hook(controller)
+    for _name, module in _collect_lora_hif4_act_modules(model):
+        module_id = id(module)
+        if module_id in seen:
+            continue
+        seen.add(module_id)
+        handles.append(module.register_forward_pre_hook(hook, with_kwargs=True))
+    return handles
+
+
+def _remove_hook_handles(handles: Sequence[torch.utils.hooks.RemovableHandle]) -> None:
+    for handle in handles:
+        handle.remove()
+
+
 class CustomSFTTrainer(SFTTrainer):
-    def __init__(self, *args, loss_type: str = "r_kl_top_1000", temperature: float = 1.0, loss_alpha: float = 0.5, **kwargs):
+    def __init__(
+        self,
+        *args,
+        loss_type: str = "r_kl_top_1000",
+        temperature: float = 1.0,
+        loss_alpha: float = 0.5,
+        lora_hif4_act_controller: Optional[_LoraHif4ActController] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.loss_type = str(loss_type).strip().lower()
         self.temperature = float(temperature)
         self.loss_alpha = float(loss_alpha)
+        self.lora_hif4_act_controller = lora_hif4_act_controller
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         args = self.args
@@ -52,6 +177,8 @@ class CustomSFTTrainer(SFTTrainer):
             if callable(getattr(module, "set_temporary", None))
         ]
         previous_temporary = [getattr(module, "temporary", None) for module in temporary_modules]
+        hif4_act_controller = self.lora_hif4_act_controller
+        previous_hif4_enabled = bool(getattr(hif4_act_controller, "enabled", False))
         peft_model_for_teacher = unwrapped_model if isinstance(unwrapped_model, PeftModel) else model
 
         def set_temporary(temporary: bool) -> None:
@@ -61,6 +188,14 @@ class CustomSFTTrainer(SFTTrainer):
         def restore_temporary() -> None:
             for module, previous in zip(temporary_modules, previous_temporary):
                 module.set_temporary(True if previous is None else bool(previous))
+
+        def set_hif4_act_enabled(enabled: bool) -> None:
+            if hif4_act_controller is not None:
+                hif4_act_controller.enabled = bool(enabled)
+
+        def prepare_student_path() -> None:
+            set_temporary(True)
+            set_hif4_act_enabled(previous_hif4_enabled)
 
         def parse_k(prefix: str, default_k: int = 1000) -> int:
             if loss_type == prefix:
@@ -78,6 +213,7 @@ class CustomSFTTrainer(SFTTrainer):
         @torch.no_grad()
         def get_ori_outputs():
             set_temporary(False)
+            set_hif4_act_enabled(False)
             adapter_context = (
                 peft_model_for_teacher.disable_adapter()
                 if hasattr(peft_model_for_teacher, "disable_adapter")
@@ -104,11 +240,11 @@ class CustomSFTTrainer(SFTTrainer):
                         return_outputs=return_outputs,
                     )
 
-            set_temporary(True)
+            prepare_student_path()
 
             if loss_type == "rkl":
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 loss = F.kl_div(
@@ -120,7 +256,7 @@ class CustomSFTTrainer(SFTTrainer):
 
             if loss_type == "dual_rkl":
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 token_mask = build_distill_token_mask(
@@ -137,7 +273,7 @@ class CustomSFTTrainer(SFTTrainer):
 
             if loss_type == "kl":
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 loss = F.kl_div(
@@ -150,7 +286,7 @@ class CustomSFTTrainer(SFTTrainer):
             if loss_type.startswith("r_kl_top"):
                 k = parse_k("r_kl_top", default_k=1000)
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 k = min(k, int(logits.shape[-1]))
@@ -166,7 +302,7 @@ class CustomSFTTrainer(SFTTrainer):
             if loss_type.startswith("dual_r_kl_top"):
                 k = parse_k("dual_r_kl_top", default_k=1000)
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 token_mask = build_distill_token_mask(
@@ -186,7 +322,7 @@ class CustomSFTTrainer(SFTTrainer):
             if loss_type.startswith("kl_top"):
                 k = parse_k("kl_top", default_k=1000)
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 k = min(k, int(ori_logits.shape[-1]))
@@ -207,7 +343,7 @@ class CustomSFTTrainer(SFTTrainer):
             if loss_type.startswith("kd_top"):
                 k = parse_k("kd_top", default_k=1000)
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**full_inputs)
                 logits = outputs.logits
                 T, alpha = self.temperature, self.loss_alpha
@@ -230,7 +366,7 @@ class CustomSFTTrainer(SFTTrainer):
 
             if loss_type == "mse":
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 loss = F.mse_loss(logits, ori_logits)
@@ -238,7 +374,7 @@ class CustomSFTTrainer(SFTTrainer):
 
             if loss_type == "kd":
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**full_inputs)
                 logits = outputs.logits
                 T, alpha = self.temperature, self.loss_alpha
@@ -255,7 +391,7 @@ class CustomSFTTrainer(SFTTrainer):
 
             if loss_type == "dual_kl":
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 token_mask = build_distill_token_mask(
@@ -273,7 +409,7 @@ class CustomSFTTrainer(SFTTrainer):
             if loss_type.startswith("dual_kl_top"):
                 k = parse_k("dual_kl_top", default_k=1000)
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**student_inputs)
                 logits = outputs.logits
                 token_mask = build_distill_token_mask(
@@ -293,7 +429,7 @@ class CustomSFTTrainer(SFTTrainer):
             if loss_type.startswith("dual_kd_top"):
                 k = parse_k("dual_kd_top", default_k=1000)
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**full_inputs)
                 logits = outputs.logits
                 ori_loss = outputs["loss"]
@@ -315,7 +451,7 @@ class CustomSFTTrainer(SFTTrainer):
 
             if loss_type == "dual_kd":
                 ori_logits = get_ori_outputs().logits
-                set_temporary(True)
+                prepare_student_path()
                 outputs = model(**full_inputs)
                 logits = outputs.logits
                 ori_loss = outputs["loss"]
@@ -340,6 +476,7 @@ class CustomSFTTrainer(SFTTrainer):
             )
         finally:
             restore_temporary()
+            set_hif4_act_enabled(previous_hif4_enabled)
 
 
 def _ensure_lora_stack_available() -> None:
@@ -496,6 +633,7 @@ def lora_finetune_remaining_categories(
     lora_loss_alpha = float(runtime_cfg.loss_alpha)
     lora_loss_type = str(runtime_cfg.loss_type)
     use_dora = bool(runtime_cfg.use_dora)
+    use_lora_hif4_act = bool(getattr(training_args, "lora_hif4_act", False))
 
     if steps <= 0 or not remaining_categories:
         return model
@@ -538,6 +676,8 @@ def lora_finetune_remaining_categories(
         model = get_peft_model(model, lora_config)
     else:
         logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
+
+    hif4_act_controller = _LoraHif4ActController(_load_lora_hif4_act_quantizer()) if use_lora_hif4_act else None
 
     resolved_lora_loss = str(lora_loss_type).strip().lower() if lora_loss_type is not None else "sft"
     use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"}
@@ -647,10 +787,29 @@ def lora_finetune_remaining_categories(
             loss_type=resolved_lora_loss,
             temperature=lora_temperature,
             loss_alpha=lora_loss_alpha,
+            lora_hif4_act_controller=hif4_act_controller,
         )
     else:
         trainer = SFTTrainer(**trainer_kwargs)
-    trainer.train()
+    hif4_act_handles: List[torch.utils.hooks.RemovableHandle] = []
+    if hif4_act_controller is not None:
+        if hasattr(trainer, "lora_hif4_act_controller"):
+            trainer.lora_hif4_act_controller = hif4_act_controller
+        hif4_act_handles = _register_lora_hif4_act_hooks(trainer.model, hif4_act_controller)
+        if not hif4_act_handles:
+            raise RuntimeError("启用 --lora_hif4_act 失败：未找到可注册 hook 的逻辑线性层。")
+        logger.info(
+            "LoRA: 已启用 HiFloat4 激活量化，student 前向量化类型=hifx4，hook 模块数=%d",
+            len(hif4_act_handles),
+        )
+    if hif4_act_controller is not None:
+        hif4_act_controller.enabled = True
+    try:
+        trainer.train()
+    finally:
+        if hif4_act_controller is not None:
+            hif4_act_controller.enabled = False
+        _remove_hook_handles(hif4_act_handles)
 
     model, merged_count = merge_all_lora(trainer.model)
     model.to("cpu")

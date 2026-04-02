@@ -723,6 +723,9 @@ def prime_model_vae_linear_cache(
     for module in model.modules():
         if not isinstance(module, VAELinear):
             continue
+        if bool(getattr(module, "_skip_global_cache_prewarm", False)):
+            skipped += 1
+            continue
         total += 1
         if clear_existing:
             module.clear_decoded_weight_cache()

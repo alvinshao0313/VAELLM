@@ -6,7 +6,24 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
-from e2e_fintuning.lora import ensure_lora_vae_linear, iter_named_vae_module_refs
+from e2e_fintuning.lora import (
+    LoRAEmbedding,
+    LoRALinear,
+    LoRAVAELinear,
+    ensure_lora_embedding,
+    ensure_lora_linear,
+    ensure_lora_vae_linear,
+    iter_named_vae_module_refs,
+)
+from e2e_fintuning.peft_proxy import (
+    PeftVAELinearProxy,
+    collect_peft_vae_proxy_adapter_specs,
+    ensure_peft_vae_linear_proxy,
+    ensure_peft_vae_proxy_lora,
+    iter_named_peft_vae_proxies,
+    strip_proxy_dense_base_from_state_dict,
+)
+from rotation.common import separate_embeddings_and_lm_head
 from rotation.model_utils import get_model
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
@@ -33,6 +50,21 @@ def _tensor_spec(tensor: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
         "shape": list(tensor.shape),
         "dtype": _dtype_to_name(tensor.dtype),
     }
+
+
+def _embedding_and_lm_head_are_tied(model: nn.Module) -> bool:
+    embedding = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+    lm_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+    if not isinstance(embedding, nn.Embedding) or not isinstance(lm_head, nn.Linear):
+        return False
+    return embedding.weight.data_ptr() == lm_head.weight.data_ptr()
+
+
+def _checkpoint_has_extra_lora(adapter_modules: Sequence[Dict[str, Any]]) -> bool:
+    for spec in adapter_modules:
+        if str(spec.get("adapter_type")) in {"linear_lora", "embedding_lora"}:
+            return True
+    return False
 
 
 def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
@@ -112,21 +144,73 @@ def _collect_e2e_module_specs(model: nn.Module):
     adapter_modules: List[Dict[str, Any]] = []
     for ref in iter_named_vae_module_refs(model):
         converted_modules.append(_collect_single_vae_linear_spec(ref.name, ref.base_layer))
-        if ref.adapter is None:
-            continue
-        adapter_modules.append(
-            {
-                "name": ref.name,
-                "adapter_type": "vae_lora",
-                "base_type": "VAELinear",
-                "r": int(ref.adapter.rank),
-                "alpha": float(ref.adapter.lora_alpha),
-                "dropout": float(ref.adapter.lora_dropout_p),
-                "target_layer": extract_layer_idx(ref.name),
-                "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
-            }
+        if isinstance(ref.adapter, LoRAVAELinear):
+            adapter_modules.append(
+                {
+                    "name": ref.name,
+                    "adapter_type": "vae_lora",
+                    "base_type": "VAELinear",
+                    "r": int(ref.adapter.rank),
+                    "alpha": float(ref.adapter.lora_alpha),
+                    "dropout": float(ref.adapter.lora_dropout_p),
+                    "target_layer": extract_layer_idx(ref.name),
+                    "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
+                }
+            )
+    adapter_modules.extend(
+        collect_peft_vae_proxy_adapter_specs(
+            model,
+            train_mode=str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
         )
+    )
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALinear):
+            adapter_modules.append(
+                {
+                    "name": name,
+                    "adapter_type": "linear_lora",
+                    "base_type": "Linear",
+                    "r": int(module.rank),
+                    "alpha": float(module.lora_alpha),
+                    "dropout": float(module.lora_dropout_p),
+                    "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
+                }
+            )
+        elif isinstance(module, LoRAEmbedding):
+            adapter_modules.append(
+                {
+                    "name": name,
+                    "adapter_type": "embedding_lora",
+                    "base_type": "Embedding",
+                    "r": int(module.rank),
+                    "alpha": float(module.lora_alpha),
+                    "dropout": float(module.lora_dropout_p),
+                    "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
+                }
+            )
     return converted_modules, adapter_modules
+
+
+def _build_compact_e2e_checkpoint_payload(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+) -> tuple[Dict[str, torch.Tensor], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    compact_state_dict = dict(state_dict)
+    converted_modules, adapter_modules = _collect_e2e_module_specs(model)
+    compact_converted_modules: List[Dict[str, Any]] = []
+    for spec in converted_modules:
+        spec_copy = dict(spec)
+        keep_original = bool(spec_copy.get("always_use_original", False)) or bool(
+            spec_copy.get("protect_original_weight", False)
+        )
+        if bool(spec_copy.get("has_original_weight", False)) and not keep_original:
+            spec_copy["has_original_weight"] = False
+            module_name = str(spec_copy["name"])
+            compact_state_dict.pop(f"{module_name}.original_weight", None)
+            compact_state_dict.pop(f"{module_name}.base_layer.original_weight", None)
+        compact_converted_modules.append(spec_copy)
+    strip_proxy_dense_base_from_state_dict(model, compact_state_dict)
+    return compact_state_dict, compact_converted_modules, adapter_modules
 
 
 def save_e2e_model_checkpoint(
@@ -139,6 +223,7 @@ def save_e2e_model_checkpoint(
     extra_meta: Optional[Dict[str, Any]] = None,
     unload_vae_original_weights: bool = False,
     state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    compact_unload_vae_original_weights: bool = False,
 ) -> Dict[str, str]:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -147,6 +232,11 @@ def save_e2e_model_checkpoint(
 
     if state_dict is None:
         state_dict = model.state_dict()
+
+    if compact_unload_vae_original_weights:
+        state_dict, converted_modules, adapter_modules = _build_compact_e2e_checkpoint_payload(model, state_dict)
+    else:
+        converted_modules, adapter_modules = _collect_e2e_module_specs(model)
 
     state_path = os.path.join(output_dir, STATE_DICT_FILENAME)
     torch.save(state_dict, state_path)
@@ -159,7 +249,6 @@ def save_e2e_model_checkpoint(
     if base_model_path is None and getattr(model, "config", None) is not None:
         base_model_path = getattr(model.config, "_name_or_path", None)
 
-    converted_modules, adapter_modules = _collect_e2e_module_specs(model)
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
         "version": 3,
@@ -186,19 +275,82 @@ def save_e2e_model_checkpoint(
 
 
 def _rebuild_adapter_modules(model: nn.Module, adapter_modules: Sequence[Dict[str, Any]]) -> None:
+    proxy_specs = [spec for spec in adapter_modules if str(spec.get("adapter_type")) == "peft_proxy_lora"]
+    if proxy_specs:
+        first = proxy_specs[0]
+        requested_rank = int(first["r"])
+        requested_alpha = float(first["alpha"])
+        requested_dropout = float(first.get("dropout", 0.0))
+        requested_rslora = bool(first.get("use_rslora", False))
+        for spec in proxy_specs:
+            name = str(spec["name"])
+            module = _get_module_by_name(model, name)
+            ensure_peft_vae_linear_proxy(model, name, module)
+            if int(spec["r"]) != requested_rank:
+                raise ValueError("All peft_proxy_lora modules must share the same rank.")
+            if float(spec["alpha"]) != requested_alpha:
+                raise ValueError("All peft_proxy_lora modules must share the same alpha.")
+            if float(spec.get("dropout", 0.0)) != requested_dropout:
+                raise ValueError("All peft_proxy_lora modules must share the same dropout.")
+            if bool(spec.get("use_rslora", False)) != requested_rslora:
+                raise ValueError("All peft_proxy_lora modules must share the same use_rslora value.")
+        ensure_peft_vae_proxy_lora(
+            model,
+            rank=requested_rank,
+            alpha=requested_alpha,
+            dropout=requested_dropout,
+            use_rslora=requested_rslora,
+        )
+
     for spec in adapter_modules:
-        if str(spec.get("adapter_type")) != "vae_lora":
-            raise ValueError(f"Unsupported adapter_type: {spec.get('adapter_type')}")
+        adapter_type = str(spec.get("adapter_type"))
+        if adapter_type == "peft_proxy_lora":
+            continue
         name = str(spec["name"])
         module = _get_module_by_name(model, name)
-        ensure_lora_vae_linear(
-            model,
-            name,
-            module,
-            rank=int(spec["r"]),
-            alpha=float(spec["alpha"]),
-            dropout=float(spec.get("dropout", 0.0)),
-        )
+        if adapter_type == "vae_lora":
+            ensure_lora_vae_linear(
+                model,
+                name,
+                module,
+                rank=int(spec["r"]),
+                alpha=float(spec["alpha"]),
+                dropout=float(spec.get("dropout", 0.0)),
+            )
+            continue
+        if adapter_type == "linear_lora":
+            ensure_lora_linear(
+                model,
+                name,
+                module,
+                rank=int(spec["r"]),
+                alpha=float(spec["alpha"]),
+                dropout=float(spec.get("dropout", 0.0)),
+            )
+            continue
+        if adapter_type == "embedding_lora":
+            ensure_lora_embedding(
+                model,
+                name,
+                module,
+                rank=int(spec["r"]),
+                alpha=float(spec["alpha"]),
+                dropout=float(spec.get("dropout", 0.0)),
+            )
+            continue
+        raise ValueError(f"Unsupported adapter_type: {spec.get('adapter_type')}")
+
+
+def _materialize_missing_proxy_dense_base_from_model(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+) -> None:
+    current_state = model.state_dict()
+    for name, _proxy in iter_named_peft_vae_proxies(model):
+        for suffix in ("weight", "bias"):
+            key = f"{name}.per_decoded_linear.base_layer.{suffix}"
+            if key in current_state and key not in state_dict:
+                state_dict[key] = current_state[key]
 
 
 def load_e2e_checkpoint_into_model(
@@ -220,6 +372,8 @@ def load_e2e_checkpoint_into_model(
         _rebuild_converted_modules(model, converted_modules)
 
     adapter_modules = meta.get("adapter_modules", [])
+    if adapter_modules and _checkpoint_has_extra_lora(adapter_modules) and _embedding_and_lm_head_are_tied(model):
+        separate_embeddings_and_lm_head(model)
     if adapter_modules:
         _rebuild_adapter_modules(model, adapter_modules)
 
@@ -229,6 +383,7 @@ def load_e2e_checkpoint_into_model(
     model_state_keys = tuple(model.state_dict().keys())
     state_dict, _remap_count = _remap_legacy_parallel_linear_state_dict_keys(state_dict, model_state_keys)
     _materialize_missing_bias_params_from_state_dict(model, state_dict)
+    _materialize_missing_proxy_dense_base_from_model(model, state_dict)
 
     load_result = model.load_state_dict(state_dict, strict=strict)
     model.eval()

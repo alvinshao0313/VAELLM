@@ -94,6 +94,10 @@ class CatTrainHFTrainingArguments:
         default=False,
         metadata={"help": "For *_top LoRA distillation losses, compute KL on gathered full-vocab probabilities instead of renormalizing within the top-k subset."},
     )
+    lora_hif4_act: bool = field(
+        default=False,
+        metadata={"help": "Enable HiFloat4 activation pseudo-quantization for student linear inputs during the LoRA stage."},
+    )
     fp16: bool = field(default=False)
     bf16: bool = field(default=False)
 

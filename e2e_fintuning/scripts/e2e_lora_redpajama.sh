@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,4}"
 
-torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
+torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --student_checkpoint_dir .result/meta-llama_Llama-2-7b-hf_20260323_071142/final_model \
+  --teacher_model_path meta-llama/Llama-2-7b-hf \
   --run_root_dir .result/e2e_vae_lora_redpajama \
   --dataset_name ZengXiangyu/RedPajama-Data-1T-Sample \
   --train_split train \
@@ -20,6 +21,9 @@ torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
+  --lora_embedding false \
+  --lora_lm_head false \
+  --lora_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \
   --skip_ppl_eval false \
@@ -29,9 +33,10 @@ torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --unload_vae_original_weights_on_save false \
   --bf16 true \
   --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 4 \
-  --learning_rate 5e-5 \
+  --gradient_accumulation_steps 2 \
+  --learning_rate 1e-4 \
   --logging_steps 10 \
-  --save_strategy no \
-  --max_steps 6000 \
+  --save_strategy steps \
+  --save_steps 10000 \
+  --max_steps 50000 \
   "$@"
