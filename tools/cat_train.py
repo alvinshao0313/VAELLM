@@ -1132,7 +1132,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 eval_device=cat_args.train_device,
             )
 
-            remaining_categories = active_categories[cat_idx + 1:]
+            current_remaining_linears = _collect_linears(
+                model,
+                transpose_modules,
+                only_decoder_projections=only_decoder_projections,
+                projection_suffixes=projection_suffixes,
+            )
+            remaining_categories = list(dict.fromkeys(r.category for r in current_remaining_linears))
             model = lora_finetune_remaining_categories(
                 model=model,
                 remaining_categories=remaining_categories,

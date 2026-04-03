@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,6,7}"
 
-torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
+torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --student_checkpoint_dir .result/meta-llama_Llama-2-7b-hf_20260323_071142/final_model \
   --teacher_model_path meta-llama/Llama-2-7b-hf \
   --run_root_dir .result/e2e_vae_lora_openorca \
@@ -33,7 +33,7 @@ torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --unload_vae_original_weights_on_save true \
   --bf16 true \
   --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 8 \
+  --gradient_accumulation_steps 2 \
   --learning_rate 1e-4 \
   --logging_steps 10 \
   --save_strategy steps \

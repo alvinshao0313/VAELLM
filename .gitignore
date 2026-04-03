@@ -25,10 +25,10 @@ prepares
 *.pth
 *.bin
 *.h5
-AGENTS.md
 tests/
 .pytest_cache/
 eval_log/
+wandb/
 
 # HiFloat4 generated files
 HiFloat4/**/.DS_Store

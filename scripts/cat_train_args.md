@@ -147,12 +147,13 @@
 | `--wa_mse_calib_log_every` | `0` | 动态采集日志间隔 | `0` 表示关闭 |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
 | `--lora_after_category` | `False` | 每训练完一个类别后，对剩余类别做一次 LoRA 微调并融合 | 开启后才会进入 LoRA 阶段 |
+| `--lora_dataset` | `wiki` | LoRA 补偿训练数据集 | 支持 `wiki / fineweb_edu / openorca / redpajama / alpaca` |
 | `--lora_rank` | `default=8` | LoRA rank | after-category override |
 | `--lora_alpha` | `default=16.0` | LoRA alpha | after-category override |
 | `--lora_dropout` | `default=0.0` | LoRA dropout | after-category override |
 | `--lora_steps` | `default=50` | LoRA 最大步数 | `0` 表示跳过该轮 LoRA |
 | `--lora_batch_size` | `default=2` | LoRA 每卡 batch size | after-category override |
-| `--lora_nsamples` | `default=128` | LoRA 训练样本数 | 从 `wikitext2` 采样 |
+| `--lora_nsamples` | `default=128` | LoRA 训练样本数 | 从 `--lora_dataset` 指定的数据集采样 |
 | `--lora_lr` | `default=1e-4` | LoRA 学习率 | after-category override |
 | `--lora_weight_decay` | `default=0.0` | LoRA 权重衰减 | after-category override |
 | `--lora_log_every` | `default=1` | LoRA 日志间隔 | after-category override |
@@ -444,6 +445,7 @@ python tools/cat_train.py \
 python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
   --lora_after_category \
+  --lora_dataset openorca \
   --lora_rank default=8,after:q_proj=16 \
   --lora_steps default=50,after:q_proj=200 \
   --lora_hif4_act false \

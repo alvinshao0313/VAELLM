@@ -53,6 +53,7 @@ class NormalizedCatArgs:
     wa_mse_calib_log_every: int
     ppl_limit: int
     lora_after_category: bool
+    lora_dataset: str
     lora_rank: OverrideTable[int]
     lora_alpha: OverrideTable[float]
     lora_dropout: OverrideTable[float]
@@ -144,6 +145,14 @@ _AFTER_CATEGORY_OVERRIDE_SELECTORS = ("default", "after")
 _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse")
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
+_LORA_DATASET_ALIASES = {
+    "wiki": "wiki",
+    "wikitext2": "wiki",
+    "fineweb_edu": "fineweb_edu",
+    "openorca": "openorca",
+    "redpajama": "redpajama",
+    "alpaca": "alpaca",
+}
 
 
 def _split_csv(value: Optional[str]) -> List[str]:
@@ -185,6 +194,15 @@ def _parse_lora_loss_alpha_text(raw: str, *, arg_name: str) -> float:
     if value > 1.0:
         raise argparse.ArgumentTypeError(f"{arg_name} must be <= 1.0, got {value}.")
     return float(value)
+
+
+def _parse_lora_dataset_text(raw: str, *, arg_name: str) -> str:
+    value = str(raw).strip().lower()
+    if value not in _LORA_DATASET_ALIASES:
+        raise argparse.ArgumentTypeError(
+            f"{arg_name} must be one of: {', '.join(_LORA_DATASET_ALIASES.keys())}. Got {raw!r}."
+        )
+    return str(_LORA_DATASET_ALIASES[value])
 
 
 def _make_override_spec(
@@ -486,6 +504,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         wa_mse_calib_log_every=int(raw_args.wa_mse_calib_log_every),
         ppl_limit=int(raw_args.ppl_limit),
         lora_after_category=bool(raw_args.lora_after_category),
+        lora_dataset=str(raw_args.lora_dataset),
         lora_rank=_parse_cat_override(raw_args.lora_rank, spec=_LORA_RANK_SPEC),
         lora_alpha=_parse_cat_override(raw_args.lora_alpha, spec=_LORA_ALPHA_SPEC),
         lora_dropout=_parse_cat_override(raw_args.lora_dropout, spec=_LORA_DROPOUT_SPEC),
@@ -626,6 +645,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wa_mse_calib_log_every", type=int, default=0, help="Log interval for wa_mse dynamic act-max recomputation progress (0 to disable).")
     parser.add_argument("--ppl_limit", type=int, default=-1, help="每类训练后 PPL 评估样本上限，-1 为全量。")
     parser.add_argument("--lora_after_category", action="store_true", help="每个类别 VAE 训练后，对剩余类别做一次 LoRA 微调并融合。")
+    parser.add_argument(
+        "--lora_dataset",
+        type=lambda raw: _parse_lora_dataset_text(raw, arg_name="--lora_dataset"),
+        default="wiki",
+        help="LoRA 补偿训练数据集。支持: wiki, fineweb_edu, openorca, redpajama, alpaca。",
+    )
     parser.add_argument("--lora_rank", type=str, default="default=8", help=f"after_category 覆盖参数。示例：{_LORA_RANK_SPEC.example}")
     parser.add_argument("--lora_alpha", type=str, default="default=16.0", help=f"after_category 覆盖参数。示例：{_LORA_ALPHA_SPEC.example}")
     parser.add_argument("--lora_dropout", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_LORA_DROPOUT_SPEC.example}")
