@@ -1,6 +1,8 @@
 import json
 import os
 import argparse
+import gc
+from typing import Optional
 
 import torch
 from torch import nn
@@ -9,9 +11,14 @@ from transformers import default_data_collator
 
 from distill_utils.layerwise_distill_runtime import resolve_checkpoint_dir
 from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
+from e2e_fintuning.args import needs_teacher
 from e2e_fintuning.data import build_datasets, build_tokenizer
 from e2e_fintuning.lora import merge_and_unload_extra_lora_modules, merge_extra_lora_state_dict
-from e2e_fintuning.peft_proxy import convert_peft_vae_proxy_modules_to_lora, ensure_peft_vae_proxy_lora
+from e2e_fintuning.peft_proxy import (
+    convert_peft_vae_proxy_modules_to_lora,
+    ensure_peft_vae_proxy_lora,
+    initialize_peft_vae_proxy_lora_from_teacher_residual,
+)
 from e2e_fintuning.trainables import resolve_target_layer_ids, select_e2e_trainables_peft_proxy
 from e2e_fintuning.trainer import (
     E2EFinetuneTrainer,
@@ -54,17 +61,17 @@ def _embedding_and_lm_head_are_tied(model: nn.Module) -> bool:
     return embedding.weight.data_ptr() == lm_head.weight.data_ptr()
 
 
-def _load_teacher_if_needed(*, model, args, hf_args, meta, log):
-    if args.loss_type in {"sft", "origin"}:
-        return None, "student"
+def _resolve_teacher_model_path(*, args, meta) -> Optional[str]:
+    teacher_model_path = None if args.teacher_model_path is None else str(args.teacher_model_path).strip()
+    if teacher_model_path:
+        return teacher_model_path
+    meta_path = meta.get("base_model_path")
+    if meta_path:
+        return str(meta_path)
+    return None
 
-    teacher_model_path = args.teacher_model_path or meta.get("base_model_path")
-    if not teacher_model_path:
-        raise ValueError(
-            "当前 e2e 蒸馏已强制使用外部 teacher，"
-            "但既没有 --teacher_model_path，也无法从 checkpoint meta 里解析 base_model_path。"
-        )
 
+def _load_external_teacher_model(*, teacher_model_path: str, hf_args, log) -> nn.Module:
     log.info("Loading external teacher model from %s", teacher_model_path)
     teacher_model = get_model(str(teacher_model_path), hf_args.access_token)
     teacher_model.eval()
@@ -72,7 +79,42 @@ def _load_teacher_if_needed(*, model, args, hf_args, meta, log):
         teacher_model.config.use_cache = False
     for param in teacher_model.parameters():
         param.requires_grad = False
-    return teacher_model, "external_teacher"
+    return teacher_model
+
+
+def _load_teacher_for_e2e(*, args, hf_args, meta, log, require_for_init: bool):
+    require_for_training = needs_teacher(args.loss_type)
+    if not require_for_init and not require_for_training:
+        return None, "student", False
+
+    teacher_model_path = _resolve_teacher_model_path(args=args, meta=meta)
+    if not teacher_model_path:
+        raise ValueError(
+            "当前运行需要外部 teacher（蒸馏或 residual_svd 初始化），"
+            "但既没有 --teacher_model_path，也无法从 checkpoint meta 里解析 base_model_path。"
+        )
+
+    teacher_model = _load_external_teacher_model(
+        teacher_model_path=str(teacher_model_path),
+        hf_args=hf_args,
+        log=log,
+    )
+    teacher_source = "external_teacher" if require_for_training else "external_teacher_init_only"
+    return teacher_model, teacher_source, require_for_training
+
+
+def _release_init_only_teacher(teacher_model, log):
+    if teacher_model is None:
+        return None
+    try:
+        teacher_model.to("cpu")
+    finally:
+        del teacher_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    log.info("Released init-only external teacher model after residual_svd initialization.")
+    return None
 
 
 def _normalize_module_names(names):
@@ -123,6 +165,34 @@ def _validate_resume_checkpoint_config(*, args, meta, decoder_layer_ids) -> None
         raise ValueError(
             f"resume checkpoint 的 lora_lm_head={extra_meta['lora_lm_head']} 与当前参数 {args.lora_lm_head} 不一致。"
         )
+
+
+def _checkpoint_has_peft_proxy_lora(meta) -> bool:
+    adapter_modules = meta.get("adapter_modules", [])
+    if not isinstance(adapter_modules, list):
+        return False
+    for spec in adapter_modules:
+        if isinstance(spec, dict) and str(spec.get("adapter_type")) == "peft_proxy_lora":
+            return True
+    return False
+
+
+def _should_initialize_vae_lora_residual_svd(*, args, selection, resume_from_checkpoint) -> bool:
+    return (
+        str(getattr(args, "vae_lora_init_mode", "zero")).strip().lower() == "residual_svd"
+        and not bool(resume_from_checkpoint)
+        and bool(getattr(selection, "peft_proxy_modules", []))
+    )
+
+
+def _resolve_saved_vae_lora_init_mode(*, args, meta, resume_from_checkpoint) -> Optional[str]:
+    if resume_from_checkpoint:
+        extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
+        saved_mode = extra_meta.get("vae_lora_init_mode")
+        if saved_mode is None:
+            return None
+        return str(saved_mode).strip().lower()
+    return str(getattr(args, "vae_lora_init_mode", "zero")).strip().lower()
 
 
 def _eval_final_ppl(*, model, args, model_path: str, output_dir: str, log):
@@ -219,6 +289,12 @@ def run(args, hf_args, training_args):
             meta=meta,
             decoder_layer_ids=decoder_layer_ids,
         )
+    if (
+        not resume_from_checkpoint
+        and str(args.vae_lora_init_mode) == "residual_svd"
+        and _checkpoint_has_peft_proxy_lora(meta)
+    ):
+        raise ValueError("Fresh e2e 训练遇到已包含 peft_proxy_lora 的 checkpoint，拒绝再次执行 residual_svd 初始化。")
     selection = select_e2e_trainables_peft_proxy(
         model,
         decoder_layer_ids=decoder_layer_ids,
@@ -238,6 +314,29 @@ def run(args, hf_args, training_args):
             dropout=float(args.vae_lora_dropout),
             use_rslora=False,
         )
+    need_residual_svd_init = _should_initialize_vae_lora_residual_svd(
+        args=args,
+        selection=selection,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
+    teacher_model, teacher_source, keep_teacher_for_training = _load_teacher_for_e2e(
+        args=args,
+        hf_args=hf_args,
+        meta=meta,
+        log=log,
+        require_for_init=need_residual_svd_init,
+    )
+    if need_residual_svd_init:
+        initialized_proxy_count = initialize_peft_vae_proxy_lora_from_teacher_residual(
+            model,
+            teacher_model,
+        )
+        log.info(
+            "Initialized %d PEFT VAELinear proxy LoRA modules with residual_svd.",
+            initialized_proxy_count,
+        )
+        if not keep_teacher_for_training:
+            teacher_model = _release_init_only_teacher(teacher_model, log)
     trainable_params = _collect_trainable_params(model)
     if not trainable_params:
         raise RuntimeError("No trainable parameters found for requested decoder layers.")
@@ -272,13 +371,6 @@ def run(args, hf_args, training_args):
         int(data_info["block_size"]),
     )
 
-    teacher_model, teacher_source = _load_teacher_if_needed(
-        model=model,
-        args=args,
-        hf_args=hf_args,
-        meta=meta,
-        log=log,
-    )
     log.info("Teacher source: %s", teacher_source)
 
     training_args.output_dir = os.path.join(run_output_dir, "trainer_state")
@@ -319,6 +411,13 @@ def run(args, hf_args, training_args):
         "vae_lora_alpha": float(args.vae_lora_alpha),
         "vae_lora_dropout": float(args.vae_lora_dropout),
     }
+    saved_init_mode = _resolve_saved_vae_lora_init_mode(
+        args=args,
+        meta=meta,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
+    if saved_init_mode is not None:
+        checkpoint_extra_meta["vae_lora_init_mode"] = saved_init_mode
     trainer._e2e_base_model_path = str(base_model_path)
     trainer._e2e_checkpoint_extra_meta = checkpoint_extra_meta
     hif4_act_handles = []

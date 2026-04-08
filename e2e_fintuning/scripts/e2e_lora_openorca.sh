@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
 torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --student_checkpoint_dir .result/meta-llama_Llama-2-7b-hf_20260323_071142/final_model \
@@ -21,8 +21,9 @@ torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
-  --lora_embedding false \
-  --lora_lm_head false \
+  --vae_lora_init_mode residual_svd \
+  --lora_embedding true \
+  --lora_lm_head true \
   --lora_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \

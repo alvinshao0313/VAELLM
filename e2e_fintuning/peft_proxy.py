@@ -34,6 +34,19 @@ def _dropout_p(module: nn.Module) -> float:
     return 0.0
 
 
+def _get_module_by_name(model: nn.Module, module_name: str) -> nn.Module:
+    if not module_name:
+        return model
+    current = model
+    for token in str(module_name).split("."):
+        if not hasattr(current, token):
+            raise ValueError(f"Failed to resolve module '{module_name}': missing '{token}'.")
+        current = getattr(current, token)
+    if not isinstance(current, nn.Module):
+        raise TypeError(f"Resolved object at '{module_name}' is not an nn.Module: {type(current)}")
+    return current
+
+
 def is_peft_lora_linear(module: nn.Module) -> bool:
     return isinstance(module, PeftLoraLinear)
 
@@ -173,6 +186,26 @@ def _validate_existing_peft_proxy_linear(
         )
 
 
+def _validate_plain_peft_proxy_linear_for_residual_init(
+    module_name: str,
+    peft_linear: PeftLoraLinear,
+) -> str:
+    adapter_name = _get_default_adapter_name(peft_linear)
+    if bool(peft_linear.merged):
+        raise ValueError(f"PEFT proxy LoRA at '{module_name}' is already merged, cannot run residual_svd init.")
+    if bool(peft_linear.use_dora.get(adapter_name, False)):
+        raise ValueError(f"PEFT proxy LoRA at '{module_name}' has DoRA enabled, residual_svd init only supports plain LoRA.")
+    if bool(_resolve_use_rslora(peft_linear, adapter_name)):
+        raise ValueError(
+            f"PEFT proxy LoRA at '{module_name}' uses rsLoRA scaling, residual_svd init only supports alpha/r scaling."
+        )
+    if bool(getattr(peft_linear, "fan_in_fan_out", False)):
+        raise ValueError(
+            f"PEFT proxy LoRA at '{module_name}' has fan_in_fan_out=True, residual_svd init only supports plain nn.Linear."
+        )
+    return adapter_name
+
+
 def _enable_peft_proxy_adapters(model: nn.Module) -> None:
     for _name, proxy in iter_named_peft_vae_proxies(model):
         peft_linear = proxy.per_decoded_linear
@@ -240,6 +273,96 @@ def ensure_peft_vae_proxy_lora(
     return len(proxy_refs)
 
 
+@torch.no_grad()
+def initialize_peft_linear_from_residual_svd(
+    peft_linear: PeftLoraLinear,
+    residual: torch.Tensor,
+    *,
+    module_name: str,
+) -> None:
+    adapter_name = _validate_plain_peft_proxy_linear_for_residual_init(module_name, peft_linear)
+    base_layer = peft_linear.base_layer
+    if not isinstance(base_layer, nn.Linear):
+        raise TypeError(
+            f"Expected nn.Linear base layer under '{module_name}', got {type(base_layer)}"
+        )
+
+    expected_shape = tuple(base_layer.weight.shape)
+    if tuple(residual.shape) != expected_shape:
+        raise ValueError(
+            f"Residual shape mismatch at '{module_name}': got {tuple(residual.shape)}, expected {expected_shape}."
+        )
+    if not residual.is_floating_point():
+        raise TypeError(f"Residual at '{module_name}' must be floating point, got {residual.dtype}.")
+
+    weight_A = peft_linear.lora_A[adapter_name].weight
+    weight_B = peft_linear.lora_B[adapter_name].weight
+    scaling = float(peft_linear.scaling[adapter_name])
+    if scaling <= 0.0:
+        raise ValueError(f"PEFT proxy LoRA at '{module_name}' has invalid scaling={scaling}.")
+
+    scaled_residual = residual.detach().to(device=weight_B.device, dtype=torch.float32) / scaling
+    u, s, vh = torch.linalg.svd(scaled_residual, full_matrices=False)
+    rank = int(weight_A.shape[0])
+    k = min(rank, int(s.shape[0]))
+
+    weight_A.zero_()
+    weight_B.zero_()
+    if k == 0:
+        return
+
+    sqrt_s = torch.sqrt(s[:k])
+    b_factor = u[:, :k] * sqrt_s.unsqueeze(0)
+    a_factor = sqrt_s.unsqueeze(1) * vh[:k, :]
+    weight_B[:, :k].copy_(b_factor.to(device=weight_B.device, dtype=weight_B.dtype))
+    weight_A[:k, :].copy_(a_factor.to(device=weight_A.device, dtype=weight_A.dtype))
+
+
+@torch.no_grad()
+def initialize_peft_vae_proxy_lora_from_teacher_residual(
+    model: nn.Module,
+    teacher_model: nn.Module,
+) -> int:
+    if teacher_model is None:
+        raise ValueError("teacher_model is required for residual_svd init.")
+
+    initialized = 0
+    for name, proxy in iter_named_peft_vae_proxies(model):
+        peft_linear = proxy.per_decoded_linear
+        if not is_peft_lora_linear(peft_linear):
+            raise ValueError(f"Expected PEFT LoRA linear under '{name}.per_decoded_linear' before residual_svd init.")
+        if not isinstance(peft_linear.base_layer, nn.Linear):
+            raise TypeError(
+                f"Expected nn.Linear base layer under '{name}.per_decoded_linear', got {type(peft_linear.base_layer)}"
+            )
+
+        teacher_module = _get_module_by_name(teacher_model, name)
+        teacher_weight = getattr(teacher_module, "weight", None)
+        if not isinstance(teacher_weight, torch.Tensor):
+            raise ValueError(f"Teacher module '{name}' is missing weight, cannot run residual_svd init.")
+        if not teacher_weight.is_floating_point():
+            raise TypeError(f"Teacher module '{name}' weight must be floating point, got {teacher_weight.dtype}.")
+
+        decoded_weight = peft_linear.base_layer.weight
+        if tuple(teacher_weight.shape) != tuple(decoded_weight.shape):
+            raise ValueError(
+                f"Teacher/student weight shape mismatch at '{name}': "
+                f"teacher={tuple(teacher_weight.shape)} student={tuple(decoded_weight.shape)}."
+            )
+
+        residual = teacher_weight.detach().to(device=decoded_weight.device, dtype=torch.float32) - decoded_weight.detach().to(
+            device=decoded_weight.device,
+            dtype=torch.float32,
+        )
+        initialize_peft_linear_from_residual_svd(
+            peft_linear,
+            residual,
+            module_name=name,
+        )
+        initialized += 1
+    return initialized
+
+
 def collect_peft_vae_proxy_adapter_specs(
     model: nn.Module,
     *,
@@ -280,6 +403,46 @@ def strip_proxy_dense_base_from_state_dict(
                 state_dict.pop(key)
                 removed += 1
     return removed
+
+
+@torch.no_grad()
+def refresh_peft_proxy_decoded_linears(model: nn.Module) -> int:
+    refreshed = 0
+    for name, proxy in iter_named_peft_vae_proxies(model):
+        decoded_linear = proxy.per_decoded_linear
+        if is_peft_lora_linear(decoded_linear):
+            decoded_linear = decoded_linear.base_layer
+        if not isinstance(decoded_linear, nn.Linear):
+            raise TypeError(
+                f"Expected nn.Linear under '{name}.per_decoded_linear', got {type(decoded_linear)}"
+            )
+
+        target_device = decoded_linear.weight.device
+        target_dtype = decoded_linear.weight.dtype
+        decoded_weight = proxy.base_layer._decode_weight(dtype=target_dtype).to(
+            device=target_device,
+            dtype=target_dtype,
+        )
+        decoded_linear.weight.copy_(decoded_weight)
+
+        base_bias = proxy.base_layer.bias
+        if decoded_linear.bias is None:
+            if base_bias is not None:
+                raise ValueError(
+                    f"Decoded linear under '{name}.per_decoded_linear' is missing bias while base_layer has bias."
+                )
+        else:
+            if base_bias is None:
+                decoded_linear.bias.zero_()
+            else:
+                decoded_linear.bias.copy_(
+                    base_bias.detach().to(
+                        device=decoded_linear.bias.device,
+                        dtype=decoded_linear.bias.dtype,
+                    )
+                )
+        refreshed += 1
+    return refreshed
 
 
 def convert_peft_vae_proxy_modules_to_lora(model: nn.Module) -> int:

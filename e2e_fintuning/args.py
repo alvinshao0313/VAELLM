@@ -10,6 +10,7 @@ from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_l
 
 
 _DEFAULT_RUN_ROOT = ".result/e2e_fintuning"
+_VALID_VAE_LORA_INIT_MODES = {"zero", "residual_svd"}
 _TARGET_MODULE_ALIASES = {
     "q": "q_proj",
     "query": "q_proj",
@@ -40,6 +41,7 @@ class E2EFinetuneArguments:
     vae_lora_rank: int = 8
     vae_lora_alpha: float = 16.0
     vae_lora_dropout: float = 0.0
+    vae_lora_init_mode: str = "zero"
     lora_embedding: bool = False
     lora_lm_head: bool = False
     lora_hif4_act: bool = False
@@ -127,6 +129,17 @@ def needs_teacher(loss_type: str) -> bool:
     return norm not in {"", "sft", "origin"}
 
 
+def parse_vae_lora_init_mode(value: Optional[str]) -> str:
+    norm = str(value or "").strip().lower()
+    if not norm:
+        norm = "zero"
+    if norm not in _VALID_VAE_LORA_INIT_MODES:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --vae_lora_init_mode '{value}'. Expected one of: {sorted(_VALID_VAE_LORA_INIT_MODES)}."
+        )
+    return norm
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="End-to-end LFQ finetuning for VAELinear checkpoints.")
     parser.add_argument("--student_checkpoint_dir", type=str, required=True)
@@ -162,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vae_lora_rank", type=int, default=8)
     parser.add_argument("--vae_lora_alpha", type=float, default=16.0)
     parser.add_argument("--vae_lora_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--vae_lora_init_mode",
+        type=parse_vae_lora_init_mode,
+        default="zero",
+        help="VAELinear proxy LoRA init mode: zero or residual_svd.",
+    )
     parser.add_argument(
         "--lora_embedding",
         type=lambda v: _parse_bool_like(v, arg_name="--lora_embedding"),
@@ -260,6 +279,7 @@ def _validate_numeric_inputs(parser: argparse.ArgumentParser, args: E2EFinetuneA
 def validate_args(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -> None:
     _validate_dataset_inputs(parser, args)
     _validate_numeric_inputs(parser, args)
+    args.vae_lora_init_mode = parse_vae_lora_init_mode(args.vae_lora_init_mode)
     resume_path = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
     if resume_path:
         resume_path = os.path.abspath(resume_path)

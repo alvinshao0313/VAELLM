@@ -20,6 +20,7 @@ from e2e_fintuning.peft_proxy import (
     collect_peft_vae_proxy_adapter_specs,
     ensure_peft_vae_linear_proxy,
     ensure_peft_vae_proxy_lora,
+    refresh_peft_proxy_decoded_linears,
     iter_named_peft_vae_proxies,
     strip_proxy_dense_base_from_state_dict,
 )
@@ -386,6 +387,7 @@ def load_e2e_checkpoint_into_model(
     _materialize_missing_proxy_dense_base_from_model(model, state_dict)
 
     load_result = model.load_state_dict(state_dict, strict=strict)
+    refresh_peft_proxy_decoded_linears(model)
     model.eval()
     return model, meta, load_result
 
