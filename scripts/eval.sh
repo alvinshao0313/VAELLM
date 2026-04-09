@@ -10,7 +10,7 @@ export CUDA_VISIBLE_DEVICES=2
 # --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa"
 
 python tools/cat_eval.py \
-  --checkpoint_dir ".result/e2e_vae_lora_openorca/final_model_20260402_111728/trainer_state/checkpoint-20000" \
+  --checkpoint_dir ".result/e2e_vae_lora_openorca/final_model_20260407_033223/trainer_state/checkpoint-10000" \
   --eval_ppl \
   --eval_lm_eval \
   --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \

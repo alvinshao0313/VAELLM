@@ -34,7 +34,6 @@ class NormalizedCatArgs:
     projection_suffixes: str
     include_all_linears: bool
     steps_per_category: OverrideTable[int]
-    steps_per_group: OverrideTable[Optional[int]]
     skip_layers: str
     linear_group_size: int
     intra_parallel: OverrideTable[Tuple[int, int]]
@@ -274,12 +273,6 @@ _STEPS_PER_CATEGORY_SPEC = _make_positive_int_override_spec(
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
     example="default=2000,cat:down_proj=1000",
 )
-_STEPS_PER_GROUP_SPEC = _make_optional_int_override_spec(
-    arg_name="--steps_per_group",
-    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=none,cat:q_proj=500",
-    min_value=1,
-)
 _INTRA_PARALLEL_SPEC = _make_override_spec(
     arg_name="--intra_parallel",
     parse_value=lambda raw: parse_intra_parallel_text(raw, arg_name="--intra_parallel"),
@@ -485,7 +478,6 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         projection_suffixes=str(raw_args.projection_suffixes),
         include_all_linears=bool(raw_args.include_all_linears),
         steps_per_category=_parse_cat_override(raw_args.steps_per_category, spec=_STEPS_PER_CATEGORY_SPEC),
-        steps_per_group=_parse_cat_override(raw_args.steps_per_group, spec=_STEPS_PER_GROUP_SPEC),
         skip_layers=str(raw_args.skip_layers),
         linear_group_size=int(raw_args.linear_group_size),
         intra_parallel=_parse_cat_override(raw_args.intra_parallel, spec=_INTRA_PARALLEL_SPEC),
@@ -549,7 +541,6 @@ def _normalize_cat_train_vae_args(raw_args):
 def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, active_categories: Sequence[str]) -> Dict[str, ResolvedCategoryRuntimeConfig]:
     tables = (
         (cat_args.steps_per_category, "--steps_per_category"),
-        (cat_args.steps_per_group, "--steps_per_group"),
         (cat_args.intra_parallel, "--intra_parallel"),
         (cat_args.intra_part_sort_mode, "--intra_part_sort_mode"),
         (cat_args.outlier_protect_count, "--outlier_protect_count"),
@@ -570,11 +561,10 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
     resolved: Dict[str, ResolvedCategoryRuntimeConfig] = {}
     for category in active_categories:
         steps_per_category = resolve_category_value(cat_args.steps_per_category, category)
-        steps_per_group = resolve_category_value(cat_args.steps_per_group, category)
         resolved[category] = ResolvedCategoryRuntimeConfig(
             category=str(category),
             residual_stages=int(resolve_category_value(vae_args.residual_stages, category)),
-            steps=int(steps_per_group) if steps_per_group is not None else int(steps_per_category),
+            steps=int(steps_per_category),
             intra_parallel=tuple(resolve_category_value(cat_args.intra_parallel, category)),
             intra_part_sort_mode=resolve_category_value(cat_args.intra_part_sort_mode, category),
             codebook_bits=int(resolve_category_value(vae_args.codebook_bits, category)),
@@ -626,7 +616,6 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="关闭默认的 projection-only 过滤，改为包含模型中全部 nn.Linear。",
     )
     parser.add_argument("--steps_per_category", type=str, default="default=2000", help=f"类别覆盖参数。示例：{_STEPS_PER_CATEGORY_SPEC.example}")
-    parser.add_argument("--steps_per_group", type=str, default="default=none", help=f"类别覆盖参数。示例：{_STEPS_PER_GROUP_SPEC.example}")
     parser.add_argument("--skip_layers", type=str, default="", help="指定在 LLM 前向中始终使用原始线性权重的层，格式: layer_idx.category，例如 0.down_proj,30.q_proj。")
     parser.add_argument("--linear_group_size", type=int, default=32, help="跨层分组大小：每组同时训练多少个同类 Linear。")
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"类别覆盖参数。示例：{_INTRA_PARALLEL_SPEC.example}")

@@ -26,6 +26,7 @@ prepares
 *.bin
 *.h5
 tests/
+test/
 .pytest_cache/
 eval_log/
 wandb/

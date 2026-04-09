@@ -28,7 +28,6 @@ python tools/cat_train.py \
   --skip_layers "1.down_proj" \
   --linear_group_size "36" \
   --steps_per_category "default=5000" \
-  --steps_per_group "default=none" \
   --batch_size "2048" \
   --log_every "50" \
   --eval_every "0" \

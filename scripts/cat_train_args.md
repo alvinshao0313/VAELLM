@@ -35,7 +35,6 @@
 用于：
 
 - `steps_per_category`
-- `steps_per_group`
 - `intra_parallel`
 - `intra_part_sort_mode`
 - `outlier_protect_count`
@@ -54,7 +53,7 @@
 
 ```bash
 --codebook_bits default=16,cat:q_proj=24
---steps_per_group default=none,cat:q_proj=500
+--steps_per_category default=2000,cat:q_proj=500
 --intra_parallel default=1x1,cat:q_proj=4x1
 ```
 
@@ -127,8 +126,7 @@
 | `--transpose_modules` | `v_proj,o_proj,gate_proj,up_proj,down_proj` | 这些类别在切分前先转置权重 | 影响切分方向与整除性 |
 | `--projection_suffixes` | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | 默认 projection-only 模式下允许的后缀 | 仅在未开启 `include_all_linears` 时生效 |
 | `--include_all_linears` | `False` | 关闭默认的 projection-only 过滤，改为收集模型中全部 `nn.Linear` | 开启后忽略 `projection_suffixes` 过滤 |
-| `--steps_per_category` | `default=2000` | 每个类别训练步数 | 类别 override |
-| `--steps_per_group` | `default=none` | 每个分组训练步数 | 若该类别非 `none`，优先级高于 `steps_per_category` |
+| `--steps_per_category` | `default=2000` | 每个 group 的训练步数 | 类别 override；名字保留但语义就是每组步数 |
 | `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式必须是 `layer_idx.category` |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
 | `--intra_parallel` | `default=1x1` | 单个 Linear 的层内切分 | 类别 override |
@@ -282,11 +280,10 @@
 - 某类别为 `N>1` 时，会做逐阶残差量化：当前 stage 重建后，从 residual 中扣除该 stage 重建结果，再进入下一 stage。
 - 但同一类别的各个 stage 不再有单独参数配置，自由度只剩“stage 数量”。
 
-### 6.3 `steps_per_group` 与 `steps_per_category`
+### 6.3 `steps_per_category`
 
-- 先按类别解析 `steps_per_category`
-- 再按类别解析 `steps_per_group`
-- 如果某类别 `steps_per_group` 不是 `none`，训练时实际使用它
+- 当前实现里它表示“这个类别里每个 group 训练多少步”
+- 它不是“整个类别总步数”
 
 ### 6.4 `normalize_weight`
 

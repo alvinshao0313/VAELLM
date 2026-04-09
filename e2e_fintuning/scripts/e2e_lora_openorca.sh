@@ -22,8 +22,8 @@ torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
   --vae_lora_init_mode residual_svd \
-  --lora_embedding true \
-  --lora_lm_head true \
+  --lora_embedding false \
+  --lora_lm_head false \
   --lora_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \
@@ -38,6 +38,6 @@ torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --learning_rate 1e-4 \
   --logging_steps 10 \
   --save_strategy steps \
-  --save_steps 10000 \
-  --max_steps 30000 \
+  --save_steps 5000 \
+  --max_steps 10000 \
   "$@"
