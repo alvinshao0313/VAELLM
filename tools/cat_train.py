@@ -19,7 +19,6 @@ from train_utils.cat_train_args import (
     ResolvedCategoryRuntimeConfig,
     process_cat_train_args,
     resolve_category_runtime_configs,
-    resolve_lora_runtime_config,
     resolve_skip_layer_matches,
 )
 from litebsq.vae_args import apply_autoencoder_arch_defaults
@@ -28,9 +27,7 @@ from train_utils.cat_data_prep import (
     LinearPrepRef,
     format_intra_part_sort_mode,
     gather_wa_mse_act_max_batch,
-    normalize_intra_part_sort_mode,
     prepare_group_weight_data,
-    resolve_intra_parallel,
 )
 from train_utils.activation_utils import (
     ActivationCalibrationCache,
@@ -295,11 +292,61 @@ def _eval_ppl_after_category(model: nn.Module, vae_args, ppl_limit: int, categor
     model.eval()
     model.to(eval_device)
     with torch.no_grad():
-        setattr(vae_args, "limit", int(ppl_limit))
-        ppl_result = calculate_ppl(model, vae_args)
+        ppl_args = _clone_namespace(vae_args, limit=int(ppl_limit))
+        ppl_result = calculate_ppl(model, ppl_args)
     model.to("cpu")
     torch.cuda.empty_cache()
     log.info("类别 %s 训练后 PPL: %.2f", category, float(ppl_result.get("wiki_ppl", float("nan"))))
+
+
+def _resolve_train_dtype(training_args) -> torch.dtype:
+    if bool(getattr(training_args, "bf16", False)):
+        return torch.bfloat16
+    if bool(getattr(training_args, "fp16", False)):
+        return torch.float16
+    return torch.float32
+
+
+def _collect_current_trainable_linears(
+    model: nn.Module,
+    *,
+    transpose_modules: Sequence[str],
+    only_decoder_projections: bool,
+    projection_suffixes: Sequence[str],
+) -> List[LinearRef]:
+    return _collect_linears(
+        model,
+        transpose_modules,
+        only_decoder_projections=only_decoder_projections,
+        projection_suffixes=projection_suffixes,
+    )
+
+
+def _collect_sorted_category_refs(
+    model: nn.Module,
+    *,
+    category: str,
+    transpose_modules: Sequence[str],
+    only_decoder_projections: bool,
+    projection_suffixes: Sequence[str],
+) -> Tuple[List[Tuple[int, LinearRef]], int]:
+    refs_sorted: List[Tuple[int, LinearRef]] = []
+    missing = 0
+    for ref in _collect_current_trainable_linears(
+        model,
+        transpose_modules=transpose_modules,
+        only_decoder_projections=only_decoder_projections,
+        projection_suffixes=projection_suffixes,
+    ):
+        if ref.category != category:
+            continue
+        layer_idx = _extract_layer_idx(ref.name)
+        if layer_idx is None:
+            missing += 1
+            continue
+        refs_sorted.append((layer_idx, ref))
+    refs_sorted.sort(key=lambda item: item[0])
+    return refs_sorted, missing
 
 
 def _train_group_vae_and_replace(
@@ -317,22 +364,14 @@ def _train_group_vae_and_replace(
     log_every: int,
     eval_every: int,
     eval_blocks: int,
-    output_dir: str,
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
-    outlier_protect_count: int = 0,
     outlier_protect_axis: str = "input",
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
     from litebsq.vae_linear import VAELinear
 
-    # 根据训练参数选择输入精度。
-    if bool(getattr(training_args, "bf16", False)):
-        train_dtype = torch.bfloat16
-    elif bool(getattr(training_args, "fp16", False)):
-        train_dtype = torch.float16
-    else:
-        train_dtype = torch.float32
+    train_dtype = _resolve_train_dtype(training_args)
 
     residual_stages = int(runtime_cfg.residual_stages)
     if residual_stages < 1:
@@ -340,16 +379,20 @@ def _train_group_vae_and_replace(
     if len(group_refs) == 0:
         raise ValueError(f"[{group_tag}] group_refs cannot be empty.")
 
-    stage0_sort_mode = runtime_cfg.intra_part_sort_mode
-    stage0_codebook_dim = int(runtime_cfg.codebook_dim)
-    stage0_recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
-    use_wa_mse_loss = stage0_recon_loss == "wa_mse"
+    stage_sort_mode = runtime_cfg.intra_part_sort_mode
+    stage_codebook_bits = int(runtime_cfg.codebook_bits)
+    stage_codebook_dim = int(runtime_cfg.codebook_dim)
+    stage_steps = int(runtime_cfg.steps)
+    stage_recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
+    stage_base_ch = int(runtime_cfg.base_ch)
+    stage_num_res_blocks = int(runtime_cfg.num_res_blocks)
+    stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
+    stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
+    outlier_protect_count = int(runtime_cfg.outlier_protect_count)
+    use_wa_mse_loss = stage_recon_loss == "wa_mse"
     row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
     parts_per_linear = int(row_parts) * int(col_parts)
-    row_sort_mode, col_sort_mode = normalize_intra_part_sort_mode(
-        stage0_sort_mode,
-        arg_name="--intra_part_sort_mode",
-    )
+    row_sort_mode, col_sort_mode = runtime_cfg.intra_part_sort_mode
     needs_dynamic_activation = (
         use_wa_mse_loss
         or row_sort_mode == "act_l2"
@@ -402,14 +445,14 @@ def _train_group_vae_and_replace(
     prep_result = prepare_group_weight_data(
         group_refs=prep_refs,
         intra_parallel=(row_parts, col_parts),
-        codebook_dim=int(stage0_codebook_dim),
+        codebook_dim=int(stage_codebook_dim),
         batch_size=int(batch_size),
         # 多阶残差独立 norm：这里保持原始域，后续在每个 stage 内单独做标准化。
         normalize_weight=False,
-        recon_loss_type="wa_mse" if use_wa_mse_loss else stage0_recon_loss,
+        recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
         activation_weight_by_linear=effective_activation_weight,
         train_device=train_device,
-        intra_part_sort_mode=stage0_sort_mode,
+        intra_part_sort_mode=stage_sort_mode,
         outlier_protect_count=int(outlier_protect_count),
         outlier_protect_axis=str(outlier_protect_axis),
     )
@@ -446,7 +489,10 @@ def _train_group_vae_and_replace(
     if use_wa_mse:
         log.info("[%s] wa_mse enabled with online act_max gather.", group_tag)
 
-    residual_data = stacked_data.detach().clone().contiguous()
+    residual_data = _reshape_blocks_for_codebook_dim(
+        stacked_data.detach().clone().contiguous(),
+        codebook_dim=int(stage_codebook_dim),
+    )
     all_stage_bits: List[torch.Tensor] = []
     all_stage_decoders: List[List[nn.Module]] = []
     all_stage_codebook_dims: List[int] = []
@@ -455,38 +501,28 @@ def _train_group_vae_and_replace(
         vae_args,
         parallel_layers=num_models,
         residual_stages=int(runtime_cfg.residual_stages),
-        codebook_bits=int(runtime_cfg.codebook_bits),
-        codebook_dim=int(runtime_cfg.codebook_dim),
-        base_ch=int(runtime_cfg.base_ch),
-        num_res_blocks=int(runtime_cfg.num_res_blocks),
-        norm_type=str(runtime_cfg.norm_type),
-        decoder_type=str(runtime_cfg.decoder_type),
+        codebook_bits=int(stage_codebook_bits),
+        codebook_dim=int(stage_codebook_dim),
+        base_ch=int(stage_base_ch),
+        num_res_blocks=int(stage_num_res_blocks),
+        norm_type=str(stage_norm_type),
+        decoder_type=str(stage_decoder_type),
         decoder_base_ch=(
             None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch)
         ),
         decoder_num_res_blocks=(
             None if runtime_cfg.decoder_num_res_blocks is None else int(runtime_cfg.decoder_num_res_blocks)
         ),
-        recon_loss_type=str(runtime_cfg.recon_loss_type),
+        recon_loss_type=str(stage_recon_loss),
     )
     apply_autoencoder_arch_defaults(shared_stage_args)
+    use_stage_norm = bool(getattr(shared_stage_args, "normalize_weight", False))
 
     for stage_idx in range(residual_stages):
         stage_tag = f"{group_tag}/stage{stage_idx + 1}"
-        stage_steps = int(runtime_cfg.steps)
-        stage_codebook_bits = int(runtime_cfg.codebook_bits)
-        stage_codebook_dim = int(runtime_cfg.codebook_dim)
-        residual_data = _reshape_blocks_for_codebook_dim(residual_data, codebook_dim=int(stage_codebook_dim))
-        stage_recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
-        stage_base_ch = int(runtime_cfg.base_ch)
-        stage_num_res_blocks = int(runtime_cfg.num_res_blocks)
-        stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
-        stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
-        stage_decoder_base_ch = runtime_cfg.decoder_base_ch
-        stage_decoder_num_res_blocks = runtime_cfg.decoder_num_res_blocks
         stage_vae_args = _clone_namespace(shared_stage_args)
 
-        if bool(getattr(stage_vae_args, "normalize_weight", False)):
+        if use_stage_norm:
             stage_norm_mean, stage_norm_scale = _compute_stage_norm_stats(residual_data)
             stage_train_data = _apply_stage_norm(
                 residual_data,
@@ -529,7 +565,7 @@ def _train_group_vae_and_replace(
             int(stage_num_res_blocks),
             stage_norm_type,
             stage_decoder_type,
-            "on" if bool(getattr(stage_vae_args, "normalize_weight", False)) else "off",
+            "on" if use_stage_norm else "off",
         )
         start = time.time()
         train_iter = iter(train_loader)
@@ -666,7 +702,7 @@ def _train_group_vae_and_replace(
             for i in range(num_models):
                 dec = vae.model.decoder.get_sub_decoder(i)
                 _fuse_q_scale_into_decoder(dec, q_scale=float(quant_q_scale))
-                if bool(getattr(stage_vae_args, "normalize_weight", False)):
+                if use_stage_norm:
                     if stage_norm_mean is None or stage_norm_scale is None:
                         raise RuntimeError(f"[{stage_tag}] stage norm stats missing while normalize_weight=True")
                     _fuse_norm_into_decoder(
@@ -796,7 +832,7 @@ def _train_group_vae_and_replace(
         try:
             new_linear.prime_decoded_weight_cache(dtype=train_dtype)
         except Exception as e:
-            log.warning("[%s] cache warmup failed for %s: %s", group_tag, r.name, e)
+            raise RuntimeError(f"[{group_tag}] cache warmup failed for {r.name}: {e}") from e
         # 替换后将模块放回 CPU，降低显存占用。
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
@@ -810,6 +846,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cat_args, hf_args, training_args, vae_args = process_cat_train_args(argv)
     if bool(getattr(training_args, "lora_hif4_act", False)) and not bool(cat_args.lora_after_category):
         raise ValueError("--lora_hif4_act 仅在 LoRA 阶段生效，因此必须同时开启 --lora_after_category。")
+    if bool(cat_args.lora_after_category) and not bool(cat_args.convert):
+        raise ValueError("--lora_after_category requires --convert，因为 LoRA 补偿必须作用在已替换的压缩模型上。")
     set_seed(cat_args.seed)
 
     os.makedirs(cat_args.output_dir, exist_ok=True)
@@ -832,18 +870,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     transpose_modules = _split_csv(cat_args.transpose_modules)
     projection_suffixes = _split_csv(cat_args.projection_suffixes)
     only_decoder_projections = not bool(cat_args.include_all_linears)
-    all_linears = _collect_linears(
+    run_ppl_eval = bool(cat_args.convert)
+    if not run_ppl_eval:
+        log.info("跳过 PPL 评估：--convert=false 时模型权重不会被替换。")
+    all_linears = _collect_current_trainable_linears(
         model,
-        transpose_modules,
+        transpose_modules=transpose_modules,
         only_decoder_projections=only_decoder_projections,
         projection_suffixes=projection_suffixes,
     )
     discovered_categories = [r.category for r in all_linears]
     category_order = _resolve_category_order(cat_args.category_order, discovered_categories)
-
-    refs_by_cat: Dict[str, List[LinearRef]] = {}
-    for r in all_linears:
-        refs_by_cat.setdefault(r.category, []).append(r)
+    discovered_category_set = set(discovered_categories)
     discovered_skip_keys = []
     for r in all_linears:
         li = _extract_layer_idx(r.name)
@@ -869,7 +907,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if linear_group_size < 1:
         raise ValueError(f"linear_group_size must be >= 1, got {linear_group_size}")
 
-    active_categories = [c for c in category_order if c in refs_by_cat]
+    active_categories = [c for c in category_order if c in discovered_category_set]
     if not active_categories:
         raise ValueError("No active categories discovered for training.")
 
@@ -906,10 +944,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cat: int(resolved_category_cfgs[cat].outlier_protect_count) for cat in active_categories
     }
     category_sort_modes: Dict[str, Tuple[str, str]] = {
-        cat: normalize_intra_part_sort_mode(
-            resolved_category_cfgs[cat].intra_part_sort_mode,
-            arg_name="--intra_part_sort_mode",
-        )
+        cat: tuple(resolved_category_cfgs[cat].intra_part_sort_mode)
         for cat in active_categories
     }
     category_sort_mode_desc: Dict[str, str] = {
@@ -1038,15 +1073,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 )
             ),
         )
-    for cat_idx, cat in enumerate(active_categories):
-        if cat not in refs_by_cat:
-            continue
-
-        refs = refs_by_cat[cat]
-        if not refs:
+    for cat in active_categories:
+        refs_sorted, missing = _collect_sorted_category_refs(
+            model,
+            category=cat,
+            transpose_modules=transpose_modules,
+            only_decoder_projections=only_decoder_projections,
+            projection_suffixes=projection_suffixes,
+        )
+        if missing:
+            log.warning("[%s] %d modules missing layer_idx, skipped.", cat, missing)
+        if not refs_sorted:
             continue
 
         cat_cfg = resolved_category_cfgs[cat]
+        refs = [ref for _, ref in refs_sorted]
         cat_row_parts, cat_col_parts = category_intra_parallel[cat]
         cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
         cat_parts_per_linear = int(cat_row_parts) * int(cat_col_parts)
@@ -1065,18 +1106,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             category_sort_mode_desc[cat],
             int(cat_cfg.steps),
         )
-
-        refs_sorted = []
-        missing = 0
-        for r in refs:
-            li = _extract_layer_idx(r.name)
-            if li is None:
-                missing += 1
-                continue
-            refs_sorted.append((li, r))
-        if missing:
-            log.warning("[%s] %d modules missing layer_idx, skipped.", cat, missing)
-        refs_sorted.sort(key=lambda x: x[0])
         ordered_refs = [r for _, r in refs_sorted]
 
         for start in range(0, len(ordered_refs), linear_group_size):
@@ -1107,10 +1136,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 log_every=cat_args.log_every,
                 eval_every=cat_args.eval_every,
                 eval_blocks=cat_args.eval_blocks,
-                output_dir=cat_args.output_dir,
                 skip_layer_keys=skip_layer_keys,
                 activation_runtime=activation_runtime,
-                outlier_protect_count=category_outlier_protect_count[cat],
                 outlier_protect_axis=outlier_protect_axis,
             )
             # _eval_ppl_after_category(
@@ -1123,18 +1150,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
         if cat_args.lora_after_category:
             from train_utils.lora_utils import lora_finetune_remaining_categories
-            log.info("LoRA 微调前评估...")
-            _eval_ppl_after_category(
-                model=model,
-                vae_args=vae_args,
-                ppl_limit=cat_args.ppl_limit,
-                category=cat,
-                eval_device=cat_args.train_device,
-            )
+            if run_ppl_eval:
+                log.info("LoRA 微调前评估...")
+                _eval_ppl_after_category(
+                    model=model,
+                    vae_args=vae_args,
+                    ppl_limit=cat_args.ppl_limit,
+                    category=cat,
+                    eval_device=cat_args.train_device,
+                )
 
-            current_remaining_linears = _collect_linears(
+            current_remaining_linears = _collect_current_trainable_linears(
                 model,
-                transpose_modules,
+                transpose_modules=transpose_modules,
                 only_decoder_projections=only_decoder_projections,
                 projection_suffixes=projection_suffixes,
             )
@@ -1142,10 +1170,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             model = lora_finetune_remaining_categories(
                 model=model,
                 remaining_categories=remaining_categories,
-                collect_linears_fn=_collect_linears,
-                transpose_modules=transpose_modules,
-                projection_suffixes=projection_suffixes,
-                only_decoder_projections=only_decoder_projections,
+                target_names=[r.name for r in current_remaining_linears],
                 cat_args=cat_args,
                 vae_args=vae_args,
                 training_args=training_args,
@@ -1155,13 +1180,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             lora_round_idx += 1
 
-        _eval_ppl_after_category(
-            model=model,
-            vae_args=vae_args,
-            ppl_limit=cat_args.ppl_limit,
-            category=cat,
-            eval_device=cat_args.train_device,
-        )
+        if run_ppl_eval:
+            _eval_ppl_after_category(
+                model=model,
+                vae_args=vae_args,
+                ppl_limit=cat_args.ppl_limit,
+                category=cat,
+                eval_device=cat_args.train_device,
+            )
         # cat_dir_name = _safe_path_token(cat)
         # cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
         # save_paths = save_model_checkpoint(
@@ -1179,13 +1205,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         # )
         # log.info("Saved category checkpoint (%s): %s", cat, save_paths["output_dir"])
 
-    _eval_ppl_after_category(
-        model=model,
-        vae_args=vae_args,
-        ppl_limit=cat_args.ppl_limit,
-        category="none",
-        eval_device=cat_args.train_device,
-    )
+    if run_ppl_eval:
+        _eval_ppl_after_category(
+            model=model,
+            vae_args=vae_args,
+            ppl_limit=cat_args.ppl_limit,
+            category="none",
+            eval_device=cat_args.train_device,
+        )
     if cat_args.save_model:
         if not cat_args.convert:
             raise ValueError("--save_model requires --convert")

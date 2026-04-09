@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 import torch
 from torch import nn
@@ -64,15 +64,6 @@ def _enum_to_value(value, default: str) -> str:
         raw = raw.split(".")[-1]
     return raw.lower()
 
-
-def _resolve_lora_round_idx(cat_args, lora_round_idx: Optional[int]) -> int:
-    if lora_round_idx is not None:
-        return int(lora_round_idx)
-    auto_round = int(getattr(cat_args, "_lora_round_idx", 0))
-    setattr(cat_args, "_lora_round_idx", auto_round + 1)
-    return auto_round
-
-
 def _resolve_lora_stage_config(
     *,
     cat_args,
@@ -80,7 +71,7 @@ def _resolve_lora_stage_config(
     after_category: Optional[str],
     lora_round_idx: Optional[int],
 ) -> _ResolvedLoraStageConfig:
-    round_idx = _resolve_lora_round_idx(cat_args, lora_round_idx)
+    round_idx = 0 if lora_round_idx is None else int(lora_round_idx)
     if round_idx < 0:
         raise ValueError(f"lora_round_idx must be >= 0, got {round_idx}")
 
@@ -107,26 +98,6 @@ def _resolve_lora_stage_config(
         use_dora=bool(runtime_cfg.use_dora),
         use_lora_hif4_act=bool(getattr(training_args, "lora_hif4_act", False)),
     )
-
-
-def _collect_lora_target_names(
-    model: nn.Module,
-    *,
-    remaining_categories: Sequence[str],
-    collect_linears_fn: Callable,
-    transpose_modules: Sequence[str],
-    projection_suffixes: Sequence[str],
-    only_decoder_projections: bool,
-) -> List[str]:
-    remaining_set = set(remaining_categories)
-    current_linears = collect_linears_fn(
-        model,
-        transpose_modules,
-        only_decoder_projections=only_decoder_projections,
-        projection_suffixes=projection_suffixes,
-    )
-    return [ref.name for ref in current_linears if ref.category in remaining_set]
-
 
 def _freeze_model_for_lora(model: nn.Module, *, device: str, logger) -> None:
     for param in model.parameters():
@@ -186,17 +157,19 @@ def _log_lora_stage_start(
     )
 
 
-def _build_tokenizer(*, vae_args, model: nn.Module):
-    tokenizer = AutoTokenizer.from_pretrained(
-        vae_args.model_path,
-        use_fast=True,
-        token=getattr(vae_args, "access_token", None),
-    )
+def _ensure_lora_tokenizer_ready(*, vae_args, model: nn.Module) -> None:
+    tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(
+            vae_args.model_path,
+            use_fast=True,
+            token=getattr(vae_args, "access_token", None),
+        )
+        setattr(vae_args, "_cached_lora_tokenizer", tokenizer)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
-    return tokenizer
 
 
 def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedLoraStageConfig):
@@ -296,10 +269,7 @@ def lora_finetune_remaining_categories(
     model: nn.Module,
     remaining_categories: Sequence[str],
     *,
-    collect_linears_fn: Callable,
-    transpose_modules: Sequence[str],
-    projection_suffixes: Sequence[str],
-    only_decoder_projections: bool,
+    target_names: Sequence[str],
     cat_args,
     vae_args,
     training_args,
@@ -317,14 +287,6 @@ def lora_finetune_remaining_categories(
         return model
     _ensure_lora_stack_available()
 
-    target_names = _collect_lora_target_names(
-        model,
-        remaining_categories=remaining_categories,
-        collect_linears_fn=collect_linears_fn,
-        transpose_modules=transpose_modules,
-        projection_suffixes=projection_suffixes,
-        only_decoder_projections=only_decoder_projections,
-    )
     if not target_names:
         logger.info("LoRA: 没有可微调的剩余 Linear，跳过。")
         return model
@@ -370,7 +332,7 @@ def lora_finetune_remaining_categories(
         model, _merged_count = merge_all_lora(model)
         return model
 
-    _build_tokenizer(vae_args=vae_args, model=model)
+    _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
     sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
     hif4_act_controller = build_lora_hif4_act_controller(cfg.use_lora_hif4_act)
     trainer = _build_lora_trainer(

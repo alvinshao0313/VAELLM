@@ -26,6 +26,18 @@ def _build_teacher_with_q_proj(*, in_features: int, out_features: int) -> nn.Mod
     return teacher
 
 
+def _build_teacher_with_q_proj_and_up_proj() -> nn.Module:
+    teacher = nn.Module()
+    teacher.model = nn.Module()
+    teacher.model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+    for layer in teacher.model.layers:
+        layer.self_attn = nn.Module()
+        layer.mlp = nn.Module()
+        layer.self_attn.q_proj = nn.Linear(4, 3, bias=False)
+        layer.mlp.up_proj = nn.Linear(4, 5, bias=False)
+    return teacher
+
+
 def test_initialize_peft_linear_from_residual_svd_matches_truncated_svd():
     base_layer = nn.Linear(5, 4, bias=False, dtype=torch.float32)
     peft_linear = PeftLoraLinear(
@@ -85,6 +97,50 @@ def test_initialize_peft_linear_from_residual_svd_zero_pads_tail_rank():
     assert torch.count_nonzero(peft_linear.lora_B["default"].weight[:, 2:]).item() == 0
 
 
+def test_initialize_peft_linear_from_residual_svd_recomputes_dora_magnitude():
+    base_layer = nn.Linear(3, 2, bias=False, dtype=torch.float32)
+    with torch.no_grad():
+        base_layer.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, -2.0, 0.5],
+                    [0.5, 1.5, -1.0],
+                ],
+                dtype=torch.float32,
+            )
+        )
+    peft_linear = PeftLoraLinear(
+        base_layer,
+        "default",
+        r=2,
+        lora_alpha=4,
+        lora_dropout=0.0,
+        use_dora=True,
+    )
+    residual = torch.tensor(
+        [
+            [0.5, 1.0, -0.5],
+            [-1.0, 0.0, 1.5],
+        ],
+        dtype=torch.float32,
+    )
+
+    peft_proxy_module.initialize_peft_linear_from_residual_svd(
+        peft_linear,
+        residual,
+        module_name="model.layers.0.self_attn.q_proj",
+    )
+
+    actual_delta = peft_linear.get_delta_weight("default")
+    expected_magnitude = torch.linalg.norm(base_layer.weight.detach() + actual_delta, dim=1)
+    torch.testing.assert_close(
+        peft_linear.lora_magnitude_vector["default"].detach(),
+        expected_magnitude,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
 def test_initialize_peft_vae_proxy_lora_from_teacher_residual_uses_matching_module_name(monkeypatch):
     base_layer = nn.Linear(4, 3, bias=False, dtype=torch.float32)
     with torch.no_grad():
@@ -134,6 +190,7 @@ def test_initialize_peft_vae_proxy_lora_from_teacher_residual_uses_matching_modu
     initialized = peft_proxy_module.initialize_peft_vae_proxy_lora_from_teacher_residual(
         nn.Module(),
         teacher,
+        batch_device=torch.device("cpu"),
     )
 
     expected = _truncated_svd_reconstruction(target_weight - base_layer.weight.detach(), rank=2)
@@ -167,10 +224,145 @@ def test_initialize_peft_vae_proxy_lora_from_teacher_residual_rejects_shape_mism
     )
 
     try:
-        peft_proxy_module.initialize_peft_vae_proxy_lora_from_teacher_residual(nn.Module(), teacher)
+        peft_proxy_module.initialize_peft_vae_proxy_lora_from_teacher_residual(
+            nn.Module(),
+            teacher,
+            batch_device=torch.device("cpu"),
+        )
         raise AssertionError("Expected shape mismatch error.")
     except ValueError as exc:
         assert "shape mismatch" in str(exc)
+
+
+def test_initialize_peft_vae_proxy_lora_from_teacher_residual_batches_same_category_together(monkeypatch):
+    teacher = _build_teacher_with_q_proj_and_up_proj()
+
+    q_proj_0 = PeftLoraLinear(
+        nn.Linear(4, 3, bias=False, dtype=torch.float32),
+        "default",
+        r=2,
+        lora_alpha=8,
+        lora_dropout=0.0,
+    )
+    q_proj_1 = PeftLoraLinear(
+        nn.Linear(4, 3, bias=False, dtype=torch.float32),
+        "default",
+        r=2,
+        lora_alpha=8,
+        lora_dropout=0.0,
+    )
+    up_proj_0 = PeftLoraLinear(
+        nn.Linear(4, 5, bias=False, dtype=torch.float32),
+        "default",
+        r=2,
+        lora_alpha=8,
+        lora_dropout=0.0,
+    )
+
+    with torch.no_grad():
+        q_proj_0.base_layer.weight.copy_(
+            torch.tensor(
+                [
+                    [0.5, -1.0, 2.0, 1.5],
+                    [1.0, 0.0, -0.5, 3.0],
+                    [-2.0, 1.0, 0.5, -1.5],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        q_proj_1.base_layer.weight.copy_(
+            torch.tensor(
+                [
+                    [1.5, -0.5, 0.0, 2.0],
+                    [0.5, 1.0, -1.0, 0.0],
+                    [2.0, -1.0, 0.5, -0.5],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        up_proj_0.base_layer.weight.copy_(
+            torch.tensor(
+                [
+                    [0.0, 1.0, -1.0, 0.5],
+                    [1.5, -0.5, 2.0, -1.0],
+                    [-1.0, 0.5, 0.5, 1.0],
+                    [2.0, -1.5, 1.0, 0.0],
+                    [0.5, 0.5, -0.5, 1.5],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        teacher.model.layers[0].self_attn.q_proj.weight.copy_(
+            q_proj_0.base_layer.weight.detach()
+            + torch.tensor(
+                [
+                    [1.0, 0.0, -2.0, 0.5],
+                    [0.0, 1.5, 0.5, -1.0],
+                    [2.0, -0.5, 1.0, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        teacher.model.layers[1].self_attn.q_proj.weight.copy_(
+            q_proj_1.base_layer.weight.detach()
+            + torch.tensor(
+                [
+                    [-1.0, 2.0, 0.5, 0.0],
+                    [0.5, -0.5, 1.5, 2.0],
+                    [1.0, 1.0, -1.5, 0.5],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        teacher.model.layers[0].mlp.up_proj.weight.copy_(
+            up_proj_0.base_layer.weight.detach()
+            + torch.tensor(
+                [
+                    [0.5, -1.0, 0.0, 1.0],
+                    [-0.5, 1.5, -1.0, 0.0],
+                    [1.0, 0.0, 0.5, -1.5],
+                    [0.0, 2.0, -0.5, 0.5],
+                    [-1.0, 0.5, 1.5, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+        )
+
+    monkeypatch.setattr(
+        peft_proxy_module,
+        "iter_named_peft_vae_proxies",
+        lambda _model: iter(
+            [
+                ("model.layers.1.self_attn.q_proj", SimpleNamespace(per_decoded_linear=q_proj_1)),
+                ("model.layers.0.mlp.up_proj", SimpleNamespace(per_decoded_linear=up_proj_0)),
+                ("model.layers.0.self_attn.q_proj", SimpleNamespace(per_decoded_linear=q_proj_0)),
+            ]
+        ),
+    )
+
+    initialized = peft_proxy_module.initialize_peft_vae_proxy_lora_from_teacher_residual(
+        nn.Module(),
+        teacher,
+        batch_device=torch.device("cpu"),
+    )
+
+    expected_q0 = _truncated_svd_reconstruction(
+        teacher.model.layers[0].self_attn.q_proj.weight.detach() - q_proj_0.base_layer.weight.detach(),
+        rank=2,
+    )
+    expected_q1 = _truncated_svd_reconstruction(
+        teacher.model.layers[1].self_attn.q_proj.weight.detach() - q_proj_1.base_layer.weight.detach(),
+        rank=2,
+    )
+    expected_up0 = _truncated_svd_reconstruction(
+        teacher.model.layers[0].mlp.up_proj.weight.detach() - up_proj_0.base_layer.weight.detach(),
+        rank=2,
+    )
+
+    assert initialized == 3
+    torch.testing.assert_close(q_proj_0.get_delta_weight("default"), expected_q0, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(q_proj_1.get_delta_weight("default"), expected_q1, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(up_proj_0.get_delta_weight("default"), expected_up0, atol=1e-5, rtol=1e-5)
 
 
 def test_should_initialize_vae_lora_residual_svd_skips_resume():
@@ -185,6 +377,16 @@ def test_should_initialize_vae_lora_residual_svd_skips_resume():
         args=args,
         selection=selection,
         resume_from_checkpoint="checkpoint-100",
+    )
+
+
+def test_should_initialize_vae_lora_residual_svd_rejects_adalora():
+    args = SimpleNamespace(vae_lora_variant="adalora", vae_lora_init_mode="residual_svd")
+    selection = SimpleNamespace(peft_proxy_modules=["model.layers.0.self_attn.q_proj"])
+    assert not runtime._should_initialize_vae_lora_residual_svd(
+        args=args,
+        selection=selection,
+        resume_from_checkpoint=None,
     )
 
 

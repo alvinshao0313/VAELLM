@@ -7,10 +7,15 @@ from typing import Dict, List, Optional
 
 from transformers.modeling_utils import load_sharded_checkpoint
 
-from e2e_fintuning.args import parse_decoder_layers, parse_target_modules
+from e2e_fintuning.args import (
+    parse_decoder_layers,
+    parse_target_modules,
+    parse_vae_lora_init_mode,
+    parse_vae_lora_variant,
+)
 from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
-from e2e_fintuning.trainables import resolve_target_layer_ids, select_e2e_trainables
-from rotation.common import separate_embeddings_and_lm_head
+from e2e_fintuning.peft_proxy import ensure_peft_vae_proxy_adapter
+from e2e_fintuning.trainables import resolve_target_layer_ids, select_e2e_trainables_peft_proxy
 from rotation.model_utils import get_layers
 from train_utils.train_args import _parse_bool_like
 
@@ -25,16 +30,6 @@ _COPY_FILES = (
 )
 
 
-def _embedding_and_lm_head_are_tied(model) -> bool:
-    embedding = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
-    lm_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
-    if embedding is None or lm_head is None:
-        return False
-    if not hasattr(embedding, "weight") or not hasattr(lm_head, "weight"):
-        return False
-    return embedding.weight.data_ptr() == lm_head.weight.data_ptr()
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert a legacy HF e2e trainer checkpoint into the new compact resumable checkpoint format."
@@ -45,19 +40,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--access_token", type=str, default=None)
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
+    parser.add_argument("--vae_lora_variant", type=parse_vae_lora_variant, default="plain")
     parser.add_argument("--vae_lora_rank", type=int, default=8)
     parser.add_argument("--vae_lora_alpha", type=float, default=16.0)
     parser.add_argument("--vae_lora_dropout", type=float, default=0.0)
-    parser.add_argument(
-        "--lora_embedding",
-        type=lambda v: _parse_bool_like(v, arg_name="--lora_embedding"),
-        default=False,
-    )
-    parser.add_argument(
-        "--lora_lm_head",
-        type=lambda v: _parse_bool_like(v, arg_name="--lora_lm_head"),
-        default=False,
-    )
+    parser.add_argument("--vae_lora_init_mode", type=parse_vae_lora_init_mode, default="zero")
+    parser.add_argument("--vae_adalora_target_r", type=int, default=8)
+    parser.add_argument("--vae_adalora_init_r", type=int, default=12)
+    parser.add_argument("--vae_adalora_tinit", type=int, default=0)
+    parser.add_argument("--vae_adalora_tfinal", type=int, default=0)
+    parser.add_argument("--vae_adalora_delta_t", type=int, default=1)
+    parser.add_argument("--vae_adalora_beta1", type=float, default=0.85)
+    parser.add_argument("--vae_adalora_beta2", type=float, default=0.85)
+    parser.add_argument("--vae_adalora_orth_reg_weight", type=float, default=0.5)
     parser.add_argument("--loss_type", type=str, default="sft")
     parser.add_argument(
         "--post_attn",
@@ -70,6 +65,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     return parser
+
+
+def _load_legacy_trainer_state(legacy_checkpoint_dir: str) -> Dict[str, object]:
+    trainer_state_path = os.path.join(legacy_checkpoint_dir, "trainer_state.json")
+    with open(trainer_state_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _validate_args(args) -> None:
@@ -99,9 +100,22 @@ def _validate_args(args) -> None:
         raise ValueError("--vae_lora_alpha must be > 0.")
     if float(args.vae_lora_dropout) < 0.0 or float(args.vae_lora_dropout) >= 1.0:
         raise ValueError("--vae_lora_dropout must satisfy 0 <= dropout < 1.")
-
+    if str(args.vae_lora_variant) == "adalora":
+        if str(args.vae_lora_init_mode) == "residual_svd":
+            raise ValueError("AdaLoRA does not support residual_svd init.")
+        if int(args.vae_adalora_target_r) < 1:
+            raise ValueError("--vae_adalora_target_r must be >= 1.")
+        if int(args.vae_adalora_init_r) < int(args.vae_adalora_target_r):
+            raise ValueError("--vae_adalora_init_r must be >= --vae_adalora_target_r.")
+        if int(args.vae_adalora_delta_t) < 1:
+            raise ValueError("--vae_adalora_delta_t must be >= 1.")
+        if not (0.0 < float(args.vae_adalora_beta1) < 1.0):
+            raise ValueError("--vae_adalora_beta1 must satisfy 0 < beta1 < 1.")
+        if not (0.0 < float(args.vae_adalora_beta2) < 1.0):
+            raise ValueError("--vae_adalora_beta2 must satisfy 0 < beta2 < 1.")
     args.decoder_layer_ids = parse_decoder_layers(args.decoder_layers)
     args.target_module_names = parse_target_modules(args.target_modules)
+    args.legacy_trainer_state = _load_legacy_trainer_state(args.legacy_checkpoint_dir)
 
 
 def _copy_resume_state_files(src_dir: str, dst_dir: str) -> List[str]:
@@ -122,7 +136,9 @@ def _copy_resume_state_files(src_dir: str, dst_dir: str) -> List[str]:
 
 
 def _build_extra_meta(args, selection) -> Dict[str, object]:
-    return {
+    use_rslora = str(args.vae_lora_variant) == "rslora"
+    use_dora = str(args.vae_lora_variant) == "dora"
+    extra_meta: Dict[str, object] = {
         "stage": "e2e_fintuning",
         "source_checkpoint_dir": args.student_checkpoint_dir,
         "legacy_hf_checkpoint_dir": args.legacy_checkpoint_dir,
@@ -132,14 +148,34 @@ def _build_extra_meta(args, selection) -> Dict[str, object]:
         "target_module_names": None if args.target_module_names is None else list(args.target_module_names),
         "loss_type": str(args.loss_type),
         "post_attn": bool(args.post_attn),
-        "lora_embedding": bool(args.lora_embedding),
-        "lora_lm_head": bool(args.lora_lm_head),
         "lora_hif4_act": bool(args.lora_hif4_act),
         "finetune_mode": _E2E_FINETUNE_MODE,
+        "vae_lora_variant": str(args.vae_lora_variant),
         "vae_lora_rank": int(args.vae_lora_rank),
         "vae_lora_alpha": float(args.vae_lora_alpha),
         "vae_lora_dropout": float(args.vae_lora_dropout),
+        "vae_lora_init_mode": str(args.vae_lora_init_mode),
+        "vae_lora_use_rslora": bool(use_rslora),
+        "vae_lora_use_dora": bool(use_dora),
     }
+    if str(args.vae_lora_variant) == "adalora":
+        max_steps = int(args.legacy_trainer_state.get("max_steps", -1))
+        if max_steps <= 0:
+            raise ValueError("Legacy trainer_state.json does not contain a valid max_steps for AdaLoRA conversion.")
+        extra_meta.update(
+            {
+                "vae_adalora_target_r": int(args.vae_adalora_target_r),
+                "vae_adalora_init_r": int(args.vae_adalora_init_r),
+                "vae_adalora_tinit": int(args.vae_adalora_tinit),
+                "vae_adalora_tfinal": int(args.vae_adalora_tfinal),
+                "vae_adalora_delta_t": int(args.vae_adalora_delta_t),
+                "vae_adalora_beta1": float(args.vae_adalora_beta1),
+                "vae_adalora_beta2": float(args.vae_adalora_beta2),
+                "vae_adalora_orth_reg_weight": float(args.vae_adalora_orth_reg_weight),
+                "vae_adalora_total_step": max_steps,
+            }
+        )
+    return extra_meta
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -166,22 +202,32 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
     )
 
-    if (bool(args.lora_embedding) or bool(args.lora_lm_head)) and _embedding_and_lm_head_are_tied(model):
-        separate_embeddings_and_lm_head(model)
-
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(list(get_layers(model))))
-    selection = select_e2e_trainables(
+    selection = select_e2e_trainables_peft_proxy(
         model,
         decoder_layer_ids=decoder_layer_ids,
         target_module_names=args.target_module_names,
-        vae_lora_rank=int(args.vae_lora_rank),
-        vae_lora_alpha=float(args.vae_lora_alpha),
-        vae_lora_dropout=float(args.vae_lora_dropout),
-        lora_embedding=bool(args.lora_embedding),
-        lora_lm_head=bool(args.lora_lm_head),
     )
-    if not selection.trainable_params:
-        raise RuntimeError("No trainable parameters found for requested decoder layers.")
+    if not selection.peft_proxy_modules:
+        raise RuntimeError("No PEFT proxy modules found for requested decoder layers.")
+
+    ensure_peft_vae_proxy_adapter(
+        model,
+        variant=str(args.vae_lora_variant),
+        rank=int(args.vae_lora_rank),
+        alpha=float(args.vae_lora_alpha),
+        dropout=float(args.vae_lora_dropout),
+        init_mode=str(args.vae_lora_init_mode),
+        total_step=int(args.legacy_trainer_state.get("max_steps", -1)) if str(args.vae_lora_variant) == "adalora" else None,
+        adalora_target_r=int(args.vae_adalora_target_r),
+        adalora_init_r=int(args.vae_adalora_init_r),
+        adalora_tinit=int(args.vae_adalora_tinit),
+        adalora_tfinal=int(args.vae_adalora_tfinal),
+        adalora_delta_t=int(args.vae_adalora_delta_t),
+        adalora_beta1=float(args.vae_adalora_beta1),
+        adalora_beta2=float(args.vae_adalora_beta2),
+        adalora_orth_reg_weight=float(args.vae_adalora_orth_reg_weight),
+    )
 
     setattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
     load_result = load_sharded_checkpoint(model, args.legacy_checkpoint_dir, strict=True, prefer_safe=True)

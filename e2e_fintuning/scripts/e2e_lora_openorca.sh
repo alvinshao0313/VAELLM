@@ -18,12 +18,11 @@ torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --model_max_length 4096 \
   --decoder_layers 0-31 \
   --target_modules all \
+  --vae_lora_variant plain \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
   --vae_lora_init_mode residual_svd \
-  --lora_embedding false \
-  --lora_lm_head false \
   --lora_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \

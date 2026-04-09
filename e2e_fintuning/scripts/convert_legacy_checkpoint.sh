@@ -23,11 +23,11 @@ python -m e2e_fintuning.convert_legacy_checkpoint \
   --output_checkpoint_dir "$OUT_CKPT" \
   --decoder_layers 0-31 \
   --target_modules all \
+  --vae_lora_variant plain \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
-  --lora_embedding false \
-  --lora_lm_head false \
+  --vae_lora_init_mode zero \
   --loss_type sft \
   --post_attn false \
   --lora_hif4_act false \

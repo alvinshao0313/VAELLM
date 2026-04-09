@@ -10,7 +10,8 @@ from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_l
 
 
 _DEFAULT_RUN_ROOT = ".result/e2e_fintuning"
-_VALID_VAE_LORA_INIT_MODES = {"zero", "residual_svd"}
+_VALID_VAE_LORA_VARIANTS = {"plain", "rslora", "dora", "adalora"}
+_VALID_VAE_LORA_INIT_MODES = {"zero", "gaussian", "residual_svd"}
 _TARGET_MODULE_ALIASES = {
     "q": "q_proj",
     "query": "q_proj",
@@ -38,12 +39,19 @@ class E2EFinetuneArguments:
     post_attn: bool = False
     decoder_layers: str = "all"
     target_modules: str = "all"
+    vae_lora_variant: str = "plain"
     vae_lora_rank: int = 8
     vae_lora_alpha: float = 16.0
     vae_lora_dropout: float = 0.0
     vae_lora_init_mode: str = "zero"
-    lora_embedding: bool = False
-    lora_lm_head: bool = False
+    vae_adalora_target_r: int = 8
+    vae_adalora_init_r: int = 12
+    vae_adalora_tinit: int = 0
+    vae_adalora_tfinal: int = 0
+    vae_adalora_delta_t: int = 1
+    vae_adalora_beta1: float = 0.85
+    vae_adalora_beta2: float = 0.85
+    vae_adalora_orth_reg_weight: float = 0.5
     lora_hif4_act: bool = False
     prewarm_frozen_vae: bool = True
     prewarm_log_every: int = 32
@@ -140,6 +148,17 @@ def parse_vae_lora_init_mode(value: Optional[str]) -> str:
     return norm
 
 
+def parse_vae_lora_variant(value: Optional[str]) -> str:
+    norm = str(value or "").strip().lower()
+    if not norm:
+        norm = "plain"
+    if norm not in _VALID_VAE_LORA_VARIANTS:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --vae_lora_variant '{value}'. Expected one of: {sorted(_VALID_VAE_LORA_VARIANTS)}."
+        )
+    return norm
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="End-to-end LFQ finetuning for VAELinear checkpoints.")
     parser.add_argument("--student_checkpoint_dir", type=str, required=True)
@@ -172,6 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Comma-separated module categories to finetune, e.g. down_proj or down,q_proj. Default: all.",
     )
+    parser.add_argument(
+        "--vae_lora_variant",
+        type=parse_vae_lora_variant,
+        default="plain",
+        help="VAELinear proxy adapter variant: plain, rslora, dora or adalora.",
+    )
     parser.add_argument("--vae_lora_rank", type=int, default=8)
     parser.add_argument("--vae_lora_alpha", type=float, default=16.0)
     parser.add_argument("--vae_lora_dropout", type=float, default=0.0)
@@ -179,20 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--vae_lora_init_mode",
         type=parse_vae_lora_init_mode,
         default="zero",
-        help="VAELinear proxy LoRA init mode: zero or residual_svd.",
+        help="VAELinear proxy LoRA init mode: zero, gaussian or residual_svd.",
     )
-    parser.add_argument(
-        "--lora_embedding",
-        type=lambda v: _parse_bool_like(v, arg_name="--lora_embedding"),
-        default=False,
-        help="Enable LoRA finetuning for token embedding during e2e LoRA finetuning.",
-    )
-    parser.add_argument(
-        "--lora_lm_head",
-        type=lambda v: _parse_bool_like(v, arg_name="--lora_lm_head"),
-        default=False,
-        help="Enable LoRA finetuning for lm_head during e2e LoRA finetuning.",
-    )
+    parser.add_argument("--vae_adalora_target_r", type=int, default=8)
+    parser.add_argument("--vae_adalora_init_r", type=int, default=12)
+    parser.add_argument("--vae_adalora_tinit", type=int, default=0)
+    parser.add_argument("--vae_adalora_tfinal", type=int, default=0)
+    parser.add_argument("--vae_adalora_delta_t", type=int, default=1)
+    parser.add_argument("--vae_adalora_beta1", type=float, default=0.85)
+    parser.add_argument("--vae_adalora_beta2", type=float, default=0.85)
+    parser.add_argument("--vae_adalora_orth_reg_weight", type=float, default=0.5)
     parser.add_argument(
         "--lora_hif4_act",
         type=lambda v: _parse_bool_like(v, arg_name="--lora_hif4_act"),
@@ -276,10 +297,45 @@ def _validate_numeric_inputs(parser: argparse.ArgumentParser, args: E2EFinetuneA
         parser.error("--max_eval_samples must be >= 1 when provided.")
 
 
-def validate_args(parser: argparse.ArgumentParser, args: E2EFinetuneArguments) -> None:
+def _validate_variant_inputs(
+    parser: argparse.ArgumentParser,
+    args: E2EFinetuneArguments,
+    training_args: Optional[TrainingArguments],
+) -> None:
+    args.vae_lora_variant = parse_vae_lora_variant(args.vae_lora_variant)
+    args.vae_lora_init_mode = parse_vae_lora_init_mode(args.vae_lora_init_mode)
+
+    if args.vae_lora_variant == "adalora":
+        if args.vae_lora_init_mode == "residual_svd":
+            parser.error("--vae_lora_variant adalora does not support --vae_lora_init_mode residual_svd.")
+        if int(args.vae_adalora_target_r) < 1:
+            parser.error("--vae_adalora_target_r must be >= 1.")
+        if int(args.vae_adalora_init_r) < int(args.vae_adalora_target_r):
+            parser.error("--vae_adalora_init_r must be >= --vae_adalora_target_r.")
+        if int(args.vae_adalora_tinit) < 0:
+            parser.error("--vae_adalora_tinit must be >= 0.")
+        if int(args.vae_adalora_tfinal) < 0:
+            parser.error("--vae_adalora_tfinal must be >= 0.")
+        if int(args.vae_adalora_delta_t) < 1:
+            parser.error("--vae_adalora_delta_t must be >= 1.")
+        if not (0.0 < float(args.vae_adalora_beta1) < 1.0):
+            parser.error("--vae_adalora_beta1 must satisfy 0 < beta1 < 1.")
+        if not (0.0 < float(args.vae_adalora_beta2) < 1.0):
+            parser.error("--vae_adalora_beta2 must satisfy 0 < beta2 < 1.")
+        if float(args.vae_adalora_orth_reg_weight) < 0.0:
+            parser.error("--vae_adalora_orth_reg_weight must be >= 0.")
+        if training_args is None or int(getattr(training_args, "max_steps", -1)) <= 0:
+            parser.error("--vae_lora_variant adalora requires TrainingArguments.max_steps > 0.")
+
+
+def validate_args(
+    parser: argparse.ArgumentParser,
+    args: E2EFinetuneArguments,
+    training_args: Optional[TrainingArguments] = None,
+) -> None:
     _validate_dataset_inputs(parser, args)
     _validate_numeric_inputs(parser, args)
-    args.vae_lora_init_mode = parse_vae_lora_init_mode(args.vae_lora_init_mode)
+    _validate_variant_inputs(parser, args, training_args)
     resume_path = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
     if resume_path:
         resume_path = os.path.abspath(resume_path)
@@ -316,8 +372,7 @@ def parse_args(
     parser = build_parser()
     e2e_ns, remaining = parser.parse_known_args(argv)
     e2e_args = E2EFinetuneArguments(**vars(e2e_ns))
-    validate_args(parser, e2e_args)
-
     hf_parser = HfArgumentParser((HFArguments, TrainingArguments))
     hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=list(remaining))
+    validate_args(parser, e2e_args, training_args)
     return e2e_args, hf_args, training_args

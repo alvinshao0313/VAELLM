@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import transformers
 
+from train_utils.cat_data_prep import normalize_intra_part_sort_mode
 from train_utils.cat_arg_overrides import (
     OverrideSpec,
     OverrideTable,
@@ -25,6 +26,7 @@ from train_utils.train_args import (
     _parse_bool_like,
     _parse_lora_loss_type,
 )
+from train_utils.utils import split_csv
 
 
 @dataclass
@@ -108,7 +110,7 @@ class ResolvedCategoryRuntimeConfig:
     residual_stages: int
     steps: int
     intra_parallel: Tuple[int, int]
-    intra_part_sort_mode: Union[str, Tuple[str, str]]
+    intra_part_sort_mode: Tuple[str, str]
     codebook_bits: int
     codebook_dim: int
     outlier_protect_count: int
@@ -153,18 +155,8 @@ _LORA_DATASET_ALIASES = {
     "alpaca": "alpaca",
 }
 
-
-def _split_csv(value: Optional[str]) -> List[str]:
-    if value is None:
-        return []
-    value = str(value).strip()
-    if not value:
-        return []
-    return [part.strip() for part in value.split(",") if part.strip()]
-
-
 def parse_skip_layers(value: Optional[str]) -> Set[Tuple[int, str]]:
-    entries = _split_csv(value)
+    entries = split_csv(None if value is None else str(value))
     out: Set[Tuple[int, str]] = set()
     for item in entries:
         match = _SKIP_LAYER_PATTERN.match(item)
@@ -566,7 +558,10 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
             residual_stages=int(resolve_category_value(vae_args.residual_stages, category)),
             steps=int(steps_per_category),
             intra_parallel=tuple(resolve_category_value(cat_args.intra_parallel, category)),
-            intra_part_sort_mode=resolve_category_value(cat_args.intra_part_sort_mode, category),
+            intra_part_sort_mode=normalize_intra_part_sort_mode(
+                resolve_category_value(cat_args.intra_part_sort_mode, category),
+                arg_name="--intra_part_sort_mode",
+            ),
             codebook_bits=int(resolve_category_value(vae_args.codebook_bits, category)),
             codebook_dim=int(resolve_category_value(vae_args.codebook_dim, category)),
             outlier_protect_count=int(resolve_category_value(cat_args.outlier_protect_count, category)),

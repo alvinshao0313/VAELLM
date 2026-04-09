@@ -7,12 +7,16 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from transformers.trainer import SCHEDULER_NAME, reissue_pt_warnings, save_fsdp_optimizer
 
 from e2e_fintuning.checkpoint_io import save_e2e_model_checkpoint
-from e2e_fintuning.lora import LoRAEmbedding, LoRALinear, LoRAVAELinear, iter_named_vae_module_refs
-from e2e_fintuning.peft_proxy import PeftVAELinearProxy, is_peft_lora_linear
+from e2e_fintuning.lora import LoRAVAELinear, iter_named_vae_module_refs
+from e2e_fintuning.peft_proxy import (
+    PeftVAELinearProxy,
+    is_peft_proxy_adapter_linear,
+    update_peft_vae_proxy_adalora,
+)
 from litebsq.vae_linear import VAELinear
 from train_utils.distill_losses import (
     build_distill_token_mask,
@@ -78,13 +82,13 @@ def _collect_lora_hif4_act_modules(model: nn.Module) -> List[Tuple[str, nn.Modul
         if not name:
             continue
         has_wrapped_parent = any(
-            isinstance(module_map[parent_name], (LoRAEmbedding, LoRALinear, LoRAVAELinear, PeftVAELinearProxy, VAELinear))
-            or is_peft_lora_linear(module_map[parent_name])
+            isinstance(module_map[parent_name], (LoRAVAELinear, PeftVAELinearProxy, VAELinear))
+            or is_peft_proxy_adapter_linear(module_map[parent_name])
             for parent_name in _iter_parent_names(name)
         )
         if has_wrapped_parent:
             continue
-        if isinstance(module, (LoRALinear, LoRAVAELinear, VAELinear)) or is_peft_lora_linear(module):
+        if isinstance(module, (LoRAVAELinear, VAELinear)) or is_peft_proxy_adapter_linear(module):
             targets.append((name, module))
             continue
         if not isinstance(module, nn.Linear):
@@ -131,7 +135,7 @@ def _iter_named_temporary_modules(model: nn.Module):
     for name, module in model.named_modules():
         if any(name == prefix or name.startswith(f"{prefix}.") for prefix in skip_prefixes):
             continue
-        if isinstance(module, (LoRAEmbedding, LoRALinear, LoRAVAELinear)):
+        if isinstance(module, LoRAVAELinear):
             skip_prefixes.append(f"{name}.base_layer")
         if isinstance(module, PeftVAELinearProxy):
             skip_prefixes.append(f"{name}.base_layer")
@@ -139,9 +143,22 @@ def _iter_named_temporary_modules(model: nn.Module):
         if callable(getattr(module, "set_temporary", None)):
             yield name, module
 
+
 def set_model_temporary(model: nn.Module, temporary: bool) -> None:
     for _name, module in _iter_named_temporary_modules(model):
         module.set_temporary(bool(temporary))
+
+
+class E2EAdaLoraCallback(TrainerCallback):
+    def __init__(self, trainer: "_E2ELossMixin"):
+        self.trainer = trainer
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        update_peft_vae_proxy_adalora(
+            self.trainer._unwrap_student_model(),
+            global_step=int(state.global_step) + 1,
+        )
+        return control
 
 
 def _get_output_logits(outputs) -> torch.Tensor:

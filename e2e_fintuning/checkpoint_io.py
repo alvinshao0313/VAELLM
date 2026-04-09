@@ -6,25 +6,18 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
-from e2e_fintuning.lora import (
-    LoRAEmbedding,
-    LoRALinear,
-    LoRAVAELinear,
-    ensure_lora_embedding,
-    ensure_lora_linear,
-    ensure_lora_vae_linear,
-    iter_named_vae_module_refs,
-)
+from e2e_fintuning.lora import LoRAVAELinear, ensure_lora_vae_linear, iter_named_vae_module_refs
 from e2e_fintuning.peft_proxy import (
-    PeftVAELinearProxy,
     collect_peft_vae_proxy_adapter_specs,
     ensure_peft_vae_linear_proxy,
-    ensure_peft_vae_proxy_lora,
-    refresh_peft_proxy_decoded_linears,
+    ensure_peft_vae_proxy_adapter,
+    inject_peft_proxy_adalora_runtime_state_dict,
     iter_named_peft_vae_proxies,
+    pop_peft_proxy_adalora_runtime_state_dict,
+    refresh_peft_proxy_decoded_linears,
+    restore_peft_proxy_adalora_runtime_state_dict,
     strip_proxy_dense_base_from_state_dict,
 )
-from rotation.common import separate_embeddings_and_lm_head
 from rotation.model_utils import get_model
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
@@ -53,19 +46,17 @@ def _tensor_spec(tensor: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _embedding_and_lm_head_are_tied(model: nn.Module) -> bool:
-    embedding = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
-    lm_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
-    if not isinstance(embedding, nn.Embedding) or not isinstance(lm_head, nn.Linear):
-        return False
-    return embedding.weight.data_ptr() == lm_head.weight.data_ptr()
-
-
-def _checkpoint_has_extra_lora(adapter_modules: Sequence[Dict[str, Any]]) -> bool:
+def _reject_removed_extra_lora_checkpoint(meta: Dict[str, Any]) -> None:
+    extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
+    if bool(extra_meta.get("lora_embedding", False)) or bool(extra_meta.get("lora_lm_head", False)):
+        raise ValueError("embedding/head LoRA checkpoint is no longer supported in e2e_fintuning.")
+    adapter_modules = meta.get("adapter_modules", [])
+    if not isinstance(adapter_modules, list):
+        return
     for spec in adapter_modules:
-        if str(spec.get("adapter_type")) in {"linear_lora", "embedding_lora"}:
-            return True
-    return False
+        adapter_type = str(spec.get("adapter_type"))
+        if adapter_type in {"linear_lora", "embedding_lora"}:
+            raise ValueError(f"Unsupported legacy adapter_type for e2e_fintuning: {adapter_type}")
 
 
 def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
@@ -164,31 +155,6 @@ def _collect_e2e_module_specs(model: nn.Module):
             train_mode=str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
         )
     )
-    for name, module in model.named_modules():
-        if isinstance(module, LoRALinear):
-            adapter_modules.append(
-                {
-                    "name": name,
-                    "adapter_type": "linear_lora",
-                    "base_type": "Linear",
-                    "r": int(module.rank),
-                    "alpha": float(module.lora_alpha),
-                    "dropout": float(module.lora_dropout_p),
-                    "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
-                }
-            )
-        elif isinstance(module, LoRAEmbedding):
-            adapter_modules.append(
-                {
-                    "name": name,
-                    "adapter_type": "embedding_lora",
-                    "base_type": "Embedding",
-                    "r": int(module.rank),
-                    "alpha": float(module.lora_alpha),
-                    "dropout": float(module.lora_dropout_p),
-                    "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
-                }
-            )
     return converted_modules, adapter_modules
 
 
@@ -238,6 +204,7 @@ def save_e2e_model_checkpoint(
         state_dict, converted_modules, adapter_modules = _build_compact_e2e_checkpoint_payload(model, state_dict)
     else:
         converted_modules, adapter_modules = _collect_e2e_module_specs(model)
+    inject_peft_proxy_adalora_runtime_state_dict(model, state_dict)
 
     state_path = os.path.join(output_dir, STATE_DICT_FILENAME)
     torch.save(state_dict, state_path)
@@ -252,7 +219,7 @@ def save_e2e_model_checkpoint(
 
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
-        "version": 3,
+        "version": 4,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_model_path": base_model_path,
         "state_dict_file": STATE_DICT_FILENAME,
@@ -275,18 +242,36 @@ def save_e2e_model_checkpoint(
     }
 
 
-def _rebuild_adapter_modules(model: nn.Module, adapter_modules: Sequence[Dict[str, Any]]) -> None:
-    proxy_specs = [spec for spec in adapter_modules if str(spec.get("adapter_type")) == "peft_proxy_lora"]
-    if proxy_specs:
-        first = proxy_specs[0]
+def _rebuild_proxy_adapter_modules(
+    model: nn.Module,
+    adapter_modules: Sequence[Dict[str, Any]],
+    *,
+    extra_meta: Optional[Dict[str, Any]],
+) -> None:
+    lora_specs = [spec for spec in adapter_modules if str(spec.get("adapter_type")) == "peft_proxy_lora"]
+    adalora_specs = [spec for spec in adapter_modules if str(spec.get("adapter_type")) == "peft_proxy_adalora"]
+    if lora_specs and adalora_specs:
+        raise ValueError("Mixed peft_proxy_lora and peft_proxy_adalora checkpoint is not supported.")
+
+    proxy_specs = lora_specs or adalora_specs
+    if not proxy_specs:
+        return
+
+    for spec in proxy_specs:
+        name = str(spec["name"])
+        module = _get_module_by_name(model, name)
+        ensure_peft_vae_linear_proxy(model, name, module)
+
+    if lora_specs:
+        first = lora_specs[0]
         requested_rank = int(first["r"])
         requested_alpha = float(first["alpha"])
         requested_dropout = float(first.get("dropout", 0.0))
         requested_rslora = bool(first.get("use_rslora", False))
-        for spec in proxy_specs:
-            name = str(spec["name"])
-            module = _get_module_by_name(model, name)
-            ensure_peft_vae_linear_proxy(model, name, module)
+        requested_dora = bool(first.get("use_dora", False))
+        if requested_rslora and requested_dora:
+            raise ValueError("Checkpoint cannot enable both rsLoRA and DoRA at the same time.")
+        for spec in lora_specs:
             if int(spec["r"]) != requested_rank:
                 raise ValueError("All peft_proxy_lora modules must share the same rank.")
             if float(spec["alpha"]) != requested_alpha:
@@ -295,21 +280,88 @@ def _rebuild_adapter_modules(model: nn.Module, adapter_modules: Sequence[Dict[st
                 raise ValueError("All peft_proxy_lora modules must share the same dropout.")
             if bool(spec.get("use_rslora", False)) != requested_rslora:
                 raise ValueError("All peft_proxy_lora modules must share the same use_rslora value.")
-        ensure_peft_vae_proxy_lora(
+            if bool(spec.get("use_dora", False)) != requested_dora:
+                raise ValueError("All peft_proxy_lora modules must share the same use_dora value.")
+        variant = "dora" if requested_dora else ("rslora" if requested_rslora else "plain")
+        ensure_peft_vae_proxy_adapter(
             model,
+            variant=variant,
             rank=requested_rank,
             alpha=requested_alpha,
             dropout=requested_dropout,
-            use_rslora=requested_rslora,
+            init_mode="zero",
         )
+        return
 
+    first = adalora_specs[0]
+    requested_alpha = float(first["alpha"])
+    requested_dropout = float(first.get("dropout", 0.0))
+    requested_target_r = int(first.get("target_r", extra_meta.get("vae_adalora_target_r")))
+    requested_init_r = int(first.get("init_r", first["r"]))
+    requested_tinit = int(first.get("tinit", extra_meta.get("vae_adalora_tinit", 0)))
+    requested_tfinal = int(first.get("tfinal", extra_meta.get("vae_adalora_tfinal", 0)))
+    requested_delta_t = int(first.get("delta_t", extra_meta.get("vae_adalora_delta_t", 1)))
+    requested_beta1 = float(first.get("beta1", extra_meta.get("vae_adalora_beta1", 0.85)))
+    requested_beta2 = float(first.get("beta2", extra_meta.get("vae_adalora_beta2", 0.85)))
+    requested_orth = float(first.get("orth_reg_weight", extra_meta.get("vae_adalora_orth_reg_weight", 0.5)))
+    requested_total_step = first.get("total_step", extra_meta.get("vae_adalora_total_step"))
+    requested_total_step = None if requested_total_step is None else int(requested_total_step)
+    for spec in adalora_specs:
+        if int(spec["r"]) != requested_init_r:
+            raise ValueError("All peft_proxy_adalora modules must share the same init_r.")
+        if float(spec["alpha"]) != requested_alpha:
+            raise ValueError("All peft_proxy_adalora modules must share the same alpha.")
+        if float(spec.get("dropout", 0.0)) != requested_dropout:
+            raise ValueError("All peft_proxy_adalora modules must share the same dropout.")
+        if int(spec.get("target_r", requested_target_r)) != requested_target_r:
+            raise ValueError("All peft_proxy_adalora modules must share the same target_r.")
+        if int(spec.get("init_r", requested_init_r)) != requested_init_r:
+            raise ValueError("All peft_proxy_adalora modules must share the same init_r.")
+        if int(spec.get("tinit", requested_tinit)) != requested_tinit:
+            raise ValueError("All peft_proxy_adalora modules must share the same tinit.")
+        if int(spec.get("tfinal", requested_tfinal)) != requested_tfinal:
+            raise ValueError("All peft_proxy_adalora modules must share the same tfinal.")
+        if int(spec.get("delta_t", requested_delta_t)) != requested_delta_t:
+            raise ValueError("All peft_proxy_adalora modules must share the same delta_t.")
+        if float(spec.get("beta1", requested_beta1)) != requested_beta1:
+            raise ValueError("All peft_proxy_adalora modules must share the same beta1.")
+        if float(spec.get("beta2", requested_beta2)) != requested_beta2:
+            raise ValueError("All peft_proxy_adalora modules must share the same beta2.")
+        if float(spec.get("orth_reg_weight", requested_orth)) != requested_orth:
+            raise ValueError("All peft_proxy_adalora modules must share the same orth_reg_weight.")
+    ensure_peft_vae_proxy_adapter(
+        model,
+        variant="adalora",
+        rank=requested_init_r,
+        alpha=requested_alpha,
+        dropout=requested_dropout,
+        init_mode="zero",
+        total_step=requested_total_step,
+        adalora_target_r=requested_target_r,
+        adalora_init_r=requested_init_r,
+        adalora_tinit=requested_tinit,
+        adalora_tfinal=requested_tfinal,
+        adalora_delta_t=requested_delta_t,
+        adalora_beta1=requested_beta1,
+        adalora_beta2=requested_beta2,
+        adalora_orth_reg_weight=requested_orth,
+    )
+
+
+def _rebuild_adapter_modules(
+    model: nn.Module,
+    adapter_modules: Sequence[Dict[str, Any]],
+    *,
+    extra_meta: Optional[Dict[str, Any]],
+) -> None:
+    _rebuild_proxy_adapter_modules(model, adapter_modules, extra_meta=extra_meta or {})
     for spec in adapter_modules:
         adapter_type = str(spec.get("adapter_type"))
-        if adapter_type == "peft_proxy_lora":
+        if adapter_type in {"peft_proxy_lora", "peft_proxy_adalora"}:
             continue
-        name = str(spec["name"])
-        module = _get_module_by_name(model, name)
         if adapter_type == "vae_lora":
+            name = str(spec["name"])
+            module = _get_module_by_name(model, name)
             ensure_lora_vae_linear(
                 model,
                 name,
@@ -319,26 +371,8 @@ def _rebuild_adapter_modules(model: nn.Module, adapter_modules: Sequence[Dict[st
                 dropout=float(spec.get("dropout", 0.0)),
             )
             continue
-        if adapter_type == "linear_lora":
-            ensure_lora_linear(
-                model,
-                name,
-                module,
-                rank=int(spec["r"]),
-                alpha=float(spec["alpha"]),
-                dropout=float(spec.get("dropout", 0.0)),
-            )
-            continue
-        if adapter_type == "embedding_lora":
-            ensure_lora_embedding(
-                model,
-                name,
-                module,
-                rank=int(spec["r"]),
-                alpha=float(spec["alpha"]),
-                dropout=float(spec.get("dropout", 0.0)),
-            )
-            continue
+        if adapter_type in {"linear_lora", "embedding_lora"}:
+            raise ValueError(f"Unsupported adapter_type for e2e_fintuning: {adapter_type}")
         raise ValueError(f"Unsupported adapter_type: {spec.get('adapter_type')}")
 
 
@@ -367,20 +401,21 @@ def load_e2e_checkpoint_into_model(
 
     with open(meta_path, "r", encoding="utf-8") as handle:
         meta = json.load(handle)
+    _reject_removed_extra_lora_checkpoint(meta)
 
     converted_modules = meta.get("converted_modules", [])
     if converted_modules:
         _rebuild_converted_modules(model, converted_modules)
 
     adapter_modules = meta.get("adapter_modules", [])
-    if adapter_modules and _checkpoint_has_extra_lora(adapter_modules) and _embedding_and_lm_head_are_tied(model):
-        separate_embeddings_and_lm_head(model)
+    extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
     if adapter_modules:
-        _rebuild_adapter_modules(model, adapter_modules)
+        _rebuild_adapter_modules(model, adapter_modules, extra_meta=extra_meta)
 
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)
     state_dict = _torch_load_state_dict(state_dict_path, map_location=map_location)
+    adalora_runtime_state = pop_peft_proxy_adalora_runtime_state_dict(state_dict)
     model_state_keys = tuple(model.state_dict().keys())
     state_dict, _remap_count = _remap_legacy_parallel_linear_state_dict_keys(state_dict, model_state_keys)
     _materialize_missing_bias_params_from_state_dict(model, state_dict)
@@ -388,6 +423,7 @@ def load_e2e_checkpoint_into_model(
 
     load_result = model.load_state_dict(state_dict, strict=strict)
     refresh_peft_proxy_decoded_linears(model)
+    restore_peft_proxy_adalora_runtime_state_dict(model, adalora_runtime_state)
     model.eval()
     return model, meta, load_result
 
@@ -406,6 +442,7 @@ def load_e2e_model_checkpoint(
 
     with open(meta_path, "r", encoding="utf-8") as handle:
         meta = json.load(handle)
+    _reject_removed_extra_lora_checkpoint(meta)
 
     base_path = base_model_path or meta.get("base_model_path")
     if not base_path:
