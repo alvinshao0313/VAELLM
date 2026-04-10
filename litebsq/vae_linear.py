@@ -37,6 +37,9 @@ class VAELinear(nn.Module):
         protected_input_weight: Optional[torch.Tensor] = None,
         protected_output_indices: Optional[torch.Tensor] = None,
         protected_output_weight: Optional[torch.Tensor] = None,
+        sparse_residual_row_indices: Optional[torch.Tensor] = None,
+        sparse_residual_col_indices: Optional[torch.Tensor] = None,
+        sparse_residual_values: Optional[torch.Tensor] = None,
         always_use_original: bool = False,
         protect_original_weight: bool = False,
     ):
@@ -250,6 +253,66 @@ class VAELinear(nn.Module):
             )
         if protected_out_count > 0 and self.protected_output_weight is None:
             raise ValueError("protected_output_weight is required when protected_output_indices is provided.")
+
+        sparse_payload_provided = any(
+            item is not None
+            for item in (
+                sparse_residual_row_indices,
+                sparse_residual_col_indices,
+                sparse_residual_values,
+            )
+        )
+        if sparse_payload_provided:
+            if (
+                sparse_residual_row_indices is None
+                or sparse_residual_col_indices is None
+                or sparse_residual_values is None
+            ):
+                raise ValueError(
+                    "sparse_residual_row_indices, sparse_residual_col_indices, and sparse_residual_values "
+                    "must be provided together."
+                )
+            sparse_row_idx = sparse_residual_row_indices.detach().to(device="cpu").contiguous()
+            sparse_col_idx = sparse_residual_col_indices.detach().to(device="cpu").contiguous()
+            sparse_values = sparse_residual_values.detach().to(device="cpu").contiguous()
+            if sparse_row_idx.ndim != 1 or sparse_col_idx.ndim != 1 or sparse_values.ndim != 1:
+                raise ValueError("sparse residual COO payload must be 1D tensors.")
+            if sparse_row_idx.numel() != sparse_col_idx.numel() or sparse_row_idx.numel() != sparse_values.numel():
+                raise ValueError(
+                    "sparse residual COO payload length mismatch: "
+                    f"rows={int(sparse_row_idx.numel())} cols={int(sparse_col_idx.numel())} "
+                    f"values={int(sparse_values.numel())}"
+                )
+            if sparse_row_idx.numel() == 0:
+                self.register_buffer("sparse_residual_row_indices", None, persistent=True)
+                self.register_buffer("sparse_residual_col_indices", None, persistent=True)
+                self.register_buffer("sparse_residual_values", None, persistent=True)
+            else:
+                if sparse_row_idx.is_floating_point() or sparse_row_idx.is_complex() or sparse_row_idx.dtype == torch.bool:
+                    raise ValueError(f"sparse_residual_row_indices must be integer dtype, got {sparse_row_idx.dtype}")
+                if sparse_col_idx.is_floating_point() or sparse_col_idx.is_complex() or sparse_col_idx.dtype == torch.bool:
+                    raise ValueError(f"sparse_residual_col_indices must be integer dtype, got {sparse_col_idx.dtype}")
+                if not sparse_values.is_floating_point():
+                    raise ValueError(f"sparse_residual_values must be floating dtype, got {sparse_values.dtype}")
+                sparse_row_check = sparse_row_idx.to(dtype=torch.int64)
+                sparse_col_check = sparse_col_idx.to(dtype=torch.int64)
+                if int(sparse_row_check.min().item()) < 0 or int(sparse_row_check.max().item()) >= self.out_features:
+                    raise ValueError(
+                        f"sparse_residual_row_indices must be within [0, {self.out_features}), got "
+                        f"[{int(sparse_row_check.min().item())}, {int(sparse_row_check.max().item())}]"
+                    )
+                if int(sparse_col_check.min().item()) < 0 or int(sparse_col_check.max().item()) >= self.in_features:
+                    raise ValueError(
+                        f"sparse_residual_col_indices must be within [0, {self.in_features}), got "
+                        f"[{int(sparse_col_check.min().item())}, {int(sparse_col_check.max().item())}]"
+                    )
+                self.register_buffer("sparse_residual_row_indices", sparse_row_idx, persistent=True)
+                self.register_buffer("sparse_residual_col_indices", sparse_col_idx, persistent=True)
+                self.register_buffer("sparse_residual_values", sparse_values, persistent=True)
+        else:
+            self.register_buffer("sparse_residual_row_indices", None, persistent=True)
+            self.register_buffer("sparse_residual_col_indices", None, persistent=True)
+            self.register_buffer("sparse_residual_values", None, persistent=True)
 
         if bias is None:
             self.register_parameter("bias", None)
@@ -616,7 +679,24 @@ class VAELinear(nn.Module):
             compressed_weight,
             dtype=dtype,
         )
+        full_weight = self._apply_sparse_residual_patch(full_weight, dtype=dtype)
         return full_weight.contiguous()
+
+    def _apply_sparse_residual_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        row_idx = getattr(self, "sparse_residual_row_indices", None)
+        if row_idx is None:
+            return full_weight
+        col_idx = getattr(self, "sparse_residual_col_indices", None)
+        values = getattr(self, "sparse_residual_values", None)
+        if col_idx is None or values is None:
+            raise RuntimeError("Sparse residual COO payload is incomplete.")
+        if int(row_idx.numel()) == 0:
+            return full_weight
+        row_idx = row_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
+        col_idx = col_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
+        values = values.to(device=full_weight.device, dtype=dtype, non_blocking=True)
+        full_weight.index_put_((row_idx, col_idx), values, accumulate=True)
+        return full_weight
 
     def has_protected_outliers(self) -> bool:
         protected_input_weight = getattr(self, "protected_input_weight", None)
@@ -624,6 +704,10 @@ class VAELinear(nn.Module):
             return True
         protected_output_weight = getattr(self, "protected_output_weight", None)
         return isinstance(protected_output_weight, torch.Tensor) and int(protected_output_weight.numel()) > 0
+
+    def has_sparse_residual(self) -> bool:
+        sparse_values = getattr(self, "sparse_residual_values", None)
+        return isinstance(sparse_values, torch.Tensor) and int(sparse_values.numel()) > 0
 
     def has_original_linear(self) -> bool:
         return self.original_weight is not None

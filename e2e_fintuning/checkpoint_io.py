@@ -128,6 +128,9 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
         "protected_input_weight": _tensor_spec(getattr(module, "protected_input_weight", None)),
         "protected_output_indices": _tensor_spec(getattr(module, "protected_output_indices", None)),
         "protected_output_weight": _tensor_spec(getattr(module, "protected_output_weight", None)),
+        "sparse_residual_row_indices": _tensor_spec(getattr(module, "sparse_residual_row_indices", None)),
+        "sparse_residual_col_indices": _tensor_spec(getattr(module, "sparse_residual_col_indices", None)),
+        "sparse_residual_values": _tensor_spec(getattr(module, "sparse_residual_values", None)),
     }
 
 

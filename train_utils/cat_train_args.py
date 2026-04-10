@@ -45,6 +45,9 @@ class NormalizedCatArgs:
     eval_every: int
     eval_blocks: int
     outlier_protect_count: OverrideTable[int]
+    outlier_protect_mode: str
+    outlier_residual_top_p: float
+    outlier_residual_score: str
     outlier_protect_axis: str
     wa_mse_calib_dataset: str
     wa_mse_calib_nsamples: int
@@ -146,6 +149,8 @@ _AFTER_CATEGORY_OVERRIDE_SELECTORS = ("default", "after")
 _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse")
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
+_OUTLIER_PROTECT_MODE_CHOICES = ("channel", "residual_sparse")
+_OUTLIER_RESIDUAL_SCORE_CHOICES = ("abs", "input_act_weighted_abs")
 _LORA_DATASET_ALIASES = {
     "wiki": "wiki",
     "wikitext2": "wiki",
@@ -479,6 +484,9 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         eval_every=int(raw_args.eval_every),
         eval_blocks=int(raw_args.eval_blocks),
         outlier_protect_count=_parse_cat_override(raw_args.outlier_protect_count, spec=_OUTLIER_PROTECT_COUNT_SPEC),
+        outlier_protect_mode=str(raw_args.outlier_protect_mode).strip().lower(),
+        outlier_residual_top_p=float(raw_args.outlier_residual_top_p),
+        outlier_residual_score=str(raw_args.outlier_residual_score).strip().lower(),
         outlier_protect_axis=str(raw_args.outlier_protect_axis).strip().lower(),
         wa_mse_calib_dataset=str(raw_args.wa_mse_calib_dataset),
         wa_mse_calib_nsamples=int(raw_args.wa_mse_calib_nsamples),
@@ -513,6 +521,47 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         output_dir=str(raw_args.output_dir),
         allow_tail_group=bool(raw_args.allow_tail_group),
     )
+
+
+def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
+    mode = str(cat_args.outlier_protect_mode).strip().lower()
+    top_p = float(cat_args.outlier_residual_top_p)
+    protect_table = cat_args.outlier_protect_count
+    if mode not in _OUTLIER_PROTECT_MODE_CHOICES:
+        raise ValueError(
+            f"Unsupported --outlier_protect_mode={cat_args.outlier_protect_mode!r}. "
+            f"Expected one of: {', '.join(_OUTLIER_PROTECT_MODE_CHOICES)}."
+        )
+    if str(cat_args.outlier_residual_score).strip().lower() not in _OUTLIER_RESIDUAL_SCORE_CHOICES:
+        raise ValueError(
+            f"Unsupported --outlier_residual_score={cat_args.outlier_residual_score!r}. "
+            f"Expected one of: {', '.join(_OUTLIER_RESIDUAL_SCORE_CHOICES)}."
+        )
+    if mode == "channel":
+        if top_p != 0.0:
+            raise ValueError(
+                "--outlier_residual_top_p is only valid when --outlier_protect_mode=residual_sparse. "
+                f"Got top_p={top_p} with mode=channel."
+            )
+        return
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError(
+            f"--outlier_residual_top_p must satisfy 0 < top_p <= 1 when "
+            f"--outlier_protect_mode=residual_sparse, got {top_p}."
+        )
+    nonzero_entries = []
+    if bool(getattr(protect_table, "has_default", False)) and int(getattr(protect_table, "default", 0)) != 0:
+        nonzero_entries.append(f"default={int(getattr(protect_table, 'default', 0))}")
+    nonzero_entries.extend(
+        f"cat:{category}={int(value)}"
+        for category, value in sorted(getattr(protect_table, "by_category", {}).items())
+        if int(value) != 0
+    )
+    if nonzero_entries:
+        raise ValueError(
+            "--outlier_protect_count must be 0 for every selector when "
+            "--outlier_protect_mode=residual_sparse. Got: " + ",".join(nonzero_entries)
+        )
 
 
 def _normalize_cat_train_vae_args(raw_args):
@@ -620,6 +669,26 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_every", type=int, default=0)
     parser.add_argument("--eval_blocks", type=int, default=256)
     parser.add_argument("--outlier_protect_count", type=str, default="default=0", help=f"类别覆盖参数。示例：{_OUTLIER_PROTECT_COUNT_SPEC.example}")
+    parser.add_argument(
+        "--outlier_protect_mode",
+        type=str,
+        choices=list(_OUTLIER_PROTECT_MODE_CHOICES),
+        default="channel",
+        help="离群值保护模式：channel 为压缩前保护通道，residual_sparse 为训练后保存残差 COO 补丁。",
+    )
+    parser.add_argument(
+        "--outlier_residual_top_p",
+        type=float,
+        default=0.0,
+        help="仅 residual_sparse 模式生效。按最终完整重构权重残差保留 top-p 比例元素。",
+    )
+    parser.add_argument(
+        "--outlier_residual_score",
+        type=str,
+        choices=list(_OUTLIER_RESIDUAL_SCORE_CHOICES),
+        default="abs",
+        help="仅 residual_sparse 模式生效。残差打分方式：abs 或 input_act_weighted_abs。",
+    )
     parser.add_argument("--outlier_protect_axis", type=str, choices=["input", "output"], default="input", help="Choose whether outlier protection preserves input channels or output channels.")
     parser.add_argument("--wa_mse_calib_dataset", type=str, default="wikitext2", help="Calibration dataset used for wa_mse dynamic act-max recomputation.")
     parser.add_argument("--wa_mse_calib_nsamples", type=int, default=512, help="Calibration sample count used for wa_mse dynamic act-max recomputation.")
@@ -674,6 +743,7 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
     script_parser = build_cat_train_parser()
     raw_script_args, remaining = script_parser.parse_known_args(list(argv))
     cat_args = _normalize_cat_train_script_args(raw_script_args)
+    _validate_outlier_protect_mode_args(cat_args)
 
     vae_parser = _build_cat_train_vae_parser()
     raw_vae_args, unknown_args = vae_parser.parse_known_args(remaining)

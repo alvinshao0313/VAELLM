@@ -11,9 +11,11 @@ export CUDA_VISIBLE_DEVICES=3
 # --include_all_linears
 # --rot_llm
 # --unload_vae_original_weights_on_final_save
+# --allow_tail_group "true"
+# --outlier_residual_score "abs" or "input_act_weighted_abs"
 
 python tools/cat_train.py \
-  --model_path "Qwen/Qwen3-8B" \
+  --model_path "meta-llama/Llama-2-7b-hf" \
   --output_dir ".result" \
   --seed "0" \
   --train_device "cuda" \
@@ -22,11 +24,11 @@ python tools/cat_train.py \
   --save_model \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --category_order "q_proj" \
-  --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
+  --category_order "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --transpose_modules "v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "1.down_proj" \
-  --linear_group_size "36" \
+  --linear_group_size "32" \
   --steps_per_category "default=5000" \
   --batch_size "2048" \
   --log_every "50" \
@@ -37,6 +39,9 @@ python tools/cat_train.py \
   --intra_part_sort_mode "default=none" \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
+  --outlier_protect_mode "residual_sparse" \
+  --outlier_residual_top_p "0.003" \
+  --outlier_residual_score "input_act_weighted_abs" \
   --wa_mse_calib_dataset "wikitext2" \
   --wa_mse_calib_nsamples "512" \
   --wa_mse_calib_seqlen "512" \
@@ -74,10 +79,10 @@ python tools/cat_train.py \
   --use_checkpoint \
   --new_quant \
   --lora_after_category \
-  --lora_rank "default=32" \
-  --lora_alpha "default=64.0" \
+  --lora_rank "default=8" \
+  --lora_alpha "default=16.0" \
   --lora_dropout "default=0.0" \
-  --lora_steps "default=3000" \
+  --lora_steps "default=2000" \
   --lora_batch_size "default=2" \
   --lora_nsamples "default=10000000" \
   --lora_lr "default=1e-4" \
@@ -86,7 +91,7 @@ python tools/cat_train.py \
   --lora_post_attn "false" \
   --lora_temperature "default=1.0" \
   --lora_loss_alpha "default=0.5" \
-  --lora_loss_type "default=kl_top_1000" \
+  --lora_loss_type "default=sft" \
   --lora_use_dora "default=false" \
   --lora_hif4_act "false" \
   --lora_gradient_accumulation_steps "1" \
@@ -95,7 +100,7 @@ python tools/cat_train.py \
   --lora_warmup_ratio "0.3" \
   --lora_group_by_length "true" \
   --lora_lr_scheduler_type "linear" \
-  --lora_model_max_length "2048" \
+  --lora_model_max_length "4096" \
   --fp16 "false" \
   --bf16 "true" \
   "$@"

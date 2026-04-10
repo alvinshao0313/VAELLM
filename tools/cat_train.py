@@ -349,6 +349,161 @@ def _collect_sorted_category_refs(
     return refs_sorted, missing
 
 
+def _build_vae_linear_from_stage_payload(
+    *,
+    old_module: nn.Module,
+    transpose: bool,
+    split_meta,
+    stage_part_bits_payload: Sequence[object],
+    stage_part_decoders_payload: Sequence[object],
+    stage_codebook_dims: Sequence[int],
+    parallel_rows: int,
+    parallel_cols: int,
+    parallel_parts: int,
+    bias,
+    original_weight,
+    always_use_original: bool,
+    protect_original_weight: bool,
+    sparse_residual_row_indices: Optional[torch.Tensor] = None,
+    sparse_residual_col_indices: Optional[torch.Tensor] = None,
+    sparse_residual_values: Optional[torch.Tensor] = None,
+):
+    from litebsq.vae_linear import VAELinear
+
+    residual_stages = int(len(stage_part_bits_payload))
+    if residual_stages < 1:
+        raise ValueError("stage_part_bits_payload cannot be empty.")
+    common_kwargs = dict(
+        in_features=old_module.in_features,
+        out_features=old_module.out_features,
+        bias=bias,
+        original_weight=original_weight,
+        codebook_dim=int(stage_codebook_dims[0]),
+        stage_codebook_dims=list(int(v) for v in stage_codebook_dims),
+        transpose=bool(transpose),
+        parallel_parts=int(parallel_parts),
+        parallel_rows=int(parallel_rows),
+        parallel_cols=int(parallel_cols),
+        restore_row_indices=split_meta.restore_row_indices,
+        restore_col_indices=split_meta.restore_col_indices,
+        compressed_in_features=int(split_meta.compressed_in_features),
+        compressed_out_features=int(split_meta.compressed_out_features),
+        protected_input_indices=split_meta.protected_input_indices,
+        protected_input_weight=split_meta.protected_input_weight,
+        protected_output_indices=split_meta.protected_output_indices,
+        protected_output_weight=split_meta.protected_output_weight,
+        sparse_residual_row_indices=sparse_residual_row_indices,
+        sparse_residual_col_indices=sparse_residual_col_indices,
+        sparse_residual_values=sparse_residual_values,
+        always_use_original=bool(always_use_original),
+        protect_original_weight=bool(protect_original_weight),
+    )
+    if residual_stages == 1:
+        return VAELinear(
+            vq_weight=stage_part_bits_payload[0],
+            decoder=stage_part_decoders_payload[0],
+            **common_kwargs,
+        )
+    return VAELinear(
+        vq_weight=None,
+        decoder=None,
+        stage_vq_weights=list(stage_part_bits_payload),
+        stage_decoders=list(stage_part_decoders_payload),
+        **common_kwargs,
+    )
+
+
+def _decode_reconstructed_linear_weight(
+    *,
+    old_module: nn.Module,
+    transpose: bool,
+    split_meta,
+    stage_part_bits_payload: Sequence[object],
+    stage_part_decoders_payload: Sequence[object],
+    stage_codebook_dims: Sequence[int],
+    parallel_rows: int,
+    parallel_cols: int,
+    parallel_parts: int,
+) -> torch.Tensor:
+    temp_linear = _build_vae_linear_from_stage_payload(
+        old_module=old_module,
+        transpose=transpose,
+        split_meta=split_meta,
+        stage_part_bits_payload=stage_part_bits_payload,
+        stage_part_decoders_payload=stage_part_decoders_payload,
+        stage_codebook_dims=stage_codebook_dims,
+        parallel_rows=parallel_rows,
+        parallel_cols=parallel_cols,
+        parallel_parts=parallel_parts,
+        bias=None,
+        original_weight=None,
+        always_use_original=False,
+        protect_original_weight=False,
+    )
+    return temp_linear._decode_weight(dtype=torch.float32).detach().to(device="cpu", dtype=torch.float32)
+
+
+def _build_sparse_residual_coo_patch(
+    *,
+    linear_name: str,
+    original_weight: torch.Tensor,
+    reconstructed_weight: torch.Tensor,
+    activation_weight: Optional[torch.Tensor],
+    score_mode: str,
+    top_p: float,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    original_weight = original_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    reconstructed_weight = reconstructed_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if tuple(original_weight.shape) != tuple(reconstructed_weight.shape):
+        raise ValueError(
+            f"{linear_name}: original/reconstructed weight shape mismatch: "
+            f"{tuple(original_weight.shape)} vs {tuple(reconstructed_weight.shape)}"
+        )
+    out_features, in_features = int(original_weight.shape[0]), int(original_weight.shape[1])
+    if out_features > 65535 or in_features > 65535:
+        raise ValueError(
+            f"{linear_name}: residual_sparse requires out_features/in_features <= 65535 for uint16 COO indices, "
+            f"got out_features={out_features}, in_features={in_features}."
+        )
+    if not (0.0 < float(top_p) <= 1.0):
+        raise ValueError(f"{linear_name}: residual_sparse top_p must satisfy 0 < top_p <= 1, got {top_p}.")
+
+    residual = (original_weight - reconstructed_weight).contiguous()
+    score = residual.abs()
+    resolved_score_mode = str(score_mode).strip().lower()
+    if resolved_score_mode == "input_act_weighted_abs":
+        if activation_weight is None:
+            raise ValueError(f"{linear_name}: input_act_weighted_abs requires activation_weight.")
+        act = activation_weight.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
+        if int(act.numel()) != in_features:
+            raise ValueError(
+                f"{linear_name}: activation_weight size mismatch for residual_sparse, "
+                f"got {int(act.numel())}, expected {in_features}."
+            )
+        score = score * act.view(1, in_features)
+    elif resolved_score_mode != "abs":
+        raise ValueError(
+            f"{linear_name}: unsupported residual sparse score mode {score_mode!r}. "
+            "Expected abs or input_act_weighted_abs."
+        )
+
+    flat_score = score.view(-1)
+    total_numel = int(flat_score.numel())
+    nnz_target = max(1, int(math.ceil(float(top_p) * float(total_numel))))
+    nnz_target = min(nnz_target, total_numel)
+    top_score, top_idx = torch.topk(flat_score, k=nnz_target, largest=True, sorted=False)
+    positive_mask = top_score > 0
+    top_idx = top_idx[positive_mask]
+    if int(top_idx.numel()) == 0:
+        return None, None, None
+    top_idx = torch.sort(top_idx.to(dtype=torch.int64)).values.contiguous()
+    flat_residual = residual.view(-1)
+    values = flat_residual.index_select(0, top_idx).to(dtype=torch.float16).contiguous()
+    row_idx = torch.div(top_idx, in_features, rounding_mode="floor").to(dtype=torch.uint16).contiguous()
+    col_idx = torch.remainder(top_idx, in_features).to(dtype=torch.uint16).contiguous()
+    return row_idx, col_idx, values
+
+
 def _train_group_vae_and_replace(
     *,
     model: nn.Module,
@@ -366,10 +521,12 @@ def _train_group_vae_and_replace(
     eval_blocks: int,
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
+    outlier_protect_mode: str = "channel",
+    outlier_residual_top_p: float = 0.0,
+    outlier_residual_score: str = "abs",
     outlier_protect_axis: str = "input",
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
-    from litebsq.vae_linear import VAELinear
 
     train_dtype = _resolve_train_dtype(training_args)
 
@@ -389,6 +546,21 @@ def _train_group_vae_and_replace(
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
     stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
     outlier_protect_count = int(runtime_cfg.outlier_protect_count)
+    resolved_outlier_mode = str(outlier_protect_mode).strip().lower()
+    resolved_residual_score = str(outlier_residual_score).strip().lower()
+    residual_sparse_enabled = resolved_outlier_mode == "residual_sparse"
+    residual_sparse_needs_activation = (
+        residual_sparse_enabled and resolved_residual_score == "input_act_weighted_abs"
+    )
+    if resolved_outlier_mode not in {"channel", "residual_sparse"}:
+        raise ValueError(
+            f"[{group_tag}] unsupported outlier_protect_mode={outlier_protect_mode!r}. "
+            "Expected channel or residual_sparse."
+        )
+    if residual_sparse_enabled and int(outlier_protect_count) != 0:
+        raise ValueError(
+            f"[{group_tag}] residual_sparse mode requires outlier_protect_count=0, got {outlier_protect_count}."
+        )
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
     row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
     parts_per_linear = int(row_parts) * int(col_parts)
@@ -397,7 +569,8 @@ def _train_group_vae_and_replace(
         use_wa_mse_loss
         or row_sort_mode == "act_l2"
         or col_sort_mode == "act_l2"
-        or int(outlier_protect_count) > 0
+        or (resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0)
+        or residual_sparse_needs_activation
     )
     effective_activation_weight: Optional[Dict[str, torch.Tensor]] = None
     if needs_dynamic_activation:
@@ -453,7 +626,7 @@ def _train_group_vae_and_replace(
         activation_weight_by_linear=effective_activation_weight,
         train_device=train_device,
         intra_part_sort_mode=stage_sort_mode,
-        outlier_protect_count=int(outlier_protect_count),
+        outlier_protect_count=int(outlier_protect_count) if resolved_outlier_mode == "channel" else 0,
         outlier_protect_axis=str(outlier_protect_axis),
     )
     num_models = int(prep_result.num_models)
@@ -461,7 +634,7 @@ def _train_group_vae_and_replace(
     use_wa_mse = bool(prep_result.use_wa_mse)
     part_metas = prep_result.part_metas
     split_metas = prep_result.split_metas
-    if int(outlier_protect_count) > 0:
+    if resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0:
         per_linear_protected = []
         for ref, meta in zip(group_refs, split_metas):
             if str(outlier_protect_axis) == "output":
@@ -480,6 +653,13 @@ def _train_group_vae_and_replace(
             str(outlier_protect_axis),
             int(outlier_protect_count),
             ",".join(per_linear_protected),
+        )
+    if residual_sparse_enabled:
+        log.info(
+            "[%s] residual sparse protection enabled: top_p=%.6f score=%s",
+            group_tag,
+            float(outlier_residual_top_p),
+            resolved_residual_score,
         )
     if len(split_metas) != len(group_refs):
         raise RuntimeError(
@@ -777,57 +957,63 @@ def _train_group_vae_and_replace(
                 stage_part_bits_payload.append(part_bits[0])
                 stage_part_decoders_payload.append(part_decoders[0])
 
-        if residual_stages == 1:
-            new_linear = VAELinear(
-                in_features=old.in_features,
-                out_features=old.out_features,
-                bias=old.bias,
-                original_weight=old.weight,
-                vq_weight=stage_part_bits_payload[0],
-                decoder=stage_part_decoders_payload[0],
-                codebook_dim=int(all_stage_codebook_dims[0]),
+        sparse_row_idx = None
+        sparse_col_idx = None
+        sparse_values = None
+        if residual_sparse_enabled:
+            activation_weight = None
+            if resolved_residual_score == "input_act_weighted_abs":
+                if effective_activation_weight is None or r.name not in effective_activation_weight:
+                    raise ValueError(
+                        f"[{group_tag}] missing activation vector for residual_sparse scoring at linear '{r.name}'."
+                    )
+                activation_weight = effective_activation_weight[r.name]
+            reconstructed_weight = _decode_reconstructed_linear_weight(
+                old_module=old,
                 transpose=r.transpose,
-                parallel_parts=parts_per_linear,
+                split_meta=split_meta,
+                stage_part_bits_payload=stage_part_bits_payload,
+                stage_part_decoders_payload=stage_part_decoders_payload,
+                stage_codebook_dims=all_stage_codebook_dims,
                 parallel_rows=row_parts,
                 parallel_cols=col_parts,
-                restore_row_indices=split_meta.restore_row_indices,
-                restore_col_indices=split_meta.restore_col_indices,
-                compressed_in_features=int(split_meta.compressed_in_features),
-                compressed_out_features=int(split_meta.compressed_out_features),
-                protected_input_indices=split_meta.protected_input_indices,
-                protected_input_weight=split_meta.protected_input_weight,
-                protected_output_indices=split_meta.protected_output_indices,
-                protected_output_weight=split_meta.protected_output_weight,
-                always_use_original=skip_this,
-                protect_original_weight=skip_this,
-            ).to(convert_device)
-        else:
-            new_linear = VAELinear(
-                in_features=old.in_features,
-                out_features=old.out_features,
-                bias=old.bias,
-                original_weight=old.weight,
-                vq_weight=None,
-                decoder=None,
-                stage_vq_weights=stage_part_bits_payload,
-                stage_decoders=stage_part_decoders_payload,
-                codebook_dim=int(all_stage_codebook_dims[0]),
-                stage_codebook_dims=list(all_stage_codebook_dims),
-                transpose=r.transpose,
                 parallel_parts=parts_per_linear,
-                parallel_rows=row_parts,
-                parallel_cols=col_parts,
-                restore_row_indices=split_meta.restore_row_indices,
-                restore_col_indices=split_meta.restore_col_indices,
-                compressed_in_features=int(split_meta.compressed_in_features),
-                compressed_out_features=int(split_meta.compressed_out_features),
-                protected_input_indices=split_meta.protected_input_indices,
-                protected_input_weight=split_meta.protected_input_weight,
-                protected_output_indices=split_meta.protected_output_indices,
-                protected_output_weight=split_meta.protected_output_weight,
-                always_use_original=skip_this,
-                protect_original_weight=skip_this,
-            ).to(convert_device)
+            )
+            sparse_row_idx, sparse_col_idx, sparse_values = _build_sparse_residual_coo_patch(
+                linear_name=r.name,
+                original_weight=old.weight,
+                reconstructed_weight=reconstructed_weight,
+                activation_weight=activation_weight,
+                score_mode=resolved_residual_score,
+                top_p=float(outlier_residual_top_p),
+            )
+            sparse_nnz = 0 if sparse_values is None else int(sparse_values.numel())
+            log.info(
+                "[%s] residual sparse patch for %s: nnz=%d top_p=%.6f score=%s",
+                group_tag,
+                r.name,
+                sparse_nnz,
+                float(outlier_residual_top_p),
+                resolved_residual_score,
+            )
+        new_linear = _build_vae_linear_from_stage_payload(
+            old_module=old,
+            transpose=r.transpose,
+            split_meta=split_meta,
+            stage_part_bits_payload=stage_part_bits_payload,
+            stage_part_decoders_payload=stage_part_decoders_payload,
+            stage_codebook_dims=all_stage_codebook_dims,
+            parallel_rows=row_parts,
+            parallel_cols=col_parts,
+            parallel_parts=parts_per_linear,
+            bias=old.bias,
+            original_weight=old.weight,
+            always_use_original=skip_this,
+            protect_original_weight=skip_this,
+            sparse_residual_row_indices=sparse_row_idx,
+            sparse_residual_col_indices=sparse_col_idx,
+            sparse_residual_values=sparse_values,
+        ).to(convert_device)
         # 替换时预热：后续 LoRA / PPL 前向可直接复用缓存权重，避免重复重构。
         try:
             new_linear.prime_decoded_weight_cache(dtype=train_dtype)
@@ -912,6 +1098,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("No active categories discovered for training.")
 
     resolved_category_cfgs = resolve_category_runtime_configs(cat_args, vae_args, active_categories)
+    resolved_outlier_mode = str(getattr(cat_args, "outlier_protect_mode", "channel")).strip().lower()
+    resolved_residual_score = str(getattr(cat_args, "outlier_residual_score", "abs")).strip().lower()
+    if resolved_outlier_mode == "residual_sparse":
+        nonzero_counts = {
+            cat: int(cfg.outlier_protect_count)
+            for cat, cfg in resolved_category_cfgs.items()
+            if int(cfg.outlier_protect_count) != 0
+        }
+        if nonzero_counts:
+            raise ValueError(
+                "residual_sparse mode requires outlier_protect_count=0 for all active categories, got "
+                + ",".join(f"{cat}:{count}" for cat, count in nonzero_counts.items())
+            )
     lora_tables = (
         (cat_args.lora_rank, "--lora_rank"),
         (cat_args.lora_alpha, "--lora_alpha"),
@@ -955,11 +1154,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     any_wa_mse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip(
     ).lower() == "wa_mse" for cat in active_categories)
     any_outlier_protect = any(count > 0 for count in category_outlier_protect_count.values())
+    residual_sparse_needs_activation = (
+        resolved_outlier_mode == "residual_sparse" and resolved_residual_score == "input_act_weighted_abs"
+    )
     sort_needs_act = any(
         row_mode == "act_l2" or col_mode == "act_l2"
         for row_mode, col_mode in category_sort_modes.values()
     )
-    if any_wa_mse or any_outlier_protect or sort_needs_act:
+    if any_wa_mse or any_outlier_protect or sort_needs_act or residual_sparse_needs_activation:
         activation_runtime = {
             "cache": None,  # type: Optional[ActivationCalibrationCache]
             "dataset": str(getattr(cat_args, "wa_mse_calib_dataset", "wikitext2")),
@@ -978,6 +1180,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             enabled_features.append("outlier_protect")
         if sort_needs_act:
             enabled_features.append("act_l2_sort")
+        if residual_sparse_needs_activation:
+            enabled_features.append("residual_sparse_score")
         log.info(
             "Dynamic activation recalibration enabled for %s: dataset=%s nsamples=%d seqlen=%d seed=%d device=%s",
             ",".join(enabled_features),
@@ -995,6 +1199,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             if count > 0
         )
         log.info("Outlier protection enabled: axis=%s count_by_category=%s", outlier_protect_axis, enabled_counts)
+    if resolved_outlier_mode == "residual_sparse":
+        log.info(
+            "Residual sparse protection enabled: top_p=%.6f score=%s",
+            float(getattr(cat_args, "outlier_residual_top_p", 0.0)),
+            resolved_residual_score,
+        )
 
     unique_parallel = sorted(set(category_intra_parallel.values()))
     if unique_parallel:
@@ -1138,6 +1348,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 eval_blocks=cat_args.eval_blocks,
                 skip_layer_keys=skip_layer_keys,
                 activation_runtime=activation_runtime,
+                outlier_protect_mode=resolved_outlier_mode,
+                outlier_residual_top_p=float(getattr(cat_args, "outlier_residual_top_p", 0.0)),
+                outlier_residual_score=resolved_residual_score,
                 outlier_protect_axis=outlier_protect_axis,
             )
             # _eval_ppl_after_category(

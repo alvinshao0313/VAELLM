@@ -135,12 +135,15 @@
 | `--log_every` | `50` | 每多少 step 打印一次训练日志 | `<=0` 等价关闭 |
 | `--eval_every` | `0` | 每多少 step 做一次 VAE 中间评估 | `0` 表示不做中间评估 |
 | `--eval_blocks` | `256` | 每次中间评估最多评估多少块 | 与 `eval_every` 联动 |
-| `--outlier_protect_count` | `default=0` | 保护 top-N channel 不参与压缩 | 类别 override；`>0` 时依赖 activation 向量 |
+| `--outlier_protect_count` | `default=0` | `channel` 模式下保护 top-N channel 不参与压缩 | 类别 override；`residual_sparse` 模式要求它对所有类别都为 `0` |
+| `--outlier_protect_mode` | `channel` | 离群值保护模式 | `channel` / `residual_sparse`，两者互斥 |
+| `--outlier_residual_top_p` | `0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 仅 `residual_sparse` 生效，要求 `0 < p <= 1` |
+| `--outlier_residual_score` | `abs` | `residual_sparse` 模式下的残差打分方式 | `abs` / `input_act_weighted_abs` |
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
-| `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_l2 / outlier_protect_count` 共用 |
-| `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_l2 / outlier_protect_count` 共用 |
-| `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / act_l2 / outlier_protect_count` 共用 |
-| `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_l2 / outlier_protect_count` 共用 |
+| `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
+| `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
+| `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
+| `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
 | `--wa_mse_calib_device` | `""` | 动态采集设备 | 为空时回退 `train_device` |
 | `--wa_mse_calib_log_every` | `0` | 动态采集日志间隔 | `0` 表示关闭 |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
@@ -294,7 +297,8 @@
 ### 6.5 `wa_mse` 与 activation 依赖
 
 - `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
-- `outlier_protect_count > 0` 也复用同一条动态 activation 路径
+- `outlier_protect_mode=channel` 且 `outlier_protect_count > 0` 时，也复用同一条动态 activation 路径
+- `outlier_protect_mode=residual_sparse` 且 `outlier_residual_score=input_act_weighted_abs` 时，也复用同一条动态 activation 路径
 - `intra_part_sort_mode` 若启用 `act_l2`，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
@@ -373,7 +377,7 @@
 3. override 参数缺少 `default`，且当前类别没有显式值
 4. override 参数包含未知 category / after-category key
 5. 动态 activation 重算失败，导致当前 group 缺少 activation 向量
-6. `outlier_protect_count > 0` 或 `act_l2` 启用，但当前 group 的动态 activation 采集失败
+6. `outlier_protect_mode=channel` 且 `outlier_protect_count > 0`，或 `act_l2`，或 `residual_sparse + input_act_weighted_abs` 启用，但当前 group 的动态 activation 采集失败
 7. 切分后某个 part 的展平长度无法被该类别的 `codebook_dim` 整除
 8. `linear_group_size < 1`
 

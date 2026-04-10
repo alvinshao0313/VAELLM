@@ -40,6 +40,7 @@ torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --save_tokenizer true \
   --unload_vae_original_weights_on_save false \
   --bf16 true \
+  --gradient_checkpointing true \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 4 \
   --learning_rate 1e-4 \

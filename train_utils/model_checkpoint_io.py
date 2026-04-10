@@ -244,6 +244,27 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "shape": list(protected_out_weight.shape),
                 "dtype": _dtype_to_name(protected_out_weight.dtype),
             }
+        sparse_row_idx = getattr(module, "sparse_residual_row_indices", None)
+        sparse_row_idx_spec = None
+        if isinstance(sparse_row_idx, torch.Tensor):
+            sparse_row_idx_spec = {
+                "shape": list(sparse_row_idx.shape),
+                "dtype": _dtype_to_name(sparse_row_idx.dtype),
+            }
+        sparse_col_idx = getattr(module, "sparse_residual_col_indices", None)
+        sparse_col_idx_spec = None
+        if isinstance(sparse_col_idx, torch.Tensor):
+            sparse_col_idx_spec = {
+                "shape": list(sparse_col_idx.shape),
+                "dtype": _dtype_to_name(sparse_col_idx.dtype),
+            }
+        sparse_values = getattr(module, "sparse_residual_values", None)
+        sparse_values_spec = None
+        if isinstance(sparse_values, torch.Tensor):
+            sparse_values_spec = {
+                "shape": list(sparse_values.shape),
+                "dtype": _dtype_to_name(sparse_values.dtype),
+            }
         specs.append(
             {
                 "name": name,
@@ -272,6 +293,9 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "protected_input_weight": protected_weight_spec,
                 "protected_output_indices": protected_out_idx_spec,
                 "protected_output_weight": protected_out_weight_spec,
+                "sparse_residual_row_indices": sparse_row_idx_spec,
+                "sparse_residual_col_indices": sparse_col_idx_spec,
+                "sparse_residual_values": sparse_values_spec,
             }
         )
     return specs
@@ -517,6 +541,30 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 raise ValueError(f"[{name}] protected_output_weight shape must be 2D, got {shape}")
             protected_out_weight_dtype = _name_to_dtype(str(protected_out_weight_spec.get("dtype", "float32")))
             protected_out_weight_payload = torch.zeros(shape, dtype=protected_out_weight_dtype, device=device)
+        sparse_row_idx_payload = None
+        sparse_row_idx_spec = spec.get("sparse_residual_row_indices")
+        if isinstance(sparse_row_idx_spec, dict):
+            shape = tuple(int(v) for v in sparse_row_idx_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] sparse_residual_row_indices shape must be 1D, got {shape}")
+            sparse_row_idx_dtype = _name_to_dtype(str(sparse_row_idx_spec.get("dtype", "uint16")))
+            sparse_row_idx_payload = torch.zeros(shape, dtype=sparse_row_idx_dtype, device=device)
+        sparse_col_idx_payload = None
+        sparse_col_idx_spec = spec.get("sparse_residual_col_indices")
+        if isinstance(sparse_col_idx_spec, dict):
+            shape = tuple(int(v) for v in sparse_col_idx_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] sparse_residual_col_indices shape must be 1D, got {shape}")
+            sparse_col_idx_dtype = _name_to_dtype(str(sparse_col_idx_spec.get("dtype", "uint16")))
+            sparse_col_idx_payload = torch.zeros(shape, dtype=sparse_col_idx_dtype, device=device)
+        sparse_values_payload = None
+        sparse_values_spec = spec.get("sparse_residual_values")
+        if isinstance(sparse_values_spec, dict):
+            shape = tuple(int(v) for v in sparse_values_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] sparse_residual_values shape must be 1D, got {shape}")
+            sparse_values_dtype = _name_to_dtype(str(sparse_values_spec.get("dtype", "float16")))
+            sparse_values_payload = torch.zeros(shape, dtype=sparse_values_dtype, device=device)
 
         new_module = VAELinear(
             in_features=int(spec["in_features"]),
@@ -545,6 +593,9 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             protected_input_weight=protected_weight_payload,
             protected_output_indices=protected_out_idx_payload,
             protected_output_weight=protected_out_weight_payload,
+            sparse_residual_row_indices=sparse_row_idx_payload,
+            sparse_residual_col_indices=sparse_col_idx_payload,
+            sparse_residual_values=sparse_values_payload,
             always_use_original=bool(spec.get("always_use_original", False)),
             protect_original_weight=bool(spec.get("protect_original_weight", False)),
         )

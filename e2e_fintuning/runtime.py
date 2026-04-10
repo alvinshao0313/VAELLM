@@ -8,7 +8,6 @@ import torch
 from torch import nn
 from transformers import default_data_collator
 
-from distill_utils.layerwise_distill_runtime import resolve_checkpoint_dir
 from e2e_fintuning.args import needs_teacher
 from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
 from e2e_fintuning.data import build_datasets, build_tokenizer
@@ -29,7 +28,11 @@ from e2e_fintuning.trainer import (
 from litebsq.vae_linear import clear_model_vae_linear_cache
 from rotation.model_utils import get_layers, get_model
 from train_utils.eval_utils import calculate_ppl
-from train_utils.model_checkpoint_io import _build_run_output_dir, unload_vae_original_linear_weights
+from train_utils.model_checkpoint_io import (
+    _build_run_output_dir,
+    resolve_checkpoint_dir,
+    unload_vae_original_linear_weights,
+)
 from train_utils.utils import get_logger, pt_fsdp_state_dict
 
 
