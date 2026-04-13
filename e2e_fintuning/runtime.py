@@ -383,6 +383,37 @@ def _eval_final_ppl(*, model, args, model_path: str, output_dir: str, log):
     }
 
 
+def _save_final_e2e_model(
+    *,
+    final_model: nn.Module,
+    final_dir: str,
+    base_model_path: str,
+    tokenizer,
+    extra_meta: Dict[str, object],
+    save_tokenizer: bool,
+    should_save: bool,
+    state_dict: Optional[Dict[str, torch.Tensor]] = None,
+):
+    if not bool(should_save):
+        return None
+
+    save_kwargs = {
+        "base_model_path": str(base_model_path),
+        "tokenizer": tokenizer if bool(save_tokenizer) else None,
+        "save_config": True,
+        "extra_meta": extra_meta,
+        "compact_unload_vae_original_weights": True,
+    }
+    if state_dict is not None:
+        save_kwargs["state_dict"] = state_dict
+
+    return save_e2e_model_checkpoint(
+        final_model,
+        final_dir,
+        **save_kwargs,
+    )
+
+
 def _collect_trainable_params(model: nn.Module):
     return [(name, param) for name, param in model.named_parameters() if param.requires_grad]
 
@@ -623,30 +654,21 @@ def run(args, hf_args, training_args):
         teacher_model.to("cpu")
 
     final_dir = os.path.join(run_output_dir, "final_model")
-    extra_meta = dict(checkpoint_extra_meta)
-    if _uses_fsdp(training_args):
-        save_paths = save_e2e_model_checkpoint(
-            final_model,
-            final_dir,
-            base_model_path=str(base_model_path),
-            tokenizer=tokenizer if bool(args.save_tokenizer) else None,
-            save_config=True,
-            extra_meta=extra_meta,
-            state_dict=pt_fsdp_state_dict(trainer.model),
-            compact_unload_vae_original_weights=True,
-        )
+    final_state_dict = pt_fsdp_state_dict(trainer.model) if _uses_fsdp(training_args) else None
+    save_paths = _save_final_e2e_model(
+        final_model=final_model,
+        final_dir=final_dir,
+        base_model_path=str(base_model_path),
+        tokenizer=tokenizer,
+        extra_meta=dict(checkpoint_extra_meta),
+        save_tokenizer=bool(args.save_tokenizer),
+        should_save=bool(getattr(training_args, "should_save", True)),
+        state_dict=final_state_dict,
+    )
+    if save_paths is not None:
+        log.info("Saved final model to %s", save_paths["output_dir"])
     else:
-        save_paths = save_e2e_model_checkpoint(
-            final_model,
-            final_dir,
-            base_model_path=str(base_model_path),
-            tokenizer=tokenizer if bool(args.save_tokenizer) else None,
-            save_config=True,
-            extra_meta=extra_meta,
-            compact_unload_vae_original_weights=True,
-        )
-
-    log.info("Saved final model to %s", save_paths["output_dir"])
+        log.info("Skipping final model save on this rank because should_save=false.")
     ppl_eval = _eval_final_ppl(
         model=final_model,
         args=args,
@@ -657,7 +679,7 @@ def run(args, hf_args, training_args):
     clear_model_vae_linear_cache(final_model)
     return {
         "run_output_dir": run_output_dir,
-        "saved_model_dir": save_paths["output_dir"],
+        "saved_model_dir": None if save_paths is None else save_paths["output_dir"],
         "teacher_source": teacher_source,
         "final_ppl": None if ppl_eval is None else ppl_eval["result"],
         "final_ppl_path": None if ppl_eval is None else ppl_eval["path"],
