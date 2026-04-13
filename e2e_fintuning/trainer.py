@@ -17,7 +17,7 @@ from e2e_fintuning.peft_proxy import (
     is_peft_proxy_adapter_linear,
     update_peft_vae_proxy_adalora,
 )
-from litebsq.vae_linear import VAELinear
+from litebsq.vae_linear import NamedVAELinearTarget, VAELinear, prime_named_vae_linear_cache
 from train_utils.distill_losses import (
     build_distill_token_mask,
     compute_dual_kl_loss,
@@ -337,6 +337,8 @@ class _E2ELossMixin:
         lora_hif4_act: bool = False,
         prewarm_frozen_vae: bool = True,
         prewarm_log_every: int = 32,
+        prewarm_group_size: int = 8,
+        prewarm_module_names: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         self.loss_type = str(loss_type).strip().lower()
@@ -352,6 +354,12 @@ class _E2ELossMixin:
         )
         self.prewarm_frozen_vae = bool(prewarm_frozen_vae)
         self.prewarm_log_every = max(1, int(prewarm_log_every))
+        self.prewarm_group_size = max(1, int(prewarm_group_size))
+        self.prewarm_module_names = (
+            None
+            if prewarm_module_names is None
+            else {str(name) for name in prewarm_module_names if str(name)}
+        )
         self._teacher_device = None
         self._vae_cache_prepared = False
         self._logger = logging.getLogger("e2e_fintuning")
@@ -433,45 +441,31 @@ class _E2ELossMixin:
             return
 
         target_dtype = self._infer_cache_dtype(model)
-        total = 0
-        warmed = 0
-        skipped = 0
-        failed = 0
-        for index, ref in enumerate(iter_named_vae_module_refs(model), start=1):
-            total += 1
+        named_targets: List[NamedVAELinearTarget] = []
+        for ref in iter_named_vae_module_refs(model):
             if isinstance(ref.module, PeftVAELinearProxy):
-                skipped += 1
                 continue
-            base_layer = ref.base_layer
-            if not bool(getattr(base_layer, "cache_decoded_weight", True)):
-                skipped += 1
-            else:
-                try:
-                    base_layer.clear_decoded_weight_cache()
-                    if base_layer.prime_decoded_weight_cache(dtype=target_dtype):
-                        warmed += 1
-                    else:
-                        skipped += 1
-                except Exception as exc:
-                    failed += 1
-                    self._logger.warning("Failed to prewarm VAELinear cache for %s: %s", ref.name, exc)
-            if index % self.prewarm_log_every == 0:
-                self._logger.info(
-                    "VAELinear prewarm progress: processed=%d warmed=%d skipped=%d failed=%d",
-                    index,
-                    warmed,
-                    skipped,
-                    failed,
-                )
+            if self.prewarm_module_names is not None and ref.name not in self.prewarm_module_names:
+                continue
+            named_targets.append(NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer))
+
+        stats = prime_named_vae_linear_cache(
+            named_targets,
+            dtype=target_dtype,
+            clear_existing=True,
+            group_size=int(self.prewarm_group_size),
+            logger=self._logger,
+        )
 
         self._vae_cache_prepared = True
         self._logger.info(
-            "VAELinear prewarm complete: total=%d warmed=%d skipped=%d failed=%d dtype=%s",
-            total,
-            warmed,
-            skipped,
-            failed,
+            "VAELinear prewarm complete: total=%d warmed=%d skipped=%d failed=%d dtype=%s prewarm_group_size=%d",
+            int(stats.get("total", 0)),
+            int(stats.get("warmed", 0)),
+            int(stats.get("skipped", 0)),
+            int(stats.get("failed", 0)),
             str(target_dtype),
+            int(self.prewarm_group_size),
         )
 
     def _compute_teacher_outputs(

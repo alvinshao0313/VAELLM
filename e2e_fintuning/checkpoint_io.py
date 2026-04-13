@@ -22,6 +22,7 @@ from rotation.model_utils import get_model
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
     STATE_DICT_FILENAME,
+    _collect_sparse_residual_specs,
     _decoder_to_spec,
     _dtype_to_name,
     _get_module_by_name,
@@ -128,9 +129,7 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
         "protected_input_weight": _tensor_spec(getattr(module, "protected_input_weight", None)),
         "protected_output_indices": _tensor_spec(getattr(module, "protected_output_indices", None)),
         "protected_output_weight": _tensor_spec(getattr(module, "protected_output_weight", None)),
-        "sparse_residual_row_indices": _tensor_spec(getattr(module, "sparse_residual_row_indices", None)),
-        "sparse_residual_col_indices": _tensor_spec(getattr(module, "sparse_residual_col_indices", None)),
-        "sparse_residual_values": _tensor_spec(getattr(module, "sparse_residual_values", None)),
+        **_collect_sparse_residual_specs(module),
     }
 
 
@@ -222,7 +221,7 @@ def save_e2e_model_checkpoint(
 
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
-        "version": 4,
+        "version": 5,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_model_path": base_model_path,
         "state_dict_file": STATE_DICT_FILENAME,

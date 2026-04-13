@@ -120,7 +120,7 @@ def collect_act_max_for_linears(
 
     run_device = str(device)
     if run_device.startswith("cuda") and not torch.cuda.is_available():
-        run_device = "cpu"
+        raise RuntimeError(f"Requested device={run_device}, but CUDA is not available.")
     device_obj = torch.device(run_device)
 
     absmax_by_linear: Dict[str, torch.Tensor] = {}

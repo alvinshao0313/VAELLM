@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=7
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
@@ -12,7 +12,11 @@ export CUDA_VISIBLE_DEVICES=3
 # --rot_llm
 # --unload_vae_original_weights_on_final_save
 # --allow_tail_group "true"
+# --outlier_residual_top_p "default=0.01,cat:down_proj=0.02"
 # --outlier_residual_score "abs" or "input_act_weighted_abs"
+# --outlier_residual_codec "blocked_quantized" or "coo_fp16"
+# --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
+# --outlier_residual_value_bits "8"   # 8 or 4 
 
 python tools/cat_train.py \
   --model_path "meta-llama/Llama-2-7b-hf" \
@@ -40,8 +44,11 @@ python tools/cat_train.py \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
   --outlier_protect_mode "residual_sparse" \
-  --outlier_residual_top_p "0.003" \
+  --outlier_residual_top_p "default=0.01" \
   --outlier_residual_score "input_act_weighted_abs" \
+  --outlier_residual_codec "blocked_quantized" \
+  --outlier_residual_index_bits "8" \
+  --outlier_residual_value_bits "4" \
   --wa_mse_calib_dataset "wikitext2" \
   --wa_mse_calib_nsamples "512" \
   --wa_mse_calib_seqlen "512" \

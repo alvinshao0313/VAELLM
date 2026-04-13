@@ -38,6 +38,7 @@
 - `intra_parallel`
 - `intra_part_sort_mode`
 - `outlier_protect_count`
+- `outlier_residual_top_p`
 - `codebook_bits`
 - `codebook_dim`
 - `residual_stages`
@@ -55,6 +56,7 @@
 --codebook_bits default=16,cat:q_proj=24
 --steps_per_category default=2000,cat:q_proj=500
 --intra_parallel default=1x1,cat:q_proj=4x1
+--outlier_residual_top_p default=0.01,cat:down_proj=0.02
 ```
 
 规则：
@@ -112,6 +114,9 @@
 - `transpose_modules`
 - `projection_suffixes`
 - `skip_layers`
+- `outlier_residual_codec`
+- `outlier_residual_index_bits`
+- `outlier_residual_value_bits`
 
 其中：
 
@@ -137,8 +142,11 @@
 | `--eval_blocks` | `256` | 每次中间评估最多评估多少块 | 与 `eval_every` 联动 |
 | `--outlier_protect_count` | `default=0` | `channel` 模式下保护 top-N channel 不参与压缩 | 类别 override；`residual_sparse` 模式要求它对所有类别都为 `0` |
 | `--outlier_protect_mode` | `channel` | 离群值保护模式 | `channel` / `residual_sparse`，两者互斥 |
-| `--outlier_residual_top_p` | `0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 仅 `residual_sparse` 生效，要求 `0 < p <= 1` |
+| `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；对所有参与训练的类别要求 `0 < p <= 1` |
 | `--outlier_residual_score` | `abs` | `residual_sparse` 模式下的残差打分方式 | `abs` / `input_act_weighted_abs` |
+| `--outlier_residual_codec` | `coo_fp16` | `residual_sparse` 的存储格式 | `coo_fp16` / `blocked_quantized` |
+| `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
+| `--outlier_residual_value_bits` | `8` | `blocked_quantized` 的残差 value 位宽 | `8` / `4` |
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
 | `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
 | `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |

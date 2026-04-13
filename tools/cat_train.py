@@ -23,6 +23,13 @@ from train_utils.cat_train_args import (
 )
 from litebsq.vae_args import apply_autoencoder_arch_defaults
 from litebsq.misc import set_module_by_name
+from litebsq.sparse_residual import (
+    SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED,
+    SPARSE_RESIDUAL_FORMAT_COO_FP16,
+    encode_blocked_quantized_sparse_residual,
+    sparse_residual_blocked_storage_bytes,
+    sparse_residual_coo_storage_bytes,
+)
 from train_utils.cat_data_prep import (
     LinearPrepRef,
     format_intra_part_sort_mode,
@@ -364,9 +371,7 @@ def _build_vae_linear_from_stage_payload(
     original_weight,
     always_use_original: bool,
     protect_original_weight: bool,
-    sparse_residual_row_indices: Optional[torch.Tensor] = None,
-    sparse_residual_col_indices: Optional[torch.Tensor] = None,
-    sparse_residual_values: Optional[torch.Tensor] = None,
+    sparse_residual_kwargs: Optional[Dict[str, object]] = None,
 ):
     from litebsq.vae_linear import VAELinear
 
@@ -392,12 +397,11 @@ def _build_vae_linear_from_stage_payload(
         protected_input_weight=split_meta.protected_input_weight,
         protected_output_indices=split_meta.protected_output_indices,
         protected_output_weight=split_meta.protected_output_weight,
-        sparse_residual_row_indices=sparse_residual_row_indices,
-        sparse_residual_col_indices=sparse_residual_col_indices,
-        sparse_residual_values=sparse_residual_values,
         always_use_original=bool(always_use_original),
         protect_original_weight=bool(protect_original_weight),
     )
+    if sparse_residual_kwargs:
+        common_kwargs.update(dict(sparse_residual_kwargs))
     if residual_stages == 1:
         return VAELinear(
             vq_weight=stage_part_bits_payload[0],
@@ -443,7 +447,7 @@ def _decode_reconstructed_linear_weight(
     return temp_linear._decode_weight(dtype=torch.float32).detach().to(device="cpu", dtype=torch.float32)
 
 
-def _build_sparse_residual_coo_patch(
+def _select_sparse_residual_entries(
     *,
     linear_name: str,
     original_weight: torch.Tensor,
@@ -460,11 +464,6 @@ def _build_sparse_residual_coo_patch(
             f"{tuple(original_weight.shape)} vs {tuple(reconstructed_weight.shape)}"
         )
     out_features, in_features = int(original_weight.shape[0]), int(original_weight.shape[1])
-    if out_features > 65535 or in_features > 65535:
-        raise ValueError(
-            f"{linear_name}: residual_sparse requires out_features/in_features <= 65535 for uint16 COO indices, "
-            f"got out_features={out_features}, in_features={in_features}."
-        )
     if not (0.0 < float(top_p) <= 1.0):
         raise ValueError(f"{linear_name}: residual_sparse top_p must satisfy 0 < top_p <= 1, got {top_p}.")
 
@@ -498,10 +497,87 @@ def _build_sparse_residual_coo_patch(
         return None, None, None
     top_idx = torch.sort(top_idx.to(dtype=torch.int64)).values.contiguous()
     flat_residual = residual.view(-1)
-    values = flat_residual.index_select(0, top_idx).to(dtype=torch.float16).contiguous()
-    row_idx = torch.div(top_idx, in_features, rounding_mode="floor").to(dtype=torch.uint16).contiguous()
-    col_idx = torch.remainder(top_idx, in_features).to(dtype=torch.uint16).contiguous()
+    values = flat_residual.index_select(0, top_idx).to(dtype=torch.float32).contiguous()
+    row_idx = torch.div(top_idx, in_features, rounding_mode="floor").to(dtype=torch.int64).contiguous()
+    col_idx = torch.remainder(top_idx, in_features).to(dtype=torch.int64).contiguous()
     return row_idx, col_idx, values
+
+
+def _build_sparse_residual_payload(
+    *,
+    linear_name: str,
+    original_weight: torch.Tensor,
+    reconstructed_weight: torch.Tensor,
+    activation_weight: Optional[torch.Tensor],
+    score_mode: str,
+    top_p: float,
+    codec: str,
+    index_bits: int,
+    value_bits: int,
+    block_shape: Tuple[int, int],
+) -> Tuple[Optional[Dict[str, object]], int, Dict[str, int]]:
+    row_idx, col_idx, values = _select_sparse_residual_entries(
+        linear_name=linear_name,
+        original_weight=original_weight,
+        reconstructed_weight=reconstructed_weight,
+        activation_weight=activation_weight,
+        score_mode=score_mode,
+        top_p=top_p,
+    )
+    if row_idx is None or col_idx is None or values is None:
+        return None, 0, {"coo_bytes": 0, "codec_bytes": 0}
+
+    nnz = int(values.numel())
+    out_features = int(original_weight.shape[0])
+    in_features = int(original_weight.shape[1])
+    coo_bytes = sparse_residual_coo_storage_bytes(nnz)
+    resolved_codec = str(codec).strip().lower()
+    if resolved_codec == SPARSE_RESIDUAL_FORMAT_COO_FP16:
+        if out_features > 65535 or in_features > 65535:
+            raise ValueError(
+                f"{linear_name}: residual_sparse codec=coo_fp16 requires out_features/in_features <= 65535 for uint16 indices, "
+                f"got out_features={out_features}, in_features={in_features}."
+            )
+        payload = {
+            "sparse_residual_format": SPARSE_RESIDUAL_FORMAT_COO_FP16,
+            "sparse_residual_row_indices": row_idx.to(dtype=torch.uint16).contiguous(),
+            "sparse_residual_col_indices": col_idx.to(dtype=torch.uint16).contiguous(),
+            "sparse_residual_values": values.to(dtype=torch.float16).contiguous(),
+        }
+        return payload, nnz, {"coo_bytes": coo_bytes, "codec_bytes": coo_bytes}
+    if resolved_codec != SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED:
+        raise ValueError(
+            f"{linear_name}: unsupported sparse residual codec {codec!r}. "
+            f"Expected {SPARSE_RESIDUAL_FORMAT_COO_FP16} or {SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED}."
+        )
+    blocked_payload = encode_blocked_quantized_sparse_residual(
+        row_idx=row_idx,
+        col_idx=col_idx,
+        values=values,
+        out_features=out_features,
+        in_features=in_features,
+        block_rows=int(block_shape[0]),
+        block_cols=int(block_shape[1]),
+        index_bits=int(index_bits),
+        value_bits=int(value_bits),
+    )
+    payload = {
+        "sparse_residual_format": str(blocked_payload["format"]),
+        "sparse_residual_index_bits": int(blocked_payload["index_bits"]),
+        "sparse_residual_value_bits": int(blocked_payload["value_bits"]),
+        "sparse_residual_block_rows": int(blocked_payload["block_rows"]),
+        "sparse_residual_block_cols": int(blocked_payload["block_cols"]),
+        "sparse_residual_active_block_ids": blocked_payload["active_block_ids"],
+        "sparse_residual_block_ptr": blocked_payload["block_ptr"],
+        "sparse_residual_local_indices": blocked_payload["local_indices"],
+        "sparse_residual_qvalues": blocked_payload["qvalues"],
+        "sparse_residual_scales": blocked_payload["scales"],
+        "sparse_residual_zero_points": blocked_payload["zero_points"],
+    }
+    return payload, nnz, {
+        "coo_bytes": coo_bytes,
+        "codec_bytes": sparse_residual_blocked_storage_bytes(blocked_payload),
+    }
 
 
 def _train_group_vae_and_replace(
@@ -522,9 +598,12 @@ def _train_group_vae_and_replace(
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
     outlier_protect_mode: str = "channel",
-    outlier_residual_top_p: float = 0.0,
     outlier_residual_score: str = "abs",
     outlier_protect_axis: str = "input",
+    outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
+    outlier_residual_index_bits: int = 8,
+    outlier_residual_value_bits: int = 8,
+    outlier_residual_block_shape: Tuple[int, int] = (256, 256),
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
 
@@ -546,6 +625,7 @@ def _train_group_vae_and_replace(
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
     stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
     outlier_protect_count = int(runtime_cfg.outlier_protect_count)
+    outlier_residual_top_p = float(runtime_cfg.outlier_residual_top_p)
     resolved_outlier_mode = str(outlier_protect_mode).strip().lower()
     resolved_residual_score = str(outlier_residual_score).strip().lower()
     residual_sparse_enabled = resolved_outlier_mode == "residual_sparse"
@@ -561,6 +641,12 @@ def _train_group_vae_and_replace(
         raise ValueError(
             f"[{group_tag}] residual_sparse mode requires outlier_protect_count=0, got {outlier_protect_count}."
         )
+    if residual_sparse_enabled and not (0.0 < outlier_residual_top_p <= 1.0):
+        raise ValueError(
+            f"[{group_tag}] residual_sparse mode requires 0 < outlier_residual_top_p <= 1, "
+            f"got {outlier_residual_top_p}."
+        )
+    resolved_residual_codec = str(outlier_residual_codec).strip().lower()
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
     row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
     parts_per_linear = int(row_parts) * int(col_parts)
@@ -656,10 +742,15 @@ def _train_group_vae_and_replace(
         )
     if residual_sparse_enabled:
         log.info(
-            "[%s] residual sparse protection enabled: top_p=%.6f score=%s",
+            "[%s] residual sparse protection enabled: top_p=%.6f score=%s codec=%s index_bits=%d value_bits=%d block=%dx%d",
             group_tag,
-            float(outlier_residual_top_p),
+            outlier_residual_top_p,
             resolved_residual_score,
+            resolved_residual_codec,
+            int(outlier_residual_index_bits),
+            int(outlier_residual_value_bits),
+            int(outlier_residual_block_shape[0]),
+            int(outlier_residual_block_shape[1]),
         )
     if len(split_metas) != len(group_refs):
         raise RuntimeError(
@@ -957,9 +1048,7 @@ def _train_group_vae_and_replace(
                 stage_part_bits_payload.append(part_bits[0])
                 stage_part_decoders_payload.append(part_decoders[0])
 
-        sparse_row_idx = None
-        sparse_col_idx = None
-        sparse_values = None
+        sparse_residual_kwargs = None
         if residual_sparse_enabled:
             activation_weight = None
             if resolved_residual_score == "input_act_weighted_abs":
@@ -979,22 +1068,28 @@ def _train_group_vae_and_replace(
                 parallel_cols=col_parts,
                 parallel_parts=parts_per_linear,
             )
-            sparse_row_idx, sparse_col_idx, sparse_values = _build_sparse_residual_coo_patch(
+            sparse_residual_kwargs, sparse_nnz, sparse_storage = _build_sparse_residual_payload(
                 linear_name=r.name,
                 original_weight=old.weight,
                 reconstructed_weight=reconstructed_weight,
                 activation_weight=activation_weight,
                 score_mode=resolved_residual_score,
-                top_p=float(outlier_residual_top_p),
+                top_p=outlier_residual_top_p,
+                codec=resolved_residual_codec,
+                index_bits=outlier_residual_index_bits,
+                value_bits=outlier_residual_value_bits,
+                block_shape=outlier_residual_block_shape,
             )
-            sparse_nnz = 0 if sparse_values is None else int(sparse_values.numel())
             log.info(
-                "[%s] residual sparse patch for %s: nnz=%d top_p=%.6f score=%s",
+                "[%s] residual sparse patch for %s: nnz=%d top_p=%.6f score=%s codec=%s bytes(codec=%d coo=%d)",
                 group_tag,
                 r.name,
                 sparse_nnz,
-                float(outlier_residual_top_p),
+                outlier_residual_top_p,
                 resolved_residual_score,
+                resolved_residual_codec,
+                int(sparse_storage["codec_bytes"]),
+                int(sparse_storage["coo_bytes"]),
             )
         new_linear = _build_vae_linear_from_stage_payload(
             old_module=old,
@@ -1010,16 +1105,8 @@ def _train_group_vae_and_replace(
             original_weight=old.weight,
             always_use_original=skip_this,
             protect_original_weight=skip_this,
-            sparse_residual_row_indices=sparse_row_idx,
-            sparse_residual_col_indices=sparse_col_idx,
-            sparse_residual_values=sparse_values,
+            sparse_residual_kwargs=sparse_residual_kwargs,
         ).to(convert_device)
-        # 替换时预热：后续 LoRA / PPL 前向可直接复用缓存权重，避免重复重构。
-        try:
-            new_linear.prime_decoded_weight_cache(dtype=train_dtype)
-        except Exception as e:
-            raise RuntimeError(f"[{group_tag}] cache warmup failed for {r.name}: {e}") from e
-        # 替换后将模块放回 CPU，降低显存占用。
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
 
@@ -1111,6 +1198,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "residual_sparse mode requires outlier_protect_count=0 for all active categories, got "
                 + ",".join(f"{cat}:{count}" for cat, count in nonzero_counts.items())
             )
+        invalid_top_p = {
+            cat: float(cfg.outlier_residual_top_p)
+            for cat, cfg in resolved_category_cfgs.items()
+            if not (0.0 < float(cfg.outlier_residual_top_p) <= 1.0)
+        }
+        if invalid_top_p:
+            raise ValueError(
+                "residual_sparse mode requires 0 < outlier_residual_top_p <= 1 for all active categories, got "
+                + ",".join(f"{cat}:{top_p}" for cat, top_p in invalid_top_p.items())
+            )
     lora_tables = (
         (cat_args.lora_rank, "--lora_rank"),
         (cat_args.lora_alpha, "--lora_alpha"),
@@ -1141,6 +1238,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     }
     category_outlier_protect_count: Dict[str, int] = {
         cat: int(resolved_category_cfgs[cat].outlier_protect_count) for cat in active_categories
+    }
+    category_outlier_residual_top_p: Dict[str, float] = {
+        cat: float(resolved_category_cfgs[cat].outlier_residual_top_p) for cat in active_categories
     }
     category_sort_modes: Dict[str, Tuple[str, str]] = {
         cat: tuple(resolved_category_cfgs[cat].intra_part_sort_mode)
@@ -1200,11 +1300,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         log.info("Outlier protection enabled: axis=%s count_by_category=%s", outlier_protect_axis, enabled_counts)
     if resolved_outlier_mode == "residual_sparse":
-        log.info(
-            "Residual sparse protection enabled: top_p=%.6f score=%s",
-            float(getattr(cat_args, "outlier_residual_top_p", 0.0)),
-            resolved_residual_score,
-        )
+        unique_top_p = sorted(set(category_outlier_residual_top_p.values()))
+        if len(unique_top_p) == 1:
+            log.info(
+                "Residual sparse protection enabled: top_p=%.6f score=%s codec=%s index_bits=%d value_bits=%d block=%dx%d",
+                unique_top_p[0],
+                resolved_residual_score,
+                cat_args.outlier_residual_codec,
+                int(cat_args.outlier_residual_index_bits),
+                int(cat_args.outlier_residual_value_bits),
+                int(cat_args.outlier_residual_block_shape[0]),
+                int(cat_args.outlier_residual_block_shape[1]),
+            )
+        else:
+            log.info(
+                "Residual sparse protection enabled: top_p_by_category={%s} score=%s codec=%s index_bits=%d value_bits=%d block=%dx%d",
+                ",".join(f"{cat}:{category_outlier_residual_top_p[cat]:.6f}" for cat in active_categories),
+                resolved_residual_score,
+                cat_args.outlier_residual_codec,
+                int(cat_args.outlier_residual_index_bits),
+                int(cat_args.outlier_residual_value_bits),
+                int(cat_args.outlier_residual_block_shape[0]),
+                int(cat_args.outlier_residual_block_shape[1]),
+            )
 
     unique_parallel = sorted(set(category_intra_parallel.values()))
     if unique_parallel:
@@ -1349,9 +1467,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 skip_layer_keys=skip_layer_keys,
                 activation_runtime=activation_runtime,
                 outlier_protect_mode=resolved_outlier_mode,
-                outlier_residual_top_p=float(getattr(cat_args, "outlier_residual_top_p", 0.0)),
                 outlier_residual_score=resolved_residual_score,
                 outlier_protect_axis=outlier_protect_axis,
+                outlier_residual_codec=cat_args.outlier_residual_codec,
+                outlier_residual_index_bits=cat_args.outlier_residual_index_bits,
+                outlier_residual_value_bits=cat_args.outlier_residual_value_bits,
+                outlier_residual_block_shape=cat_args.outlier_residual_block_shape,
             )
             # _eval_ppl_after_category(
             #     model=model,

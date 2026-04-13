@@ -604,6 +604,8 @@ def run(args, hf_args, training_args):
         lora_hif4_act=bool(args.lora_hif4_act),
         prewarm_frozen_vae=bool(args.prewarm_frozen_vae),
         prewarm_log_every=int(args.prewarm_log_every),
+        prewarm_group_size=int(args.prewarm_group_size),
+        prewarm_module_names=selection.frozen_cacheable_vae_modules,
     )
     if str(args.vae_lora_variant) == "adalora":
         trainer.add_callback(E2EAdaLoraCallback(trainer))

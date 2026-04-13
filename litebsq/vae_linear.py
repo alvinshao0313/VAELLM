@@ -1,8 +1,20 @@
-import torch
-from torch import nn
-import torch.nn.functional as F
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from litebsq.autoencoder import Decoder
+
+from litebsq.sparse_residual import (
+    SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED,
+    SPARSE_RESIDUAL_FORMAT_CHOICES,
+    SPARSE_RESIDUAL_FORMAT_COO_FP16,
+    SPARSE_RESIDUAL_INDEX_BITS_CHOICES,
+    SPARSE_RESIDUAL_VALUE_BITS_CHOICES,
+    decode_blocked_quantized_sparse_residual,
+    validate_sparse_residual_block_shape,
+)
 
 class VAELinear(nn.Module):
     """
@@ -37,9 +49,20 @@ class VAELinear(nn.Module):
         protected_input_weight: Optional[torch.Tensor] = None,
         protected_output_indices: Optional[torch.Tensor] = None,
         protected_output_weight: Optional[torch.Tensor] = None,
+        sparse_residual_format: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
         sparse_residual_row_indices: Optional[torch.Tensor] = None,
         sparse_residual_col_indices: Optional[torch.Tensor] = None,
         sparse_residual_values: Optional[torch.Tensor] = None,
+        sparse_residual_index_bits: Optional[int] = None,
+        sparse_residual_value_bits: Optional[int] = None,
+        sparse_residual_block_rows: Optional[int] = None,
+        sparse_residual_block_cols: Optional[int] = None,
+        sparse_residual_active_block_ids: Optional[torch.Tensor] = None,
+        sparse_residual_block_ptr: Optional[torch.Tensor] = None,
+        sparse_residual_local_indices: Optional[torch.Tensor] = None,
+        sparse_residual_qvalues: Optional[torch.Tensor] = None,
+        sparse_residual_scales: Optional[torch.Tensor] = None,
+        sparse_residual_zero_points: Optional[torch.Tensor] = None,
         always_use_original: bool = False,
         protect_original_weight: bool = False,
     ):
@@ -254,7 +277,19 @@ class VAELinear(nn.Module):
         if protected_out_count > 0 and self.protected_output_weight is None:
             raise ValueError("protected_output_weight is required when protected_output_indices is provided.")
 
-        sparse_payload_provided = any(
+        resolved_sparse_format = str(sparse_residual_format).strip().lower()
+        if resolved_sparse_format not in SPARSE_RESIDUAL_FORMAT_CHOICES:
+            raise ValueError(
+                f"Unsupported sparse_residual_format={sparse_residual_format!r}. "
+                f"Expected one of: {', '.join(SPARSE_RESIDUAL_FORMAT_CHOICES)}."
+            )
+        self.sparse_residual_format = resolved_sparse_format
+        self.sparse_residual_index_bits = None if sparse_residual_index_bits is None else int(sparse_residual_index_bits)
+        self.sparse_residual_value_bits = None if sparse_residual_value_bits is None else int(sparse_residual_value_bits)
+        self.sparse_residual_block_rows = None if sparse_residual_block_rows is None else int(sparse_residual_block_rows)
+        self.sparse_residual_block_cols = None if sparse_residual_block_cols is None else int(sparse_residual_block_cols)
+
+        sparse_coo_payload_provided = any(
             item is not None
             for item in (
                 sparse_residual_row_indices,
@@ -262,7 +297,25 @@ class VAELinear(nn.Module):
                 sparse_residual_values,
             )
         )
-        if sparse_payload_provided:
+        sparse_blocked_payload_provided = any(
+            item is not None
+            for item in (
+                sparse_residual_active_block_ids,
+                sparse_residual_block_ptr,
+                sparse_residual_local_indices,
+                sparse_residual_qvalues,
+                sparse_residual_scales,
+                sparse_residual_zero_points,
+            )
+        )
+        if sparse_coo_payload_provided and sparse_blocked_payload_provided:
+            raise ValueError("Sparse residual COO payload and blocked_quantized payload cannot be provided together.")
+
+        if sparse_coo_payload_provided:
+            if resolved_sparse_format != SPARSE_RESIDUAL_FORMAT_COO_FP16:
+                raise ValueError(
+                    f"sparse_residual_format={resolved_sparse_format!r} is incompatible with COO payload."
+                )
             if (
                 sparse_residual_row_indices is None
                 or sparse_residual_col_indices is None
@@ -309,10 +362,125 @@ class VAELinear(nn.Module):
                 self.register_buffer("sparse_residual_row_indices", sparse_row_idx, persistent=True)
                 self.register_buffer("sparse_residual_col_indices", sparse_col_idx, persistent=True)
                 self.register_buffer("sparse_residual_values", sparse_values, persistent=True)
+            self.register_buffer("sparse_residual_active_block_ids", None, persistent=True)
+            self.register_buffer("sparse_residual_block_ptr", None, persistent=True)
+            self.register_buffer("sparse_residual_local_indices", None, persistent=True)
+            self.register_buffer("sparse_residual_qvalues", None, persistent=True)
+            self.register_buffer("sparse_residual_scales", None, persistent=True)
+            self.register_buffer("sparse_residual_zero_points", None, persistent=True)
+        elif sparse_blocked_payload_provided:
+            if resolved_sparse_format != SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED:
+                raise ValueError(
+                    f"sparse_residual_format={resolved_sparse_format!r} is incompatible with blocked payload."
+                )
+            if self.sparse_residual_index_bits not in SPARSE_RESIDUAL_INDEX_BITS_CHOICES:
+                raise ValueError(
+                    f"sparse_residual_index_bits must be one of {SPARSE_RESIDUAL_INDEX_BITS_CHOICES}, "
+                    f"got {self.sparse_residual_index_bits}."
+                )
+            if self.sparse_residual_value_bits not in SPARSE_RESIDUAL_VALUE_BITS_CHOICES:
+                raise ValueError(
+                    f"sparse_residual_value_bits must be one of {SPARSE_RESIDUAL_VALUE_BITS_CHOICES}, "
+                    f"got {self.sparse_residual_value_bits}."
+                )
+            if self.sparse_residual_block_rows is None or self.sparse_residual_block_cols is None:
+                raise ValueError("Blocked sparse residual payload requires sparse_residual_block_rows/block_cols.")
+            validate_sparse_residual_block_shape(
+                block_rows=self.sparse_residual_block_rows,
+                block_cols=self.sparse_residual_block_cols,
+                index_bits=self.sparse_residual_index_bits,
+                arg_name="sparse residual block shape",
+            )
+            blocked_items = (
+                sparse_residual_active_block_ids,
+                sparse_residual_block_ptr,
+                sparse_residual_local_indices,
+                sparse_residual_qvalues,
+                sparse_residual_scales,
+                sparse_residual_zero_points,
+            )
+            if any(item is None for item in blocked_items):
+                raise ValueError(
+                    "Blocked sparse residual payload requires active_block_ids, block_ptr, local_indices, "
+                    "qvalues, scales, and zero_points to be provided together."
+                )
+            active_block_ids = sparse_residual_active_block_ids.detach().to(device="cpu").contiguous()
+            block_ptr = sparse_residual_block_ptr.detach().to(device="cpu").contiguous()
+            local_indices = sparse_residual_local_indices.detach().to(device="cpu").contiguous()
+            qvalues = sparse_residual_qvalues.detach().to(device="cpu").contiguous()
+            scales = sparse_residual_scales.detach().to(device="cpu").contiguous()
+            zero_points = sparse_residual_zero_points.detach().to(device="cpu").contiguous()
+            if (
+                active_block_ids.ndim != 1
+                or block_ptr.ndim != 1
+                or local_indices.ndim != 1
+                or qvalues.ndim != 1
+                or scales.ndim != 1
+                or zero_points.ndim != 1
+            ):
+                raise ValueError("Blocked sparse residual payload must be 1D tensors.")
+            if (
+                active_block_ids.is_floating_point()
+                or active_block_ids.is_complex()
+                or active_block_ids.dtype == torch.bool
+            ):
+                raise ValueError(
+                    f"sparse_residual_active_block_ids must be integer dtype, got {active_block_ids.dtype}"
+                )
+            if block_ptr.is_floating_point() or block_ptr.is_complex() or block_ptr.dtype == torch.bool:
+                raise ValueError(f"sparse_residual_block_ptr must be integer dtype, got {block_ptr.dtype}")
+            if local_indices.is_floating_point() or local_indices.is_complex() or local_indices.dtype == torch.bool:
+                raise ValueError(f"sparse_residual_local_indices must be integer dtype, got {local_indices.dtype}")
+            if qvalues.is_floating_point() or qvalues.is_complex() or qvalues.dtype == torch.bool:
+                raise ValueError(f"sparse_residual_qvalues must be integer dtype, got {qvalues.dtype}")
+            if not scales.is_floating_point():
+                raise ValueError(f"sparse_residual_scales must be floating dtype, got {scales.dtype}")
+            if not zero_points.is_floating_point():
+                raise ValueError(f"sparse_residual_zero_points must be floating dtype, got {zero_points.dtype}")
+            decoded_row, decoded_col, decoded_values = decode_blocked_quantized_sparse_residual(
+                active_block_ids=active_block_ids,
+                block_ptr=block_ptr,
+                local_indices=local_indices,
+                qvalues=qvalues,
+                scales=scales,
+                zero_points=zero_points,
+                out_features=self.out_features,
+                in_features=self.in_features,
+                block_rows=self.sparse_residual_block_rows,
+                block_cols=self.sparse_residual_block_cols,
+                index_bits=self.sparse_residual_index_bits,
+                value_bits=self.sparse_residual_value_bits,
+                value_dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+            nnz = int(decoded_values.numel())
+            if nnz == 0:
+                self.register_buffer("sparse_residual_active_block_ids", None, persistent=True)
+                self.register_buffer("sparse_residual_block_ptr", None, persistent=True)
+                self.register_buffer("sparse_residual_local_indices", None, persistent=True)
+                self.register_buffer("sparse_residual_qvalues", None, persistent=True)
+                self.register_buffer("sparse_residual_scales", None, persistent=True)
+                self.register_buffer("sparse_residual_zero_points", None, persistent=True)
+            else:
+                self.register_buffer("sparse_residual_active_block_ids", active_block_ids, persistent=True)
+                self.register_buffer("sparse_residual_block_ptr", block_ptr, persistent=True)
+                self.register_buffer("sparse_residual_local_indices", local_indices, persistent=True)
+                self.register_buffer("sparse_residual_qvalues", qvalues, persistent=True)
+                self.register_buffer("sparse_residual_scales", scales, persistent=True)
+                self.register_buffer("sparse_residual_zero_points", zero_points, persistent=True)
+            self.register_buffer("sparse_residual_row_indices", None, persistent=True)
+            self.register_buffer("sparse_residual_col_indices", None, persistent=True)
+            self.register_buffer("sparse_residual_values", None, persistent=True)
         else:
             self.register_buffer("sparse_residual_row_indices", None, persistent=True)
             self.register_buffer("sparse_residual_col_indices", None, persistent=True)
             self.register_buffer("sparse_residual_values", None, persistent=True)
+            self.register_buffer("sparse_residual_active_block_ids", None, persistent=True)
+            self.register_buffer("sparse_residual_block_ptr", None, persistent=True)
+            self.register_buffer("sparse_residual_local_indices", None, persistent=True)
+            self.register_buffer("sparse_residual_qvalues", None, persistent=True)
+            self.register_buffer("sparse_residual_scales", None, persistent=True)
+            self.register_buffer("sparse_residual_zero_points", None, persistent=True)
 
         if bias is None:
             self.register_parameter("bias", None)
@@ -518,10 +686,12 @@ class VAELinear(nn.Module):
 
     def _decode_single_flat(self, decoder: nn.Module, vq_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         # decoder expects [B, num_models=1, latent_dim]; output [B, 1, codebook_dim]
-        # 为避免 matmul dtype 不一致，先对齐到 decoder 参数 dtype，再在外层统一转回目标 dtype。
+        # 为避免 matmul device/dtype 不一致，先对齐到 decoder 参数设备和 dtype，
+        # 再在外层统一转回目标 dtype。
         param = next(decoder.parameters(), None)
+        decode_device = param.device if param is not None else vq_weight.device
         decode_dtype = param.dtype if param is not None else dtype
-        w_blocks = decoder(vq_weight.to(dtype=decode_dtype))
+        w_blocks = decoder(vq_weight.to(device=decode_device, dtype=decode_dtype, non_blocking=True))
         return w_blocks.permute(1, 0, 2).contiguous().view(-1)
 
     def _restore_split_row_order(self, w_split: torch.Tensor) -> torch.Tensor:
@@ -548,36 +718,53 @@ class VAELinear(nn.Module):
             restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
         return w_split.index_select(1, restore_idx)
 
-    def _decode_split_weight(self, dtype: torch.dtype) -> torch.Tensor:
+    def _decode_part_flat(self, stage_idx: int, part_idx: int, dtype: torch.dtype) -> torch.Tensor:
+        part_flat = None
+        decoder = self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+        vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
+        stage_flat = self._decode_single_flat(decoder, vq_weight, dtype=dtype)
+        part_flat = stage_flat if part_flat is None else (part_flat + stage_flat)
+        return part_flat
+
+    def _expected_part_numel(self) -> int:
+        total_numel = int(self.compressed_in_features) * int(self.compressed_out_features)
+        if total_numel % int(self.parallel_parts) != 0:
+            raise ValueError(
+                f"compressed weight numel {total_numel} not divisible by parallel_parts={int(self.parallel_parts)}."
+            )
+        return total_numel // int(self.parallel_parts)
+
+    def _restore_split_weight_from_part_flats(
+        self,
+        part_flats: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         split_rows = self.compressed_in_features if self.transpose else self.compressed_out_features
         split_cols = self.compressed_out_features if self.transpose else self.compressed_in_features
+        part_flats = part_flats.reshape(int(self.parallel_parts), -1).contiguous()
+        expected_part_numel = self._expected_part_numel()
+        if int(part_flats.shape[1]) != expected_part_numel:
+            raise ValueError(
+                f"part flat width mismatch: got {int(part_flats.shape[1])}, expected {expected_part_numel}."
+            )
+
         if not self._multi_parts:
-            w_flat = None
-            for stage_idx in range(self.residual_stages):
-                decoder = self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=0)
-                vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=0)
-                stage_flat = self._decode_single_flat(decoder, vq_weight, dtype=dtype)
-                w_flat = stage_flat if w_flat is None else (w_flat + stage_flat)
-            if w_flat is None:
-                raise RuntimeError("no stage payload found in VAELinear.")
-            w_split = w_flat.view(split_rows, split_cols)
+            w_split = part_flats[0].view(split_rows, split_cols)
             w_split = self._restore_split_row_order(w_split)
             w_split = self._restore_split_col_order(w_split)
             return w_split.contiguous().to(dtype=dtype)
 
         rows_per_part = split_rows // self.parallel_rows
         cols_per_part = split_cols // self.parallel_cols
-        parts = []
-        for part_idx in range(self.parallel_parts):
-            part_flat = None
-            for stage_idx in range(self.residual_stages):
-                decoder = self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
-                vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
-                stage_flat = self._decode_single_flat(decoder, vq_weight, dtype=dtype)
-                part_flat = stage_flat if part_flat is None else (part_flat + stage_flat)
-            if part_flat is None:
-                raise RuntimeError("no stage payload found in VAELinear.")
-            parts.append(part_flat.view(rows_per_part, cols_per_part))
+        expected_per_part = int(rows_per_part) * int(cols_per_part)
+        if int(part_flats.shape[1]) != expected_per_part:
+            raise ValueError(
+                f"per-part flat width mismatch: got {int(part_flats.shape[1])}, expected {expected_per_part}."
+            )
+        parts = [
+            part_flats[part_idx].view(rows_per_part, cols_per_part)
+            for part_idx in range(self.parallel_parts)
+        ]
 
         row_blocks = []
         for row_idx in range(self.parallel_rows):
@@ -588,6 +775,29 @@ class VAELinear(nn.Module):
         w_split = self._restore_split_row_order(w_split)
         w_split = self._restore_split_col_order(w_split)
         return w_split.contiguous().to(dtype=dtype)
+
+    def _decode_split_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        decoded_parts = []
+        for part_idx in range(self.parallel_parts):
+            part_flat = None
+            for stage_idx in range(self.residual_stages):
+                stage_flat = self._decode_part_flat(stage_idx=stage_idx, part_idx=part_idx, dtype=dtype)
+                part_flat = stage_flat if part_flat is None else (part_flat + stage_flat)
+            if part_flat is None:
+                raise RuntimeError("no stage payload found in VAELinear.")
+            decoded_parts.append(part_flat)
+        stacked_parts = torch.stack(decoded_parts, dim=0)
+        return self._restore_split_weight_from_part_flats(stacked_parts, dtype=dtype)
+
+    def _decode_compressed_weight_from_part_flats(
+        self,
+        part_flats: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        w_split = self._restore_split_weight_from_part_flats(part_flats, dtype=dtype)
+        if self.transpose:
+            return w_split.t().contiguous()
+        return w_split.contiguous()
 
     def _decode_compressed_weight(self, dtype: torch.dtype) -> torch.Tensor:
         w_split = self._decode_split_weight(dtype=dtype)
@@ -673,8 +883,11 @@ class VAELinear(nn.Module):
         full_in.index_copy_(1, compressed_idx, full_weight)
         return full_in
 
-    def _decode_weight(self, dtype: torch.dtype) -> torch.Tensor:
-        compressed_weight = self._decode_compressed_weight(dtype=dtype)
+    def _finalize_decoded_weight_from_compressed(
+        self,
+        compressed_weight: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         full_weight = self._materialize_full_weight(
             compressed_weight,
             dtype=dtype,
@@ -682,19 +895,47 @@ class VAELinear(nn.Module):
         full_weight = self._apply_sparse_residual_patch(full_weight, dtype=dtype)
         return full_weight.contiguous()
 
+    def _decode_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        compressed_weight = self._decode_compressed_weight(dtype=dtype)
+        return self._finalize_decoded_weight_from_compressed(compressed_weight, dtype=dtype)
+
     def _apply_sparse_residual_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        row_idx = getattr(self, "sparse_residual_row_indices", None)
-        if row_idx is None:
-            return full_weight
-        col_idx = getattr(self, "sparse_residual_col_indices", None)
-        values = getattr(self, "sparse_residual_values", None)
-        if col_idx is None or values is None:
-            raise RuntimeError("Sparse residual COO payload is incomplete.")
+        resolved_format = str(getattr(self, "sparse_residual_format", SPARSE_RESIDUAL_FORMAT_COO_FP16)).strip().lower()
+        if resolved_format == SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED:
+            active_block_ids = getattr(self, "sparse_residual_active_block_ids", None)
+            if active_block_ids is None:
+                return full_weight
+            row_idx, col_idx, values = decode_blocked_quantized_sparse_residual(
+                active_block_ids=active_block_ids,
+                block_ptr=getattr(self, "sparse_residual_block_ptr", None),
+                local_indices=getattr(self, "sparse_residual_local_indices", None),
+                qvalues=getattr(self, "sparse_residual_qvalues", None),
+                scales=getattr(self, "sparse_residual_scales", None),
+                zero_points=getattr(self, "sparse_residual_zero_points", None),
+                out_features=self.out_features,
+                in_features=self.in_features,
+                block_rows=int(self.sparse_residual_block_rows),
+                block_cols=int(self.sparse_residual_block_cols),
+                index_bits=int(self.sparse_residual_index_bits),
+                value_bits=int(self.sparse_residual_value_bits),
+                value_dtype=dtype,
+                device=full_weight.device,
+            )
+        else:
+            row_idx = getattr(self, "sparse_residual_row_indices", None)
+            if row_idx is None:
+                return full_weight
+            col_idx = getattr(self, "sparse_residual_col_indices", None)
+            values = getattr(self, "sparse_residual_values", None)
+            if col_idx is None or values is None:
+                raise RuntimeError("Sparse residual COO payload is incomplete.")
+            if int(row_idx.numel()) == 0:
+                return full_weight
+            row_idx = row_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
+            col_idx = col_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
+            values = values.to(device=full_weight.device, dtype=dtype, non_blocking=True)
         if int(row_idx.numel()) == 0:
             return full_weight
-        row_idx = row_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
-        col_idx = col_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
-        values = values.to(device=full_weight.device, dtype=dtype, non_blocking=True)
         full_weight.index_put_((row_idx, col_idx), values, accumulate=True)
         return full_weight
 
@@ -706,6 +947,9 @@ class VAELinear(nn.Module):
         return isinstance(protected_output_weight, torch.Tensor) and int(protected_output_weight.numel()) > 0
 
     def has_sparse_residual(self) -> bool:
+        if str(getattr(self, "sparse_residual_format", SPARSE_RESIDUAL_FORMAT_COO_FP16)).strip().lower() == SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED:
+            sparse_qvalues = getattr(self, "sparse_residual_qvalues", None)
+            return isinstance(sparse_qvalues, torch.Tensor) and int(sparse_qvalues.numel()) > 0
         sparse_values = getattr(self, "sparse_residual_values", None)
         return isinstance(sparse_values, torch.Tensor) and int(sparse_values.numel()) > 0
 
@@ -784,46 +1028,9 @@ class VAELinear(nn.Module):
         return F.linear(x, w, bias)
 
 
-def clear_model_vae_linear_cache(model: nn.Module) -> int:
-    cleared = 0
-    for module in model.modules():
-        if isinstance(module, VAELinear):
-            module.clear_decoded_weight_cache()
-            cleared += 1
-    return cleared
-
-
-@torch.no_grad()
-def prime_model_vae_linear_cache(
-    model: nn.Module,
-    dtype: Optional[torch.dtype] = None,
-    clear_existing: bool = False,
-) -> Dict[str, int]:
-    total = 0
-    warmed = 0
-    skipped = 0
-    failed = 0
-
-    for module in model.modules():
-        if not isinstance(module, VAELinear):
-            continue
-        if bool(getattr(module, "_skip_global_cache_prewarm", False)):
-            skipped += 1
-            continue
-        total += 1
-        if clear_existing:
-            module.clear_decoded_weight_cache()
-        try:
-            if module.prime_decoded_weight_cache(dtype=dtype):
-                warmed += 1
-            else:
-                skipped += 1
-        except Exception:
-            failed += 1
-
-    return {
-        "total": int(total),
-        "warmed": int(warmed),
-        "skipped": int(skipped),
-        "failed": int(failed),
-    }
+from litebsq.vae_linear_prewarm import (  # noqa: E402
+    NamedVAELinearTarget,
+    clear_model_vae_linear_cache,
+    prime_model_vae_linear_cache,
+    prime_named_vae_linear_cache,
+)

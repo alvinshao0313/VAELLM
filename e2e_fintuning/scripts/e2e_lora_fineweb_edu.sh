@@ -3,6 +3,15 @@ set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
+# 说明：
+# - 这是单卡 FineWeb-Edu 蒸馏脚本，默认使用 sample-10BT 配置。
+# - 当前脚本保持 HF 默认，不额外启用梯度检查点。
+# - 以下配置是有意为之，不是漏配：
+#   --teacher_model_path 不显式传，默认从 student checkpoint meta 推断
+#   --dataset_config_name sample-10BT，需要和数据集配套
+#   --save_strategy no，默认只落最终导出
+#   --unload_vae_original_weights_on_save false，保留原始权重便于后续检查
+
 torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --student_checkpoint_dir .result/meta-llama_Llama-2-7b-hf_20260323_071142/final_model \
   --run_root_dir .result/e2e_vae_lora_fineweb_edu \
@@ -32,7 +41,6 @@ torchrun --standalone --nproc_per_node=1 -m e2e_fintuning.main \
   --save_tokenizer true \
   --unload_vae_original_weights_on_save false \
   --bf16 true \
-  --gradient_checkpointing true \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 4 \
   --learning_rate 5e-5 \

@@ -85,8 +85,7 @@ def main(argv=None) -> None:
     if args.access_token is not None and not str(args.access_token).strip():
         args.access_token = None
     if args.device.startswith("cuda") and not torch.cuda.is_available():
-        log.warning("CUDA not available, fallback to cpu.")
-        args.device = "cpu"
+        raise RuntimeError(f"Requested device={args.device}, but CUDA is not available.")
 
     set_seed(int(args.seed))
     suffixes = _split_csv(args.projection_suffixes)

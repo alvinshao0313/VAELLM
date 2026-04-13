@@ -55,6 +55,7 @@ class E2EFinetuneArguments:
     lora_hif4_act: bool = False
     prewarm_frozen_vae: bool = True
     prewarm_log_every: int = 32
+    prewarm_group_size: int = 8
     skip_ppl_eval: bool = False
     ppl_seqlen: int = 2048
     ppl_limit: int = -1
@@ -226,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument("--prewarm_log_every", type=int, default=32)
+    parser.add_argument("--prewarm_group_size", type=int, default=8)
     parser.add_argument(
         "--skip_ppl_eval",
         type=lambda v: _parse_bool_like(v, arg_name="--skip_ppl_eval"),
@@ -287,6 +289,8 @@ def _validate_numeric_inputs(parser: argparse.ArgumentParser, args: E2EFinetuneA
         parser.error("--vae_lora_dropout must satisfy 0 <= dropout < 1.")
     if int(args.prewarm_log_every) < 1:
         parser.error("--prewarm_log_every must be >= 1.")
+    if int(args.prewarm_group_size) < 1:
+        parser.error("--prewarm_group_size must be >= 1.")
     if int(args.ppl_seqlen) < 1:
         parser.error("--ppl_seqlen must be >= 1.")
     if int(args.ppl_limit) == 0 or int(args.ppl_limit) < -1:

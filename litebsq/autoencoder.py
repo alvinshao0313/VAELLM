@@ -1,7 +1,7 @@
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -11,7 +11,15 @@ from torch import Tensor
 
 from litebsq.bsq import BSQ
 from litebsq.misc import ptdtype
-from litebsq.parallel_layers import Normalize, ParallelLinear, ResnetBlock1D, swish
+from litebsq.parallel_layers import (
+    Normalize,
+    ParallelLinear,
+    ResnetBlock1D,
+    pack_normalizes,
+    pack_parallel_linears,
+    pack_resnet_blocks,
+    swish,
+)
 from litebsq.vae_args import add_autoencoder_model_args, resolve_autoencoder_arch_spec
 
 
@@ -179,6 +187,7 @@ class Decoder(nn.Module):
 
         if self.decoder_type == "linear":
             decoder.linear = self.linear.extract_single(model_idx)
+            decoder.train(self.training)
             return decoder
 
         decoder.linear_in = self.linear_in.extract_single(model_idx)
@@ -187,10 +196,102 @@ class Decoder(nn.Module):
         )
         decoder.norm_out = self.norm_out.extract_single(model_idx)
         decoder.linear_out = self.linear_out.extract_single(model_idx)
+        decoder.train(self.training)
         return decoder
 
     def get_sub_decoder(self, model_idx: int) -> "Decoder":
         return self.extract_single(model_idx)
+
+
+@torch.no_grad()
+def pack_decoders(decoders: Sequence[Decoder]) -> Decoder:
+    if not decoders:
+        raise ValueError("pack_decoders expects at least one decoder.")
+
+    first = decoders[0]
+    if not isinstance(first, Decoder):
+        raise TypeError(f"pack_decoders expects Decoder instances, got {type(first)}.")
+    if int(first.num_models) != 1:
+        raise ValueError(f"pack_decoders expects single-model decoders, got num_models={first.num_models}.")
+
+    training = bool(first.training)
+    device = None
+    dtype = None
+    for param in first.parameters():
+        if param.is_floating_point():
+            device = param.device
+            dtype = param.dtype
+            break
+
+    for idx, decoder in enumerate(decoders[1:], start=1):
+        if not isinstance(decoder, Decoder):
+            raise TypeError(f"pack_decoders expects Decoder instances, got {type(decoder)} at idx={idx}.")
+        if int(decoder.num_models) != 1:
+            raise ValueError(
+                f"pack_decoders expects single-model decoders, got num_models={decoder.num_models} at idx={idx}."
+            )
+        if (
+            int(decoder.in_dim) != int(first.in_dim)
+            or int(decoder.out_dim) != int(first.out_dim)
+            or int(decoder.hidden_dim) != int(first.hidden_dim)
+            or int(decoder.num_res_blocks) != int(first.num_res_blocks)
+            or str(decoder.norm_type) != str(first.norm_type)
+            or str(decoder.decoder_type) != str(first.decoder_type)
+            or bool(decoder.use_checkpoint) != bool(first.use_checkpoint)
+        ):
+            raise ValueError(
+                f"pack_decoders config mismatch at idx={idx}: "
+                f"got in={int(decoder.in_dim)}, out={int(decoder.out_dim)}, hidden={int(decoder.hidden_dim)}, "
+                f"blocks={int(decoder.num_res_blocks)}, norm={str(decoder.norm_type)}, "
+                f"type={str(decoder.decoder_type)}, ckpt={bool(decoder.use_checkpoint)} "
+                f"vs first decoder."
+            )
+        if bool(decoder.training) != training:
+            raise ValueError("pack_decoders requires all decoders to share the same training mode.")
+        if bool(decoder._q_scale_fused) != bool(first._q_scale_fused):
+            raise ValueError("pack_decoders requires identical _q_scale_fused across all decoders.")
+        for param in decoder.parameters():
+            if not param.is_floating_point():
+                continue
+            if device is None:
+                device = param.device
+                dtype = param.dtype
+            elif param.device != device or param.dtype != dtype:
+                raise ValueError(
+                    f"pack_decoders dtype/device mismatch at idx={idx}: "
+                    f"device={param.device}, dtype={param.dtype} vs device={device}, dtype={dtype}."
+                )
+            break
+
+    packed = Decoder(
+        in_dim=first.in_dim,
+        out_dim=first.out_dim,
+        hidden_dim=first.hidden_dim,
+        num_res_blocks=first.num_res_blocks,
+        norm_type=first.norm_type,
+        decoder_type=first.decoder_type,
+        use_checkpoint=first.use_checkpoint,
+        num_models=len(decoders),
+    )
+    if device is not None:
+        packed = packed.to(device=device, dtype=dtype)
+    packed.requires_grad_(False)
+    packed._q_scale_fused = bool(first._q_scale_fused)
+
+    if packed.decoder_type == "linear":
+        packed.linear = pack_parallel_linears([decoder.linear for decoder in decoders])
+        packed.train(training)
+        return packed
+
+    packed.linear_in = pack_parallel_linears([decoder.linear_in for decoder in decoders])
+    packed.blocks = nn.ModuleList(
+        pack_resnet_blocks([decoder.blocks[block_idx] for decoder in decoders])
+        for block_idx in range(int(first.num_res_blocks))
+    )
+    packed.norm_out = pack_normalizes([decoder.norm_out for decoder in decoders])
+    packed.linear_out = pack_parallel_linears([decoder.linear_out for decoder in decoders])
+    packed.train(training)
+    return packed
 
 
 class AutoEncoder(nn.Module):

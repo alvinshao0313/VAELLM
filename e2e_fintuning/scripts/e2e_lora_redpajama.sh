@@ -3,6 +3,14 @@ set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,4}"
 
+# 说明：
+# - 这是四卡 RedPajama 脚本，当前走的是 SFT 路径，不是 KD。
+# - 当前脚本保持 HF 默认，不额外启用梯度检查点。
+# - 以下配置是有意为之，不是漏配：
+#   --teacher_model_path 先保留在命令行里，方便切回蒸馏配置时少改一处
+#   --save_strategy steps，长跑训练按步保存
+#   --unload_vae_original_weights_on_save false，保留原始权重便于后续检查
+
 torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --student_checkpoint_dir .result/meta-llama_Llama-2-7b-hf_20260323_071142/final_model \
   --teacher_model_path meta-llama/Llama-2-7b-hf \
@@ -32,7 +40,6 @@ torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --save_tokenizer true \
   --unload_vae_original_weights_on_save false \
   --bf16 true \
-  --gradient_checkpointing true \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 2 \
   --learning_rate 1e-4 \

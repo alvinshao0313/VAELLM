@@ -122,18 +122,19 @@ def _resolve_checkpoint_loader(meta: Dict[str, Any]) -> str:
 def _resolve_eval_device(requested_device: str, logger: logging.Logger) -> str:
     device = str(requested_device)
     if device.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("CUDA not available, fallback eval_device to cpu.")
-        return "cpu"
+        raise RuntimeError(f"Requested eval_device={device}, but CUDA is not available.")
     return device
 
 
 def _prepare_model_for_eval(
     model: torch.nn.Module,
     device: str,
+    prewarm_group_size: int,
     logger: logging.Logger,
     prepared: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
-    cached = prepared.get(device)
+    prepared_key = f"{device}|g{int(prewarm_group_size)}"
+    cached = prepared.get(prepared_key)
     if cached is not None:
         logger.info(
             "[warmup] Reuse prepared model on %s: total=%d warmed=%d skipped=%d failed=%d duration_sec=%.2f",
@@ -149,25 +150,36 @@ def _prepare_model_for_eval(
     logger.info("[warmup] Moving model to %s ...", device)
     model.to(device)
 
-    from litebsq.vae_linear import prime_model_vae_linear_cache
+    from e2e_fintuning.lora import iter_named_vae_module_refs
+    from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
 
     start_time = time.time()
-    stats = prime_model_vae_linear_cache(model)
+    named_targets = [
+        NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer)
+        for ref in iter_named_vae_module_refs(model)
+    ]
+    stats = prime_named_vae_linear_cache(
+        named_targets,
+        group_size=int(prewarm_group_size),
+        logger=logger,
+    )
     duration_sec = float(time.time() - start_time)
     result = {
         **stats,
         "device": device,
+        "prewarm_group_size": int(prewarm_group_size),
         "duration_sec": duration_sec,
     }
-    prepared[device] = result
+    prepared[prepared_key] = result
     logger.info(
-        "[warmup] VAELinear cache primed on %s in %.2fs: total=%d warmed=%d skipped=%d failed=%d",
+        "[warmup] VAELinear cache primed on %s in %.2fs: total=%d warmed=%d skipped=%d failed=%d prewarm_group_size=%d",
         device,
         duration_sec,
         int(stats.get("total", 0)),
         int(stats.get("warmed", 0)),
         int(stats.get("skipped", 0)),
         int(stats.get("failed", 0)),
+        int(prewarm_group_size),
     )
     return result
 
@@ -242,6 +254,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--eval_device", type=str, default="cuda", help="Device for PPL/lm_eval.")
+    parser.add_argument(
+        "--prewarm_group_size",
+        type=int,
+        default=8,
+        help="Maximum number of same-category VAELinear modules to decode together during cache prewarm.",
+    )
     parser.add_argument("--ppl_seqlen", type=int, default=2048, help="Sequence length for PPL evaluation.")
     parser.add_argument("--ppl_limit", type=int, default=-1, help="Max number of PPL samples, -1 for all.")
 
@@ -270,6 +288,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if not (args.eval_ppl or args.eval_lm_eval or args.eval_linear_mse):
         raise ValueError("No evaluation selected. Please enable at least one of: --eval_ppl, --eval_lm_eval, --eval_linear_mse")
+    if int(args.prewarm_group_size) < 1:
+        raise ValueError("--prewarm_group_size must be >= 1.")
     if args.eval_lm_eval and (args.tasks is None or not str(args.tasks).strip()):
         raise ValueError("--tasks is required when --eval_lm_eval is enabled.")
 
@@ -355,7 +375,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         from train_utils.eval_utils import calculate_ppl
 
         logger.info("[ppl] Run via train_utils.eval_utils.calculate_ppl")
-        warmup_result = _prepare_model_for_eval(model, device, logger, prepared_eval_devices)
+        warmup_result = _prepare_model_for_eval(
+            model,
+            device,
+            int(args.prewarm_group_size),
+            logger,
+            prepared_eval_devices,
+        )
         summary["evals"].setdefault("cache_warmup", warmup_result)
         ppl_args = argparse.Namespace(
             model_path=tokenizer_name,
@@ -372,7 +398,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         from train_utils.eval_utils import run_lm_eval
 
         logger.info("[lm_eval] Run via train_utils.eval_utils.run_lm_eval")
-        warmup_result = _prepare_model_for_eval(model, device, logger, prepared_eval_devices)
+        warmup_result = _prepare_model_for_eval(
+            model,
+            device,
+            int(args.prewarm_group_size),
+            logger,
+            prepared_eval_devices,
+        )
         summary["evals"].setdefault("cache_warmup", warmup_result)
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
