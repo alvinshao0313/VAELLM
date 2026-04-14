@@ -27,6 +27,22 @@ class NamedVAELinearTarget:
 
 
 @dataclass(frozen=True)
+class NamedVAELinearDecodeTarget:
+    name: str
+    base_layer: "VAELinear"
+    target_dtype: Optional[torch.dtype] = None
+
+
+@dataclass(frozen=True)
+class DecodedVAELinearWeight:
+    name: str
+    base_layer: "VAELinear"
+    decoded_weight: torch.Tensor
+    target_dtype: torch.dtype
+    compute_device: torch.device
+
+
+@dataclass(frozen=True)
 class _DecoderPackSignature:
     decoder_type: str
     in_dim: int
@@ -105,6 +121,46 @@ def _normalize_named_vae_targets(named_targets: Sequence[Any]) -> List[NamedVAEL
         if not isinstance(target.base_layer, VAELinear):
             raise TypeError(
                 f"Named VAE target '{target.name}' must reference VAELinear, got {type(target.base_layer)}."
+            )
+        out.append(target)
+    return out
+
+
+def _normalize_named_vae_decode_targets(named_targets: Sequence[Any]) -> List[NamedVAELinearDecodeTarget]:
+    from litebsq.vae_linear import VAELinear
+
+    out: List[NamedVAELinearDecodeTarget] = []
+    for idx, item in enumerate(named_targets):
+        if isinstance(item, NamedVAELinearDecodeTarget):
+            target = item
+        elif isinstance(item, NamedVAELinearTarget):
+            target = NamedVAELinearDecodeTarget(
+                name=str(item.name),
+                base_layer=item.base_layer,
+                target_dtype=None,
+            )
+        elif isinstance(item, tuple) and len(item) in {2, 3}:
+            target = NamedVAELinearDecodeTarget(
+                name=str(item[0]),
+                base_layer=item[1],
+                target_dtype=None if len(item) == 2 else item[2],
+            )
+        else:
+            name = getattr(item, "name", None)
+            base_layer = getattr(item, "base_layer", None)
+            target_dtype = getattr(item, "target_dtype", None)
+            if name is None or base_layer is None:
+                raise TypeError(
+                    f"Named VAE decode target at idx={idx} must provide 'name' and 'base_layer', got {type(item)}."
+                )
+            target = NamedVAELinearDecodeTarget(
+                name=str(name),
+                base_layer=base_layer,
+                target_dtype=target_dtype,
+            )
+        if not isinstance(target.base_layer, VAELinear):
+            raise TypeError(
+                f"Named VAE decode target '{target.name}' must reference VAELinear, got {type(target.base_layer)}."
             )
         out.append(target)
     return out
@@ -194,19 +250,20 @@ def _named_target_sort_key(target: NamedVAELinearTarget) -> Tuple[int, str]:
 
 
 @torch.no_grad()
-def _prime_named_vae_linear_cache_chunk(
-    chunk_targets: Sequence[NamedVAELinearTarget],
+def _decode_named_vae_linear_weights_chunk(
+    chunk_targets: Sequence[NamedVAELinearDecodeTarget],
     *,
-    target_dtype: torch.dtype,
-) -> Tuple[int, int]:
+    compute_device: Optional[torch.device],
+) -> Tuple[List[DecodedVAELinearWeight], int]:
     if not chunk_targets:
-        raise ValueError("_prime_named_vae_linear_cache_chunk expects a non-empty chunk.")
+        raise ValueError("_decode_named_vae_linear_weights_chunk expects a non-empty chunk.")
 
     first = chunk_targets[0].base_layer
     parts_per_linear = int(first.parallel_parts)
     residual_stages = int(first.residual_stages)
     chunk_num_models = int(len(chunk_targets)) * parts_per_linear
     chunk_part_flat: Optional[torch.Tensor] = None
+    resolved_compute_device: Optional[torch.device] = None
 
     for stage_idx in range(residual_stages):
         stage_decoders: List[Decoder] = []
@@ -219,8 +276,9 @@ def _prime_named_vae_linear_cache_chunk(
 
         grouped_decoder = pack_decoders(stage_decoders)
         grouped_vq = torch.cat(stage_vq_weights, dim=1).contiguous()
-        decode_device = _resolve_decoder_param_device(grouped_decoder)
         decode_dtype = _resolve_decoder_param_dtype(grouped_decoder)
+        decode_device = _resolve_decoder_param_device(grouped_decoder) if compute_device is None else torch.device(compute_device)
+        grouped_decoder = grouped_decoder.to(device=decode_device, dtype=decode_dtype)
         stage_out = grouped_decoder(grouped_vq.to(device=decode_device, dtype=decode_dtype, non_blocking=True))
         stage_flat = stage_out.permute(1, 0, 2).contiguous().view(chunk_num_models, -1)
         if chunk_part_flat is None:
@@ -233,24 +291,164 @@ def _prime_named_vae_linear_cache_chunk(
                 )
             chunk_part_flat = chunk_part_flat + stage_flat
         del grouped_decoder, grouped_vq, stage_out, stage_flat
+        resolved_compute_device = decode_device
 
     if chunk_part_flat is None:
         raise RuntimeError("Grouped prewarm produced no decoded part flats.")
 
-    warmed = 0
+    if resolved_compute_device is None:
+        resolved_compute_device = torch.device("cpu")
+
+    decoded_results: List[DecodedVAELinearWeight] = []
     for linear_idx, target in enumerate(chunk_targets):
         base_layer = target.base_layer
         start = linear_idx * parts_per_linear
         end = start + parts_per_linear
         part_flats = chunk_part_flat[start:end]
+        target_dtype = _resolve_cache_dtype_for_layer(base_layer, target.target_dtype)
         compressed_weight = base_layer._decode_compressed_weight_from_part_flats(part_flats, dtype=target_dtype)
         decoded_weight = base_layer._finalize_decoded_weight_from_compressed(
             compressed_weight,
             dtype=target_dtype,
         ).detach()
-        base_layer._cached_weight = decoded_weight
-        warmed += 1
-    return warmed, chunk_num_models
+        decoded_results.append(
+            DecodedVAELinearWeight(
+                name=str(target.name),
+                base_layer=base_layer,
+                decoded_weight=decoded_weight,
+                target_dtype=target_dtype,
+                compute_device=resolved_compute_device,
+            )
+        )
+    return decoded_results, chunk_num_models
+
+
+def resolve_grouped_decode_compute_device(
+    requested_device: Optional[Any],
+    *,
+    logger: Optional[logging.Logger] = None,
+    log_prefix: str = "",
+) -> torch.device:
+    if requested_device is None:
+        return torch.device("cpu")
+    try:
+        device = torch.device(str(requested_device))
+    except Exception as exc:
+        raise ValueError(f"{log_prefix}Invalid grouped decode device: {requested_device!r}.") from exc
+    if device.type != "cuda":
+        if device.type != "cpu":
+            raise ValueError(f"{log_prefix}Grouped decode only supports cuda/cpu, got {device!s}.")
+        return device
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"{log_prefix}Requested grouped decode device {device!s}, but CUDA is unavailable.")
+    if device.index is not None and (device.index < 0 or device.index >= torch.cuda.device_count()):
+        raise ValueError(
+            f"{log_prefix}Requested grouped decode device {device!s} is out of range for "
+            f"{torch.cuda.device_count()} visible CUDA devices."
+        )
+    return device
+
+
+def _should_skip_decode_target(
+    target: NamedVAELinearDecodeTarget,
+    *,
+    respect_cache_policy: bool,
+) -> bool:
+    if not respect_cache_policy:
+        return False
+    base_layer = target.base_layer
+    use_original = bool(getattr(base_layer, "always_use_original", False)) or not bool(
+        getattr(base_layer, "temporary", True)
+    )
+    if bool(getattr(base_layer, "_skip_global_cache_prewarm", False)):
+        return True
+    if not bool(getattr(base_layer, "cache_decoded_weight", True)):
+        return True
+    if use_original:
+        return True
+    return False
+
+
+@torch.no_grad()
+def decode_named_vae_linear_weights(
+    named_targets: Sequence[Any],
+    dtype: Optional[torch.dtype] = None,
+    group_size: int = 8,
+    compute_device: Optional[Any] = None,
+    logger: Optional[logging.Logger] = None,
+    respect_cache_policy: bool = True,
+) -> List[DecodedVAELinearWeight]:
+    normalized_targets = _normalize_named_vae_decode_targets(named_targets)
+    group_size = int(group_size)
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}.")
+
+    grouped: Dict[str, Dict[_VAELinearPrewarmSignature, List[NamedVAELinearDecodeTarget]]] = {}
+    requested_compute_device = None
+    if compute_device is not None:
+        requested_compute_device = resolve_grouped_decode_compute_device(
+            compute_device,
+            logger=logger,
+        )
+    for target in normalized_targets:
+        if _should_skip_decode_target(target, respect_cache_policy=respect_cache_policy):
+            continue
+        target_dtype = _resolve_cache_dtype_for_layer(target.base_layer, target.target_dtype or dtype)
+        resolved_target = NamedVAELinearDecodeTarget(
+            name=str(target.name),
+            base_layer=target.base_layer,
+            target_dtype=target_dtype,
+        )
+        signature = _build_vae_linear_prewarm_signature(
+            name=resolved_target.name,
+            base_layer=resolved_target.base_layer,
+            target_dtype=target_dtype,
+        )
+        grouped.setdefault(signature.category, {}).setdefault(signature, []).append(resolved_target)
+
+    decoded_results: List[DecodedVAELinearWeight] = []
+    ordered_categories = sorted(grouped.keys(), key=_category_sort_key)
+    for category in ordered_categories:
+        category_chunk_index = 0
+        signature_groups = []
+        for signature, targets in grouped[category].items():
+            ordered_targets = sorted(
+                targets,
+                key=lambda item: _named_target_sort_key(NamedVAELinearTarget(name=item.name, base_layer=item.base_layer)),
+            )
+            signature_groups.append((signature, ordered_targets))
+        signature_groups.sort(key=lambda item: _named_target_sort_key(NamedVAELinearTarget(name=item[1][0].name, base_layer=item[1][0].base_layer)))
+
+        for _signature, targets in signature_groups:
+            for start in range(0, len(targets), group_size):
+                chunk = targets[start:start + group_size]
+                category_chunk_index += 1
+                chunk_start_time = time.time()
+                try:
+                    chunk_results, chunk_num_models = _decode_named_vae_linear_weights_chunk(
+                        chunk,
+                        compute_device=requested_compute_device,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Grouped VAELinear decode failed for category={category}, chunk_index={category_chunk_index}, "
+                        f"chunk_linears={len(chunk)}, parts_per_linear={int(chunk[0].base_layer.parallel_parts)}: {exc}"
+                    ) from exc
+                decoded_results.extend(chunk_results)
+                if logger is not None:
+                    logger.info(
+                        "VAELinear decode chunk: category=%s chunk_index=%d chunk_linears=%d parts_per_linear=%d "
+                        "chunk_num_models=%d decoded=%d duration_sec=%.2f compute_device=%s",
+                        category,
+                        category_chunk_index,
+                        len(chunk),
+                        int(chunk[0].base_layer.parallel_parts),
+                        int(chunk_num_models),
+                        len(chunk_results),
+                        float(time.time() - chunk_start_time),
+                        str(chunk_results[0].compute_device if chunk_results else requested_compute_device),
+                    )
+    return decoded_results
 
 
 def clear_model_vae_linear_cache(model: nn.Module) -> int:
@@ -330,84 +528,29 @@ def prime_named_vae_linear_cache(
             dtype=dtype,
             clear_existing=clear_existing,
         )
-
-    total = 0
-    warmed = 0
-    skipped = 0
-    failed = 0
-    grouped: Dict[str, Dict[_VAELinearPrewarmSignature, List[NamedVAELinearTarget]]] = {}
-
-    for target in normalized_targets:
-        base_layer = target.base_layer
-        total += 1
-        if clear_existing:
-            base_layer.clear_decoded_weight_cache()
-        use_original = bool(getattr(base_layer, "always_use_original", False)) or not bool(
-            getattr(base_layer, "temporary", True)
+    total = len(normalized_targets)
+    if clear_existing:
+        for target in normalized_targets:
+            target.base_layer.clear_decoded_weight_cache()
+    try:
+        decoded_results = decode_named_vae_linear_weights(
+            normalized_targets,
+            dtype=dtype,
+            group_size=group_size,
+            compute_device=None,
+            logger=logger,
+            respect_cache_policy=True,
         )
-        if bool(getattr(base_layer, "_skip_global_cache_prewarm", False)):
-            skipped += 1
-            continue
-        if not bool(getattr(base_layer, "cache_decoded_weight", True)):
-            skipped += 1
-            continue
-        if use_original:
-            skipped += 1
-            continue
-        target_dtype = _resolve_cache_dtype_for_layer(base_layer, dtype=dtype)
-        signature = _build_vae_linear_prewarm_signature(
-            name=target.name,
-            base_layer=base_layer,
-            target_dtype=target_dtype,
-        )
-        grouped.setdefault(signature.category, {}).setdefault(signature, []).append(target)
-
-    ordered_categories = sorted(grouped.keys(), key=_category_sort_key)
-    for category in ordered_categories:
-        category_chunk_index = 0
-        signature_groups = []
-        for signature, targets in grouped[category].items():
-            ordered_targets = sorted(targets, key=_named_target_sort_key)
-            signature_groups.append((signature, ordered_targets))
-        signature_groups.sort(key=lambda item: _named_target_sort_key(item[1][0]))
-
-        for signature, targets in signature_groups:
-            for start in range(0, len(targets), group_size):
-                chunk = targets[start:start + group_size]
-                category_chunk_index += 1
-                chunk_start_time = time.time()
-                try:
-                    chunk_warmed, chunk_num_models = _prime_named_vae_linear_cache_chunk(
-                        chunk,
-                        target_dtype=signature.target_dtype,
-                    )
-                except Exception as exc:
-                    failed += int(len(chunk))
-                    raise RuntimeError(
-                        f"Grouped VAELinear prewarm failed for category={category}, chunk_index={category_chunk_index}, "
-                        f"chunk_linears={len(chunk)}, parts_per_linear={int(chunk[0].base_layer.parallel_parts)}: {exc}"
-                    ) from exc
-                warmed += int(chunk_warmed)
-                if logger is not None:
-                    logger.info(
-                        "VAELinear prewarm chunk: category=%s chunk_index=%d chunk_linears=%d parts_per_linear=%d "
-                        "chunk_num_models=%d warmed=%d skipped=%d failed=%d duration_sec=%.2f",
-                        category,
-                        category_chunk_index,
-                        len(chunk),
-                        int(chunk[0].base_layer.parallel_parts),
-                        int(chunk_num_models),
-                        int(chunk_warmed),
-                        0,
-                        0,
-                        float(time.time() - chunk_start_time),
-                    )
-
+    except Exception as exc:
+        raise RuntimeError(f"VAELinear prewarm failed: {exc}") from exc
+    for result in decoded_results:
+        result.base_layer._cached_weight = result.decoded_weight
+    warmed = len(decoded_results)
     return {
         "total": int(total),
         "warmed": int(warmed),
-        "skipped": int(skipped),
-        "failed": int(failed),
+        "skipped": int(total - warmed),
+        "failed": 0,
     }
 
 
@@ -436,8 +579,12 @@ def prime_model_vae_linear_cache(
 
 
 __all__ = [
+    "DecodedVAELinearWeight",
     "NamedVAELinearTarget",
+    "NamedVAELinearDecodeTarget",
     "clear_model_vae_linear_cache",
+    "decode_named_vae_linear_weights",
     "prime_model_vae_linear_cache",
     "prime_named_vae_linear_cache",
+    "resolve_grouped_decode_compute_device",
 ]

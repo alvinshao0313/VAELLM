@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
 # 说明：
 # - 这是四卡 RedPajama 脚本，当前走的是 SFT 路径，不是 KD。
@@ -19,7 +19,7 @@ torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --train_split train \
   --eval_split validation \
   --text_field text \
-  --loss_type sft \
+  --loss_type kd \
   --distill_temperature 1.0 \
   --distill_alpha 0.3 \
   --post_attn false \

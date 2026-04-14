@@ -151,18 +151,28 @@ def _prepare_model_for_eval(
     model.to(device)
 
     from e2e_fintuning.lora import iter_named_vae_module_refs
+    from e2e_fintuning.peft_proxy import iter_named_peft_vae_proxies, materialize_peft_proxy_decoded_linears
     from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
 
     start_time = time.time()
-    named_targets = [
-        NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer)
-        for ref in iter_named_vae_module_refs(model)
-    ]
-    stats = prime_named_vae_linear_cache(
-        named_targets,
-        group_size=int(prewarm_group_size),
-        logger=logger,
-    )
+    if any(True for _ in iter_named_peft_vae_proxies(model)):
+        stats = materialize_peft_proxy_decoded_linears(
+            model,
+            group_size=int(prewarm_group_size),
+            compute_device=device,
+            logger=logger,
+            log_prefix="[warmup] ",
+        )
+    else:
+        named_targets = [
+            NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer)
+            for ref in iter_named_vae_module_refs(model)
+        ]
+        stats = prime_named_vae_linear_cache(
+            named_targets,
+            group_size=int(prewarm_group_size),
+            logger=logger,
+        )
     duration_sec = float(time.time() - start_time)
     result = {
         **stats,
@@ -172,7 +182,7 @@ def _prepare_model_for_eval(
     }
     prepared[prepared_key] = result
     logger.info(
-        "[warmup] VAELinear cache primed on %s in %.2fs: total=%d warmed=%d skipped=%d failed=%d prewarm_group_size=%d",
+        "[warmup] Warmup finished on %s in %.2fs: total=%d warmed=%d skipped=%d failed=%d prewarm_group_size=%d",
         device,
         duration_sec,
         int(stats.get("total", 0)),
@@ -308,6 +318,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             base_model_path=args.base_model_path,
             map_location=args.map_location,
             strict=args.strict,
+            materialize_proxy_decoded_linears=False,
+            proxy_group_size=int(args.prewarm_group_size),
         )
     else:
         from train_utils.model_checkpoint_io import load_model_checkpoint

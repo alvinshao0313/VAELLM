@@ -227,6 +227,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         adalora_beta1=float(args.vae_adalora_beta1),
         adalora_beta2=float(args.vae_adalora_beta2),
         adalora_orth_reg_weight=float(args.vae_adalora_orth_reg_weight),
+        materialize_before_inject=False,
     )
 
     setattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)

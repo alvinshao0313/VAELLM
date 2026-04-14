@@ -1,4 +1,5 @@
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -10,6 +11,11 @@ from peft.tuners.lora.layer import Linear as PeftLoraLinear
 from torch import nn
 
 from litebsq.misc import set_module_by_name
+from litebsq.vae_linear_prewarm import (
+    NamedVAELinearDecodeTarget,
+    decode_named_vae_linear_weights,
+    resolve_grouped_decode_compute_device,
+)
 from litebsq.vae_linear import VAELinear
 
 
@@ -97,36 +103,31 @@ class PeftVAELinearProxy(nn.Module):
         self.in_features = int(base_layer.in_features)
         self.out_features = int(base_layer.out_features)
         self.temporary = bool(getattr(base_layer, "temporary", True))
-        self.per_decoded_linear = self._build_decoded_linear()
+        self.per_decoded_linear = self._build_placeholder_decoded_linear()
+        self._dense_base_materialized = False
 
         self.base_layer.cache_decoded_weight = False
         self.base_layer.clear_decoded_weight_cache()
         setattr(self.base_layer, "_skip_global_cache_prewarm", True)
 
     @torch.no_grad()
-    def _build_decoded_linear(self) -> nn.Linear:
-        previous_temporary = bool(getattr(self.base_layer, "temporary", True))
-        self.base_layer.set_temporary(True)
-        try:
-            decoded_weight = self.base_layer._decode_weight(dtype=_resolve_proxy_dtype(self.base_layer)).detach()
-        finally:
-            self.base_layer.set_temporary(previous_temporary)
-            self.base_layer.clear_decoded_weight_cache()
-
+    def _build_placeholder_decoded_linear(self) -> nn.Linear:
+        target_dtype = _resolve_proxy_dtype(self.base_layer)
+        target_device = next(self.base_layer.parameters(), None)
+        target_device = torch.device("cpu") if target_device is None else target_device.device
         bias = self.base_layer.bias
-        decoded_bias = None if bias is None else bias.detach().to(device=decoded_weight.device, dtype=decoded_weight.dtype)
         linear = nn.Linear(
             self.in_features,
             self.out_features,
-            bias=decoded_bias is not None,
-            device=decoded_weight.device,
-            dtype=decoded_weight.dtype,
+            bias=bias is not None,
+            device=target_device,
+            dtype=target_dtype,
         )
         linear.weight.requires_grad = False
-        linear.weight.copy_(decoded_weight)
-        if decoded_bias is not None:
+        linear.weight.zero_()
+        if bias is not None:
             linear.bias.requires_grad = False
-            linear.bias.copy_(decoded_bias)
+            linear.bias.zero_()
         return linear
 
     def set_temporary(self, temporary: bool = True) -> None:
@@ -140,6 +141,8 @@ class PeftVAELinearProxy(nn.Module):
         use_original = bool(getattr(self.base_layer, "always_use_original", False)) or not bool(self.temporary)
         if use_original:
             return self.base_layer(x)
+        if not bool(self._dense_base_materialized):
+            raise RuntimeError("PeftVAELinearProxy dense base has not been materialized.")
         return self.per_decoded_linear(x)
 
 
@@ -172,6 +175,24 @@ def iter_named_peft_vae_proxies(model: nn.Module) -> Iterator[Tuple[str, PeftVAE
 
 def _sorted_named_peft_vae_proxies(model: nn.Module) -> List[Tuple[str, PeftVAELinearProxy]]:
     return sorted(iter_named_peft_vae_proxies(model), key=lambda item: str(item[0]))
+
+
+def _resolve_proxy_base_linear(module_name: str, proxy: PeftVAELinearProxy) -> nn.Linear:
+    decoded_linear = proxy.per_decoded_linear
+    if is_peft_proxy_adapter_linear(decoded_linear):
+        decoded_linear = decoded_linear.get_base_layer()
+    if not isinstance(decoded_linear, nn.Linear):
+        raise TypeError(
+            f"Expected nn.Linear under '{module_name}.per_decoded_linear', got {type(decoded_linear)}"
+        )
+    return decoded_linear
+
+
+def _has_unmaterialized_proxy_refs(proxy_refs: List[Tuple[str, PeftVAELinearProxy]]) -> bool:
+    for _name, proxy in proxy_refs:
+        if not bool(getattr(proxy, "_dense_base_materialized", False)):
+            return True
+    return False
 
 
 def _normalize_variant(variant: str) -> str:
@@ -608,6 +629,10 @@ def ensure_peft_vae_proxy_adapter(
     adalora_beta1: float = 0.85,
     adalora_beta2: float = 0.85,
     adalora_orth_reg_weight: float = 0.5,
+    materialize_before_inject: bool = True,
+    materialize_group_size: int = 8,
+    materialize_compute_device: Optional[object] = None,
+    materialize_logger=None,
 ) -> int:
     variant = _normalize_variant(variant)
     init_mode = str(init_mode).strip().lower()
@@ -653,6 +678,13 @@ def ensure_peft_vae_proxy_adapter(
         raise ValueError("Detected partially injected PEFT VAELinear proxies. Refusing to continue.")
 
     if injected_count == 0:
+        if bool(materialize_before_inject) and _has_unmaterialized_proxy_refs(proxy_refs):
+            materialize_peft_proxy_decoded_linears(
+                model,
+                group_size=int(materialize_group_size),
+                compute_device=materialize_compute_device,
+                logger=materialize_logger,
+            )
         if variant == "adalora":
             inject_adapter_in_model(
                 AdaLoraConfig(
@@ -869,26 +901,91 @@ def strip_proxy_dense_base_from_state_dict(
                 removed += 1
     return removed
 
-
 @torch.no_grad()
-def refresh_peft_proxy_decoded_linears(model: nn.Module) -> int:
-    refreshed = 0
-    for name, proxy in iter_named_peft_vae_proxies(model):
-        decoded_linear = proxy.per_decoded_linear
-        if is_peft_proxy_adapter_linear(decoded_linear):
-            decoded_linear = decoded_linear.get_base_layer()
-        if not isinstance(decoded_linear, nn.Linear):
-            raise TypeError(
-                f"Expected nn.Linear under '{name}.per_decoded_linear', got {type(decoded_linear)}"
-            )
+def materialize_peft_proxy_decoded_linears(
+    model: nn.Module,
+    *,
+    group_size: int = 8,
+    compute_device: Optional[object] = None,
+    logger=None,
+    log_prefix: str = "",
+) -> Dict[str, object]:
+    proxy_refs = _sorted_named_peft_vae_proxies(model)
+    if not proxy_refs:
+        resolved_compute_device = resolve_grouped_decode_compute_device(
+            compute_device,
+            logger=logger,
+            log_prefix=log_prefix,
+        )
+        return {
+            "total": 0,
+            "refreshed": 0,
+            "warmed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "group_size": int(group_size),
+            "compute_device": str(resolved_compute_device),
+            "writeback_device": "none",
+            "duration_sec": 0.0,
+        }
 
+    requested_compute_device = compute_device
+    if requested_compute_device is None:
+        requested_compute_device = _resolve_proxy_base_linear(proxy_refs[0][0], proxy_refs[0][1]).weight.device
+    resolved_compute_device = resolve_grouped_decode_compute_device(
+        requested_compute_device,
+        logger=logger,
+        log_prefix=log_prefix,
+    )
+
+    writeback_devices = {
+        str(_resolve_proxy_base_linear(name, proxy).weight.device)
+        for name, proxy in proxy_refs
+    }
+    writeback_device_label = next(iter(writeback_devices)) if len(writeback_devices) == 1 else "mixed"
+    if logger is not None:
+        logger.info(
+            "%sStart proxy materialize: total=%d group_size=%d compute_device=%s writeback_device=%s",
+            log_prefix,
+            len(proxy_refs),
+            int(group_size),
+            str(resolved_compute_device),
+            writeback_device_label,
+        )
+
+    start_time = time.time()
+    decode_targets = [
+        NamedVAELinearDecodeTarget(
+            name=name,
+            base_layer=proxy.base_layer,
+            target_dtype=_resolve_proxy_base_linear(name, proxy).weight.dtype,
+        )
+        for name, proxy in proxy_refs
+    ]
+    decoded_results = decode_named_vae_linear_weights(
+        decode_targets,
+        group_size=int(group_size),
+        compute_device=resolved_compute_device,
+        logger=logger,
+        respect_cache_policy=False,
+    )
+    decoded_by_name = {item.name: item for item in decoded_results}
+    if len(decoded_by_name) != len(proxy_refs):
+        raise RuntimeError(
+            f"Proxy materialize result count mismatch: decoded={len(decoded_by_name)} expected={len(proxy_refs)}."
+        )
+
+    refreshed = 0
+    for name, proxy in proxy_refs:
+        if name not in decoded_by_name:
+            raise RuntimeError(f"Missing grouped decode result for proxy '{name}'.")
+        decoded_item = decoded_by_name[name]
+        decoded_linear = _resolve_proxy_base_linear(name, proxy)
         target_device = decoded_linear.weight.device
         target_dtype = decoded_linear.weight.dtype
-        decoded_weight = proxy.base_layer._decode_weight(dtype=target_dtype).to(
-            device=target_device,
-            dtype=target_dtype,
+        decoded_linear.weight.copy_(
+            decoded_item.decoded_weight.to(device=target_device, dtype=target_dtype)
         )
-        decoded_linear.weight.copy_(decoded_weight)
 
         base_bias = proxy.base_layer.bias
         if decoded_linear.bias is None:
@@ -906,8 +1003,34 @@ def refresh_peft_proxy_decoded_linears(model: nn.Module) -> int:
                         dtype=decoded_linear.bias.dtype,
                     )
                 )
+        proxy.base_layer.clear_decoded_weight_cache()
+        proxy._dense_base_materialized = True
         refreshed += 1
-    return refreshed
+
+    duration_sec = float(time.time() - start_time)
+    if logger is not None:
+        logger.info(
+            "%sFinished proxy materialize: total=%d refreshed=%d failed=%d group_size=%d compute_device=%s writeback_device=%s duration_sec=%.2f",
+            log_prefix,
+            len(proxy_refs),
+            refreshed,
+            0,
+            int(group_size),
+            str(resolved_compute_device),
+            writeback_device_label,
+            duration_sec,
+        )
+    return {
+        "total": int(len(proxy_refs)),
+        "refreshed": int(refreshed),
+        "warmed": int(refreshed),
+        "skipped": int(len(proxy_refs) - refreshed),
+        "failed": 0,
+        "group_size": int(group_size),
+        "compute_device": str(resolved_compute_device),
+        "writeback_device": writeback_device_label,
+        "duration_sec": duration_sec,
+    }
 
 
 def update_peft_vae_proxy_adalora(

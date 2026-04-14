@@ -49,7 +49,6 @@ def _uses_fsdp(training_args) -> bool:
     fsdp = getattr(training_args, "fsdp", "")
     return not (fsdp is None or fsdp == "" or fsdp == [])
 
-
 def _ensure_student_mode(model) -> None:
     set_model_temporary(model, True)
 
@@ -438,6 +437,10 @@ def run(args, hf_args, training_args):
         base_model_path=None if resume_from_checkpoint else args.teacher_model_path,
         map_location="cpu",
         strict=True,
+        materialize_proxy_decoded_linears=True,
+        proxy_group_size=int(args.prewarm_group_size),
+        proxy_compute_device=str(training_args.device),
+        proxy_logger=log,
     )
     log.info(
         "Student checkpoint loaded from %s. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
@@ -497,6 +500,10 @@ def run(args, hf_args, training_args):
             adalora_beta1=float(args.vae_adalora_beta1),
             adalora_beta2=float(args.vae_adalora_beta2),
             adalora_orth_reg_weight=float(args.vae_adalora_orth_reg_weight),
+            materialize_before_inject=True,
+            materialize_group_size=int(args.prewarm_group_size),
+            materialize_compute_device=str(training_args.device),
+            materialize_logger=log,
         )
 
     need_residual_svd_init = _should_initialize_vae_lora_residual_svd(

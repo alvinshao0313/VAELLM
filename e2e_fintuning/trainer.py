@@ -449,6 +449,12 @@ class _E2ELossMixin:
                 continue
             named_targets.append(NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer))
 
+        self._logger.info(
+            "Start VAELinear prewarm: total=%d dtype=%s prewarm_group_size=%d",
+            len(named_targets),
+            str(target_dtype),
+            int(self.prewarm_group_size),
+        )
         stats = prime_named_vae_linear_cache(
             named_targets,
             dtype=target_dtype,
@@ -467,6 +473,7 @@ class _E2ELossMixin:
             str(target_dtype),
             int(self.prewarm_group_size),
         )
+        self._logger.info("Finished VAELinear prewarm.")
 
     def _compute_teacher_outputs(
         self,

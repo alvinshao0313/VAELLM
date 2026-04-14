@@ -13,8 +13,8 @@ from e2e_fintuning.peft_proxy import (
     ensure_peft_vae_proxy_adapter,
     inject_peft_proxy_adalora_runtime_state_dict,
     iter_named_peft_vae_proxies,
+    materialize_peft_proxy_decoded_linears,
     pop_peft_proxy_adalora_runtime_state_dict,
-    refresh_peft_proxy_decoded_linears,
     restore_peft_proxy_adalora_runtime_state_dict,
     strip_proxy_dense_base_from_state_dict,
 )
@@ -292,6 +292,7 @@ def _rebuild_proxy_adapter_modules(
             alpha=requested_alpha,
             dropout=requested_dropout,
             init_mode="zero",
+            materialize_before_inject=False,
         )
         return
 
@@ -347,6 +348,7 @@ def _rebuild_proxy_adapter_modules(
         adalora_beta1=requested_beta1,
         adalora_beta2=requested_beta2,
         adalora_orth_reg_weight=requested_orth,
+        materialize_before_inject=False,
     )
 
 
@@ -396,6 +398,10 @@ def load_e2e_checkpoint_into_model(
     *,
     map_location: str = "cpu",
     strict: bool = True,
+    materialize_proxy_decoded_linears: bool = True,
+    proxy_group_size: int = 8,
+    proxy_compute_device: Optional[object] = None,
+    proxy_logger=None,
 ):
     meta_path = os.path.join(model_dir, META_FILENAME)
     if not os.path.exists(meta_path):
@@ -424,7 +430,13 @@ def load_e2e_checkpoint_into_model(
     _materialize_missing_proxy_dense_base_from_model(model, state_dict)
 
     load_result = model.load_state_dict(state_dict, strict=strict)
-    refresh_peft_proxy_decoded_linears(model)
+    if materialize_proxy_decoded_linears:
+        materialize_peft_proxy_decoded_linears(
+            model,
+            group_size=int(proxy_group_size),
+            compute_device=map_location if proxy_compute_device is None else proxy_compute_device,
+            logger=proxy_logger,
+        )
     restore_peft_proxy_adalora_runtime_state_dict(model, adalora_runtime_state)
     model.eval()
     return model, meta, load_result
@@ -437,6 +449,10 @@ def load_e2e_model_checkpoint(
     base_model_path: Optional[str] = None,
     map_location: str = "cpu",
     strict: bool = True,
+    materialize_proxy_decoded_linears: bool = True,
+    proxy_group_size: int = 8,
+    proxy_compute_device: Optional[object] = None,
+    proxy_logger=None,
 ):
     meta_path = os.path.join(model_dir, META_FILENAME)
     if not os.path.exists(meta_path):
@@ -456,4 +472,8 @@ def load_e2e_model_checkpoint(
         model_dir=model_dir,
         map_location=map_location,
         strict=strict,
+        materialize_proxy_decoded_linears=materialize_proxy_decoded_linears,
+        proxy_group_size=int(proxy_group_size),
+        proxy_compute_device=proxy_compute_device,
+        proxy_logger=proxy_logger,
     )
