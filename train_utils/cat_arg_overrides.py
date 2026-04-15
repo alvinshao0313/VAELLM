@@ -283,43 +283,17 @@ def parse_intra_part_sort_mode_text(
     raw: str,
     *,
     arg_name: str,
-) -> Union[str, Tuple[str, str]]:
-    parse_choice = make_choice_parser(arg_name=arg_name, choices=("none", "l2", "act_l2"))
+) -> str:
+    parse_choice = make_choice_parser(
+        arg_name=arg_name,
+        choices=("none", "spectral_cosine", "act_spectral_cosine"),
+    )
     value = str(raw).strip().lower()
     if not value:
         raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
-    if "," in value:
+    if "," in value or "|" in value or ":" in value:
         raise argparse.ArgumentTypeError(
-            f"Invalid {arg_name} value '{raw}'. Old comma syntax is no longer supported. "
-            "Use a single mode like l2 or row:l2|col:none."
+            f"Invalid {arg_name} value '{raw}'. "
+            "Only single-mode syntax is supported: none / spectral_cosine / act_spectral_cosine."
         )
-    if "|" not in value:
-        return parse_choice(value)
-
-    parts = [item.strip() for item in value.split("|") if item.strip()]
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError(
-            f"Invalid {arg_name} value '{raw}'. Expected row:<mode>|col:<mode>."
-        )
-
-    parsed: Dict[str, str] = {}
-    for item in parts:
-        if ":" not in item:
-            raise argparse.ArgumentTypeError(
-                f"Invalid {arg_name} entry '{item}'. Expected row:<mode>|col:<mode>."
-            )
-        axis, mode = item.split(":", 1)
-        axis_key = axis.strip().lower()
-        if axis_key not in {"row", "col"}:
-            raise argparse.ArgumentTypeError(
-                f"Invalid {arg_name} axis '{axis}'. Supported axes: row,col."
-            )
-        if axis_key in parsed:
-            raise argparse.ArgumentTypeError(f"Duplicate {arg_name} axis '{axis_key}'.")
-        parsed[axis_key] = parse_choice(mode.strip())
-
-    if set(parsed.keys()) != {"row", "col"}:
-        raise argparse.ArgumentTypeError(
-            f"Invalid {arg_name} value '{raw}'. Expected both row and col modes."
-        )
-    return parsed["row"], parsed["col"]
+    return parse_choice(value)

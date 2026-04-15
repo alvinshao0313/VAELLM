@@ -21,13 +21,16 @@ from e2e_fintuning.trainer import (
     E2EAdaLoraCallback,
     E2EFinetuneTrainer,
     E2EFSDPFinetuneTrainer,
-    register_lora_hif4_act_hooks,
-    remove_lora_hif4_act_hooks,
     set_model_temporary,
 )
 from litebsq.vae_linear import clear_model_vae_linear_cache
 from rotation.model_utils import get_layers, get_model
 from train_utils.eval_utils import calculate_ppl
+from train_utils.hif4_act import (
+    applied_hif4_act,
+    register_hif4_act_hooks,
+    remove_hif4_act_hooks,
+)
 from train_utils.model_checkpoint_io import (
     _build_run_output_dir,
     resolve_checkpoint_dir,
@@ -358,8 +361,14 @@ def _eval_final_ppl(*, model, args, model_path: str, output_dir: str, log):
         int(ppl_args.seqlen),
         int(ppl_args.limit),
     )
-    with torch.no_grad():
-        ppl_result = calculate_ppl(model, ppl_args)
+    with applied_hif4_act(
+        model,
+        enabled=bool(getattr(args, "eval_hif4_act", False)),
+        logger=log,
+        log_prefix="[final_ppl] ",
+    ):
+        with torch.no_grad():
+            ppl_result = calculate_ppl(model, ppl_args)
 
     result = {
         "wiki_ppl": float(ppl_result.get("wiki_ppl", float("nan"))),
@@ -641,9 +650,9 @@ def run(args, hf_args, training_args):
 
     hif4_act_handles = []
     if trainer.lora_hif4_act_controller is not None:
-        hif4_act_handles = register_lora_hif4_act_hooks(trainer.model, trainer.lora_hif4_act_controller)
+        hif4_act_handles = register_hif4_act_hooks(trainer.model, trainer.lora_hif4_act_controller)
         if not hif4_act_handles:
-            raise RuntimeError("启用 --lora_hif4_act 失败：未找到可注册 hook 的逻辑线性层。")
+            raise RuntimeError("启用 HiFloat4 激活量化失败：未找到可注册 hook 的逻辑线性层。")
         trainer.lora_hif4_act_controller.enabled = True
         log.info("Registered %d HiFloat4 activation hooks for e2e LoRA training.", len(hif4_act_handles))
     try:
@@ -651,7 +660,7 @@ def run(args, hf_args, training_args):
     finally:
         if trainer.lora_hif4_act_controller is not None:
             trainer.lora_hif4_act_controller.enabled = False
-        remove_lora_hif4_act_hooks(hif4_act_handles)
+        remove_hif4_act_hooks(hif4_act_handles)
 
     final_model = _unwrap_model(trainer, trainer.model)
     setattr(final_model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)

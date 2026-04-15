@@ -1,8 +1,6 @@
 import logging
-import os
-import sys
 import warnings
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -14,10 +12,9 @@ from e2e_fintuning.checkpoint_io import save_e2e_model_checkpoint
 from e2e_fintuning.lora import LoRAVAELinear, iter_named_vae_module_refs
 from e2e_fintuning.peft_proxy import (
     PeftVAELinearProxy,
-    is_peft_proxy_adapter_linear,
     update_peft_vae_proxy_adalora,
 )
-from litebsq.vae_linear import NamedVAELinearTarget, VAELinear, prime_named_vae_linear_cache
+from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
 from train_utils.distill_losses import (
     build_distill_token_mask,
     compute_dual_kl_loss,
@@ -26,108 +23,9 @@ from train_utils.distill_losses import (
     compute_dual_rkl_topk_loss,
 )
 from train_utils.fsdp_trainer import FSDPTrainer
+from train_utils.hif4_act import build_hif4_act_controller
 from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME
 from train_utils.utils import pt_fsdp_state_dict
-
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_HIF4_GPU_ROOT = os.path.join(_REPO_ROOT, "HiFloat4", "hif4_gpu")
-_HIF4_ACT_QUANTIZER: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
-
-
-class _E2EHif4ActController:
-    def __init__(self, quantize: Callable[[torch.Tensor], torch.Tensor]):
-        self.quantize = quantize
-        self.enabled = False
-
-
-def _iter_parent_names(name: str):
-    parts = [part for part in str(name).split(".") if part]
-    for idx in range(len(parts) - 1, 0, -1):
-        yield ".".join(parts[:idx])
-
-
-def _load_lora_hif4_act_quantizer() -> Callable[[torch.Tensor], torch.Tensor]:
-    global _HIF4_ACT_QUANTIZER
-    if _HIF4_ACT_QUANTIZER is not None:
-        return _HIF4_ACT_QUANTIZER
-    if not os.path.isdir(_HIF4_GPU_ROOT):
-        raise ImportError(
-            "启用 --lora_hif4_act 失败：未找到 HiFloat4 GPU 目录。"
-            f" 期望路径: {_HIF4_GPU_ROOT}"
-        )
-    if _HIF4_GPU_ROOT not in sys.path:
-        sys.path.insert(0, _HIF4_GPU_ROOT)
-    try:
-        from quant_cy import QType, quant_func
-    except Exception as exc:
-        raise ImportError(
-            "启用 --lora_hif4_act 失败：无法导入 HiFloat4 quant_cy。"
-            f" 请确认已构建 {_HIF4_GPU_ROOT}/build.sh。原始错误: {exc}"
-        ) from exc
-
-    quant_type = QType("hifx4").dim(-1)
-
-    def quantize(x: torch.Tensor) -> torch.Tensor:
-        return quant_func(x, quant_type, force_py=False, force_fp32=True)
-
-    _HIF4_ACT_QUANTIZER = quantize
-    return _HIF4_ACT_QUANTIZER
-
-
-def _collect_lora_hif4_act_modules(model: nn.Module) -> List[Tuple[str, nn.Module]]:
-    module_map = dict(model.named_modules())
-    targets: List[Tuple[str, nn.Module]] = []
-    for name, module in module_map.items():
-        if not name:
-            continue
-        has_wrapped_parent = any(
-            isinstance(module_map[parent_name], (LoRAVAELinear, PeftVAELinearProxy, VAELinear))
-            or is_peft_proxy_adapter_linear(module_map[parent_name])
-            for parent_name in _iter_parent_names(name)
-        )
-        if has_wrapped_parent:
-            continue
-        if isinstance(module, (LoRAVAELinear, VAELinear)) or is_peft_proxy_adapter_linear(module):
-            targets.append((name, module))
-            continue
-        if not isinstance(module, nn.Linear):
-            continue
-        targets.append((name, module))
-    return targets
-
-
-def _make_lora_hif4_act_pre_hook(controller: _E2EHif4ActController):
-    def hook(_module, args, kwargs):
-        if not controller.enabled or not args:
-            return None
-        x = args[0]
-        if not isinstance(x, torch.Tensor) or not x.is_floating_point():
-            return None
-        return (controller.quantize(x),) + tuple(args[1:]), kwargs
-
-    return hook
-
-
-def register_lora_hif4_act_hooks(
-    model: nn.Module,
-    controller: _E2EHif4ActController,
-) -> List[torch.utils.hooks.RemovableHandle]:
-    handles: List[torch.utils.hooks.RemovableHandle] = []
-    seen: set[int] = set()
-    hook = _make_lora_hif4_act_pre_hook(controller)
-    for _name, module in _collect_lora_hif4_act_modules(model):
-        module_id = id(module)
-        if module_id in seen:
-            continue
-        seen.add(module_id)
-        handles.append(module.register_forward_pre_hook(hook, with_kwargs=True))
-    return handles
-
-
-def remove_lora_hif4_act_hooks(handles: Sequence[torch.utils.hooks.RemovableHandle]) -> None:
-    for handle in handles:
-        handle.remove()
 
 
 def _iter_named_temporary_modules(model: nn.Module):
@@ -347,11 +245,7 @@ class _E2ELossMixin:
         self.distill_alpha = float(distill_alpha)
         self.post_attn = bool(post_attn)
         self.lora_hif4_act = bool(lora_hif4_act)
-        self.lora_hif4_act_controller = (
-            _E2EHif4ActController(_load_lora_hif4_act_quantizer())
-            if self.lora_hif4_act
-            else None
-        )
+        self.lora_hif4_act_controller = build_hif4_act_controller(self.lora_hif4_act)
         self.prewarm_frozen_vae = bool(prewarm_frozen_vae)
         self.prewarm_log_every = max(1, int(prewarm_log_every))
         self.prewarm_group_size = max(1, int(prewarm_group_size))

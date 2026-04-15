@@ -12,16 +12,18 @@ except ImportError:
     TrainingArguments = None
 
 from train_utils.cat_train_args import resolve_lora_runtime_config
+from train_utils.hif4_act import (
+    build_hif4_act_controller,
+    register_hif4_act_hooks,
+    remove_hif4_act_hooks,
+)
 from train_utils.lora_data import ensure_lora_dataset_stack_available, prepare_lora_datasets
 from train_utils.lora_training import (
     CustomSFTTrainer,
     SFTTrainer,
-    build_lora_hif4_act_controller,
     create_lora_adapters,
     ensure_lora_training_stack_available,
     merge_all_lora,
-    register_lora_hif4_act_hooks,
-    remove_hook_handles,
 )
 
 
@@ -241,9 +243,9 @@ def _train_and_merge_lora_model(
     if hif4_act_controller is not None:
         if hasattr(trainer, "lora_hif4_act_controller"):
             trainer.lora_hif4_act_controller = hif4_act_controller
-        hif4_act_handles = register_lora_hif4_act_hooks(trainer.model, hif4_act_controller)
+        hif4_act_handles = register_hif4_act_hooks(trainer.model, hif4_act_controller)
         if not hif4_act_handles:
-            raise RuntimeError("启用 --lora_hif4_act 失败：未找到可注册 hook 的逻辑线性层。")
+            raise RuntimeError("启用 HiFloat4 激活量化失败：未找到可注册 hook 的逻辑线性层。")
         logger.info(
             "LoRA: 已启用 HiFloat4 激活量化，student 前向量化类型=hifx4，hook 模块数=%d",
             len(hif4_act_handles),
@@ -256,7 +258,7 @@ def _train_and_merge_lora_model(
     finally:
         if hif4_act_controller is not None:
             hif4_act_controller.enabled = False
-        remove_hook_handles(hif4_act_handles)
+        remove_hif4_act_hooks(hif4_act_handles)
 
     model, merged_count = merge_all_lora(trainer.model)
     model.to("cpu")
@@ -334,7 +336,7 @@ def lora_finetune_remaining_categories(
 
     _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
     sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
-    hif4_act_controller = build_lora_hif4_act_controller(cfg.use_lora_hif4_act)
+    hif4_act_controller = build_hif4_act_controller(cfg.use_lora_hif4_act)
     trainer = _build_lora_trainer(
         model=model,
         train_ds=train_ds,

@@ -41,6 +41,7 @@ from train_utils.activation_utils import (
     collect_act_max_for_linears,
 )
 from train_utils.cat_arg_overrides import validate_category_keys
+from train_utils.hif4_act import applied_hif4_act
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
     _build_run_output_dir,
@@ -63,6 +64,11 @@ from train_utils.utils import (
 
 
 log = get_logger("linear_by_category")
+
+
+_RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT = frozenset(
+    {"input_act_weighted_abs", "input_act_weighted_original_weight_abs"}
+)
 
 
 def _to_jsonable(value):
@@ -292,15 +298,28 @@ def _restore_stage_norm(
     return raw_flat.view(num_models, num_blocks, codebook_dim).permute(1, 0, 2).contiguous()
 
 
-def _eval_ppl_after_category(model: nn.Module, vae_args, ppl_limit: int, category: str, eval_device: str = "cuda") -> None:
+def _eval_ppl_after_category(
+    model: nn.Module,
+    vae_args,
+    ppl_limit: int,
+    category: str,
+    eval_device: str = "cuda",
+    eval_hif4_act: bool = False,
+) -> None:
     from train_utils.eval_utils import calculate_ppl
 
     log.info("开始类别 %s 的 PPL 评估...", category)
     model.eval()
     model.to(eval_device)
-    with torch.no_grad():
-        ppl_args = _clone_namespace(vae_args, limit=int(ppl_limit))
-        ppl_result = calculate_ppl(model, ppl_args)
+    with applied_hif4_act(
+        model,
+        enabled=bool(eval_hif4_act),
+        logger=log,
+        log_prefix=f"[ppl:{category}] ",
+    ):
+        with torch.no_grad():
+            ppl_args = _clone_namespace(vae_args, limit=int(ppl_limit))
+            ppl_result = calculate_ppl(model, ppl_args)
     model.to("cpu")
     torch.cuda.empty_cache()
     log.info("类别 %s 训练后 PPL: %.2f", category, float(ppl_result.get("wiki_ppl", float("nan"))))
@@ -391,6 +410,7 @@ def _build_vae_linear_from_stage_payload(
         parallel_cols=int(parallel_cols),
         restore_row_indices=split_meta.restore_row_indices,
         restore_col_indices=split_meta.restore_col_indices,
+        part_restore_col_indices=split_meta.part_restore_col_indices,
         compressed_in_features=int(split_meta.compressed_in_features),
         compressed_out_features=int(split_meta.compressed_out_features),
         protected_input_indices=split_meta.protected_input_indices,
@@ -455,6 +475,7 @@ def _select_sparse_residual_entries(
     activation_weight: Optional[torch.Tensor],
     score_mode: str,
     top_p: float,
+    min_abs: float,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     original_weight = original_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
     reconstructed_weight = reconstructed_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -466,13 +487,26 @@ def _select_sparse_residual_entries(
     out_features, in_features = int(original_weight.shape[0]), int(original_weight.shape[1])
     if not (0.0 < float(top_p) <= 1.0):
         raise ValueError(f"{linear_name}: residual_sparse top_p must satisfy 0 < top_p <= 1, got {top_p}.")
+    if float(min_abs) < 0.0:
+        raise ValueError(f"{linear_name}: residual_sparse min_abs must be >= 0, got {min_abs}.")
 
     residual = (original_weight - reconstructed_weight).contiguous()
-    score = residual.abs()
+    abs_residual = residual.abs()
     resolved_score_mode = str(score_mode).strip().lower()
-    if resolved_score_mode == "input_act_weighted_abs":
+    if resolved_score_mode in {"abs", "input_act_weighted_abs"}:
+        score = abs_residual
+    elif resolved_score_mode in {"original_weight_abs", "input_act_weighted_original_weight_abs"}:
+        score = original_weight.abs()
+    else:
+        raise ValueError(
+            f"{linear_name}: unsupported residual sparse score mode {score_mode!r}. "
+            "Expected abs, input_act_weighted_abs, original_weight_abs, "
+            "or input_act_weighted_original_weight_abs."
+        )
+
+    if resolved_score_mode in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT:
         if activation_weight is None:
-            raise ValueError(f"{linear_name}: input_act_weighted_abs requires activation_weight.")
+            raise ValueError(f"{linear_name}: {resolved_score_mode} requires activation_weight.")
         act = activation_weight.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
         if int(act.numel()) != in_features:
             raise ValueError(
@@ -480,21 +514,21 @@ def _select_sparse_residual_entries(
                 f"got {int(act.numel())}, expected {in_features}."
             )
         score = score * act.view(1, in_features)
-    elif resolved_score_mode != "abs":
-        raise ValueError(
-            f"{linear_name}: unsupported residual sparse score mode {score_mode!r}. "
-            "Expected abs or input_act_weighted_abs."
-        )
 
     flat_score = score.view(-1)
+    flat_abs_residual = abs_residual.view(-1)
     total_numel = int(flat_score.numel())
     nnz_target = max(1, int(math.ceil(float(top_p) * float(total_numel))))
     nnz_target = min(nnz_target, total_numel)
-    top_score, top_idx = torch.topk(flat_score, k=nnz_target, largest=True, sorted=False)
-    positive_mask = top_score > 0
-    top_idx = top_idx[positive_mask]
-    if int(top_idx.numel()) == 0:
+    valid_mask = (flat_score > 0) & (flat_abs_residual >= float(min_abs))
+    valid_idx = torch.nonzero(valid_mask, as_tuple=False).view(-1)
+    valid_count = int(valid_idx.numel())
+    if valid_count == 0:
         return None, None, None
+    k = min(nnz_target, valid_count)
+    valid_scores = flat_score.index_select(0, valid_idx)
+    _, top_local_idx = torch.topk(valid_scores, k=k, largest=True, sorted=False)
+    top_idx = valid_idx.index_select(0, top_local_idx)
     top_idx = torch.sort(top_idx.to(dtype=torch.int64)).values.contiguous()
     flat_residual = residual.view(-1)
     values = flat_residual.index_select(0, top_idx).to(dtype=torch.float32).contiguous()
@@ -511,6 +545,7 @@ def _build_sparse_residual_payload(
     activation_weight: Optional[torch.Tensor],
     score_mode: str,
     top_p: float,
+    min_abs: float,
     codec: str,
     index_bits: int,
     value_bits: int,
@@ -523,6 +558,7 @@ def _build_sparse_residual_payload(
         activation_weight=activation_weight,
         score_mode=score_mode,
         top_p=top_p,
+        min_abs=min_abs,
     )
     if row_idx is None or col_idx is None or values is None:
         return None, 0, {"coo_bytes": 0, "codec_bytes": 0}
@@ -599,6 +635,7 @@ def _train_group_vae_and_replace(
     activation_runtime: Optional[Dict[str, object]] = None,
     outlier_protect_mode: str = "channel",
     outlier_residual_score: str = "abs",
+    outlier_residual_min_abs: float = 1e-6,
     outlier_protect_axis: str = "input",
     outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
     outlier_residual_index_bits: int = 8,
@@ -628,9 +665,10 @@ def _train_group_vae_and_replace(
     outlier_residual_top_p = float(runtime_cfg.outlier_residual_top_p)
     resolved_outlier_mode = str(outlier_protect_mode).strip().lower()
     resolved_residual_score = str(outlier_residual_score).strip().lower()
+    resolved_residual_min_abs = float(outlier_residual_min_abs)
     residual_sparse_enabled = resolved_outlier_mode == "residual_sparse"
     residual_sparse_needs_activation = (
-        residual_sparse_enabled and resolved_residual_score == "input_act_weighted_abs"
+        residual_sparse_enabled and resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT
     )
     if resolved_outlier_mode not in {"channel", "residual_sparse"}:
         raise ValueError(
@@ -646,15 +684,19 @@ def _train_group_vae_and_replace(
             f"[{group_tag}] residual_sparse mode requires 0 < outlier_residual_top_p <= 1, "
             f"got {outlier_residual_top_p}."
         )
+    if resolved_residual_min_abs < 0.0:
+        raise ValueError(
+            f"[{group_tag}] residual_sparse mode requires outlier_residual_min_abs >= 0, "
+            f"got {resolved_residual_min_abs}."
+        )
     resolved_residual_codec = str(outlier_residual_codec).strip().lower()
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
     row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
     parts_per_linear = int(row_parts) * int(col_parts)
-    row_sort_mode, col_sort_mode = runtime_cfg.intra_part_sort_mode
+    sort_mode = str(runtime_cfg.intra_part_sort_mode).strip().lower()
     needs_dynamic_activation = (
         use_wa_mse_loss
-        or row_sort_mode == "act_l2"
-        or col_sort_mode == "act_l2"
+        or sort_mode == "act_spectral_cosine"
         or (resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0)
         or residual_sparse_needs_activation
     )
@@ -662,7 +704,7 @@ def _train_group_vae_and_replace(
     if needs_dynamic_activation:
         if activation_runtime is None:
             raise ValueError(
-                f"[{group_tag}] dynamic activation runtime is required for wa_mse, act_l2, or outlier protection."
+                f"[{group_tag}] dynamic activation runtime is required for wa_mse, act_spectral_cosine, or outlier protection."
             )
         calib_device = str(activation_runtime.get("device") or train_device)
         linear_items = [(r.name, r.module) for r in group_refs]
@@ -742,10 +784,11 @@ def _train_group_vae_and_replace(
         )
     if residual_sparse_enabled:
         log.info(
-            "[%s] residual sparse protection enabled: top_p=%.6f score=%s codec=%s index_bits=%d value_bits=%d block=%dx%d",
+            "[%s] residual sparse protection enabled: top_p=%.6f score=%s min_abs=%.6e codec=%s index_bits=%d value_bits=%d block=%dx%d",
             group_tag,
             outlier_residual_top_p,
             resolved_residual_score,
+            resolved_residual_min_abs,
             resolved_residual_codec,
             int(outlier_residual_index_bits),
             int(outlier_residual_value_bits),
@@ -1051,7 +1094,7 @@ def _train_group_vae_and_replace(
         sparse_residual_kwargs = None
         if residual_sparse_enabled:
             activation_weight = None
-            if resolved_residual_score == "input_act_weighted_abs":
+            if resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT:
                 if effective_activation_weight is None or r.name not in effective_activation_weight:
                     raise ValueError(
                         f"[{group_tag}] missing activation vector for residual_sparse scoring at linear '{r.name}'."
@@ -1075,18 +1118,20 @@ def _train_group_vae_and_replace(
                 activation_weight=activation_weight,
                 score_mode=resolved_residual_score,
                 top_p=outlier_residual_top_p,
+                min_abs=resolved_residual_min_abs,
                 codec=resolved_residual_codec,
                 index_bits=outlier_residual_index_bits,
                 value_bits=outlier_residual_value_bits,
                 block_shape=outlier_residual_block_shape,
             )
             log.info(
-                "[%s] residual sparse patch for %s: nnz=%d top_p=%.6f score=%s codec=%s bytes(codec=%d coo=%d)",
+                "[%s] residual sparse patch for %s: nnz=%d top_p=%.6f score=%s min_abs=%.6e codec=%s bytes(codec=%d coo=%d)",
                 group_tag,
                 r.name,
                 sparse_nnz,
                 outlier_residual_top_p,
                 resolved_residual_score,
+                resolved_residual_min_abs,
                 resolved_residual_codec,
                 int(sparse_storage["codec_bytes"]),
                 int(sparse_storage["coo_bytes"]),
@@ -1242,8 +1287,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     category_outlier_residual_top_p: Dict[str, float] = {
         cat: float(resolved_category_cfgs[cat].outlier_residual_top_p) for cat in active_categories
     }
-    category_sort_modes: Dict[str, Tuple[str, str]] = {
-        cat: tuple(resolved_category_cfgs[cat].intra_part_sort_mode)
+    category_sort_modes: Dict[str, str] = {
+        cat: str(resolved_category_cfgs[cat].intra_part_sort_mode)
         for cat in active_categories
     }
     category_sort_mode_desc: Dict[str, str] = {
@@ -1255,12 +1300,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ).lower() == "wa_mse" for cat in active_categories)
     any_outlier_protect = any(count > 0 for count in category_outlier_protect_count.values())
     residual_sparse_needs_activation = (
-        resolved_outlier_mode == "residual_sparse" and resolved_residual_score == "input_act_weighted_abs"
+        resolved_outlier_mode == "residual_sparse"
+        and resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT
     )
-    sort_needs_act = any(
-        row_mode == "act_l2" or col_mode == "act_l2"
-        for row_mode, col_mode in category_sort_modes.values()
-    )
+    sort_needs_act = any(mode == "act_spectral_cosine" for mode in category_sort_modes.values())
     if any_wa_mse or any_outlier_protect or sort_needs_act or residual_sparse_needs_activation:
         activation_runtime = {
             "cache": None,  # type: Optional[ActivationCalibrationCache]
@@ -1279,7 +1322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if any_outlier_protect:
             enabled_features.append("outlier_protect")
         if sort_needs_act:
-            enabled_features.append("act_l2_sort")
+            enabled_features.append("act_spectral_cosine_sort")
         if residual_sparse_needs_activation:
             enabled_features.append("residual_sparse_score")
         log.info(
@@ -1303,9 +1346,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         unique_top_p = sorted(set(category_outlier_residual_top_p.values()))
         if len(unique_top_p) == 1:
             log.info(
-                "Residual sparse protection enabled: top_p=%.6f score=%s codec=%s index_bits=%d value_bits=%d block=%dx%d",
+                "Residual sparse protection enabled: top_p=%.6f score=%s min_abs=%.6e codec=%s index_bits=%d value_bits=%d block=%dx%d",
                 unique_top_p[0],
                 resolved_residual_score,
+                float(cat_args.outlier_residual_min_abs),
                 cat_args.outlier_residual_codec,
                 int(cat_args.outlier_residual_index_bits),
                 int(cat_args.outlier_residual_value_bits),
@@ -1314,9 +1358,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
         else:
             log.info(
-                "Residual sparse protection enabled: top_p_by_category={%s} score=%s codec=%s index_bits=%d value_bits=%d block=%dx%d",
+                "Residual sparse protection enabled: top_p_by_category={%s} score=%s min_abs=%.6e codec=%s index_bits=%d value_bits=%d block=%dx%d",
                 ",".join(f"{cat}:{category_outlier_residual_top_p[cat]:.6f}" for cat in active_categories),
                 resolved_residual_score,
+                float(cat_args.outlier_residual_min_abs),
                 cat_args.outlier_residual_codec,
                 int(cat_args.outlier_residual_index_bits),
                 int(cat_args.outlier_residual_value_bits),
@@ -1468,6 +1513,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 activation_runtime=activation_runtime,
                 outlier_protect_mode=resolved_outlier_mode,
                 outlier_residual_score=resolved_residual_score,
+                outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
                 outlier_protect_axis=outlier_protect_axis,
                 outlier_residual_codec=cat_args.outlier_residual_codec,
                 outlier_residual_index_bits=cat_args.outlier_residual_index_bits,
@@ -1492,6 +1538,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     ppl_limit=cat_args.ppl_limit,
                     category=cat,
                     eval_device=cat_args.train_device,
+                    eval_hif4_act=cat_args.eval_hif4_act,
                 )
 
             current_remaining_linears = _collect_current_trainable_linears(
@@ -1521,6 +1568,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 ppl_limit=cat_args.ppl_limit,
                 category=cat,
                 eval_device=cat_args.train_device,
+                eval_hif4_act=cat_args.eval_hif4_act,
             )
         # cat_dir_name = _safe_path_token(cat)
         # cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
@@ -1546,6 +1594,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ppl_limit=cat_args.ppl_limit,
             category="none",
             eval_device=cat_args.train_device,
+            eval_hif4_act=cat_args.eval_hif4_act,
         )
     if cat_args.save_model:
         if not cat_args.convert:

@@ -8,6 +8,7 @@ export CUDA_VISIBLE_DEVICES=2
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
 # --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa"
+# --eval_hif4_act "true"
 # - 带 proxy adapter 的 e2e checkpoint 会在 eval_device 上先 grouped materialize。
 # - 非 proxy checkpoint 才走普通 VAELinear cache warmup。
 
@@ -21,5 +22,6 @@ python tools/cat_eval.py \
   --prewarm_group_size "8" \
   --ppl_seqlen "2048" \
   --ppl_limit "-1" \
+  --eval_hif4_act "false" \
   --eval_log_dir "./eval_log" \
   "$@"

@@ -53,6 +53,7 @@ class E2EFinetuneArguments:
     vae_adalora_beta2: float = 0.85
     vae_adalora_orth_reg_weight: float = 0.5
     lora_hif4_act: bool = False
+    eval_hif4_act: bool = False
     prewarm_frozen_vae: bool = True
     prewarm_log_every: int = 32
     prewarm_group_size: int = 8
@@ -220,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=lambda v: _parse_bool_like(v, arg_name="--lora_hif4_act"),
         default=False,
         help="Enable HiFloat4 activation pseudo-quantization for student linear inputs during e2e LoRA finetuning.",
+    )
+    parser.add_argument(
+        "--eval_hif4_act",
+        type=lambda v: _parse_bool_like(v, arg_name="--eval_hif4_act"),
+        default=False,
+        help="Enable HiFloat4 activation pseudo-quantization during final PPL evaluation.",
     )
     parser.add_argument(
         "--prewarm_frozen_vae",

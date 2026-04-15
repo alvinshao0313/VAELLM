@@ -1,7 +1,12 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.csgraph import laplacian as sparse_laplacian
+from scipy.sparse.linalg import eigsh
 import torch
+import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -22,7 +27,6 @@ class WAMSEPartMeta:
     rows_part: int
     col_offset: int
     act_max: torch.Tensor  # [in_features], float32 on train device
-    row_index_map: Optional[torch.Tensor] = None  # [rows_part], long on train device; sorted-row -> original channel idx
     col_index_map: Optional[torch.Tensor] = None  # [cols_part], long on train device; sorted-col -> original channel idx
 
 
@@ -33,8 +37,9 @@ class LinearSplitMeta:
     sort_mode: str
     parallel_rows: int
     parallel_cols: int
-    restore_row_indices: Optional[torch.Tensor]  # [split_rows], long on cpu; sorted rows -> original rows
-    restore_col_indices: Optional[torch.Tensor]  # [split_cols], long on cpu; sorted cols -> original cols
+    restore_row_indices: Optional[torch.Tensor]  # legacy global restore rows for old checkpoints
+    restore_col_indices: Optional[torch.Tensor]  # legacy global restore cols for old checkpoints
+    part_restore_col_indices: Optional[torch.Tensor]  # [parallel_parts, cols_per_part], long on cpu
     compressed_in_features: int
     compressed_out_features: int
     protected_input_indices: Optional[torch.Tensor]  # [num_protected], long on cpu; original input channel indices
@@ -48,7 +53,7 @@ class PreparedLinearWeight:
     split_weight: torch.Tensor  # [compressed_out_features, compressed_in_features] in original Linear layout
     compressed_in_features: int
     compressed_out_features: int
-    activation_weight: Optional[torch.Tensor]  # input-axis act vector used by act_l2 / wa_mse, float32 on cpu
+    activation_weight: Optional[torch.Tensor]  # input-axis act vector used by act_spectral_cosine / wa_mse, float32 on cpu
     protected_input_indices: Optional[torch.Tensor]  # [num_protected], long on cpu
     protected_input_weight: Optional[torch.Tensor]  # [num_protected, out_features], original dtype on cpu
     protected_output_indices: Optional[torch.Tensor]  # [num_protected], long on cpu
@@ -69,8 +74,11 @@ class GroupDataPrepResult:
     split_metas: List[LinearSplitMeta]
 
 
-_INTRA_PART_SORT_MODE_CHOICES = {"none", "l2", "act_l2"}
-_INTRA_PART_SORT_MODE_HELP = "Expected one of: none,l2,act_l2."
+_INTRA_PART_SORT_MODE_CHOICES = {"none", "spectral_cosine", "act_spectral_cosine"}
+_INTRA_PART_SORT_MODE_HELP = "Expected one of: none,spectral_cosine,act_spectral_cosine."
+_SPECTRAL_TOPK_NEIGHBORS = 32
+_SPECTRAL_SIM_CHUNK = 256
+_SPECTRAL_REFINE_SWEEPS = 4
 
 
 def _normalize_sort_mode_choice(value: object, *, arg_name: str) -> str:
@@ -88,140 +96,31 @@ def normalize_intra_part_sort_mode(
     sort_mode: Union[str, Sequence[str]],
     *,
     arg_name: str = "intra_part_sort_mode",
-) -> Tuple[str, str]:
+) -> str:
     if isinstance(sort_mode, (list, tuple)):
         items = list(sort_mode)
         if len(items) == 0:
             raise ValueError(f"{arg_name} cannot be empty.")
         if len(items) == 1:
-            single = _normalize_sort_mode_choice(items[0], arg_name=arg_name)
-            return single, single
-        if len(items) == 2:
-            return (
-                _normalize_sort_mode_choice(items[0], arg_name=arg_name),
-                _normalize_sort_mode_choice(items[1], arg_name=arg_name),
-            )
+            return _normalize_sort_mode_choice(items[0], arg_name=arg_name)
         raise ValueError(
             f"Unsupported {arg_name}={sort_mode}. "
-            "Expected scalar mode or two modes (row_mode,col_mode)."
+            "Expected exactly one scalar mode."
         )
 
     raw = str(sort_mode).strip()
     if not raw:
         raise ValueError(f"{arg_name} cannot be empty.")
-    raw = raw.replace("，", ",")
-    if "," in raw:
-        items = [p.strip() for p in raw.split(",") if p.strip()]
-        if len(items) != 2:
-            raise ValueError(
-                f"Unsupported {arg_name}={sort_mode}. "
-                "Expected one mode or two comma-separated modes (row_mode,col_mode)."
-            )
-        return (
-            _normalize_sort_mode_choice(items[0], arg_name=arg_name),
-            _normalize_sort_mode_choice(items[1], arg_name=arg_name),
+    if any(sep in raw for sep in (",", "|", ":")):
+        raise ValueError(
+            f"Unsupported {arg_name}={sort_mode}. "
+            "Only single-mode syntax is supported."
         )
-
-    single = _normalize_sort_mode_choice(raw, arg_name=arg_name)
-    return single, single
+    return _normalize_sort_mode_choice(raw, arg_name=arg_name)
 
 
 def format_intra_part_sort_mode(sort_mode: Union[str, Sequence[str]]) -> str:
-    row_mode, col_mode = normalize_intra_part_sort_mode(sort_mode)
-    return f"{row_mode},{col_mode}"
-
-
-def _apply_codebook_serpentine_distribution(
-    sorted_indices: torch.Tensor,
-    *,
-    codebook_dim: Optional[int],
-) -> torch.Tensor:
-    if sorted_indices.ndim != 1:
-        raise ValueError(
-            f"sorted_indices must be 1D, got shape={tuple(sorted_indices.shape)}"
-        )
-
-    num_items = int(sorted_indices.numel())
-    if num_items <= 1:
-        return sorted_indices
-
-    if codebook_dim is None:
-        return sorted_indices
-
-    width = int(codebook_dim)
-    if width <= 1:
-        return sorted_indices
-    width = min(width, num_items)
-    num_rows = (num_items + width - 1) // width
-
-    assign_positions: List[int] = []
-    for col_idx in range(width):
-        col_positions = [
-            row_idx * width + col_idx
-            for row_idx in range(num_rows)
-            if row_idx * width + col_idx < num_items
-        ]
-        if col_idx % 2 == 1:
-            col_positions.reverse()
-        assign_positions.extend(col_positions)
-
-    if len(assign_positions) != num_items:
-        raise RuntimeError(
-            f"Internal permutation bug: len(assign_positions)={len(assign_positions)} != num_items={num_items}"
-        )
-
-    out = torch.empty_like(sorted_indices)
-    out[torch.tensor(assign_positions, device=sorted_indices.device, dtype=torch.long)] = sorted_indices
-    return out
-
-
-def _build_axis_sort_permutation(
-    *,
-    w: torch.Tensor,
-    transpose: bool,
-    sort_mode: str,
-    activation_weight: Optional[torch.Tensor],
-    linear_name: str,
-    codebook_dim: Optional[int] = None,
-) -> Optional[torch.Tensor]:
-    mode = str(sort_mode).strip().lower()
-    if mode == "none":
-        return None
-
-    if mode == "l2":
-        score_w = w
-    elif mode == "act_l2":
-        if activation_weight is None:
-            raise ValueError(
-                f"{linear_name}: sort_mode=act_l2 requires activation vector."
-            )
-        act = activation_weight.detach().to(device=w.device, dtype=torch.float32, non_blocking=True).contiguous()
-        if transpose:
-            if int(act.numel()) != int(w.shape[0]):
-                raise ValueError(
-                    f"{linear_name}: activation size mismatch for transpose split, "
-                    f"got={int(act.numel())}, expected rows={int(w.shape[0])}."
-                )
-            score_w = w * act.view(-1, 1)
-        else:
-            if int(act.numel()) != int(w.shape[1]):
-                raise ValueError(
-                    f"{linear_name}: activation size mismatch for non-transpose split, "
-                    f"got={int(act.numel())}, expected cols={int(w.shape[1])}."
-                )
-            score_w = w * act.view(1, -1)
-    else:
-        raise ValueError(
-            f"Unsupported intra_part_sort_mode={sort_mode}. "
-            + _INTRA_PART_SORT_MODE_HELP
-        )
-
-    axis_norm = torch.norm(score_w, p=2, dim=1)
-    sorted_indices = torch.argsort(axis_norm, descending=True)
-    return _apply_codebook_serpentine_distribution(
-        sorted_indices,
-        codebook_dim=codebook_dim,
-    )
+    return normalize_intra_part_sort_mode(sort_mode)
 
 
 def resolve_intra_parallel(value: Union[int, Sequence[int]]) -> Tuple[int, int]:
@@ -260,6 +159,166 @@ def _build_restore_indices(sorted_indices: Optional[torch.Tensor]) -> Optional[t
     return restore
 
 
+def _sum_block_variance(part: torch.Tensor, codebook_dim: int) -> float:
+    blocks = part.contiguous().view(-1, int(codebook_dim))
+    centered = blocks - blocks.mean(dim=1, keepdim=True)
+    return float((centered * centered).sum().item())
+
+
+def _build_sparse_affinity_from_embeddings(
+    embeddings: torch.Tensor,
+    *,
+    importance: Optional[torch.Tensor],
+) -> sp.csr_matrix:
+    num_cols = int(embeddings.shape[0])
+    if num_cols <= 1:
+        return sp.csr_matrix((num_cols, num_cols), dtype=np.float32)
+    k = min(_SPECTRAL_TOPK_NEIGHBORS, num_cols - 1)
+    row_idx_list: List[np.ndarray] = []
+    col_idx_list: List[np.ndarray] = []
+    value_list: List[np.ndarray] = []
+    importance_cpu = None
+    if importance is not None:
+        importance_cpu = importance.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if int(importance_cpu.numel()) != num_cols:
+            raise ValueError(
+                f"importance size mismatch: got {int(importance_cpu.numel())}, expected {num_cols}."
+            )
+    embeddings = embeddings.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    for start in range(0, num_cols, _SPECTRAL_SIM_CHUNK):
+        end = min(start + _SPECTRAL_SIM_CHUNK, num_cols)
+        sim = embeddings[start:end] @ embeddings.t()
+        sim = sim.clamp_min_(0.0)
+        if importance_cpu is not None:
+            sim = sim * importance_cpu[start:end].view(-1, 1)
+            sim = sim * importance_cpu.view(1, -1)
+        local_rows = torch.arange(start, end, dtype=torch.long).view(-1, 1)
+        sim.scatter_(1, local_rows, 0.0)
+        top_vals, top_idx = torch.topk(sim, k=k, dim=1, largest=True, sorted=False)
+        keep_mask = top_vals > 0
+        if not torch.any(keep_mask):
+            continue
+        kept_rows = torch.arange(start, end, dtype=torch.long).unsqueeze(1).expand(-1, k)[keep_mask]
+        row_idx_list.append(kept_rows.cpu().numpy().astype(np.int64, copy=False))
+        col_idx_list.append(top_idx[keep_mask].cpu().numpy().astype(np.int64, copy=False))
+        value_list.append(top_vals[keep_mask].cpu().numpy().astype(np.float32, copy=False))
+    if not value_list:
+        return sp.csr_matrix((num_cols, num_cols), dtype=np.float32)
+    affinity = sp.coo_matrix(
+        (
+            np.concatenate(value_list, axis=0),
+            (np.concatenate(row_idx_list, axis=0), np.concatenate(col_idx_list, axis=0)),
+        ),
+        shape=(num_cols, num_cols),
+        dtype=np.float32,
+    ).tocsr()
+    affinity = affinity.maximum(affinity.transpose())
+    affinity.setdiag(0.0)
+    affinity.eliminate_zeros()
+    return affinity
+
+
+def _spectral_order_from_affinity(
+    affinity: sp.csr_matrix,
+    *,
+    linear_name: str,
+) -> torch.Tensor:
+    num_cols = int(affinity.shape[0])
+    if num_cols <= 1:
+        return torch.arange(num_cols, dtype=torch.long)
+    if affinity.nnz == 0:
+        return torch.arange(num_cols, dtype=torch.long)
+    if num_cols == 2:
+        return torch.arange(num_cols, dtype=torch.long)
+    lap = sparse_laplacian(affinity, normed=True)
+    if num_cols <= 32:
+        eigvals, eigvecs = np.linalg.eigh(lap.toarray())
+        if eigvecs.shape[1] < 2:
+            raise RuntimeError(f"{linear_name}: spectral sort failed because laplacian eigvec count < 2.")
+        fiedler = eigvecs[:, 1]
+    else:
+        eigvals, eigvecs = eigsh(lap, k=2, which="SM")
+        order = np.argsort(eigvals)
+        eigvecs = eigvecs[:, order]
+        fiedler = eigvecs[:, 1]
+    return torch.from_numpy(np.argsort(fiedler, kind="mergesort").astype(np.int64, copy=False)).contiguous()
+
+
+def _refine_column_order(
+    *,
+    part: torch.Tensor,
+    order: torch.Tensor,
+    codebook_dim: int,
+) -> torch.Tensor:
+    num_cols = int(order.numel())
+    if num_cols <= 1:
+        return order
+    current_order = order.detach().to(device=part.device, dtype=torch.long).contiguous()
+    reverse_order = torch.flip(current_order, dims=[0]).contiguous()
+    current_obj = _sum_block_variance(part.index_select(1, current_order), codebook_dim)
+    reverse_obj = _sum_block_variance(part.index_select(1, reverse_order), codebook_dim)
+    if reverse_obj < current_obj:
+        current_order = reverse_order
+        current_obj = reverse_obj
+    for _ in range(_SPECTRAL_REFINE_SWEEPS):
+        improved = False
+        for swap_idx in range(num_cols - 1):
+            candidate_order = current_order.clone()
+            left = candidate_order[swap_idx].clone()
+            candidate_order[swap_idx] = candidate_order[swap_idx + 1]
+            candidate_order[swap_idx + 1] = left
+            candidate_obj = _sum_block_variance(part.index_select(1, candidate_order), codebook_dim)
+            if candidate_obj + 1e-12 < current_obj:
+                current_order = candidate_order
+                current_obj = candidate_obj
+                improved = True
+        if not improved:
+            break
+    return current_order.to(device="cpu", dtype=torch.long).contiguous()
+
+
+def _build_part_col_sort_permutation(
+    *,
+    part: torch.Tensor,
+    transpose: bool,
+    sort_mode: str,
+    activation_weight: Optional[torch.Tensor],
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+    linear_name: str,
+    codebook_dim: int,
+) -> Optional[torch.Tensor]:
+    mode = normalize_intra_part_sort_mode(sort_mode, arg_name="intra_part_sort_mode")
+    if mode == "none":
+        return None
+    embeddings = part.detach().to(device="cpu", dtype=torch.float32).t().contiguous()
+    importance = None
+    if mode == "act_spectral_cosine":
+        if activation_weight is None:
+            raise ValueError(f"{linear_name}: sort_mode=act_spectral_cosine requires activation vector.")
+        act = activation_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if transpose:
+            if int(act.numel()) < int(row_end):
+                raise ValueError(
+                    f"{linear_name}: activation size mismatch for transpose split, "
+                    f"got={int(act.numel())}, expected at least rows={int(row_end)}."
+                )
+            embeddings = embeddings * act[row_start:row_end].view(1, -1)
+        else:
+            if int(act.numel()) < int(col_end):
+                raise ValueError(
+                    f"{linear_name}: activation size mismatch for non-transpose split, "
+                    f"got={int(act.numel())}, expected at least cols={int(col_end)}."
+                )
+            importance = act[col_start:col_end].contiguous()
+    embeddings = F.normalize(embeddings, p=2, dim=1, eps=1e-12)
+    affinity = _build_sparse_affinity_from_embeddings(embeddings, importance=importance)
+    initial_order = _spectral_order_from_affinity(affinity, linear_name=linear_name)
+    return _refine_column_order(part=part, order=initial_order, codebook_dim=codebook_dim)
+
+
 def split_linear_into_parts_with_sort(
     weight: torch.Tensor,
     transpose: bool,
@@ -272,9 +331,6 @@ def split_linear_into_parts_with_sort(
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
 ]:
     """
     Split a linear weight into chunks after optional transpose.
@@ -283,10 +339,7 @@ def split_linear_into_parts_with_sort(
       - intra_parallel=(row_parts, col_parts): split rows/cols into 2D parts
     Returns:
       - flat parts [row_parts*col_parts, -1]
-      - sorted_row_indices [split_rows] (sorted rows -> original rows), optional
-      - restore_row_indices [split_rows] (original rows lookup in sorted rows), optional
-      - sorted_col_indices [split_cols] (sorted cols -> original cols), optional
-      - restore_col_indices [split_cols] (original cols lookup in sorted cols), optional
+      - part_restore_col_indices [row_parts*col_parts, cols_per_part], optional
     """
     row_parts, col_parts = resolve_intra_parallel(intra_parallel)
     w = weight.detach().float()
@@ -301,56 +354,60 @@ def split_linear_into_parts_with_sort(
             f"weight dim1={w.shape[1]} not divisible by col_parts={col_parts} (transpose={transpose})"
         )
 
-    row_sort_mode, col_sort_mode = normalize_intra_part_sort_mode(
+    resolved_sort_mode = normalize_intra_part_sort_mode(
         sort_mode,
         arg_name="intra_part_sort_mode",
     )
-    sorted_row_indices = _build_axis_sort_permutation(
-        w=w,
-        transpose=transpose,
-        sort_mode=row_sort_mode,
-        activation_weight=activation_weight,
-        linear_name=linear_name,
-        codebook_dim=codebook_dim,
-    )
-    if sorted_row_indices is not None:
-        w = w.index_select(0, sorted_row_indices)
-    restore_row_indices = _build_restore_indices(sorted_row_indices)
-
-    sorted_col_indices = None
-    restore_col_indices = None
-    if col_sort_mode != "none":
-        sorted_col_indices = _build_axis_sort_permutation(
-            w=w.t().contiguous(),
-            transpose=(not transpose),
-            sort_mode=col_sort_mode,
-            activation_weight=activation_weight,
-            linear_name=f"{linear_name} (col sort)",
-            codebook_dim=codebook_dim,
-        )
-        if sorted_col_indices is not None:
-            w = w.index_select(1, sorted_col_indices)
-            restore_col_indices = _build_restore_indices(sorted_col_indices)
-
+    if resolved_sort_mode != "none" and codebook_dim is None:
+        raise ValueError(f"{linear_name}: codebook_dim is required when intra_part_sort_mode={resolved_sort_mode}.")
+    if resolved_sort_mode == "act_spectral_cosine":
+        if activation_weight is None:
+            raise ValueError(f"{linear_name}: sort_mode=act_spectral_cosine requires activation vector.")
+        act = activation_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        expected_act = int(w.shape[0] if transpose else w.shape[1])
+        if int(act.numel()) != expected_act:
+            raise ValueError(
+                f"{linear_name}: activation size mismatch for intra_part_sort_mode=act_spectral_cosine, "
+                f"got={int(act.numel())}, expected={expected_act}."
+            )
     rows_per_part = w.shape[0] // row_parts
     cols_per_part = w.shape[1] // col_parts
     parts: List[torch.Tensor] = []
+    part_restore_list: List[torch.Tensor] = []
     for row_idx in range(row_parts):
         row_start = row_idx * rows_per_part
         row_end = row_start + rows_per_part
         for col_idx in range(col_parts):
             col_start = col_idx * cols_per_part
             col_end = col_start + cols_per_part
-            part = w[row_start:row_end, col_start:col_end].contiguous().view(-1)
-            parts.append(part)
+            part = w[row_start:row_end, col_start:col_end].contiguous()
+            part_sorted_col_indices = _build_part_col_sort_permutation(
+                part=part,
+                transpose=transpose,
+                sort_mode=resolved_sort_mode,
+                activation_weight=activation_weight,
+                row_start=row_start,
+                row_end=row_end,
+                col_start=col_start,
+                col_end=col_end,
+                linear_name=linear_name,
+                codebook_dim=int(codebook_dim) if codebook_dim is not None else 0,
+            )
+            if part_sorted_col_indices is not None:
+                part = part.index_select(1, part_sorted_col_indices.to(device=part.device, dtype=torch.long))
+                part_restore = _build_restore_indices(part_sorted_col_indices)
+                if part_restore is None:
+                    raise RuntimeError(f"{linear_name}: failed to build part restore indices.")
+                part_restore_list.append(part_restore.to(device="cpu", dtype=torch.long).contiguous())
+            parts.append(part.contiguous().view(-1))
     stacked_parts = torch.stack(parts, dim=0)
-    return (
-        stacked_parts,
-        sorted_row_indices,
-        restore_row_indices,
-        sorted_col_indices,
-        restore_col_indices,
-    )
+    if not part_restore_list:
+        return stacked_parts, None
+    if len(part_restore_list) != int(stacked_parts.shape[0]):
+        raise RuntimeError(
+            f"{linear_name}: part restore count mismatch: {len(part_restore_list)} vs {int(stacked_parts.shape[0])}."
+        )
+    return stacked_parts, torch.stack(part_restore_list, dim=0)
 
 
 def split_linear_into_parts(
@@ -362,7 +419,7 @@ def split_linear_into_parts(
     Split a linear weight into parts after optional transpose.
     Returns shape [parts, -1].
     """
-    parts, _sorted_rows, _restore_rows, _sorted_cols, _restore_cols = split_linear_into_parts_with_sort(
+    parts, _part_restore_cols = split_linear_into_parts_with_sort(
         weight,
         transpose,
         intra_parallel,
@@ -489,8 +546,7 @@ def _build_wa_mse_part_metas(
     intra_parallel: Union[int, Sequence[int]],
     activation_weight_by_linear: Dict[str, torch.Tensor],
     train_device: str,
-    sorted_row_indices_by_linear: Dict[str, Optional[torch.Tensor]],
-    sorted_col_indices_by_linear: Dict[str, Optional[torch.Tensor]],
+    part_restore_col_indices_by_linear: Dict[str, Optional[torch.Tensor]],
 ) -> List[WAMSEPartMeta]:
     row_parts, col_parts = resolve_intra_parallel(intra_parallel)
     metas: List[WAMSEPartMeta] = []
@@ -519,23 +575,8 @@ def _build_wa_mse_part_metas(
                 )
             rows_part = int(r.in_features) // row_parts
             cols_part = int(r.out_features) // col_parts
-            sorted_rows = sorted_row_indices_by_linear.get(r.name)
-            sorted_rows_dev = None
-            if sorted_rows is not None:
-                if int(sorted_rows.numel()) != int(r.in_features):
-                    raise ValueError(
-                        f"{r.name}: sorted rows mismatch, got={int(sorted_rows.numel())}, "
-                        f"expected={int(r.in_features)}."
-                    )
-                sorted_rows_dev = sorted_rows.to(device=train_device, dtype=torch.long, non_blocking=True).contiguous()
             for row_part_idx in range(row_parts):
-                row_map = None
                 row_offset = row_part_idx * rows_part
-                if sorted_rows_dev is not None:
-                    start = row_part_idx * rows_part
-                    end = start + rows_part
-                    row_map = sorted_rows_dev[start:end].contiguous()
-                    row_offset = 0
                 for col_part_idx in range(col_parts):
                     metas.append(
                         WAMSEPartMeta(
@@ -546,7 +587,6 @@ def _build_wa_mse_part_metas(
                             rows_part=rows_part,
                             col_offset=col_part_idx * cols_part,
                             act_max=act_dev,
-                            row_index_map=row_map,
                             col_index_map=None,
                         )
                     )
@@ -561,33 +601,26 @@ def _build_wa_mse_part_metas(
                 )
             rows_part = int(r.out_features) // row_parts
             cols_part = int(r.in_features) // col_parts
-            sorted_cols = sorted_col_indices_by_linear.get(r.name)
-            sorted_cols_dev = None
-            if sorted_cols is not None:
-                if int(sorted_cols.numel()) != int(r.in_features):
+            part_restore = part_restore_col_indices_by_linear.get(r.name)
+            part_restore_dev = None
+            if part_restore is not None:
+                if tuple(part_restore.shape) != (int(row_parts * col_parts), int(cols_part)):
                     raise ValueError(
-                        f"{r.name}: sorted cols mismatch, got={int(sorted_cols.numel())}, "
-                        f"expected={int(r.in_features)}."
+                        f"{r.name}: part_restore_col_indices shape mismatch, got={tuple(part_restore.shape)}, "
+                        f"expected=({int(row_parts * col_parts)}, {int(cols_part)})."
                     )
-                sorted_cols_dev = sorted_cols.to(device=train_device, dtype=torch.long, non_blocking=True).contiguous()
-
-            # Precompute column mapping once per col_part and reuse across row_parts.
-            col_maps: List[Optional[torch.Tensor]] = []
-            col_offsets: List[int] = []
-            for col_part_idx in range(col_parts):
-                if sorted_cols_dev is not None:
-                    start = col_part_idx * cols_part
-                    end = start + cols_part
-                    col_maps.append(sorted_cols_dev[start:end].contiguous())
-                    col_offsets.append(0)
-                else:
-                    col_maps.append(None)
-                    col_offsets.append(col_part_idx * cols_part)
+                part_restore_dev = part_restore.to(device=train_device, dtype=torch.long, non_blocking=True).contiguous()
 
             for row_part_idx in range(row_parts):
                 for col_part_idx in range(col_parts):
-                    col_map = col_maps[col_part_idx]
-                    col_offset = col_offsets[col_part_idx]
+                    part_idx = row_part_idx * col_parts + col_part_idx
+                    col_offset = col_part_idx * cols_part
+                    col_map = None
+                    if part_restore_dev is not None:
+                        local_restore = part_restore_dev[part_idx]
+                        local_sorted = torch.argsort(local_restore).to(dtype=torch.long).contiguous()
+                        col_map = (local_sorted + int(col_offset)).contiguous()
+                        col_offset = 0
                     metas.append(
                         WAMSEPartMeta(
                             linear_name=r.name,
@@ -597,7 +630,6 @@ def _build_wa_mse_part_metas(
                             rows_part=rows_part,
                             col_offset=col_offset,
                             act_max=act_dev,
-                            row_index_map=None,
                             col_index_map=col_map,
                         )
                     )
@@ -623,21 +655,12 @@ def gather_wa_mse_act_max_batch(
     part_batches: List[torch.Tensor] = []
     for meta in part_metas:
         if meta.transpose:
-            if meta.row_index_map is not None:
-                row_map = meta.row_index_map
-                idx_key: Tuple[object, ...] = ("t_map", int(meta.cols), int(row_map.data_ptr()))
-                channel_idx = channel_idx_cache.get(idx_key)
-                if channel_idx is None:
-                    row_idx = torch.div(flat_pos, int(meta.cols), rounding_mode="floor")
-                    channel_idx = row_map.index_select(0, row_idx.reshape(-1)).view(bsz, int(codebook_dim))
-                    channel_idx_cache[idx_key] = channel_idx
-            else:
-                idx_key = ("t_off", int(meta.cols), int(meta.row_offset))
-                channel_idx = channel_idx_cache.get(idx_key)
-                if channel_idx is None:
-                    row_idx = torch.div(flat_pos, int(meta.cols), rounding_mode="floor")
-                    channel_idx = row_idx + int(meta.row_offset)
-                    channel_idx_cache[idx_key] = channel_idx
+            idx_key = ("t_off", int(meta.cols), int(meta.row_offset))
+            channel_idx = channel_idx_cache.get(idx_key)
+            if channel_idx is None:
+                row_idx = torch.div(flat_pos, int(meta.cols), rounding_mode="floor")
+                channel_idx = row_idx + int(meta.row_offset)
+                channel_idx_cache[idx_key] = channel_idx
         else:
             if meta.col_index_map is not None:
                 col_map = meta.col_index_map
@@ -677,7 +700,7 @@ def prepare_group_weight_data(
     recon_loss_type: str,
     activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
     train_device: str,
-    intra_part_sort_mode: Union[str, Sequence[str]] = "l2",
+    intra_part_sort_mode: Union[str, Sequence[str]] = "none",
     outlier_protect_count: int = 0,
     outlier_protect_axis: str = "input",
 ) -> GroupDataPrepResult:
@@ -689,26 +712,22 @@ def prepare_group_weight_data(
     if protect_count < 0:
         raise ValueError(f"outlier_protect_count must be >= 0, got {protect_count}")
 
-    row_sort_mode, col_sort_mode = normalize_intra_part_sort_mode(
+    resolved_sort_mode = normalize_intra_part_sort_mode(
         intra_part_sort_mode,
         arg_name="intra_part_sort_mode",
     )
     use_wa_mse = str(recon_loss_type).lower() == "wa_mse"
-    requires_act = (
-        row_sort_mode == "act_l2"
-        or col_sort_mode == "act_l2"
-    )
+    requires_act = resolved_sort_mode == "act_spectral_cosine"
     needs_activation = requires_act or use_wa_mse or protect_count > 0
     if needs_activation and activation_weight_by_linear is None:
         raise ValueError(
-            "Activation vectors are required by outlier protection, wa_mse, or intra_part_sort_mode=act_l2. "
+            "Activation vectors are required by outlier protection, wa_mse, or intra_part_sort_mode=act_spectral_cosine. "
             "No activation source was provided for the current group."
         )
 
     split_list = []
     split_metas: List[LinearSplitMeta] = []
-    sorted_row_indices_by_linear: Dict[str, Optional[torch.Tensor]] = {}
-    sorted_col_indices_by_linear: Dict[str, Optional[torch.Tensor]] = {}
+    part_restore_col_indices_by_linear: Dict[str, Optional[torch.Tensor]] = {}
     wa_mse_group_refs: List[LinearPrepRef] = []
     wa_mse_activation_weight_by_linear: Dict[str, torch.Tensor] = {}
     for r in group_refs:
@@ -716,7 +735,7 @@ def prepare_group_weight_data(
         if needs_activation:
             if activation_weight_by_linear is None or r.name not in activation_weight_by_linear:
                 raise KeyError(
-                    f"Missing activation vector for linear '{r.name}' required by outlier protection, wa_mse, or intra_part_sort_mode=act_l2."
+                    f"Missing activation vector for linear '{r.name}' required by outlier protection, wa_mse, or intra_part_sort_mode=act_spectral_cosine."
                 )
             act_for_linear = activation_weight_by_linear[r.name]
         prepared_weight = _prepare_linear_weight_for_outlier_protection(
@@ -727,11 +746,11 @@ def prepare_group_weight_data(
             outlier_protect_axis=outlier_protect_axis,
         )
         act_for_sort = prepared_weight.activation_weight if requires_act else None
-        split_parts, sorted_rows, restore_rows, sorted_cols, restore_cols = split_linear_into_parts_with_sort(
+        split_parts, part_restore_cols = split_linear_into_parts_with_sort(
             prepared_weight.split_weight,
             r.transpose,
             (row_parts, col_parts),
-            sort_mode=(row_sort_mode, col_sort_mode),
+            sort_mode=resolved_sort_mode,
             activation_weight=act_for_sort,
             linear_name=r.name,
             codebook_dim=int(codebook_dim),
@@ -748,21 +767,22 @@ def prepare_group_weight_data(
         )
         if prepared_weight.activation_weight is not None:
             wa_mse_activation_weight_by_linear[r.name] = prepared_weight.activation_weight
-        sorted_rows_cpu = sorted_rows.detach().to(dtype=torch.long, device="cpu").contiguous() if sorted_rows is not None else None
-        restore_rows_cpu = restore_rows.detach().to(dtype=torch.long, device="cpu").contiguous() if restore_rows is not None else None
-        sorted_cols_cpu = sorted_cols.detach().to(dtype=torch.long, device="cpu").contiguous() if sorted_cols is not None else None
-        restore_cols_cpu = restore_cols.detach().to(dtype=torch.long, device="cpu").contiguous() if restore_cols is not None else None
-        sorted_row_indices_by_linear[r.name] = sorted_rows_cpu
-        sorted_col_indices_by_linear[r.name] = sorted_cols_cpu
+        part_restore_cols_cpu = (
+            part_restore_cols.detach().to(dtype=torch.long, device="cpu").contiguous()
+            if part_restore_cols is not None
+            else None
+        )
+        part_restore_col_indices_by_linear[r.name] = part_restore_cols_cpu
         split_metas.append(
             LinearSplitMeta(
                 linear_name=r.name,
                 transpose=bool(r.transpose),
-                sort_mode=f"{row_sort_mode},{col_sort_mode}",
+                sort_mode=resolved_sort_mode,
                 parallel_rows=int(row_parts),
                 parallel_cols=int(col_parts),
-                restore_row_indices=restore_rows_cpu,
-                restore_col_indices=restore_cols_cpu,
+                restore_row_indices=None,
+                restore_col_indices=None,
+                part_restore_col_indices=part_restore_cols_cpu,
                 compressed_in_features=int(prepared_weight.compressed_in_features),
                 compressed_out_features=int(prepared_weight.compressed_out_features),
                 protected_input_indices=prepared_weight.protected_input_indices,
@@ -811,8 +831,7 @@ def prepare_group_weight_data(
             intra_parallel=(row_parts, col_parts),
             activation_weight_by_linear=wa_mse_activation_weight_by_linear,
             train_device=train_device,
-            sorted_row_indices_by_linear=sorted_row_indices_by_linear,
-            sorted_col_indices_by_linear=sorted_col_indices_by_linear,
+            part_restore_col_indices_by_linear=part_restore_col_indices_by_linear,
         )
         if len(part_metas) != num_models:
             raise RuntimeError(

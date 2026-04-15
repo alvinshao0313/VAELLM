@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -13,6 +14,29 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 META_FILENAME = "checkpoint_meta.json"
+
+
+def _parse_bool_like(value, *, arg_name: str) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        raise argparse.ArgumentTypeError(f"Invalid {arg_name} value '{value}'. Expected bool.")
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid {arg_name} value '{value}'. Expected bool.")
+
+
+def applied_hif4_act(model, *, enabled: bool, **kwargs):
+    if not enabled:
+        return nullcontext({"enabled": False, "hook_count": 0, "controller": kwargs.get("controller")})
+    from train_utils.hif4_act import applied_hif4_act as _applied_hif4_act
+
+    return _applied_hif4_act(model, enabled=enabled, **kwargs)
 
 
 def _json_dump(path: str, payload: Dict[str, Any]) -> None:
@@ -258,6 +282,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_ppl", action="store_true", help="Run Wikitext-2 PPL evaluation.")
     parser.add_argument("--eval_lm_eval", action="store_true", help="Run lm_eval tasks.")
     parser.add_argument(
+        "--eval_hif4_act",
+        type=lambda v: _parse_bool_like(v, arg_name="--eval_hif4_act"),
+        default=False,
+        help="Enable HiFloat4 activation pseudo-quantization during PPL/lm_eval.",
+    )
+    parser.add_argument(
         "--eval_linear_mse",
         action="store_true",
         help="Compute per-VAELinear MSE/topk-MSE against base model linears.",
@@ -400,7 +430,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             seqlen=int(args.ppl_seqlen),
             limit=int(args.ppl_limit),
         )
-        ppl_result = calculate_ppl(model, ppl_args)
+        with applied_hif4_act(
+            model,
+            enabled=bool(args.eval_hif4_act),
+            logger=logger,
+            log_prefix="[ppl] ",
+        ):
+            ppl_result = calculate_ppl(model, ppl_args)
         logger.info("[ppl] Result: %s", json.dumps(ppl_result, ensure_ascii=False))
         summary["evals"]["ppl"] = ppl_result
 
@@ -433,7 +469,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             eval_log_dir=args.eval_log_dir,
             eval_run_ts=eval_run_ts,
         )
-        lm_result = run_lm_eval(model, tokenizer, lm_args)
+        with applied_hif4_act(
+            model,
+            enabled=bool(args.eval_hif4_act),
+            logger=logger,
+            log_prefix="[lm_eval] ",
+        ):
+            lm_result = run_lm_eval(model, tokenizer, lm_args)
         logger.info("[lm_eval] Tasks done: %s", ",".join(lm_result.get("tasks", [])))
         summary_table = str(lm_result.get("summary_table", "")).strip()
         if summary_table:

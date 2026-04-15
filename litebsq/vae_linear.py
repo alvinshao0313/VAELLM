@@ -43,6 +43,7 @@ class VAELinear(nn.Module):
         parallel_cols: Optional[int] = None,
         restore_row_indices: Optional[torch.Tensor] = None,
         restore_col_indices: Optional[torch.Tensor] = None,
+        part_restore_col_indices: Optional[torch.Tensor] = None,
         compressed_in_features: Optional[int] = None,
         compressed_out_features: Optional[int] = None,
         protected_input_indices: Optional[torch.Tensor] = None,
@@ -159,6 +160,26 @@ class VAELinear(nn.Module):
                     f"restore_col_indices size {int(restore_col_idx.numel())} != split_cols {int(split_cols)}"
                 )
             self.register_buffer("restore_col_indices", restore_col_idx, persistent=True)
+        cols_per_part = split_cols // self.parallel_cols
+        if part_restore_col_indices is None:
+            self.register_buffer("part_restore_col_indices", None, persistent=True)
+        else:
+            part_restore_idx = part_restore_col_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+            expected_shape = (int(self.parallel_parts), int(cols_per_part))
+            if tuple(part_restore_idx.shape) != expected_shape:
+                raise ValueError(
+                    f"part_restore_col_indices shape {tuple(part_restore_idx.shape)} != {expected_shape}"
+                )
+            for part_idx in range(int(part_restore_idx.shape[0])):
+                local_restore = part_restore_idx[part_idx]
+                if int(torch.unique(local_restore, sorted=False).numel()) != int(local_restore.numel()):
+                    raise ValueError(f"part_restore_col_indices[{part_idx}] contains duplicates.")
+                if int(local_restore.min().item()) < 0 or int(local_restore.max().item()) >= int(cols_per_part):
+                    raise ValueError(
+                        f"part_restore_col_indices[{part_idx}] must be within [0, {int(cols_per_part)}), got "
+                        f"[{int(local_restore.min().item())}, {int(local_restore.max().item())}]"
+                    )
+            self.register_buffer("part_restore_col_indices", part_restore_idx, persistent=True)
 
         if protected_input_indices is None:
             self.register_buffer("protected_input_indices", None, persistent=True)
@@ -718,6 +739,27 @@ class VAELinear(nn.Module):
             restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
         return w_split.index_select(1, restore_idx)
 
+    def _restore_part_col_order(self, part_matrix: torch.Tensor, part_idx: int) -> torch.Tensor:
+        restore_all = getattr(self, "part_restore_col_indices", None)
+        if restore_all is None:
+            return part_matrix
+        if restore_all.ndim != 2:
+            raise ValueError(
+                f"part_restore_col_indices must be 2D, got shape={tuple(restore_all.shape)}"
+            )
+        if part_idx < 0 or part_idx >= int(restore_all.shape[0]):
+            raise IndexError(
+                f"part_idx out of range for part_restore_col_indices: {part_idx} vs {int(restore_all.shape[0])}"
+            )
+        restore_idx = restore_all[part_idx]
+        if int(restore_idx.numel()) != int(part_matrix.shape[1]):
+            raise ValueError(
+                f"part_restore_col_indices[{part_idx}] size {int(restore_idx.numel())} != part cols {int(part_matrix.shape[1])}"
+            )
+        if restore_idx.device != part_matrix.device:
+            restore_idx = restore_idx.to(device=part_matrix.device, non_blocking=True)
+        return part_matrix.index_select(1, restore_idx)
+
     def _decode_part_flat(self, stage_idx: int, part_idx: int, dtype: torch.dtype) -> torch.Tensor:
         part_flat = None
         decoder = self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
@@ -750,6 +792,7 @@ class VAELinear(nn.Module):
 
         if not self._multi_parts:
             w_split = part_flats[0].view(split_rows, split_cols)
+            w_split = self._restore_part_col_order(w_split, 0)
             w_split = self._restore_split_row_order(w_split)
             w_split = self._restore_split_col_order(w_split)
             return w_split.contiguous().to(dtype=dtype)
@@ -762,7 +805,10 @@ class VAELinear(nn.Module):
                 f"per-part flat width mismatch: got {int(part_flats.shape[1])}, expected {expected_per_part}."
             )
         parts = [
-            part_flats[part_idx].view(rows_per_part, cols_per_part)
+            self._restore_part_col_order(
+                part_flats[part_idx].view(rows_per_part, cols_per_part),
+                part_idx,
+            )
             for part_idx in range(self.parallel_parts)
         ]
 

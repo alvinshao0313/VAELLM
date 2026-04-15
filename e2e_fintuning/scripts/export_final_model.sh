@@ -45,6 +45,7 @@ python -m e2e_fintuning.main \
   --vae_lora_dropout 0.0 \
   --vae_lora_init_mode zero \
   --lora_hif4_act false \
+  --eval_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \
   --skip_ppl_eval true \

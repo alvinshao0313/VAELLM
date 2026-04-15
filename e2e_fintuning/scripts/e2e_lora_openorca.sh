@@ -49,6 +49,7 @@ torchrun --standalone --nproc_per_node=2 -m e2e_fintuning.main \
   --vae_adalora_beta2 0.85 \
   --vae_adalora_orth_reg_weight 0.5 \
   --lora_hif4_act false \
+  --eval_hif4_act false \
   --prewarm_frozen_vae true \
   --prewarm_log_every 32 \
   --prewarm_group_size 8 \

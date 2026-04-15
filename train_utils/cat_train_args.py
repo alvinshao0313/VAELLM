@@ -47,7 +47,7 @@ class NormalizedCatArgs:
     skip_layers: str
     linear_group_size: int
     intra_parallel: OverrideTable[Tuple[int, int]]
-    intra_part_sort_mode: OverrideTable[Union[str, Tuple[str, str]]]
+    intra_part_sort_mode: OverrideTable[str]
     batch_size: int
     log_every: int
     eval_every: int
@@ -56,6 +56,7 @@ class NormalizedCatArgs:
     outlier_protect_mode: str
     outlier_residual_top_p: OverrideTable[float]
     outlier_residual_score: str
+    outlier_residual_min_abs: float
     outlier_residual_codec: str
     outlier_residual_index_bits: int
     outlier_residual_value_bits: int
@@ -68,6 +69,7 @@ class NormalizedCatArgs:
     wa_mse_calib_device: str
     wa_mse_calib_log_every: int
     ppl_limit: int
+    eval_hif4_act: bool
     lora_after_category: bool
     lora_dataset: str
     lora_rank: OverrideTable[int]
@@ -125,7 +127,7 @@ class ResolvedCategoryRuntimeConfig:
     residual_stages: int
     steps: int
     intra_parallel: Tuple[int, int]
-    intra_part_sort_mode: Tuple[str, str]
+    intra_part_sort_mode: str
     codebook_bits: int
     codebook_dim: int
     outlier_protect_count: int
@@ -163,7 +165,12 @@ _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "co
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OUTLIER_PROTECT_MODE_CHOICES = ("channel", "residual_sparse")
-_OUTLIER_RESIDUAL_SCORE_CHOICES = ("abs", "input_act_weighted_abs")
+_OUTLIER_RESIDUAL_SCORE_CHOICES = (
+    "abs",
+    "input_act_weighted_abs",
+    "original_weight_abs",
+    "input_act_weighted_original_weight_abs",
+)
 _LORA_DATASET_ALIASES = {
     "wiki": "wiki",
     "wikitext2": "wiki",
@@ -203,6 +210,10 @@ def _parse_lora_loss_alpha_text(raw: str, *, arg_name: str) -> float:
     if value > 1.0:
         raise argparse.ArgumentTypeError(f"{arg_name} must be <= 1.0, got {value}.")
     return float(value)
+
+
+def _parse_nonnegative_float_text(raw: str, *, arg_name: str) -> float:
+    return float(parse_float_text(raw, arg_name=arg_name, min_value=0.0, inclusive_min=True))
 
 
 def _parse_lora_dataset_text(raw: str, *, arg_name: str) -> str:
@@ -293,7 +304,7 @@ _INTRA_PART_SORT_MODE_SPEC = _make_override_spec(
     arg_name="--intra_part_sort_mode",
     parse_value=lambda raw: parse_intra_part_sort_mode_text(raw, arg_name="--intra_part_sort_mode"),
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=l2,cat:q_proj=row:l2|col:none",
+    example="default=none,cat:q_proj=spectral_cosine",
 )
 _OUTLIER_PROTECT_COUNT_SPEC = _make_positive_int_override_spec(
     arg_name="--outlier_protect_count",
@@ -519,6 +530,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_protect_mode=str(raw_args.outlier_protect_mode).strip().lower(),
         outlier_residual_top_p=_parse_cat_override(raw_args.outlier_residual_top_p, spec=_OUTLIER_RESIDUAL_TOP_P_SPEC),
         outlier_residual_score=str(raw_args.outlier_residual_score).strip().lower(),
+        outlier_residual_min_abs=float(raw_args.outlier_residual_min_abs),
         outlier_residual_codec=str(raw_args.outlier_residual_codec).strip().lower(),
         outlier_residual_index_bits=resolved_index_bits,
         outlier_residual_value_bits=int(raw_args.outlier_residual_value_bits),
@@ -531,6 +543,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         wa_mse_calib_device=str(raw_args.wa_mse_calib_device),
         wa_mse_calib_log_every=int(raw_args.wa_mse_calib_log_every),
         ppl_limit=int(raw_args.ppl_limit),
+        eval_hif4_act=bool(raw_args.eval_hif4_act),
         lora_after_category=bool(raw_args.lora_after_category),
         lora_dataset=str(raw_args.lora_dataset),
         lora_rank=_parse_cat_override(raw_args.lora_rank, spec=_LORA_RANK_SPEC),
@@ -606,6 +619,10 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
         raise ValueError(
             f"Unsupported --outlier_residual_score={cat_args.outlier_residual_score!r}. "
             f"Expected one of: {', '.join(_OUTLIER_RESIDUAL_SCORE_CHOICES)}."
+        )
+    if float(cat_args.outlier_residual_min_abs) < 0.0:
+        raise ValueError(
+            f"--outlier_residual_min_abs must be >= 0, got {float(cat_args.outlier_residual_min_abs)}."
         )
     invalid_top_p_entries = [
         f"{selector}={float(value)}"
@@ -757,7 +774,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip_layers", type=str, default="", help="指定在 LLM 前向中始终使用原始线性权重的层，格式: layer_idx.category，例如 0.down_proj,30.q_proj。")
     parser.add_argument("--linear_group_size", type=int, default=32, help="跨层分组大小：每组同时训练多少个同类 Linear。")
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"类别覆盖参数。示例：{_INTRA_PARALLEL_SPEC.example}")
-    parser.add_argument("--intra_part_sort_mode", type=str, default="default=l2", help=f"类别覆盖参数。示例：{_INTRA_PART_SORT_MODE_SPEC.example}")
+    parser.add_argument("--intra_part_sort_mode", type=str, default="default=none", help=f"类别覆盖参数。示例：{_INTRA_PART_SORT_MODE_SPEC.example}")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=0)
@@ -781,7 +798,17 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         type=str,
         choices=list(_OUTLIER_RESIDUAL_SCORE_CHOICES),
         default="abs",
-        help="仅 residual_sparse 模式生效。残差打分方式：abs 或 input_act_weighted_abs。",
+        help=(
+            "仅 residual_sparse 模式生效。选点打分方式："
+            "abs / input_act_weighted_abs / original_weight_abs / "
+            "input_act_weighted_original_weight_abs。"
+        ),
+    )
+    parser.add_argument(
+        "--outlier_residual_min_abs",
+        type=lambda v: _parse_nonnegative_float_text(v, arg_name="--outlier_residual_min_abs"),
+        default=1e-6,
+        help="仅 residual_sparse 模式生效。若 |original-reconstructed| < 该阈值，则该位置不允许进入 sparse residual。",
     )
     parser.add_argument(
         "--outlier_residual_codec",
@@ -812,6 +839,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wa_mse_calib_device", type=str, default="", help="Device for wa_mse dynamic act-max recomputation. Empty means use --train_device.")
     parser.add_argument("--wa_mse_calib_log_every", type=int, default=0, help="Log interval for wa_mse dynamic act-max recomputation progress (0 to disable).")
     parser.add_argument("--ppl_limit", type=int, default=-1, help="每类训练后 PPL 评估样本上限，-1 为全量。")
+    parser.add_argument(
+        "--eval_hif4_act",
+        type=lambda v: _parse_bool_like(v, arg_name="--eval_hif4_act"),
+        default=False,
+        help="是否在 cat_train 内部的 PPL 评估阶段启用 HiFloat4 激活伪量化。",
+    )
     parser.add_argument("--lora_after_category", action="store_true", help="每个类别 VAE 训练后，对剩余类别做一次 LoRA 微调并融合。")
     parser.add_argument(
         "--lora_dataset",

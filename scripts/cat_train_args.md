@@ -104,7 +104,7 @@
 | 布尔 | `true` / `false` |
 | 可空整数 | `none` / `256` |
 | `intra_parallel` | `1x1` / `4x1` |
-| `intra_part_sort_mode` | `l2` / `row:l2|col:none` |
+| `intra_part_sort_mode` | `none` / `spectral_cosine` / `act_spectral_cosine` |
 
 ### 2.4 仍保留旧字符串语法的参数
 
@@ -135,7 +135,7 @@
 | `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式必须是 `layer_idx.category` |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
 | `--intra_parallel` | `default=1x1` | 单个 Linear 的层内切分 | 类别 override |
-| `--intra_part_sort_mode` | `default=l2` | 切分前排序方式 | 类别 override；支持 `none/l2/act_l2` |
+| `--intra_part_sort_mode` | `default=none` | 每个 part 内的列排序方式 | 类别 override；支持 `none/spectral_cosine/act_spectral_cosine` |
 | `--batch_size` | `256` | VAE 训练与评估 DataLoader batch 大小 | 作用于块数据，不是 token batch |
 | `--log_every` | `50` | 每多少 step 打印一次训练日志 | `<=0` 等价关闭 |
 | `--eval_every` | `0` | 每多少 step 做一次 VAE 中间评估 | `0` 表示不做中间评估 |
@@ -143,15 +143,16 @@
 | `--outlier_protect_count` | `default=0` | `channel` 模式下保护 top-N channel 不参与压缩 | 类别 override；`residual_sparse` 模式要求它对所有类别都为 `0` |
 | `--outlier_protect_mode` | `channel` | 离群值保护模式 | `channel` / `residual_sparse`，两者互斥 |
 | `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；对所有参与训练的类别要求 `0 < p <= 1` |
-| `--outlier_residual_score` | `abs` | `residual_sparse` 模式下的残差打分方式 | `abs` / `input_act_weighted_abs` |
+| `--outlier_residual_score` | `abs` | `residual_sparse` 模式下的选点打分方式 | `abs` / `input_act_weighted_abs` / `original_weight_abs` / `input_act_weighted_original_weight_abs`；原始权重打分只影响选点，最终保存的仍是对应 residual |
+| `--outlier_residual_min_abs` | `1e-6` | `residual_sparse` 模式下 residual 的最小绝对值门槛 | 全局单值；若 `|original-reconstructed| < threshold`，该位置会从 top-p 中剔除，并继续往后补 |
 | `--outlier_residual_codec` | `coo_fp16` | `residual_sparse` 的存储格式 | `coo_fp16` / `blocked_quantized` |
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
 | `--outlier_residual_value_bits` | `8` | `blocked_quantized` 的残差 value 位宽 | `8` / `4` |
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
-| `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
-| `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
-| `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
-| `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_l2 / channel outlier protect / residual_sparse(input_act_weighted_abs)` 共用 |
+| `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_device` | `""` | 动态采集设备 | 为空时回退 `train_device` |
 | `--wa_mse_calib_log_every` | `0` | 动态采集日志间隔 | `0` 表示关闭 |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
@@ -169,6 +170,7 @@
 | `--lora_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override |
 | `--lora_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
+| `--eval_hif4_act` | `false` | 是否在 cat_train 内部 PPL 评估阶段启用 HiFloat4 激活伪量化 | 只影响评测，不影响训练 |
 | `--seed` | `0` | 全流程随机种子 | LoRA 每轮会叠加轮次偏移 |
 | `--train_device` | `cuda` | VAE 训练与评估设备 | 例如 `cuda` / `cuda:0` / `cpu` |
 | `--rot_llm` | `False` | 压缩前先做一次离线旋转融合 | 调用 rotation 流程 |
@@ -272,6 +274,7 @@
 | `--lora_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型 |
 | `--lora_model_max_length` | LoRA trainer | LoRA 样本最大长度 |
 | `--lora_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |
+| `--eval_hif4_act` | cat_train eval | 是否在内部 PPL 评估时启用 HiFloat4 激活伪量化；默认 `false` |
 
 ## 6. 关键运行时语义
 
@@ -306,8 +309,8 @@
 
 - `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
 - `outlier_protect_mode=channel` 且 `outlier_protect_count > 0` 时，也复用同一条动态 activation 路径
-- `outlier_protect_mode=residual_sparse` 且 `outlier_residual_score=input_act_weighted_abs` 时，也复用同一条动态 activation 路径
-- `intra_part_sort_mode` 若启用 `act_l2`，也复用同一条动态 activation 路径
+- `outlier_protect_mode=residual_sparse` 且 `outlier_residual_score` 使用 activation 加权模式时，也复用同一条动态 activation 路径
+- `intra_part_sort_mode` 若启用 `act_spectral_cosine`，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
 ### 6.6 保存与输出目录
@@ -385,7 +388,7 @@
 3. override 参数缺少 `default`，且当前类别没有显式值
 4. override 参数包含未知 category / after-category key
 5. 动态 activation 重算失败，导致当前 group 缺少 activation 向量
-6. `outlier_protect_mode=channel` 且 `outlier_protect_count > 0`，或 `act_l2`，或 `residual_sparse + input_act_weighted_abs` 启用，但当前 group 的动态 activation 采集失败
+6. `outlier_protect_mode=channel` 且 `outlier_protect_count > 0`，或 `act_spectral_cosine`，或 `residual_sparse + activation 加权 score` 启用，但当前 group 的动态 activation 采集失败
 7. 切分后某个 part 的展平长度无法被该类别的 `codebook_dim` 整除
 8. `linear_group_size < 1`
 
@@ -458,6 +461,7 @@ python tools/cat_train.py \
   --lora_rank default=8,after:q_proj=16 \
   --lora_steps default=50,after:q_proj=200 \
   --lora_hif4_act false \
+  --eval_hif4_act false \
   --lora_use_dora default=true,after:q_proj=false
 ```
 

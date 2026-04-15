@@ -120,6 +120,14 @@ def _build_unique_index_placeholder(shape: Sequence[int], *, dtype: torch.dtype,
     return torch.arange(int(shape[0]), dtype=dtype, device=device)
 
 
+def _build_part_restore_placeholder(shape: Sequence[int], *, dtype: torch.dtype, device) -> torch.Tensor:
+    if len(shape) != 2:
+        raise ValueError(f"Part restore placeholder shape must be 2D, got {tuple(shape)}")
+    rows, cols = int(shape[0]), int(shape[1])
+    base = torch.arange(cols, dtype=dtype, device=device)
+    return base.unsqueeze(0).expand(rows, cols).contiguous()
+
+
 def _collect_sparse_residual_specs(module: VAELinear) -> Dict[str, Any]:
     return {
         "sparse_residual_format": str(getattr(module, "sparse_residual_format", "coo_fp16")),
@@ -244,6 +252,13 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "shape": list(restore_col_idx.shape),
                 "dtype": _dtype_to_name(restore_col_idx.dtype),
             }
+        part_restore_col_idx = getattr(module, "part_restore_col_indices", None)
+        part_restore_col_spec = None
+        if isinstance(part_restore_col_idx, torch.Tensor):
+            part_restore_col_spec = {
+                "shape": list(part_restore_col_idx.shape),
+                "dtype": _dtype_to_name(part_restore_col_idx.dtype),
+            }
         protected_idx = getattr(module, "protected_input_indices", None)
         protected_idx_spec = None
         if isinstance(protected_idx, torch.Tensor):
@@ -297,6 +312,7 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
                 "restore_row_indices": restore_spec,
                 "restore_col_indices": restore_col_spec,
+                "part_restore_col_indices": part_restore_col_spec,
                 "protected_input_indices": protected_idx_spec,
                 "protected_input_weight": protected_weight_spec,
                 "protected_output_indices": protected_out_idx_spec,
@@ -345,7 +361,7 @@ def save_model_checkpoint(
     vae_specs = _collect_vae_linear_specs(model)
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
-        "version": 3,
+        "version": 4,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_model_path": base_model_path,
         "state_dict_file": STATE_DICT_FILENAME,
@@ -507,6 +523,18 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 raise ValueError(f"[{name}] restore_col_indices shape must be 1D, got {shape}")
             restore_dtype = _name_to_dtype(str(restore_col_spec.get("dtype", "int64")))
             restore_col_payload = torch.zeros(shape, dtype=restore_dtype, device=device)
+        part_restore_col_payload = None
+        part_restore_col_spec = spec.get("part_restore_col_indices")
+        if isinstance(part_restore_col_spec, dict):
+            shape = tuple(int(v) for v in part_restore_col_spec.get("shape", []))
+            if len(shape) != 2:
+                raise ValueError(f"[{name}] part_restore_col_indices shape must be 2D, got {shape}")
+            part_restore_dtype = _name_to_dtype(str(part_restore_col_spec.get("dtype", "int64")))
+            part_restore_col_payload = _build_part_restore_placeholder(
+                shape,
+                dtype=part_restore_dtype,
+                device=device,
+            )
         protected_idx_payload = None
         protected_idx_spec = spec.get("protected_input_indices")
         if isinstance(protected_idx_spec, dict):
@@ -641,6 +669,7 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             parallel_cols=int(spec.get("parallel_cols", 1)),
             restore_row_indices=restore_payload,
             restore_col_indices=restore_col_payload,
+            part_restore_col_indices=part_restore_col_payload,
             compressed_in_features=int(spec.get("compressed_in_features", spec["in_features"])),
             compressed_out_features=int(spec.get("compressed_out_features", spec["out_features"])),
             protected_input_indices=protected_idx_payload,
