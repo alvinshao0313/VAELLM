@@ -35,6 +35,9 @@
 用于：
 
 - `steps_per_category`
+- `joint_decoder_steps`
+- `joint_decoder_lr`
+- `joint_decoder_group_size`
 - `intra_parallel`
 - `intra_part_sort_mode`
 - `outlier_protect_count`
@@ -79,6 +82,8 @@
 - `lora_lr`
 - `lora_weight_decay`
 - `lora_log_every`
+- `lora_temperature`
+- `lora_loss_alpha`
 - `lora_loss_type`
 - `lora_use_dora`
 
@@ -132,10 +137,14 @@
 | `--projection_suffixes` | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | 默认 projection-only 模式下允许的后缀 | 仅在未开启 `include_all_linears` 时生效 |
 | `--include_all_linears` | `False` | 关闭默认的 projection-only 过滤，改为收集模型中全部 `nn.Linear` | 开启后忽略 `projection_suffixes` 过滤 |
 | `--steps_per_category` | `default=2000` | 每个 group 的训练步数 | 类别 override；名字保留但语义就是每组步数 |
+| `--joint_decoder_steps` | `default=none` | 多阶段训练完成后的 decoder 联合微调步数 | 类别 override；`none` 表示回退到该类别的 `steps_per_category` |
+| `--joint_decoder_lr` | `default=none` | 多阶段 decoder 联合微调的学习率 | 类别 override；`none` 表示回退到全局 `--lr` |
+| `--joint_decoder_group_size` | `default=none` | 多阶段 decoder 联合微调时的子分组大小 | 类别 override；`none` 表示回退到 `linear_group_size` |
 | `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式必须是 `layer_idx.category` |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
 | `--intra_parallel` | `default=1x1` | 单个 Linear 的层内切分 | 类别 override |
 | `--intra_part_sort_mode` | `default=none` | 每个 part 内的列排序方式 | 类别 override；支持 `none/spectral_cosine/act_spectral_cosine` |
+| `--sort_prep_workers` | `0` | 排序预处理并行 worker 数 | 全局单值；`0=auto, 1=串行, >1=显式 CPU 多进程`；只影响 `spectral_cosine/act_spectral_cosine` |
 | `--batch_size` | `256` | VAE 训练与评估 DataLoader batch 大小 | 作用于块数据，不是 token batch |
 | `--log_every` | `50` | 每多少 step 打印一次训练日志 | `<=0` 等价关闭 |
 | `--eval_every` | `0` | 每多少 step 做一次 VAE 中间评估 | `0` 表示不做中间评估 |
@@ -167,6 +176,8 @@
 | `--lora_lr` | `default=1e-4` | LoRA 学习率 | after-category override |
 | `--lora_weight_decay` | `default=0.0` | LoRA 权重衰减 | after-category override |
 | `--lora_log_every` | `default=1` | LoRA 日志间隔 | after-category override |
+| `--lora_temperature` | `default=1.0` | LoRA 蒸馏温度 | after-category override |
+| `--lora_loss_alpha` | `default=0.5` | LoRA 蒸馏混合权重 | after-category override |
 | `--lora_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override |
 | `--lora_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
@@ -206,18 +217,24 @@
 重要语义：
 
 - `residual_stages` 允许按类别不同。
-- 同一类别内，如果 `residual_stages > 1`，所有 stage 复用同一组已解析参数：
-  - `steps`
-  - `codebook_bits`
-  - `codebook_dim`
-  - `recon_loss_type`
-  - `intra_part_sort_mode`
-  - `base_ch`
-  - `num_res_blocks`
-  - `decoder_base_ch`
-  - `decoder_num_res_blocks`
-  - `norm_type`
-  - `decoder_type`
+- 同一类别内，如果 `residual_stages > 1`：
+  - 先做逐阶残差量化；若 `intra_part_sort_mode != none`，每个 stage 都会基于当前 residual 重新排序
+  - 所有 stage 仍复用同一组已解析结构参数：
+    - `steps`
+    - `codebook_bits`
+    - `codebook_dim`
+    - `recon_loss_type`
+    - `intra_part_sort_mode`
+    - `base_ch`
+    - `num_res_blocks`
+    - `decoder_base_ch`
+    - `decoder_num_res_blocks`
+    - `norm_type`
+    - `decoder_type`
+  - 全部 stage 训练完后，会再做一次 decoder 联合微调，步数由 `joint_decoder_steps` 控制
+- `joint_decoder_steps=none` 时，回退到该类别解析后的 `steps_per_category`
+- `joint_decoder_lr=none` 时，回退到全局 `lr`
+- `joint_decoder_group_size=none` 时，联合微调直接沿用当前类别的 `linear_group_size`
 - `decoder_type=linear` 或 `decoder_type=symmetric` 时，decoder 的 hidden dim / residual blocks 会强制对齐 encoder。
 - `decoder_type=asymmetric` 时，才独立使用 `decoder_base_ch` / `decoder_num_res_blocks`。
 
@@ -292,20 +309,42 @@
 
 - `residual_stages` 是按类别解析的。
 - 某类别为 `N>1` 时，会做逐阶残差量化：当前 stage 重建后，从 residual 中扣除该 stage 重建结果，再进入下一 stage。
-- 但同一类别的各个 stage 不再有单独参数配置，自由度只剩“stage 数量”。
+- 若 `intra_part_sort_mode != none`，每个 stage 都会基于当前 residual 重新排序，而不是复用 stage1 顺序。
+- 全部 stage 训练完后，会额外做一次 decoder 联合微调。
+- 但同一类别的各个 stage 不再有单独结构参数配置，自由度只剩“stage 数量”、`joint_decoder_steps`、`joint_decoder_lr` 和 `joint_decoder_group_size`。
 
 ### 6.3 `steps_per_category`
 
 - 当前实现里它表示“这个类别里每个 group 训练多少步”
 - 它不是“整个类别总步数”
 
-### 6.4 `normalize_weight`
+### 6.4 `joint_decoder_steps`
+
+- 只在 `residual_stages > 1` 时生效。
+- 它控制“全部 stage 训练完之后”的 decoder 联合微调步数。
+- `default=none` 表示自动回退到该类别已解析的 `steps_per_category`。
+
+### 6.5 `joint_decoder_group_size`
+
+- 只在 `residual_stages > 1` 时生效。
+- 它控制联合微调时一次打包多少条 linear 一起做 full-batch。
+- `default=none` 表示自动回退到 `linear_group_size`。
+- 当它小于训练 group 时，前面的 VAE stage 训练仍按原 group 跑，只在最后的联合微调阶段拆小。
+- 当前 `recon_loss_type=cosine` 和 `relative_l1` 不支持把联合微调 group 拆小。
+
+### 6.6 `joint_decoder_lr`
+
+- 只在 `residual_stages > 1` 且 `joint_decoder_steps > 0` 时生效。
+- 它控制“全部 stage 训练完之后”的 decoder 联合微调学习率。
+- `default=none` 表示自动回退到全局 `--lr`。
+
+### 6.7 `normalize_weight`
 
 - 训练时会对当前 stage 的 residual 计算 `(mean, std)` 并标准化训练
 - 转换时会把该 stage 的 `(mean, std)` 融合进 decoder
 - 多阶 residual 会分别计算和融合各自的标准化统计量
 
-### 6.5 `wa_mse` 与 activation 依赖
+### 6.8 `wa_mse` 与 activation 依赖
 
 - `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
 - `outlier_protect_mode=channel` 且 `outlier_protect_count > 0` 时，也复用同一条动态 activation 路径
@@ -313,7 +352,7 @@
 - `intra_part_sort_mode` 若启用 `act_spectral_cosine`，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
-### 6.6 保存与输出目录
+### 6.9 保存与输出目录
 
 - `save_model` 需要同时开启 `convert`
 - 真实运行目录会自动变成：
@@ -335,7 +374,7 @@
 - `training_args`
 - 每个类别的 resolved runtime config
 
-### 6.7 从已保存 checkpoint 继续训练
+### 6.9 从已保存 checkpoint 继续训练
 
 - `--resume_from_checkpoint` 会优先加载已有 checkpoint，而不是重新从 `--model_path` 拉起纯基座模型
 - 支持三种输入：

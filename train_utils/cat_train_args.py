@@ -44,6 +44,9 @@ class NormalizedCatArgs:
     projection_suffixes: str
     include_all_linears: bool
     steps_per_category: OverrideTable[int]
+    joint_decoder_steps: OverrideTable[Optional[int]]
+    joint_decoder_lr: OverrideTable[Optional[float]]
+    joint_decoder_group_size: OverrideTable[Optional[int]]
     skip_layers: str
     linear_group_size: int
     intra_parallel: OverrideTable[Tuple[int, int]]
@@ -52,6 +55,7 @@ class NormalizedCatArgs:
     log_every: int
     eval_every: int
     eval_blocks: int
+    sort_prep_workers: int
     outlier_protect_count: OverrideTable[int]
     outlier_protect_mode: str
     outlier_residual_top_p: OverrideTable[float]
@@ -126,6 +130,9 @@ class ResolvedCategoryRuntimeConfig:
     category: str
     residual_stages: int
     steps: int
+    joint_decoder_steps: int
+    joint_decoder_lr: float
+    joint_decoder_group_size: int
     intra_parallel: Tuple[int, int]
     intra_part_sort_mode: str
     codebook_bits: int
@@ -293,6 +300,27 @@ _STEPS_PER_CATEGORY_SPEC = _make_positive_int_override_spec(
     arg_name="--steps_per_category",
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
     example="default=2000,cat:down_proj=1000",
+)
+_JOINT_DECODER_STEPS_SPEC = _make_optional_int_override_spec(
+    arg_name="--joint_decoder_steps",
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=none,cat:down_proj=500",
+    min_value=0,
+)
+_JOINT_DECODER_LR_SPEC = _make_override_spec(
+    arg_name="--joint_decoder_lr",
+    parse_value=lambda raw: (
+        None if str(raw).strip().lower() == "none"
+        else parse_float_text(raw, arg_name="--joint_decoder_lr", min_value=0.0, inclusive_min=False)
+    ),
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=none,cat:down_proj=5e-5",
+)
+_JOINT_DECODER_GROUP_SIZE_SPEC = _make_optional_int_override_spec(
+    arg_name="--joint_decoder_group_size",
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=none,cat:down_proj=2",
+    min_value=1,
 )
 _INTRA_PARALLEL_SPEC = _make_override_spec(
     arg_name="--intra_parallel",
@@ -518,6 +546,9 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         projection_suffixes=str(raw_args.projection_suffixes),
         include_all_linears=bool(raw_args.include_all_linears),
         steps_per_category=_parse_cat_override(raw_args.steps_per_category, spec=_STEPS_PER_CATEGORY_SPEC),
+        joint_decoder_steps=_parse_cat_override(raw_args.joint_decoder_steps, spec=_JOINT_DECODER_STEPS_SPEC),
+        joint_decoder_lr=_parse_cat_override(raw_args.joint_decoder_lr, spec=_JOINT_DECODER_LR_SPEC),
+        joint_decoder_group_size=_parse_cat_override(raw_args.joint_decoder_group_size, spec=_JOINT_DECODER_GROUP_SIZE_SPEC),
         skip_layers=str(raw_args.skip_layers),
         linear_group_size=int(raw_args.linear_group_size),
         intra_parallel=_parse_cat_override(raw_args.intra_parallel, spec=_INTRA_PARALLEL_SPEC),
@@ -526,6 +557,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         log_every=int(raw_args.log_every),
         eval_every=int(raw_args.eval_every),
         eval_blocks=int(raw_args.eval_blocks),
+        sort_prep_workers=int(raw_args.sort_prep_workers),
         outlier_protect_count=_parse_cat_override(raw_args.outlier_protect_count, spec=_OUTLIER_PROTECT_COUNT_SPEC),
         outlier_protect_mode=str(raw_args.outlier_protect_mode).strip().lower(),
         outlier_residual_top_p=_parse_cat_override(raw_args.outlier_residual_top_p, spec=_OUTLIER_RESIDUAL_TOP_P_SPEC),
@@ -589,6 +621,8 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
     block_rows, block_cols = tuple(int(v) for v in cat_args.outlier_residual_block_shape)
     top_p_table = cat_args.outlier_residual_top_p
     protect_table = cat_args.outlier_protect_count
+    if int(cat_args.sort_prep_workers) < 0:
+        raise ValueError(f"--sort_prep_workers must be >= 0, got {int(cat_args.sort_prep_workers)}.")
     if mode not in _OUTLIER_PROTECT_MODE_CHOICES:
         raise ValueError(
             f"Unsupported --outlier_protect_mode={cat_args.outlier_protect_mode!r}. "
@@ -680,6 +714,9 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
     resolved_outlier_mode = str(cat_args.outlier_protect_mode).strip().lower()
     tables = (
         (cat_args.steps_per_category, "--steps_per_category"),
+        (cat_args.joint_decoder_steps, "--joint_decoder_steps"),
+        (cat_args.joint_decoder_lr, "--joint_decoder_lr"),
+        (cat_args.joint_decoder_group_size, "--joint_decoder_group_size"),
         (cat_args.intra_parallel, "--intra_parallel"),
         (cat_args.intra_part_sort_mode, "--intra_part_sort_mode"),
         (cat_args.outlier_protect_count, "--outlier_protect_count"),
@@ -701,6 +738,16 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
     resolved: Dict[str, ResolvedCategoryRuntimeConfig] = {}
     for category in active_categories:
         steps_per_category = resolve_category_value(cat_args.steps_per_category, category)
+        joint_decoder_steps = resolve_category_value(cat_args.joint_decoder_steps, category)
+        joint_decoder_lr = resolve_category_value(cat_args.joint_decoder_lr, category)
+        joint_decoder_group_size = resolve_category_value(cat_args.joint_decoder_group_size, category)
+        resolved_joint_decoder_steps = int(steps_per_category) if joint_decoder_steps is None else int(joint_decoder_steps)
+        resolved_joint_decoder_lr = float(vae_args.lr) if joint_decoder_lr is None else float(joint_decoder_lr)
+        resolved_joint_decoder_group_size = (
+            int(cat_args.linear_group_size)
+            if joint_decoder_group_size is None
+            else int(joint_decoder_group_size)
+        )
         resolved_outlier_residual_top_p = float(resolve_category_value(cat_args.outlier_residual_top_p, category))
         if resolved_outlier_mode == "channel" and resolved_outlier_residual_top_p != 0.0:
             raise ValueError(
@@ -716,6 +763,9 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
             category=str(category),
             residual_stages=int(resolve_category_value(vae_args.residual_stages, category)),
             steps=int(steps_per_category),
+            joint_decoder_steps=int(resolved_joint_decoder_steps),
+            joint_decoder_lr=float(resolved_joint_decoder_lr),
+            joint_decoder_group_size=int(resolved_joint_decoder_group_size),
             intra_parallel=tuple(resolve_category_value(cat_args.intra_parallel, category)),
             intra_part_sort_mode=normalize_intra_part_sort_mode(
                 resolve_category_value(cat_args.intra_part_sort_mode, category),
@@ -771,6 +821,9 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="关闭默认的 projection-only 过滤，改为包含模型中全部 nn.Linear。",
     )
     parser.add_argument("--steps_per_category", type=str, default="default=2000", help=f"类别覆盖参数。示例：{_STEPS_PER_CATEGORY_SPEC.example}")
+    parser.add_argument("--joint_decoder_steps", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_STEPS_SPEC.example}")
+    parser.add_argument("--joint_decoder_lr", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_LR_SPEC.example}")
+    parser.add_argument("--joint_decoder_group_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_GROUP_SIZE_SPEC.example}")
     parser.add_argument("--skip_layers", type=str, default="", help="指定在 LLM 前向中始终使用原始线性权重的层，格式: layer_idx.category，例如 0.down_proj,30.q_proj。")
     parser.add_argument("--linear_group_size", type=int, default=32, help="跨层分组大小：每组同时训练多少个同类 Linear。")
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"类别覆盖参数。示例：{_INTRA_PARALLEL_SPEC.example}")
@@ -779,6 +832,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=0)
     parser.add_argument("--eval_blocks", type=int, default=256)
+    parser.add_argument("--sort_prep_workers", type=int, default=0, help="排序预处理并行 worker 数。0=auto，1=串行，>1=显式 CPU 多进程。")
     parser.add_argument("--outlier_protect_count", type=str, default="default=0", help=f"类别覆盖参数。示例：{_OUTLIER_PROTECT_COUNT_SPEC.example}")
     parser.add_argument(
         "--outlier_protect_mode",

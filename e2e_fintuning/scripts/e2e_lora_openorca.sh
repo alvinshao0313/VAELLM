@@ -35,10 +35,13 @@ torchrun --standalone --nproc_per_node=2 -m e2e_fintuning.main \
   --model_max_length 4096 \
   --decoder_layers 0-31 \
   --target_modules all \
-  --vae_lora_variant rslora \
+  --vae_lora_variant plain \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
+  --vae_lora_tune_bias true \
+  --tune_final_norm true \
+  --use_post_norm_head_linear false \
   --vae_lora_init_mode zero \
   --vae_adalora_target_r 8 \
   --vae_adalora_init_r 12 \

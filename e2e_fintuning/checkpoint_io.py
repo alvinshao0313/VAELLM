@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from e2e_fintuning.lora import LoRAVAELinear, ensure_lora_vae_linear, iter_named_vae_module_refs
+from e2e_fintuning.post_norm_head import ensure_post_norm_head_linear
 from e2e_fintuning.peft_proxy import (
     collect_peft_vae_proxy_adapter_specs,
     ensure_peft_vae_linear_proxy,
@@ -101,6 +102,22 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
     else:
         vq_specs = list(stage_vq_specs[0])
         decoder_specs = list(stage_decoder_specs[0])
+    stage_restore_row_specs = None
+    stage_restore_col_specs = None
+    stage_part_restore_col_specs = None
+    if residual_stages > 1:
+        stage_restore_row_specs = [
+            _tensor_spec(module.get_stage_restore_row_indices(stage_idx))
+            for stage_idx in range(residual_stages)
+        ]
+        stage_restore_col_specs = [
+            _tensor_spec(module.get_stage_restore_col_indices(stage_idx))
+            for stage_idx in range(residual_stages)
+        ]
+        stage_part_restore_col_specs = [
+            _tensor_spec(module.get_stage_part_restore_col_indices(stage_idx))
+            for stage_idx in range(residual_stages)
+        ]
 
     return {
         "name": name,
@@ -125,6 +142,10 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
         "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
         "restore_row_indices": _tensor_spec(getattr(module, "restore_row_indices", None)),
         "restore_col_indices": _tensor_spec(getattr(module, "restore_col_indices", None)),
+        "part_restore_col_indices": _tensor_spec(getattr(module, "part_restore_col_indices", None)),
+        "stage_restore_row_indices": stage_restore_row_specs,
+        "stage_restore_col_indices": stage_restore_col_specs,
+        "stage_part_restore_col_indices": stage_part_restore_col_specs,
         "protected_input_indices": _tensor_spec(getattr(module, "protected_input_indices", None)),
         "protected_input_weight": _tensor_spec(getattr(module, "protected_input_weight", None)),
         "protected_output_indices": _tensor_spec(getattr(module, "protected_output_indices", None)),
@@ -178,7 +199,11 @@ def _build_compact_e2e_checkpoint_payload(
             compact_state_dict.pop(f"{module_name}.original_weight", None)
             compact_state_dict.pop(f"{module_name}.base_layer.original_weight", None)
         compact_converted_modules.append(spec_copy)
-    strip_proxy_dense_base_from_state_dict(model, compact_state_dict)
+    strip_proxy_dense_base_from_state_dict(
+        model,
+        compact_state_dict,
+        keep_bias=bool(getattr(model, "_e2e_vae_lora_tune_bias", False)),
+    )
     return compact_state_dict, compact_converted_modules, adapter_modules
 
 
@@ -269,6 +294,7 @@ def _rebuild_proxy_adapter_modules(
         requested_rank = int(first["r"])
         requested_alpha = float(first["alpha"])
         requested_dropout = float(first.get("dropout", 0.0))
+        requested_bias_mode = str(first.get("bias", "none"))
         requested_rslora = bool(first.get("use_rslora", False))
         requested_dora = bool(first.get("use_dora", False))
         if requested_rslora and requested_dora:
@@ -280,6 +306,8 @@ def _rebuild_proxy_adapter_modules(
                 raise ValueError("All peft_proxy_lora modules must share the same alpha.")
             if float(spec.get("dropout", 0.0)) != requested_dropout:
                 raise ValueError("All peft_proxy_lora modules must share the same dropout.")
+            if str(spec.get("bias", requested_bias_mode)) != requested_bias_mode:
+                raise ValueError("All peft_proxy_lora modules must share the same bias mode.")
             if bool(spec.get("use_rslora", False)) != requested_rslora:
                 raise ValueError("All peft_proxy_lora modules must share the same use_rslora value.")
             if bool(spec.get("use_dora", False)) != requested_dora:
@@ -291,6 +319,7 @@ def _rebuild_proxy_adapter_modules(
             rank=requested_rank,
             alpha=requested_alpha,
             dropout=requested_dropout,
+            bias_mode=requested_bias_mode,
             init_mode="zero",
             materialize_before_inject=False,
         )
@@ -299,6 +328,7 @@ def _rebuild_proxy_adapter_modules(
     first = adalora_specs[0]
     requested_alpha = float(first["alpha"])
     requested_dropout = float(first.get("dropout", 0.0))
+    requested_bias_mode = str(first.get("bias", "none"))
     requested_target_r = int(first.get("target_r", extra_meta.get("vae_adalora_target_r")))
     requested_init_r = int(first.get("init_r", first["r"]))
     requested_tinit = int(first.get("tinit", extra_meta.get("vae_adalora_tinit", 0)))
@@ -316,6 +346,8 @@ def _rebuild_proxy_adapter_modules(
             raise ValueError("All peft_proxy_adalora modules must share the same alpha.")
         if float(spec.get("dropout", 0.0)) != requested_dropout:
             raise ValueError("All peft_proxy_adalora modules must share the same dropout.")
+        if str(spec.get("bias", requested_bias_mode)) != requested_bias_mode:
+            raise ValueError("All peft_proxy_adalora modules must share the same bias mode.")
         if int(spec.get("target_r", requested_target_r)) != requested_target_r:
             raise ValueError("All peft_proxy_adalora modules must share the same target_r.")
         if int(spec.get("init_r", requested_init_r)) != requested_init_r:
@@ -338,6 +370,7 @@ def _rebuild_proxy_adapter_modules(
         rank=requested_init_r,
         alpha=requested_alpha,
         dropout=requested_dropout,
+        bias_mode=requested_bias_mode,
         init_mode="zero",
         total_step=requested_total_step,
         adalora_target_r=requested_target_r,
@@ -380,6 +413,15 @@ def _rebuild_adapter_modules(
         raise ValueError(f"Unsupported adapter_type: {spec.get('adapter_type')}")
 
 
+def _infer_lora_tune_bias_from_adapter_specs(adapter_modules: Sequence[Dict[str, Any]]) -> bool:
+    for spec in adapter_modules:
+        if str(spec.get("adapter_type")) not in {"peft_proxy_lora", "peft_proxy_adalora"}:
+            continue
+        if str(spec.get("bias", "none")).strip().lower() == "lora_only":
+            return True
+    return False
+
+
 def _materialize_missing_proxy_dense_base_from_model(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
@@ -417,12 +459,21 @@ def load_e2e_checkpoint_into_model(
 
     adapter_modules = meta.get("adapter_modules", [])
     extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
+    if bool(extra_meta.get("use_post_norm_head_linear", False)):
+        ensure_post_norm_head_linear(model)
+    setattr(
+        model,
+        "_e2e_vae_lora_tune_bias",
+        bool(extra_meta.get("vae_lora_tune_bias", _infer_lora_tune_bias_from_adapter_specs(adapter_modules))),
+    )
     if adapter_modules:
         _rebuild_adapter_modules(model, adapter_modules, extra_meta=extra_meta)
 
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)
     state_dict = _torch_load_state_dict(state_dict_path, map_location=map_location)
+    if any(str(key).startswith("lm_head.post_norm_linear.") for key in state_dict.keys()):
+        ensure_post_norm_head_linear(model)
     adalora_runtime_state = pop_peft_proxy_adalora_runtime_state_dict(state_dict)
     model_state_keys = tuple(model.state_dict().keys())
     state_dict, _remap_count = _remap_legacy_parallel_linear_state_dict_keys(state_dict, model_state_keys)

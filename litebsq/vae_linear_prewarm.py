@@ -262,8 +262,12 @@ def _decode_named_vae_linear_weights_chunk(
     parts_per_linear = int(first.parallel_parts)
     residual_stages = int(first.residual_stages)
     chunk_num_models = int(len(chunk_targets)) * parts_per_linear
-    chunk_part_flat: Optional[torch.Tensor] = None
     resolved_compute_device: Optional[torch.device] = None
+    target_dtypes = [
+        _resolve_cache_dtype_for_layer(target.base_layer, target.target_dtype)
+        for target in chunk_targets
+    ]
+    accumulated_compressed_weights: List[Optional[torch.Tensor]] = [None for _ in chunk_targets]
 
     for stage_idx in range(residual_stages):
         stage_decoders: List[Decoder] = []
@@ -281,20 +285,28 @@ def _decode_named_vae_linear_weights_chunk(
         grouped_decoder = grouped_decoder.to(device=decode_device, dtype=decode_dtype)
         stage_out = grouped_decoder(grouped_vq.to(device=decode_device, dtype=decode_dtype, non_blocking=True))
         stage_flat = stage_out.permute(1, 0, 2).contiguous().view(chunk_num_models, -1)
-        if chunk_part_flat is None:
-            chunk_part_flat = stage_flat
-        else:
-            if tuple(stage_flat.shape) != tuple(chunk_part_flat.shape):
-                raise ValueError(
-                    f"Grouped prewarm stage flat shape mismatch: "
-                    f"stage={tuple(stage_flat.shape)} vs accumulated={tuple(chunk_part_flat.shape)}."
-                )
-            chunk_part_flat = chunk_part_flat + stage_flat
+        for linear_idx, target in enumerate(chunk_targets):
+            base_layer = target.base_layer
+            start = linear_idx * parts_per_linear
+            end = start + parts_per_linear
+            part_flats = stage_flat[start:end]
+            stage_compressed_weight = base_layer._decode_compressed_weight_from_part_flats(
+                part_flats,
+                dtype=target_dtypes[linear_idx],
+                stage_idx=stage_idx,
+            )
+            previous_weight = accumulated_compressed_weights[linear_idx]
+            if previous_weight is None:
+                accumulated_compressed_weights[linear_idx] = stage_compressed_weight
+            else:
+                if tuple(previous_weight.shape) != tuple(stage_compressed_weight.shape):
+                    raise ValueError(
+                        f"Grouped prewarm compressed weight shape mismatch for '{target.name}': "
+                        f"prev={tuple(previous_weight.shape)} vs stage={tuple(stage_compressed_weight.shape)}."
+                    )
+                accumulated_compressed_weights[linear_idx] = previous_weight + stage_compressed_weight
         del grouped_decoder, grouped_vq, stage_out, stage_flat
         resolved_compute_device = decode_device
-
-    if chunk_part_flat is None:
-        raise RuntimeError("Grouped prewarm produced no decoded part flats.")
 
     if resolved_compute_device is None:
         resolved_compute_device = torch.device("cpu")
@@ -302,11 +314,10 @@ def _decode_named_vae_linear_weights_chunk(
     decoded_results: List[DecodedVAELinearWeight] = []
     for linear_idx, target in enumerate(chunk_targets):
         base_layer = target.base_layer
-        start = linear_idx * parts_per_linear
-        end = start + parts_per_linear
-        part_flats = chunk_part_flat[start:end]
-        target_dtype = _resolve_cache_dtype_for_layer(base_layer, target.target_dtype)
-        compressed_weight = base_layer._decode_compressed_weight_from_part_flats(part_flats, dtype=target_dtype)
+        compressed_weight = accumulated_compressed_weights[linear_idx]
+        if compressed_weight is None:
+            raise RuntimeError(f"Grouped prewarm produced no compressed weight for '{target.name}'.")
+        target_dtype = target_dtypes[linear_idx]
         decoded_weight = base_layer._finalize_decoded_weight_from_compressed(
             compressed_weight,
             dtype=target_dtype,

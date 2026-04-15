@@ -11,6 +11,7 @@ from transformers import default_data_collator
 from e2e_fintuning.args import needs_teacher
 from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
 from e2e_fintuning.data import build_datasets, build_tokenizer
+from e2e_fintuning.post_norm_head import ensure_post_norm_head_linear
 from e2e_fintuning.peft_proxy import (
     ensure_peft_vae_proxy_adapter,
     initialize_peft_vae_proxy_lora_from_teacher_residual,
@@ -124,6 +125,10 @@ def _variant_flags(variant: str) -> Tuple[bool, bool]:
     return norm == "rslora", norm == "dora"
 
 
+def _resolve_lora_bias_mode(args) -> str:
+    return "lora_only" if bool(getattr(args, "vae_lora_tune_bias", False)) else "none"
+
+
 def _infer_vae_lora_variant_from_meta(meta: Dict[str, object]) -> Optional[str]:
     extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
     saved_variant = extra_meta.get("vae_lora_variant")
@@ -191,6 +196,14 @@ def _validate_resume_checkpoint_config(*, args, meta, decoder_layer_ids, trainin
         raise ValueError(
             f"resume checkpoint 的 vae_lora_dropout={extra_meta['vae_lora_dropout']} 与当前参数 {args.vae_lora_dropout} 不一致。"
         )
+    if "vae_lora_tune_bias" in extra_meta and bool(extra_meta["vae_lora_tune_bias"]) != bool(args.vae_lora_tune_bias):
+        raise ValueError("resume checkpoint 的 vae_lora_tune_bias 与当前参数不一致。")
+    if "vae_lora_bias_mode" in extra_meta and str(extra_meta["vae_lora_bias_mode"]) != str(_resolve_lora_bias_mode(args)):
+        raise ValueError("resume checkpoint 的 vae_lora_bias_mode 与当前参数不一致。")
+    if "tune_final_norm" in extra_meta and bool(extra_meta["tune_final_norm"]) != bool(args.tune_final_norm):
+        raise ValueError("resume checkpoint 的 tune_final_norm 与当前参数不一致。")
+    if "use_post_norm_head_linear" in extra_meta and bool(extra_meta["use_post_norm_head_linear"]) != bool(args.use_post_norm_head_linear):
+        raise ValueError("resume checkpoint 的 use_post_norm_head_linear 与当前参数不一致。")
 
     saved_variant = _infer_vae_lora_variant_from_meta(meta)
     if saved_variant is not None and saved_variant != str(args.vae_lora_variant):
@@ -324,8 +337,12 @@ def _build_checkpoint_extra_meta(
         "vae_lora_rank": int(args.vae_lora_rank),
         "vae_lora_alpha": float(args.vae_lora_alpha),
         "vae_lora_dropout": float(args.vae_lora_dropout),
+        "vae_lora_tune_bias": bool(args.vae_lora_tune_bias),
+        "vae_lora_bias_mode": str(_resolve_lora_bias_mode(args)),
         "vae_lora_use_rslora": bool(use_rslora),
         "vae_lora_use_dora": bool(use_dora),
+        "tune_final_norm": bool(args.tune_final_norm),
+        "use_post_norm_head_linear": bool(args.use_post_norm_head_linear),
     }
     if saved_init_mode is not None:
         extra_meta["vae_lora_init_mode"] = str(saved_init_mode)
@@ -468,6 +485,8 @@ def run(args, hf_args, training_args):
         model.config.use_cache = False
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
+    if bool(args.use_post_norm_head_linear):
+        ensure_post_norm_head_linear(model)
 
     layers = list(get_layers(model))
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(layers))
@@ -489,6 +508,8 @@ def run(args, hf_args, training_args):
         model,
         decoder_layer_ids=decoder_layer_ids,
         target_module_names=args.target_module_names,
+        tune_final_norm=bool(args.tune_final_norm),
+        use_post_norm_head_linear=bool(args.use_post_norm_head_linear),
     )
 
     injected_proxy_count = 0
@@ -509,11 +530,13 @@ def run(args, hf_args, training_args):
             adalora_beta1=float(args.vae_adalora_beta1),
             adalora_beta2=float(args.vae_adalora_beta2),
             adalora_orth_reg_weight=float(args.vae_adalora_orth_reg_weight),
+            bias_mode=str(_resolve_lora_bias_mode(args)),
             materialize_before_inject=True,
             materialize_group_size=int(args.prewarm_group_size),
             materialize_compute_device=str(training_args.device),
             materialize_logger=log,
         )
+    setattr(model, "_e2e_vae_lora_tune_bias", bool(args.vae_lora_tune_bias))
 
     need_residual_svd_init = _should_initialize_vae_lora_residual_svd(
         args=args,
@@ -568,13 +591,15 @@ def run(args, hf_args, training_args):
         raise RuntimeError("No trainable parameters found for requested decoder layers.")
     setattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
     log.info(
-        "Selected trainables: mode=%s variant=%s layers=%s modules=%d adapters=%d peft_proxy=%d trainable_tensors=%d total_params=%d cacheable=%d",
+        "Selected trainables: mode=%s variant=%s layers=%s modules=%d adapters=%d peft_proxy=%d final_norm=%d post_norm_head=%d trainable_tensors=%d total_params=%d cacheable=%d",
         _E2E_FINETUNE_MODE,
         str(args.vae_lora_variant),
         selection.decoder_layer_ids,
         len(selection.target_modules),
         len(selection.adapter_modules),
         injected_proxy_count,
+        len(selection.final_norm_modules),
+        len(selection.post_norm_head_modules),
         len(trainable_params),
         int(sum(int(param.numel()) for _name, param in trainable_params)),
         len(selection.frozen_cacheable_vae_modules),
@@ -664,6 +689,7 @@ def run(args, hf_args, training_args):
 
     final_model = _unwrap_model(trainer, trainer.model)
     setattr(final_model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)
+    setattr(final_model, "_e2e_vae_lora_tune_bias", bool(args.vae_lora_tune_bias))
     _ensure_student_mode(final_model)
     clear_model_vae_linear_cache(final_model)
     if bool(args.unload_vae_original_weights_on_save):

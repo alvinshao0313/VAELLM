@@ -44,6 +44,9 @@ class VAELinear(nn.Module):
         restore_row_indices: Optional[torch.Tensor] = None,
         restore_col_indices: Optional[torch.Tensor] = None,
         part_restore_col_indices: Optional[torch.Tensor] = None,
+        stage_restore_row_indices: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        stage_restore_col_indices: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        stage_part_restore_col_indices: Optional[Sequence[Optional[torch.Tensor]]] = None,
         compressed_in_features: Optional[int] = None,
         compressed_out_features: Optional[int] = None,
         protected_input_indices: Optional[torch.Tensor] = None,
@@ -589,6 +592,93 @@ class VAELinear(nn.Module):
         # Keep legacy scalar field for compatibility.
         self.codebook_dim = int(self.stage_codebook_dims[0])
 
+        normalized_stage_restore_rows = self._normalize_optional_stage_tensor_payload(
+            stage_restore_row_indices,
+            residual_stages=self.residual_stages,
+            payload_name="stage_restore_row_indices",
+        )
+        normalized_stage_restore_cols = self._normalize_optional_stage_tensor_payload(
+            stage_restore_col_indices,
+            residual_stages=self.residual_stages,
+            payload_name="stage_restore_col_indices",
+        )
+        normalized_stage_part_restore_cols = self._normalize_optional_stage_tensor_payload(
+            stage_part_restore_col_indices,
+            residual_stages=self.residual_stages,
+            payload_name="stage_part_restore_col_indices",
+        )
+
+        legacy_restore_row = getattr(self, "restore_row_indices", None)
+        legacy_restore_col = getattr(self, "restore_col_indices", None)
+        legacy_part_restore_col = getattr(self, "part_restore_col_indices", None)
+
+        stage_restore_rows: List[Optional[torch.Tensor]] = []
+        for stage_idx in range(self.residual_stages):
+            item = legacy_restore_row if normalized_stage_restore_rows is None else normalized_stage_restore_rows[stage_idx]
+            if item is None:
+                stage_restore_rows.append(None)
+                continue
+            restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
+            if restore_idx.ndim != 1:
+                raise ValueError(
+                    f"stage_restore_row_indices[{stage_idx}] must be 1D, got shape={tuple(restore_idx.shape)}"
+                )
+            if int(restore_idx.numel()) != int(split_rows):
+                raise ValueError(
+                    f"stage_restore_row_indices[{stage_idx}] size {int(restore_idx.numel())} != split_rows {int(split_rows)}"
+                )
+            stage_restore_rows.append(restore_idx)
+
+        stage_restore_cols: List[Optional[torch.Tensor]] = []
+        for stage_idx in range(self.residual_stages):
+            item = legacy_restore_col if normalized_stage_restore_cols is None else normalized_stage_restore_cols[stage_idx]
+            if item is None:
+                stage_restore_cols.append(None)
+                continue
+            restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
+            if restore_idx.ndim != 1:
+                raise ValueError(
+                    f"stage_restore_col_indices[{stage_idx}] must be 1D, got shape={tuple(restore_idx.shape)}"
+                )
+            if int(restore_idx.numel()) != int(split_cols):
+                raise ValueError(
+                    f"stage_restore_col_indices[{stage_idx}] size {int(restore_idx.numel())} != split_cols {int(split_cols)}"
+                )
+            stage_restore_cols.append(restore_idx)
+
+        stage_part_restore_cols: List[Optional[torch.Tensor]] = []
+        expected_part_restore_shape = (int(self.parallel_parts), int(cols_per_part))
+        for stage_idx in range(self.residual_stages):
+            item = legacy_part_restore_col if normalized_stage_part_restore_cols is None else normalized_stage_part_restore_cols[stage_idx]
+            if item is None:
+                stage_part_restore_cols.append(None)
+                continue
+            part_restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
+            if tuple(part_restore_idx.shape) != expected_part_restore_shape:
+                raise ValueError(
+                    f"stage_part_restore_col_indices[{stage_idx}] shape {tuple(part_restore_idx.shape)} != {expected_part_restore_shape}"
+                )
+            for part_idx in range(int(part_restore_idx.shape[0])):
+                local_restore = part_restore_idx[part_idx]
+                if int(torch.unique(local_restore, sorted=False).numel()) != int(local_restore.numel()):
+                    raise ValueError(
+                        f"stage_part_restore_col_indices[{stage_idx}][{part_idx}] contains duplicates."
+                    )
+                if int(local_restore.min().item()) < 0 or int(local_restore.max().item()) >= int(cols_per_part):
+                    raise ValueError(
+                        f"stage_part_restore_col_indices[{stage_idx}][{part_idx}] must be within [0, {int(cols_per_part)}), got "
+                        f"[{int(local_restore.min().item())}, {int(local_restore.max().item())}]"
+                    )
+            stage_part_restore_cols.append(part_restore_idx)
+
+        self.restore_row_indices = stage_restore_rows[0]
+        self.restore_col_indices = stage_restore_cols[0]
+        self.part_restore_col_indices = stage_part_restore_cols[0]
+        for stage_idx in range(1, self.residual_stages):
+            self.register_buffer(f"restore_row_indices_s{stage_idx}", stage_restore_rows[stage_idx], persistent=True)
+            self.register_buffer(f"restore_col_indices_s{stage_idx}", stage_restore_cols[stage_idx], persistent=True)
+            self.register_buffer(f"part_restore_col_indices_s{stage_idx}", stage_part_restore_cols[stage_idx], persistent=True)
+
         for stage_idx, stage_parts in enumerate(stage_vq_payload):
             for part_idx, w in enumerate(stage_parts):
                 if not isinstance(w, torch.Tensor):
@@ -671,6 +761,29 @@ class VAELinear(nn.Module):
                 normalized.append(list(stage_item))
         return normalized
 
+    @staticmethod
+    def _normalize_optional_stage_tensor_payload(
+        payload: Optional[Sequence[Optional[torch.Tensor]]],
+        *,
+        residual_stages: int,
+        payload_name: str,
+    ) -> Optional[List[Optional[torch.Tensor]]]:
+        if payload is None:
+            return None
+        if not isinstance(payload, (list, tuple)):
+            payload_items = [payload]
+        else:
+            payload_items = list(payload)
+        if len(payload_items) == 0:
+            raise ValueError(f"{payload_name} cannot be empty.")
+        if len(payload_items) == 1 and int(residual_stages) > 1:
+            payload_items = payload_items * int(residual_stages)
+        if len(payload_items) != int(residual_stages):
+            raise ValueError(
+                f"{payload_name} length {len(payload_items)} != residual_stages {int(residual_stages)}"
+            )
+        return list(payload_items)
+
     def get_stage_part_vq_weight(self, stage_idx: int, part_idx: int = 0) -> torch.Tensor:
         stage_idx = int(stage_idx)
         part_idx = int(part_idx)
@@ -705,6 +818,30 @@ class VAELinear(nn.Module):
             raise IndexError("single-part VAELinear only supports part_idx=0")
         return getattr(self, f"decoder_s{stage_idx}")
 
+    def get_stage_restore_row_indices(self, stage_idx: int) -> Optional[torch.Tensor]:
+        stage_idx = int(stage_idx)
+        if stage_idx < 0 or stage_idx >= self.residual_stages:
+            raise IndexError(f"stage_idx out of range: {stage_idx} vs residual_stages={self.residual_stages}")
+        if stage_idx == 0:
+            return getattr(self, "restore_row_indices", None)
+        return getattr(self, f"restore_row_indices_s{stage_idx}", None)
+
+    def get_stage_restore_col_indices(self, stage_idx: int) -> Optional[torch.Tensor]:
+        stage_idx = int(stage_idx)
+        if stage_idx < 0 or stage_idx >= self.residual_stages:
+            raise IndexError(f"stage_idx out of range: {stage_idx} vs residual_stages={self.residual_stages}")
+        if stage_idx == 0:
+            return getattr(self, "restore_col_indices", None)
+        return getattr(self, f"restore_col_indices_s{stage_idx}", None)
+
+    def get_stage_part_restore_col_indices(self, stage_idx: int) -> Optional[torch.Tensor]:
+        stage_idx = int(stage_idx)
+        if stage_idx < 0 or stage_idx >= self.residual_stages:
+            raise IndexError(f"stage_idx out of range: {stage_idx} vs residual_stages={self.residual_stages}")
+        if stage_idx == 0:
+            return getattr(self, "part_restore_col_indices", None)
+        return getattr(self, f"part_restore_col_indices_s{stage_idx}", None)
+
     def _decode_single_flat(self, decoder: nn.Module, vq_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         # decoder expects [B, num_models=1, latent_dim]; output [B, 1, codebook_dim]
         # 为避免 matmul device/dtype 不一致，先对齐到 decoder 参数设备和 dtype，
@@ -715,8 +852,8 @@ class VAELinear(nn.Module):
         w_blocks = decoder(vq_weight.to(device=decode_device, dtype=decode_dtype, non_blocking=True))
         return w_blocks.permute(1, 0, 2).contiguous().view(-1)
 
-    def _restore_split_row_order(self, w_split: torch.Tensor) -> torch.Tensor:
-        restore_idx = getattr(self, "restore_row_indices", None)
+    def _restore_split_row_order(self, w_split: torch.Tensor, *, stage_idx: int) -> torch.Tensor:
+        restore_idx = self.get_stage_restore_row_indices(stage_idx)
         if restore_idx is None:
             return w_split
         if int(restore_idx.numel()) != int(w_split.shape[0]):
@@ -727,8 +864,8 @@ class VAELinear(nn.Module):
             restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
         return w_split.index_select(0, restore_idx)
 
-    def _restore_split_col_order(self, w_split: torch.Tensor) -> torch.Tensor:
-        restore_idx = getattr(self, "restore_col_indices", None)
+    def _restore_split_col_order(self, w_split: torch.Tensor, *, stage_idx: int) -> torch.Tensor:
+        restore_idx = self.get_stage_restore_col_indices(stage_idx)
         if restore_idx is None:
             return w_split
         if int(restore_idx.numel()) != int(w_split.shape[1]):
@@ -739,8 +876,8 @@ class VAELinear(nn.Module):
             restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
         return w_split.index_select(1, restore_idx)
 
-    def _restore_part_col_order(self, part_matrix: torch.Tensor, part_idx: int) -> torch.Tensor:
-        restore_all = getattr(self, "part_restore_col_indices", None)
+    def _restore_part_col_order(self, part_matrix: torch.Tensor, part_idx: int, *, stage_idx: int) -> torch.Tensor:
+        restore_all = self.get_stage_part_restore_col_indices(stage_idx)
         if restore_all is None:
             return part_matrix
         if restore_all.ndim != 2:
@@ -761,12 +898,9 @@ class VAELinear(nn.Module):
         return part_matrix.index_select(1, restore_idx)
 
     def _decode_part_flat(self, stage_idx: int, part_idx: int, dtype: torch.dtype) -> torch.Tensor:
-        part_flat = None
         decoder = self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
         vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
-        stage_flat = self._decode_single_flat(decoder, vq_weight, dtype=dtype)
-        part_flat = stage_flat if part_flat is None else (part_flat + stage_flat)
-        return part_flat
+        return self._decode_single_flat(decoder, vq_weight, dtype=dtype)
 
     def _expected_part_numel(self) -> int:
         total_numel = int(self.compressed_in_features) * int(self.compressed_out_features)
@@ -780,6 +914,8 @@ class VAELinear(nn.Module):
         self,
         part_flats: torch.Tensor,
         dtype: torch.dtype,
+        *,
+        stage_idx: int = 0,
     ) -> torch.Tensor:
         split_rows = self.compressed_in_features if self.transpose else self.compressed_out_features
         split_cols = self.compressed_out_features if self.transpose else self.compressed_in_features
@@ -792,9 +928,9 @@ class VAELinear(nn.Module):
 
         if not self._multi_parts:
             w_split = part_flats[0].view(split_rows, split_cols)
-            w_split = self._restore_part_col_order(w_split, 0)
-            w_split = self._restore_split_row_order(w_split)
-            w_split = self._restore_split_col_order(w_split)
+            w_split = self._restore_part_col_order(w_split, 0, stage_idx=stage_idx)
+            w_split = self._restore_split_row_order(w_split, stage_idx=stage_idx)
+            w_split = self._restore_split_col_order(w_split, stage_idx=stage_idx)
             return w_split.contiguous().to(dtype=dtype)
 
         rows_per_part = split_rows // self.parallel_rows
@@ -808,6 +944,7 @@ class VAELinear(nn.Module):
             self._restore_part_col_order(
                 part_flats[part_idx].view(rows_per_part, cols_per_part),
                 part_idx,
+                stage_idx=stage_idx,
             )
             for part_idx in range(self.parallel_parts)
         ]
@@ -818,29 +955,34 @@ class VAELinear(nn.Module):
             end = start + self.parallel_cols
             row_blocks.append(torch.cat(parts[start:end], dim=1))
         w_split = torch.cat(row_blocks, dim=0)
-        w_split = self._restore_split_row_order(w_split)
-        w_split = self._restore_split_col_order(w_split)
+        w_split = self._restore_split_row_order(w_split, stage_idx=stage_idx)
+        w_split = self._restore_split_col_order(w_split, stage_idx=stage_idx)
         return w_split.contiguous().to(dtype=dtype)
 
-    def _decode_split_weight(self, dtype: torch.dtype) -> torch.Tensor:
+    def _decode_stage_split_weight(self, stage_idx: int, dtype: torch.dtype) -> torch.Tensor:
         decoded_parts = []
         for part_idx in range(self.parallel_parts):
-            part_flat = None
-            for stage_idx in range(self.residual_stages):
-                stage_flat = self._decode_part_flat(stage_idx=stage_idx, part_idx=part_idx, dtype=dtype)
-                part_flat = stage_flat if part_flat is None else (part_flat + stage_flat)
-            if part_flat is None:
-                raise RuntimeError("no stage payload found in VAELinear.")
-            decoded_parts.append(part_flat)
+            decoded_parts.append(self._decode_part_flat(stage_idx=stage_idx, part_idx=part_idx, dtype=dtype))
         stacked_parts = torch.stack(decoded_parts, dim=0)
-        return self._restore_split_weight_from_part_flats(stacked_parts, dtype=dtype)
+        return self._restore_split_weight_from_part_flats(stacked_parts, dtype=dtype, stage_idx=stage_idx)
+
+    def _decode_split_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        split_weight = None
+        for stage_idx in range(self.residual_stages):
+            stage_split = self._decode_stage_split_weight(stage_idx=stage_idx, dtype=dtype)
+            split_weight = stage_split if split_weight is None else (split_weight + stage_split)
+        if split_weight is None:
+            raise RuntimeError("no stage payload found in VAELinear.")
+        return split_weight.contiguous()
 
     def _decode_compressed_weight_from_part_flats(
         self,
         part_flats: torch.Tensor,
         dtype: torch.dtype,
+        *,
+        stage_idx: int = 0,
     ) -> torch.Tensor:
-        w_split = self._restore_split_weight_from_part_flats(part_flats, dtype=dtype)
+        w_split = self._restore_split_weight_from_part_flats(part_flats, dtype=dtype, stage_idx=stage_idx)
         if self.transpose:
             return w_split.t().contiguous()
         return w_split.contiguous()

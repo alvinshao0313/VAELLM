@@ -105,6 +105,10 @@ def _tensor_spec(tensor: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _tensor_spec_list(tensors: Sequence[Optional[torch.Tensor]]) -> List[Optional[Dict[str, Any]]]:
+    return [_tensor_spec(tensor) for tensor in tensors]
+
+
 def _get_module_by_name(model: nn.Module, name: str) -> nn.Module:
     module: nn.Module = model
     for part in name.split("."):
@@ -126,6 +130,30 @@ def _build_part_restore_placeholder(shape: Sequence[int], *, dtype: torch.dtype,
     rows, cols = int(shape[0]), int(shape[1])
     base = torch.arange(cols, dtype=dtype, device=device)
     return base.unsqueeze(0).expand(rows, cols).contiguous()
+
+
+def _normalize_stage_spec_list(
+    stage_specs: Any,
+    *,
+    residual_stages: int,
+    module_name: str,
+    field_name: str,
+) -> Optional[List[Optional[Dict[str, Any]]]]:
+    if stage_specs is None:
+        return None
+    if not isinstance(stage_specs, (list, tuple)):
+        raise ValueError(f"[{module_name}] {field_name} must be a list/tuple when provided.")
+    normalized = list(stage_specs)
+    if len(normalized) == 1 and int(residual_stages) > 1:
+        normalized = normalized * int(residual_stages)
+    if len(normalized) != int(residual_stages):
+        raise ValueError(
+            f"[{module_name}] {field_name} length {len(normalized)} != residual_stages {int(residual_stages)}"
+        )
+    for idx, item in enumerate(normalized):
+        if item is not None and not isinstance(item, dict):
+            raise ValueError(f"[{module_name}] {field_name}[{idx}] must be a dict or null, got {type(item)}")
+    return normalized
 
 
 def _collect_sparse_residual_specs(module: VAELinear) -> Dict[str, Any]:
@@ -259,6 +287,19 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "shape": list(part_restore_col_idx.shape),
                 "dtype": _dtype_to_name(part_restore_col_idx.dtype),
             }
+        stage_restore_row_specs = None
+        stage_restore_col_specs = None
+        stage_part_restore_col_specs = None
+        if residual_stages > 1:
+            stage_restore_row_specs = _tensor_spec_list(
+                [module.get_stage_restore_row_indices(stage_idx) for stage_idx in range(residual_stages)]
+            )
+            stage_restore_col_specs = _tensor_spec_list(
+                [module.get_stage_restore_col_indices(stage_idx) for stage_idx in range(residual_stages)]
+            )
+            stage_part_restore_col_specs = _tensor_spec_list(
+                [module.get_stage_part_restore_col_indices(stage_idx) for stage_idx in range(residual_stages)]
+            )
         protected_idx = getattr(module, "protected_input_indices", None)
         protected_idx_spec = None
         if isinstance(protected_idx, torch.Tensor):
@@ -313,6 +354,9 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "restore_row_indices": restore_spec,
                 "restore_col_indices": restore_col_spec,
                 "part_restore_col_indices": part_restore_col_spec,
+                "stage_restore_row_indices": stage_restore_row_specs,
+                "stage_restore_col_indices": stage_restore_col_specs,
+                "stage_part_restore_col_indices": stage_part_restore_col_specs,
                 "protected_input_indices": protected_idx_spec,
                 "protected_input_weight": protected_weight_spec,
                 "protected_output_indices": protected_out_idx_spec,
@@ -535,6 +579,84 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 dtype=part_restore_dtype,
                 device=device,
             )
+        stage_restore_row_payload = None
+        stage_restore_row_specs = _normalize_stage_spec_list(
+            spec.get("stage_restore_row_indices"),
+            residual_stages=residual_stages,
+            module_name=name,
+            field_name="stage_restore_row_indices",
+        )
+        if stage_restore_row_specs is not None:
+            stage_restore_row_payload = []
+            for stage_idx, stage_spec in enumerate(stage_restore_row_specs):
+                if stage_spec is None:
+                    stage_restore_row_payload.append(None)
+                    continue
+                shape = tuple(int(v) for v in stage_spec.get("shape", []))
+                if len(shape) != 1:
+                    raise ValueError(
+                        f"[{name}] stage_restore_row_indices[{stage_idx}] shape must be 1D, got {shape}"
+                    )
+                stage_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
+                stage_restore_row_payload.append(
+                    _build_unique_index_placeholder(
+                        shape,
+                        dtype=stage_restore_dtype,
+                        device=device,
+                    )
+                )
+        stage_restore_col_payload = None
+        stage_restore_col_specs = _normalize_stage_spec_list(
+            spec.get("stage_restore_col_indices"),
+            residual_stages=residual_stages,
+            module_name=name,
+            field_name="stage_restore_col_indices",
+        )
+        if stage_restore_col_specs is not None:
+            stage_restore_col_payload = []
+            for stage_idx, stage_spec in enumerate(stage_restore_col_specs):
+                if stage_spec is None:
+                    stage_restore_col_payload.append(None)
+                    continue
+                shape = tuple(int(v) for v in stage_spec.get("shape", []))
+                if len(shape) != 1:
+                    raise ValueError(
+                        f"[{name}] stage_restore_col_indices[{stage_idx}] shape must be 1D, got {shape}"
+                    )
+                stage_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
+                stage_restore_col_payload.append(
+                    _build_unique_index_placeholder(
+                        shape,
+                        dtype=stage_restore_dtype,
+                        device=device,
+                    )
+                )
+        stage_part_restore_col_payload = None
+        stage_part_restore_col_specs = _normalize_stage_spec_list(
+            spec.get("stage_part_restore_col_indices"),
+            residual_stages=residual_stages,
+            module_name=name,
+            field_name="stage_part_restore_col_indices",
+        )
+        if stage_part_restore_col_specs is not None:
+            stage_part_restore_col_payload = []
+            for stage_idx, stage_spec in enumerate(stage_part_restore_col_specs):
+                if stage_spec is None:
+                    stage_part_restore_col_payload.append(None)
+                    continue
+                shape = tuple(int(v) for v in stage_spec.get("shape", []))
+                if len(shape) != 2:
+                    raise ValueError(
+                        f"[{name}] stage_part_restore_col_indices[{stage_idx}] shape must be 2D, got {shape}"
+                    )
+                stage_part_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
+                stage_part_restore_col_payload.append(
+                    _build_part_restore_placeholder(
+                        shape,
+                        dtype=stage_part_restore_dtype,
+                        device=device,
+                    )
+                )
         protected_idx_payload = None
         protected_idx_spec = spec.get("protected_input_indices")
         if isinstance(protected_idx_spec, dict):
@@ -670,6 +792,9 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             restore_row_indices=restore_payload,
             restore_col_indices=restore_col_payload,
             part_restore_col_indices=part_restore_col_payload,
+            stage_restore_row_indices=stage_restore_row_payload,
+            stage_restore_col_indices=stage_restore_col_payload,
+            stage_part_restore_col_indices=stage_part_restore_col_payload,
             compressed_in_features=int(spec.get("compressed_in_features", spec["in_features"])),
             compressed_out_features=int(spec.get("compressed_out_features", spec["out_features"])),
             protected_input_indices=protected_idx_payload,

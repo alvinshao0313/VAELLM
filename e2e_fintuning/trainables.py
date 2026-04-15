@@ -4,7 +4,9 @@ from typing import List, Optional, Sequence, Set
 from torch import nn
 
 from e2e_fintuning.lora import LoRAVAELinear, iter_named_vae_module_refs
+from e2e_fintuning.post_norm_head import resolve_post_norm_linear
 from e2e_fintuning.peft_proxy import PeftVAELinearProxy, ensure_peft_vae_linear_proxy
+from rotation.model_utils import get_model_type, get_pre_head_layernorm
 from train_utils.utils import extract_layer_idx
 
 
@@ -15,6 +17,8 @@ class TrainableSelection:
     adapter_modules: List[str]
     peft_proxy_modules: List[str]
     frozen_cacheable_vae_modules: List[str]
+    final_norm_modules: List[str]
+    post_norm_head_modules: List[str]
 
 
 def resolve_target_layer_ids(requested: Optional[Sequence[int]], num_layers: int) -> List[int]:
@@ -39,11 +43,29 @@ def _freeze_all(model: nn.Module) -> None:
         ref.base_layer.clear_decoded_weight_cache()
 
 
+def _enable_module_trainable(module: nn.Module, module_name: str) -> List[str]:
+    enabled_names: List[str] = []
+    for param_name, param in module.named_parameters(recurse=True):
+        param.requires_grad = True
+        full_name = str(module_name) if not param_name else f"{module_name}.{param_name}"
+        enabled_names.append(full_name)
+    return enabled_names
+
+
+def _find_module_name(model: nn.Module, target: nn.Module, fallback: str) -> str:
+    for name, module in model.named_modules():
+        if module is target:
+            return str(name)
+    return str(fallback)
+
+
 def select_e2e_trainables_peft_proxy(
     model: nn.Module,
     *,
     decoder_layer_ids: Sequence[int],
     target_module_names: Optional[Sequence[str]] = None,
+    tune_final_norm: bool = False,
+    use_post_norm_head_linear: bool = False,
 ) -> TrainableSelection:
     _freeze_all(model)
 
@@ -55,6 +77,8 @@ def select_e2e_trainables_peft_proxy(
     adapter_modules: List[str] = []
     peft_proxy_modules: List[str] = []
     frozen_cacheable_vae_modules: List[str] = []
+    final_norm_modules: List[str] = []
+    post_norm_head_modules: List[str] = []
 
     refs = list(iter_named_vae_module_refs(model))
     for ref in refs:
@@ -83,10 +107,26 @@ def select_e2e_trainables_peft_proxy(
         base_layer.cache_decoded_weight = False
         base_layer.clear_decoded_weight_cache()
 
+    if bool(tune_final_norm):
+        model_type = get_model_type(model)
+        final_norm = get_pre_head_layernorm(model, model_type)
+        final_norm_name = _find_module_name(model, final_norm, "model.norm")
+        final_norm_modules.extend(_enable_module_trainable(final_norm, final_norm_name))
+
+    if bool(use_post_norm_head_linear):
+        post_norm_linear = resolve_post_norm_linear(model)
+        if post_norm_linear is None:
+            raise ValueError(
+                "--use_post_norm_head_linear=true but model.lm_head is not LMHeadWithPostNormLinear."
+            )
+        post_norm_head_modules.extend(_enable_module_trainable(post_norm_linear, "lm_head.post_norm_linear"))
+
     return TrainableSelection(
         decoder_layer_ids=sorted(selected_layers),
         target_modules=sorted(set(target_modules)),
         adapter_modules=sorted(set(adapter_modules)),
         peft_proxy_modules=sorted(set(peft_proxy_modules)),
         frozen_cacheable_vae_modules=sorted(set(frozen_cacheable_vae_modules)),
+        final_norm_modules=sorted(set(final_norm_modules)),
+        post_norm_head_modules=sorted(set(post_norm_head_modules)),
     )

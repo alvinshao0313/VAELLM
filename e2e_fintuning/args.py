@@ -43,6 +43,7 @@ class E2EFinetuneArguments:
     vae_lora_rank: int = 8
     vae_lora_alpha: float = 16.0
     vae_lora_dropout: float = 0.0
+    vae_lora_tune_bias: bool = False
     vae_lora_init_mode: str = "zero"
     vae_adalora_target_r: int = 8
     vae_adalora_init_r: int = 12
@@ -71,6 +72,8 @@ class E2EFinetuneArguments:
     max_eval_samples: Optional[int] = None
     save_tokenizer: bool = False
     unload_vae_original_weights_on_save: bool = False
+    tune_final_norm: bool = False
+    use_post_norm_head_linear: bool = False
     decoder_layer_ids: Optional[List[int]] = field(default=None, init=False)
     target_module_names: Optional[List[str]] = field(default=None, init=False)
 
@@ -203,6 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vae_lora_alpha", type=float, default=16.0)
     parser.add_argument("--vae_lora_dropout", type=float, default=0.0)
     parser.add_argument(
+        "--vae_lora_tune_bias",
+        type=lambda v: _parse_bool_like(v, arg_name="--vae_lora_tune_bias"),
+        default=False,
+        help="Whether to tune LoRA target bias with PEFT bias=lora_only. If a selected linear has no bias, create a zero bias first.",
+    )
+    parser.add_argument(
         "--vae_lora_init_mode",
         type=parse_vae_lora_init_mode,
         default="zero",
@@ -260,6 +269,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--unload_vae_original_weights_on_save",
         type=lambda v: _parse_bool_like(v, arg_name="--unload_vae_original_weights_on_save"),
         default=False,
+    )
+    parser.add_argument(
+        "--tune_final_norm",
+        type=lambda v: _parse_bool_like(v, arg_name="--tune_final_norm"),
+        default=False,
+        help="Whether to unfreeze and finetune pre-head final norm module.",
+    )
+    parser.add_argument(
+        "--use_post_norm_head_linear",
+        type=lambda v: _parse_bool_like(v, arg_name="--use_post_norm_head_linear"),
+        default=False,
+        help="Insert a trainable identity-initialized Linear between final norm and lm_head.",
     )
     return parser
 

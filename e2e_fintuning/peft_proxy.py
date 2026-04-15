@@ -22,6 +22,7 @@ from litebsq.vae_linear import VAELinear
 _DEFAULT_ADAPTER_NAME = "default"
 _DEFAULT_CATEGORY_ORDER = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 _VALID_VAE_LORA_VARIANTS = {"plain", "rslora", "dora", "adalora"}
+_VALID_LORA_BIAS_MODES = {"none", "lora_only"}
 _ADALORA_RANKALLOCATOR_ATTR = "_peft_proxy_adalora_rankallocator"
 _ADALORA_RUNTIME_PREFIX = "__peft_proxy_adalora_runtime__."
 
@@ -202,6 +203,15 @@ def _normalize_variant(variant: str) -> str:
     return norm
 
 
+def _normalize_bias_mode(bias_mode: str) -> str:
+    norm = str(bias_mode or "").strip().lower()
+    if not norm:
+        norm = "none"
+    if norm not in _VALID_LORA_BIAS_MODES:
+        raise ValueError(f"Unsupported LoRA bias mode: {bias_mode}. Expected one of: {sorted(_VALID_LORA_BIAS_MODES)}.")
+    return norm
+
+
 def _get_default_adapter_name(module: nn.Module) -> str:
     lora_A = getattr(module, "lora_A", None)
     if lora_A is None:
@@ -258,6 +268,13 @@ def _resolve_model_peft_config(model: nn.Module):
             raise ValueError("Only single-adapter PEFT proxy checkpoints are supported.")
         return next(iter(peft_config.values()))
     return peft_config[_DEFAULT_ADAPTER_NAME]
+
+
+def _resolve_peft_bias_mode_from_model(model: nn.Module) -> str:
+    peft_config = _resolve_model_peft_config(model)
+    if peft_config is None:
+        return "none"
+    return _normalize_bias_mode(getattr(peft_config, "bias", "none"))
 
 
 def _validate_existing_lora_proxy_linear(
@@ -319,10 +336,15 @@ def _validate_existing_adalora_root_config(
     beta2: float,
     orth_reg_weight: float,
     total_step: Optional[int],
+    bias_mode: str,
 ) -> AdaLoraConfig:
     peft_config = _resolve_model_peft_config(model)
     if not isinstance(peft_config, AdaLoraConfig):
         raise ValueError("Existing PEFT proxy adapters are not AdaLoRA.")
+    if _normalize_bias_mode(getattr(peft_config, "bias", "none")) != _normalize_bias_mode(bias_mode):
+        raise ValueError(
+            f"Existing AdaLoRA bias={getattr(peft_config, 'bias', None)} does not match requested {bias_mode}."
+        )
     if int(peft_config.target_r) != int(target_r):
         raise ValueError(f"Existing AdaLoRA target_r={peft_config.target_r} does not match requested {target_r}.")
     if int(peft_config.init_r) != int(init_r):
@@ -347,6 +369,38 @@ def _validate_existing_adalora_root_config(
             f"Existing AdaLoRA total_step={peft_config.total_step} does not match requested {total_step}."
         )
     return peft_config
+
+
+def _validate_existing_lora_root_config(
+    model: nn.Module,
+    *,
+    bias_mode: str,
+) -> LoraConfig:
+    peft_config = _resolve_model_peft_config(model)
+    if not isinstance(peft_config, LoraConfig):
+        raise ValueError("Existing PEFT proxy adapters are not LoRA.")
+    if _normalize_bias_mode(getattr(peft_config, "bias", "none")) != _normalize_bias_mode(bias_mode):
+        raise ValueError(
+            f"Existing LoRA bias={getattr(peft_config, 'bias', None)} does not match requested {bias_mode}."
+        )
+    return peft_config
+
+
+def _ensure_proxy_dense_bias(proxy_refs: List[Tuple[str, PeftVAELinearProxy]]) -> int:
+    created = 0
+    for module_name, proxy in proxy_refs:
+        base_linear = _resolve_proxy_base_linear(module_name, proxy)
+        if base_linear.bias is not None:
+            continue
+        base_linear.bias = nn.Parameter(
+            torch.zeros(
+                (int(base_linear.out_features),),
+                dtype=base_linear.weight.dtype,
+                device=base_linear.weight.device,
+            )
+        )
+        created += 1
+    return created
 
 
 def _build_residual_svd_target(
@@ -629,12 +683,14 @@ def ensure_peft_vae_proxy_adapter(
     adalora_beta1: float = 0.85,
     adalora_beta2: float = 0.85,
     adalora_orth_reg_weight: float = 0.5,
+    bias_mode: str = "none",
     materialize_before_inject: bool = True,
     materialize_group_size: int = 8,
     materialize_compute_device: Optional[object] = None,
     materialize_logger=None,
 ) -> int:
     variant = _normalize_variant(variant)
+    bias_mode = _normalize_bias_mode(bias_mode)
     init_mode = str(init_mode).strip().lower()
     proxy_refs = list(iter_named_peft_vae_proxies(model))
     if not proxy_refs:
@@ -685,6 +741,8 @@ def ensure_peft_vae_proxy_adapter(
                 compute_device=materialize_compute_device,
                 logger=materialize_logger,
             )
+        if bias_mode == "lora_only":
+            _ensure_proxy_dense_bias(proxy_refs)
         if variant == "adalora":
             inject_adapter_in_model(
                 AdaLoraConfig(
@@ -702,7 +760,7 @@ def ensure_peft_vae_proxy_adapter(
                     lora_alpha=float(alpha),
                     lora_dropout=float(dropout),
                     target_modules=["per_decoded_linear"],
-                    bias="none",
+                    bias=str(bias_mode),
                     inference_mode=False,
                     init_lora_weights="gaussian" if init_mode == "gaussian" else True,
                 ),
@@ -721,7 +779,7 @@ def ensure_peft_vae_proxy_adapter(
                     lora_alpha=float(alpha),
                     lora_dropout=float(dropout),
                     target_modules=["per_decoded_linear"],
-                    bias="none",
+                    bias=str(bias_mode),
                     inference_mode=False,
                     use_rslora=variant == "rslora",
                     use_dora=variant == "dora",
@@ -732,6 +790,10 @@ def ensure_peft_vae_proxy_adapter(
             for module_name, proxy in proxy_refs:
                 if not is_peft_lora_linear(proxy.per_decoded_linear):
                     raise RuntimeError(f"Failed to inject PEFT LoRA into '{module_name}.per_decoded_linear'.")
+            _validate_existing_lora_root_config(
+                model,
+                bias_mode=str(bias_mode),
+            )
     elif variant == "adalora":
         _validate_existing_adalora_root_config(
             model,
@@ -744,6 +806,12 @@ def ensure_peft_vae_proxy_adapter(
             beta2=float(adalora_beta2),
             orth_reg_weight=float(adalora_orth_reg_weight),
             total_step=None if total_step is None else int(total_step),
+            bias_mode=str(bias_mode),
+        )
+    else:
+        _validate_existing_lora_root_config(
+            model,
+            bias_mode=str(bias_mode),
         )
 
     _enable_peft_proxy_adapters(model)
@@ -843,6 +911,7 @@ def collect_peft_vae_proxy_adapter_specs(
 ) -> List[Dict[str, object]]:
     specs: List[Dict[str, object]] = []
     peft_config = _resolve_model_peft_config(model)
+    bias_mode = _resolve_peft_bias_mode_from_model(model)
     for name, proxy in iter_named_peft_vae_proxies(model):
         peft_linear = proxy.per_decoded_linear
         if is_peft_lora_linear(peft_linear):
@@ -855,6 +924,7 @@ def collect_peft_vae_proxy_adapter_specs(
                     "r": int(peft_linear.r[adapter_name]),
                     "alpha": float(peft_linear.lora_alpha[adapter_name]),
                     "dropout": float(_dropout_p(peft_linear.lora_dropout[adapter_name])),
+                    "bias": str(bias_mode),
                     "use_rslora": bool(_resolve_use_rslora(peft_linear, adapter_name)),
                     "use_dora": bool(peft_linear.use_dora.get(adapter_name, False)),
                     "train_mode_at_save": str(train_mode),
@@ -873,6 +943,7 @@ def collect_peft_vae_proxy_adapter_specs(
                     "r": int(peft_linear.r[adapter_name]),
                     "alpha": float(peft_linear.lora_alpha[adapter_name]),
                     "dropout": float(_dropout_p(peft_linear.lora_dropout[adapter_name])),
+                    "bias": str(bias_mode),
                     "target_r": int(peft_config.target_r),
                     "init_r": int(peft_config.init_r),
                     "tinit": int(peft_config.tinit),
@@ -891,10 +962,13 @@ def collect_peft_vae_proxy_adapter_specs(
 def strip_proxy_dense_base_from_state_dict(
     model: nn.Module,
     state_dict: Dict[str, torch.Tensor],
+    *,
+    keep_bias: bool = False,
 ) -> int:
     removed = 0
     for name, _proxy in iter_named_peft_vae_proxies(model):
-        for suffix in ("weight", "bias"):
+        suffixes = ("weight",) if bool(keep_bias) else ("weight", "bias")
+        for suffix in suffixes:
             key = f"{name}.per_decoded_linear.base_layer.{suffix}"
             if key in state_dict:
                 state_dict.pop(key)

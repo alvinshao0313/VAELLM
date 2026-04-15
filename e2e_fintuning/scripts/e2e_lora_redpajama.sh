@@ -30,7 +30,10 @@ torchrun --standalone --nproc_per_node=4 -m e2e_fintuning.main \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \
+  --vae_lora_tune_bias true \
   --vae_lora_init_mode zero \
+  --tune_final_norm true \
+  --use_post_norm_head_linear true \
   --lora_hif4_act false \
   --eval_hif4_act false \
   --prewarm_frozen_vae true \

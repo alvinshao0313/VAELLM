@@ -1,3 +1,4 @@
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -58,6 +59,12 @@ class PreparedLinearWeight:
     protected_input_weight: Optional[torch.Tensor]  # [num_protected, out_features], original dtype on cpu
     protected_output_indices: Optional[torch.Tensor]  # [num_protected], long on cpu
     protected_output_weight: Optional[torch.Tensor]  # [num_protected, in_features], original dtype on cpu
+
+
+@dataclass(frozen=True)
+class PreparedLinearEntry:
+    ref: LinearPrepRef
+    prepared_weight: PreparedLinearWeight
 
 
 @dataclass
@@ -406,8 +413,33 @@ def split_linear_into_parts_with_sort(
     if len(part_restore_list) != int(stacked_parts.shape[0]):
         raise RuntimeError(
             f"{linear_name}: part restore count mismatch: {len(part_restore_list)} vs {int(stacked_parts.shape[0])}."
-        )
+    )
     return stacked_parts, torch.stack(part_restore_list, dim=0)
+
+
+def _sort_single_linear_job(
+    *,
+    split_weight: torch.Tensor,
+    transpose: bool,
+    row_parts: int,
+    col_parts: int,
+    sort_mode: str,
+    activation_weight: Optional[torch.Tensor],
+    linear_name: str,
+    codebook_dim: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    return split_linear_into_parts_with_sort(
+        split_weight.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+        bool(transpose),
+        (int(row_parts), int(col_parts)),
+        sort_mode=str(sort_mode),
+        activation_weight=None if activation_weight is None else activation_weight.detach().to(
+            device="cpu",
+            dtype=torch.float32,
+        ).contiguous(),
+        linear_name=str(linear_name),
+        codebook_dim=int(codebook_dim),
+    )
 
 
 def split_linear_into_parts(
@@ -636,6 +668,265 @@ def _build_wa_mse_part_metas(
     return metas
 
 
+def prepare_group_linear_entries(
+    *,
+    group_refs: Sequence[LinearPrepRef],
+    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
+    outlier_protect_count: int,
+    outlier_protect_axis: str,
+    recon_loss_type: str,
+    intra_part_sort_mode: Union[str, Sequence[str]] = "none",
+) -> List[PreparedLinearEntry]:
+    protect_count = int(outlier_protect_count)
+    if protect_count < 0:
+        raise ValueError(f"outlier_protect_count must be >= 0, got {protect_count}")
+
+    resolved_sort_mode = normalize_intra_part_sort_mode(
+        intra_part_sort_mode,
+        arg_name="intra_part_sort_mode",
+    )
+    use_wa_mse = str(recon_loss_type).lower() == "wa_mse"
+    requires_act = resolved_sort_mode == "act_spectral_cosine"
+    needs_activation = requires_act or use_wa_mse or protect_count > 0
+    if needs_activation and activation_weight_by_linear is None:
+        raise ValueError(
+            "Activation vectors are required by outlier protection, wa_mse, or intra_part_sort_mode=act_spectral_cosine. "
+            "No activation source was provided for the current group."
+        )
+
+    prepared_entries: List[PreparedLinearEntry] = []
+    for r in group_refs:
+        act_for_linear = None
+        if needs_activation:
+            if activation_weight_by_linear is None or r.name not in activation_weight_by_linear:
+                raise KeyError(
+                    f"Missing activation vector for linear '{r.name}' required by outlier protection, wa_mse, or intra_part_sort_mode=act_spectral_cosine."
+                )
+            act_for_linear = activation_weight_by_linear[r.name]
+        prepared_entries.append(
+            PreparedLinearEntry(
+                ref=r,
+                prepared_weight=_prepare_linear_weight_for_outlier_protection(
+                    weight=r.weight,
+                    linear_name=r.name,
+                    activation_weight=act_for_linear,
+                    outlier_protect_count=protect_count,
+                    outlier_protect_axis=outlier_protect_axis,
+                ),
+            )
+        )
+    return prepared_entries
+
+
+def materialize_prepared_group_data(
+    *,
+    prepared_entries: Sequence[PreparedLinearEntry],
+    intra_parallel: Union[int, Sequence[int]],
+    codebook_dim: int,
+    batch_size: int,
+    normalize_weight: bool,
+    recon_loss_type: str,
+    train_device: str,
+    intra_part_sort_mode: Union[str, Sequence[str]] = "none",
+    sort_executor: Optional[Executor] = None,
+    split_weights_by_linear: Optional[Sequence[torch.Tensor]] = None,
+) -> GroupDataPrepResult:
+    row_parts, col_parts = resolve_intra_parallel(intra_parallel)
+    parts_per_linear = int(row_parts) * int(col_parts)
+    num_linear = len(prepared_entries)
+    num_models = num_linear * parts_per_linear
+    resolved_sort_mode = normalize_intra_part_sort_mode(
+        intra_part_sort_mode,
+        arg_name="intra_part_sort_mode",
+    )
+    use_wa_mse = str(recon_loss_type).lower() == "wa_mse"
+    requires_act = resolved_sort_mode == "act_spectral_cosine"
+
+    if split_weights_by_linear is not None and len(split_weights_by_linear) != len(prepared_entries):
+        raise ValueError(
+            f"split_weights_by_linear length {len(split_weights_by_linear)} != prepared_entries {len(prepared_entries)}"
+        )
+
+    split_list = []
+    split_metas: List[LinearSplitMeta] = []
+    part_restore_col_indices_by_linear: Dict[str, Optional[torch.Tensor]] = {}
+    wa_mse_group_refs: List[LinearPrepRef] = []
+    wa_mse_activation_weight_by_linear: Dict[str, torch.Tensor] = {}
+    stage_entries: List[Tuple[LinearPrepRef, PreparedLinearWeight, Optional[torch.Tensor]]] = []
+    for idx, entry in enumerate(prepared_entries):
+        r = entry.ref
+        prepared_weight = entry.prepared_weight
+        current_split_weight = prepared_weight.split_weight
+        if split_weights_by_linear is not None:
+            current_split_weight = split_weights_by_linear[idx]
+            expected_shape = (
+                int(prepared_weight.compressed_out_features),
+                int(prepared_weight.compressed_in_features),
+            )
+            if tuple(current_split_weight.shape) != expected_shape:
+                raise ValueError(
+                    f"{r.name}: split_weight shape mismatch, got={tuple(current_split_weight.shape)}, expected={expected_shape}."
+                )
+        current_prepared_weight = PreparedLinearWeight(
+            split_weight=current_split_weight,
+            compressed_in_features=int(prepared_weight.compressed_in_features),
+            compressed_out_features=int(prepared_weight.compressed_out_features),
+            activation_weight=prepared_weight.activation_weight,
+            protected_input_indices=prepared_weight.protected_input_indices,
+            protected_input_weight=prepared_weight.protected_input_weight,
+            protected_output_indices=prepared_weight.protected_output_indices,
+            protected_output_weight=prepared_weight.protected_output_weight,
+        )
+        act_for_sort = current_prepared_weight.activation_weight if requires_act else None
+        stage_entries.append((r, current_prepared_weight, act_for_sort))
+        wa_mse_group_refs.append(
+            LinearPrepRef(
+                name=r.name,
+                weight=current_prepared_weight.split_weight,
+                in_features=int(current_prepared_weight.compressed_in_features),
+                out_features=int(current_prepared_weight.compressed_out_features),
+                transpose=bool(r.transpose),
+            )
+        )
+        if current_prepared_weight.activation_weight is not None:
+            wa_mse_activation_weight_by_linear[r.name] = current_prepared_weight.activation_weight
+
+    sorted_outputs: List[Tuple[torch.Tensor, Optional[torch.Tensor]]] = []
+    use_parallel_sort = (
+        resolved_sort_mode != "none"
+        and sort_executor is not None
+        and len(stage_entries) > 1
+    )
+    if use_parallel_sort:
+        futures = [
+            sort_executor.submit(
+                _sort_single_linear_job,
+                split_weight=prepared_weight.split_weight.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                transpose=bool(r.transpose),
+                row_parts=int(row_parts),
+                col_parts=int(col_parts),
+                sort_mode=resolved_sort_mode,
+                activation_weight=None if act_for_sort is None else act_for_sort.detach().to(
+                    device="cpu",
+                    dtype=torch.float32,
+                ).contiguous(),
+                linear_name=r.name,
+                codebook_dim=int(codebook_dim),
+            )
+            for r, prepared_weight, act_for_sort in stage_entries
+        ]
+        for future in futures:
+            sorted_outputs.append(future.result())
+    else:
+        for r, prepared_weight, act_for_sort in stage_entries:
+            sorted_outputs.append(
+                _sort_single_linear_job(
+                    split_weight=prepared_weight.split_weight,
+                    transpose=bool(r.transpose),
+                    row_parts=int(row_parts),
+                    col_parts=int(col_parts),
+                    sort_mode=resolved_sort_mode,
+                    activation_weight=act_for_sort,
+                    linear_name=r.name,
+                    codebook_dim=int(codebook_dim),
+                )
+            )
+
+    for (r, prepared_weight, _act_for_sort), (split_parts, part_restore_cols) in zip(stage_entries, sorted_outputs):
+        split_list.append(split_parts.cpu())
+        part_restore_cols_cpu = (
+            part_restore_cols.detach().to(dtype=torch.long, device="cpu").contiguous()
+            if part_restore_cols is not None
+            else None
+        )
+        part_restore_col_indices_by_linear[r.name] = part_restore_cols_cpu
+        split_metas.append(
+            LinearSplitMeta(
+                linear_name=r.name,
+                transpose=bool(r.transpose),
+                sort_mode=resolved_sort_mode,
+                parallel_rows=int(row_parts),
+                parallel_cols=int(col_parts),
+                restore_row_indices=None,
+                restore_col_indices=None,
+                part_restore_col_indices=part_restore_cols_cpu,
+                compressed_in_features=int(prepared_weight.compressed_in_features),
+                compressed_out_features=int(prepared_weight.compressed_out_features),
+                protected_input_indices=prepared_weight.protected_input_indices,
+                protected_input_weight=prepared_weight.protected_input_weight,
+                protected_output_indices=prepared_weight.protected_output_indices,
+                protected_output_weight=prepared_weight.protected_output_weight,
+            )
+        )
+
+    per_linear_flat = torch.stack(split_list, dim=0)  # [num_linear, parts_per_linear, N]
+    stacked_flat = per_linear_flat.reshape(num_models, -1)  # [num_models, N]
+
+    d_mean = stacked_flat.mean(dim=1, keepdim=True)
+    d_std = stacked_flat.std(dim=1, keepdim=True)
+    if normalize_weight:
+        stacked_flat = (stacked_flat - d_mean) / (d_std + 1e-6)
+
+    numel = stacked_flat.shape[1]
+    if numel % int(codebook_dim) != 0:
+        raise ValueError(
+            f"flatten_len={numel} not divisible by codebook_dim={int(codebook_dim)}"
+        )
+
+    stacked_data = stacked_flat.view(num_models, -1, int(codebook_dim)).permute(1, 0, 2).contiguous()
+    block_indices = torch.arange(stacked_data.shape[0], dtype=torch.long)
+    train_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(stacked_data, block_indices),
+        batch_size=int(batch_size),
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+    )
+    eval_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(stacked_data, block_indices),
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    part_metas: List[WAMSEPartMeta] = []
+    if use_wa_mse:
+        if not wa_mse_activation_weight_by_linear:
+            raise ValueError("recon_loss_type=wa_mse requires activation vectors for the current group.")
+        part_metas = _build_wa_mse_part_metas(
+            group_refs=wa_mse_group_refs,
+            intra_parallel=(row_parts, col_parts),
+            activation_weight_by_linear=wa_mse_activation_weight_by_linear,
+            train_device=train_device,
+            part_restore_col_indices_by_linear=part_restore_col_indices_by_linear,
+        )
+        if len(part_metas) != num_models:
+            raise RuntimeError(
+                f"wa_mse internal mismatch: len(part_metas)={len(part_metas)} vs num_models={num_models}"
+            )
+        expected_flat_len = int(stacked_data.shape[0]) * int(codebook_dim)
+        for meta in part_metas:
+            if int(meta.rows_part) * int(meta.cols) != expected_flat_len:
+                raise ValueError(
+                    f"wa_mse index map mismatch for {meta.linear_name}: "
+                    f"rows_part*cols={int(meta.rows_part) * int(meta.cols)} vs expected={expected_flat_len}"
+                )
+
+    return GroupDataPrepResult(
+        num_models=num_models,
+        codebook_dim=int(codebook_dim),
+        stacked_data=stacked_data,
+        d_mean=d_mean,
+        d_std=d_std,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        use_wa_mse=use_wa_mse,
+        part_metas=part_metas,
+        split_metas=split_metas,
+    )
+
+
 def gather_wa_mse_act_max_batch(
     block_idx_batch: torch.Tensor,
     part_metas: Sequence[WAMSEPartMeta],
@@ -703,157 +994,25 @@ def prepare_group_weight_data(
     intra_part_sort_mode: Union[str, Sequence[str]] = "none",
     outlier_protect_count: int = 0,
     outlier_protect_axis: str = "input",
+    sort_executor: Optional[Executor] = None,
 ) -> GroupDataPrepResult:
-    row_parts, col_parts = resolve_intra_parallel(intra_parallel)
-    parts_per_linear = int(row_parts) * int(col_parts)
-    num_linear = len(group_refs)
-    num_models = num_linear * parts_per_linear
-    protect_count = int(outlier_protect_count)
-    if protect_count < 0:
-        raise ValueError(f"outlier_protect_count must be >= 0, got {protect_count}")
-
-    resolved_sort_mode = normalize_intra_part_sort_mode(
-        intra_part_sort_mode,
-        arg_name="intra_part_sort_mode",
+    prepared_entries = prepare_group_linear_entries(
+        group_refs=group_refs,
+        activation_weight_by_linear=activation_weight_by_linear,
+        outlier_protect_count=int(outlier_protect_count),
+        outlier_protect_axis=outlier_protect_axis,
+        recon_loss_type=recon_loss_type,
+        intra_part_sort_mode=intra_part_sort_mode,
     )
-    use_wa_mse = str(recon_loss_type).lower() == "wa_mse"
-    requires_act = resolved_sort_mode == "act_spectral_cosine"
-    needs_activation = requires_act or use_wa_mse or protect_count > 0
-    if needs_activation and activation_weight_by_linear is None:
-        raise ValueError(
-            "Activation vectors are required by outlier protection, wa_mse, or intra_part_sort_mode=act_spectral_cosine. "
-            "No activation source was provided for the current group."
-        )
-
-    split_list = []
-    split_metas: List[LinearSplitMeta] = []
-    part_restore_col_indices_by_linear: Dict[str, Optional[torch.Tensor]] = {}
-    wa_mse_group_refs: List[LinearPrepRef] = []
-    wa_mse_activation_weight_by_linear: Dict[str, torch.Tensor] = {}
-    for r in group_refs:
-        act_for_linear = None
-        if needs_activation:
-            if activation_weight_by_linear is None or r.name not in activation_weight_by_linear:
-                raise KeyError(
-                    f"Missing activation vector for linear '{r.name}' required by outlier protection, wa_mse, or intra_part_sort_mode=act_spectral_cosine."
-                )
-            act_for_linear = activation_weight_by_linear[r.name]
-        prepared_weight = _prepare_linear_weight_for_outlier_protection(
-            weight=r.weight,
-            linear_name=r.name,
-            activation_weight=act_for_linear,
-            outlier_protect_count=protect_count,
-            outlier_protect_axis=outlier_protect_axis,
-        )
-        act_for_sort = prepared_weight.activation_weight if requires_act else None
-        split_parts, part_restore_cols = split_linear_into_parts_with_sort(
-            prepared_weight.split_weight,
-            r.transpose,
-            (row_parts, col_parts),
-            sort_mode=resolved_sort_mode,
-            activation_weight=act_for_sort,
-            linear_name=r.name,
-            codebook_dim=int(codebook_dim),
-        )
-        split_list.append(split_parts.cpu())
-        wa_mse_group_refs.append(
-            LinearPrepRef(
-                name=r.name,
-                weight=prepared_weight.split_weight,
-                in_features=int(prepared_weight.compressed_in_features),
-                out_features=int(prepared_weight.compressed_out_features),
-                transpose=bool(r.transpose),
-            )
-        )
-        if prepared_weight.activation_weight is not None:
-            wa_mse_activation_weight_by_linear[r.name] = prepared_weight.activation_weight
-        part_restore_cols_cpu = (
-            part_restore_cols.detach().to(dtype=torch.long, device="cpu").contiguous()
-            if part_restore_cols is not None
-            else None
-        )
-        part_restore_col_indices_by_linear[r.name] = part_restore_cols_cpu
-        split_metas.append(
-            LinearSplitMeta(
-                linear_name=r.name,
-                transpose=bool(r.transpose),
-                sort_mode=resolved_sort_mode,
-                parallel_rows=int(row_parts),
-                parallel_cols=int(col_parts),
-                restore_row_indices=None,
-                restore_col_indices=None,
-                part_restore_col_indices=part_restore_cols_cpu,
-                compressed_in_features=int(prepared_weight.compressed_in_features),
-                compressed_out_features=int(prepared_weight.compressed_out_features),
-                protected_input_indices=prepared_weight.protected_input_indices,
-                protected_input_weight=prepared_weight.protected_input_weight,
-                protected_output_indices=prepared_weight.protected_output_indices,
-                protected_output_weight=prepared_weight.protected_output_weight,
-            )
-        )
-    per_linear_flat = torch.stack(split_list, dim=0)  # [num_linear, parts_per_linear, N]
-    stacked_flat = per_linear_flat.reshape(num_models, -1)  # [num_models, N]
-
-    d_mean = stacked_flat.mean(dim=1, keepdim=True)
-    d_std = stacked_flat.std(dim=1, keepdim=True)
-    if normalize_weight:
-        stacked_flat = (stacked_flat - d_mean) / (d_std + 1e-6)
-
-    numel = stacked_flat.shape[1]
-    if numel % int(codebook_dim) != 0:
-        raise ValueError(
-            f"flatten_len={numel} not divisible by codebook_dim={int(codebook_dim)}"
-        )
-
-    stacked_data = stacked_flat.view(num_models, -1, int(codebook_dim)).permute(1, 0, 2).contiguous()
-    block_indices = torch.arange(stacked_data.shape[0], dtype=torch.long)
-    train_loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(stacked_data, block_indices),
-        batch_size=int(batch_size),
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-    )
-    eval_loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(stacked_data, block_indices),
-        batch_size=int(batch_size),
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
-
-    part_metas: List[WAMSEPartMeta] = []
-    if use_wa_mse:
-        if not wa_mse_activation_weight_by_linear:
-            raise ValueError("recon_loss_type=wa_mse requires activation vectors for the current group.")
-        part_metas = _build_wa_mse_part_metas(
-            group_refs=wa_mse_group_refs,
-            intra_parallel=(row_parts, col_parts),
-            activation_weight_by_linear=wa_mse_activation_weight_by_linear,
-            train_device=train_device,
-            part_restore_col_indices_by_linear=part_restore_col_indices_by_linear,
-        )
-        if len(part_metas) != num_models:
-            raise RuntimeError(
-                f"wa_mse internal mismatch: len(part_metas)={len(part_metas)} vs num_models={num_models}"
-            )
-        expected_flat_len = int(stacked_data.shape[0]) * int(codebook_dim)
-        for meta in part_metas:
-            if int(meta.rows_part) * int(meta.cols) != expected_flat_len:
-                raise ValueError(
-                    f"wa_mse index map mismatch for {meta.linear_name}: "
-                    f"rows_part*cols={int(meta.rows_part) * int(meta.cols)} vs expected={expected_flat_len}"
-                )
-
-    return GroupDataPrepResult(
-        num_models=num_models,
-        codebook_dim=int(codebook_dim),
-        stacked_data=stacked_data,
-        d_mean=d_mean,
-        d_std=d_std,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        use_wa_mse=use_wa_mse,
-        part_metas=part_metas,
-        split_metas=split_metas,
+    return materialize_prepared_group_data(
+        prepared_entries=prepared_entries,
+        intra_parallel=intra_parallel,
+        codebook_dim=codebook_dim,
+        batch_size=batch_size,
+        normalize_weight=normalize_weight,
+        recon_loss_type=recon_loss_type,
+        train_device=train_device,
+        intra_part_sort_mode=intra_part_sort_mode,
+        sort_executor=sort_executor,
+        split_weights_by_linear=None,
     )

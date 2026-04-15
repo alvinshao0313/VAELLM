@@ -4,7 +4,10 @@ import time
 import math
 import json
 import argparse
-from dataclasses import asdict, is_dataclass
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass, is_dataclass
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
@@ -34,7 +37,9 @@ from train_utils.cat_data_prep import (
     LinearPrepRef,
     format_intra_part_sort_mode,
     gather_wa_mse_act_max_batch,
+    materialize_prepared_group_data,
     prepare_group_weight_data,
+    prepare_group_linear_entries,
 )
 from train_utils.activation_utils import (
     ActivationCalibrationCache,
@@ -69,6 +74,75 @@ log = get_logger("linear_by_category")
 _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT = frozenset(
     {"input_act_weighted_abs", "input_act_weighted_original_weight_abs"}
 )
+
+
+@dataclass
+class JointStageRestorePlan:
+    stage_src_idx_global: torch.Tensor
+    stage_src_idx_flat: torch.Tensor
+
+
+@dataclass
+class JointRestorePlan:
+    common_shape: Tuple[int, int, int]
+    stage_plans: List[JointStageRestorePlan]
+
+    def slice_blocks(self, block_idx: torch.Tensor) -> "JointRestorePlan":
+        if block_idx.ndim != 1:
+            raise ValueError(f"block_idx must be 1D, got shape={tuple(block_idx.shape)}")
+        if block_idx.numel() <= 0:
+            raise ValueError("block_idx cannot be empty.")
+        num_blocks, num_models, codebook_dim = self.common_shape
+        block_idx_cpu = block_idx.to(device="cpu", dtype=torch.long, non_blocking=False).contiguous()
+        if int(block_idx_cpu.min().item()) < 0 or int(block_idx_cpu.max().item()) >= int(num_blocks):
+            raise ValueError(
+                f"block_idx out of range: min={int(block_idx_cpu.min().item())}, "
+                f"max={int(block_idx_cpu.max().item())}, num_blocks={num_blocks}"
+            )
+        block_width = int(num_models) * int(codebook_dim)
+        inverse_block = torch.full((int(num_blocks),), -1, dtype=torch.long)
+        inverse_block[block_idx_cpu] = torch.arange(int(block_idx_cpu.numel()), dtype=torch.long)
+
+        sliced_stage_plans: List[JointStageRestorePlan] = []
+        for stage_plan in self.stage_plans:
+            src_idx = stage_plan.stage_src_idx_global.index_select(0, block_idx_cpu)
+            src_block = torch.div(src_idx, block_width, rounding_mode="floor")
+            src_offset = torch.remainder(src_idx, block_width)
+            local_src_block = inverse_block.index_select(0, src_block.reshape(-1)).view_as(src_block)
+            if bool((local_src_block < 0).any().item()):
+                raise ValueError("slice_blocks got source block outside selected block_idx.")
+            local_src_idx = (local_src_block * block_width + src_offset).contiguous()
+            sliced_stage_plans.append(
+                JointStageRestorePlan(
+                    stage_src_idx_global=local_src_idx.contiguous(),
+                    stage_src_idx_flat=local_src_idx.reshape(-1).contiguous(),
+                )
+            )
+        return JointRestorePlan(
+            common_shape=(int(block_idx_cpu.numel()), int(num_models), int(codebook_dim)),
+            stage_plans=sliced_stage_plans,
+        )
+
+
+def _init_sort_prep_worker() -> None:
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+
+def _resolve_sort_prep_workers(requested_workers: int, *, linear_group_size: int) -> int:
+    requested = int(requested_workers)
+    if requested < 0:
+        raise ValueError(f"sort_prep_workers must be >= 0, got {requested}.")
+    max_tasks = max(1, int(linear_group_size))
+    if requested == 0:
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(int(cpu_count), max_tasks))
+    return max(1, min(requested, max_tasks))
 
 
 def _to_jsonable(value):
@@ -298,6 +372,582 @@ def _restore_stage_norm(
     return raw_flat.view(num_models, num_blocks, codebook_dim).permute(1, 0, 2).contiguous()
 
 
+def _compute_recon_loss(
+    *,
+    recon_loss_type: str,
+    x_recon: torch.Tensor,
+    x: torch.Tensor,
+    act_max: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    resolved = str(recon_loss_type).strip().lower()
+    if resolved == "l1":
+        return torch.nn.functional.l1_loss(x_recon, x)
+    if resolved == "huber":
+        return torch.nn.functional.huber_loss(x_recon, x, reduction="mean", delta=1.0)
+    if resolved == "relative_l1":
+        return (x_recon - x).abs().sum() / (x.abs().sum() + 1e-10)
+    if resolved == "top_k_mse":
+        k = max(1, int(0.1 * x.shape[-1]))
+        errors = (x_recon - x).pow(2)
+        topk_errors, _ = torch.topk(errors, k, dim=-1)
+        return topk_errors.sum()
+    if resolved == "mse":
+        return torch.nn.functional.mse_loss(x_recon, x)
+    if resolved == "cosine":
+        x_recon_flat = x_recon.view(x_recon.size(0), -1)
+        x_flat = x.view(x.size(0), -1)
+        return 1 - torch.nn.functional.cosine_similarity(x_recon_flat, x_flat, dim=-1).mean()
+    if resolved == "w_mse":
+        return ((x_recon - x).pow(2) * x.abs()).mean()
+    if resolved == "w2_mse":
+        return ((x_recon - x).pow(2) * x.pow(2)).mean()
+    if resolved == "wa_mse":
+        if act_max is None:
+            raise ValueError("recon_loss_type=wa_mse requires act_max tensor.")
+        if tuple(act_max.shape) != tuple(x.shape):
+            raise ValueError(
+                f"wa_mse shape mismatch: act_max={tuple(act_max.shape)} vs x={tuple(x.shape)}"
+            )
+        x_f = x.float()
+        x_recon_f = x_recon.float()
+        act_f = act_max.float()
+        errors = (x_recon_f - x_f).pow(2)
+        weights = x_f.abs() * act_f
+        return (errors * weights).mean()
+    return torch.zeros((), device=x.device, dtype=torch.float32)
+
+
+def _split_weight_into_part_flats(
+    *,
+    weight: torch.Tensor,
+    transpose: bool,
+    parallel_rows: int,
+    parallel_cols: int,
+) -> torch.Tensor:
+    w = weight.t().contiguous() if bool(transpose) else weight.contiguous()
+    rows_per_part = int(w.shape[0]) // int(parallel_rows)
+    cols_per_part = int(w.shape[1]) // int(parallel_cols)
+    parts = []
+    for row_idx in range(int(parallel_rows)):
+        row_start = row_idx * rows_per_part
+        row_end = row_start + rows_per_part
+        for col_idx in range(int(parallel_cols)):
+            col_start = col_idx * cols_per_part
+            col_end = col_start + cols_per_part
+            parts.append(w[row_start:row_end, col_start:col_end].contiguous().view(-1))
+    return torch.stack(parts, dim=0)
+
+
+def _restore_split_row_order_with_meta(w_split: torch.Tensor, split_meta) -> torch.Tensor:
+    restore_idx = getattr(split_meta, "restore_row_indices", None)
+    if restore_idx is None:
+        return w_split
+    if int(restore_idx.numel()) != int(w_split.shape[0]):
+        raise ValueError(
+            f"{split_meta.linear_name}: restore_row_indices size {int(restore_idx.numel())} != split rows {int(w_split.shape[0])}"
+        )
+    if restore_idx.device != w_split.device:
+        restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
+    return w_split.index_select(0, restore_idx)
+
+
+def _restore_split_col_order_with_meta(w_split: torch.Tensor, split_meta) -> torch.Tensor:
+    restore_idx = getattr(split_meta, "restore_col_indices", None)
+    if restore_idx is None:
+        return w_split
+    if int(restore_idx.numel()) != int(w_split.shape[1]):
+        raise ValueError(
+            f"{split_meta.linear_name}: restore_col_indices size {int(restore_idx.numel())} != split cols {int(w_split.shape[1])}"
+        )
+    if restore_idx.device != w_split.device:
+        restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
+    return w_split.index_select(1, restore_idx)
+
+
+def _restore_part_col_order_with_meta(part_matrix: torch.Tensor, split_meta, part_idx: int) -> torch.Tensor:
+    restore_all = getattr(split_meta, "part_restore_col_indices", None)
+    if restore_all is None:
+        return part_matrix
+    if restore_all.ndim != 2:
+        raise ValueError(
+            f"{split_meta.linear_name}: part_restore_col_indices must be 2D, got shape={tuple(restore_all.shape)}"
+        )
+    if part_idx < 0 or part_idx >= int(restore_all.shape[0]):
+        raise IndexError(
+            f"{split_meta.linear_name}: part_idx out of range for part_restore_col_indices: {part_idx} vs {int(restore_all.shape[0])}"
+        )
+    restore_idx = restore_all[part_idx]
+    if int(restore_idx.numel()) != int(part_matrix.shape[1]):
+        raise ValueError(
+            f"{split_meta.linear_name}: part_restore_col_indices[{part_idx}] size {int(restore_idx.numel())} != part cols {int(part_matrix.shape[1])}"
+        )
+    if restore_idx.device != part_matrix.device:
+        restore_idx = restore_idx.to(device=part_matrix.device, non_blocking=True)
+    return part_matrix.index_select(1, restore_idx)
+
+
+def _restore_split_weight_from_part_flats_with_meta(
+    *,
+    part_flats: torch.Tensor,
+    split_meta,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    parallel_rows = int(split_meta.parallel_rows)
+    parallel_cols = int(split_meta.parallel_cols)
+    parallel_parts = int(parallel_rows) * int(parallel_cols)
+    split_rows = int(split_meta.compressed_in_features) if bool(split_meta.transpose) else int(split_meta.compressed_out_features)
+    split_cols = int(split_meta.compressed_out_features) if bool(split_meta.transpose) else int(split_meta.compressed_in_features)
+    part_flats = part_flats.reshape(parallel_parts, -1).contiguous()
+    if parallel_parts == 1:
+        w_split = part_flats[0].view(split_rows, split_cols)
+        w_split = _restore_part_col_order_with_meta(w_split, split_meta, 0)
+        w_split = _restore_split_row_order_with_meta(w_split, split_meta)
+        w_split = _restore_split_col_order_with_meta(w_split, split_meta)
+        return w_split.contiguous().to(dtype=dtype)
+
+    rows_per_part = split_rows // parallel_rows
+    cols_per_part = split_cols // parallel_cols
+    expected_per_part = int(rows_per_part) * int(cols_per_part)
+    if int(part_flats.shape[1]) != expected_per_part:
+        raise ValueError(
+            f"{split_meta.linear_name}: per-part flat width mismatch: got {int(part_flats.shape[1])}, expected {expected_per_part}."
+        )
+    parts = [
+        _restore_part_col_order_with_meta(
+            part_flats[part_idx].view(rows_per_part, cols_per_part),
+            split_meta,
+            part_idx,
+        )
+        for part_idx in range(parallel_parts)
+    ]
+    row_blocks = []
+    for row_idx in range(parallel_rows):
+        start = row_idx * parallel_cols
+        end = start + parallel_cols
+        row_blocks.append(torch.cat(parts[start:end], dim=1))
+    w_split = torch.cat(row_blocks, dim=0)
+    w_split = _restore_split_row_order_with_meta(w_split, split_meta)
+    w_split = _restore_split_col_order_with_meta(w_split, split_meta)
+    return w_split.contiguous().to(dtype=dtype)
+
+
+def _compressed_weights_to_group_data(
+    *,
+    compressed_weights: Sequence[torch.Tensor],
+    split_metas: Sequence[object],
+    codebook_dim: int,
+) -> torch.Tensor:
+    if len(compressed_weights) != len(split_metas):
+        raise ValueError(
+            f"compressed_weights length {len(compressed_weights)} != split_metas {len(split_metas)}"
+        )
+    per_linear_flat = []
+    for weight, split_meta in zip(compressed_weights, split_metas):
+        expected_shape = (
+            int(split_meta.compressed_out_features),
+            int(split_meta.compressed_in_features),
+        )
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(
+                f"{split_meta.linear_name}: compressed weight shape mismatch, got {tuple(weight.shape)}, expected {expected_shape}"
+            )
+        per_linear_flat.append(
+            _split_weight_into_part_flats(
+                weight=weight,
+                transpose=bool(split_meta.transpose),
+                parallel_rows=int(split_meta.parallel_rows),
+                parallel_cols=int(split_meta.parallel_cols),
+            )
+        )
+    stacked_flat = torch.stack(per_linear_flat, dim=0).reshape(-1, per_linear_flat[0].shape[1]).contiguous()
+    total_numel = int(stacked_flat.shape[1])
+    if total_numel % int(codebook_dim) != 0:
+        raise ValueError(
+            f"flatten_len={total_numel} not divisible by codebook_dim={int(codebook_dim)}"
+        )
+    return stacked_flat.view(stacked_flat.shape[0], -1, int(codebook_dim)).permute(1, 0, 2).contiguous()
+
+
+def _group_data_to_compressed_weights(
+    *,
+    stacked_data: torch.Tensor,
+    split_metas: Sequence[object],
+) -> List[torch.Tensor]:
+    if stacked_data.ndim != 3:
+        raise ValueError(f"stacked_data must be 3D [N_blocks, P, C], got shape={tuple(stacked_data.shape)}")
+    if len(split_metas) == 0:
+        return []
+    parts_per_linear = int(split_metas[0].parallel_rows) * int(split_metas[0].parallel_cols)
+    flat = stacked_data.permute(1, 0, 2).contiguous().view(int(stacked_data.shape[1]), -1)
+    weights: List[torch.Tensor] = []
+    for linear_idx, split_meta in enumerate(split_metas):
+        start = linear_idx * parts_per_linear
+        end = start + parts_per_linear
+        part_flats = flat[start:end]
+        w_split = _restore_split_weight_from_part_flats_with_meta(
+            part_flats=part_flats,
+            split_meta=split_meta,
+            dtype=stacked_data.dtype,
+        )
+        weight = w_split.t().contiguous() if bool(split_meta.transpose) else w_split.contiguous()
+        weights.append(weight)
+    return weights
+
+
+def _convert_stage_stacked_to_common_stacked(
+    *,
+    stage_stacked_data: torch.Tensor,
+    stage_split_metas: Sequence[object],
+    common_split_metas: Sequence[object],
+    codebook_dim: int,
+) -> torch.Tensor:
+    if len(stage_split_metas) != len(common_split_metas):
+        raise ValueError(
+            f"stage_split_metas length {len(stage_split_metas)} != common_split_metas {len(common_split_metas)}"
+        )
+    if len(stage_split_metas) == 0:
+        raise ValueError("stage_split_metas cannot be empty.")
+    parts_per_linear = int(stage_split_metas[0].parallel_rows) * int(stage_split_metas[0].parallel_cols)
+    stage_flat = stage_stacked_data.permute(1, 0, 2).contiguous().view(int(stage_stacked_data.shape[1]), -1)
+    compressed_weights: List[torch.Tensor] = []
+    for linear_idx, (stage_meta, common_meta) in enumerate(zip(stage_split_metas, common_split_metas)):
+        start = linear_idx * parts_per_linear
+        end = start + parts_per_linear
+        part_flats = stage_flat[start:end]
+        restored_split = _restore_split_weight_from_part_flats_with_meta(
+            part_flats=part_flats,
+            split_meta=stage_meta,
+            dtype=stage_stacked_data.dtype,
+        )
+        compressed_weight = restored_split.t().contiguous() if bool(stage_meta.transpose) else restored_split.contiguous()
+        expected_shape = (
+            int(common_meta.compressed_out_features),
+            int(common_meta.compressed_in_features),
+        )
+        if tuple(compressed_weight.shape) != expected_shape:
+            raise ValueError(
+                f"{stage_meta.linear_name}: common compressed weight shape mismatch, got {tuple(compressed_weight.shape)}, expected {expected_shape}"
+            )
+        compressed_weights.append(compressed_weight)
+    return _compressed_weights_to_group_data(
+        compressed_weights=compressed_weights,
+        split_metas=common_split_metas,
+        codebook_dim=int(codebook_dim),
+    )
+
+
+def _build_joint_restore_plan(
+    *,
+    common_shape: Tuple[int, int, int],
+    all_stage_split_metas: Sequence[Sequence[object]],
+    common_split_metas: Sequence[object],
+    codebook_dim: int,
+) -> JointRestorePlan:
+    if len(common_shape) != 3:
+        raise ValueError(f"common_shape must be 3D, got {common_shape}")
+    if len(all_stage_split_metas) == 0:
+        raise ValueError("all_stage_split_metas cannot be empty.")
+    num_blocks, num_models, block_dim = [int(v) for v in common_shape]
+    total_numel = int(num_blocks) * int(num_models) * int(block_dim)
+    stage_template = torch.arange(total_numel, dtype=torch.long).view(num_blocks, num_models, block_dim)
+    expected_perm = torch.arange(total_numel, dtype=torch.long)
+    stage_plans: List[JointStageRestorePlan] = []
+    for stage_split_metas in all_stage_split_metas:
+        stage_common = _convert_stage_stacked_to_common_stacked(
+            stage_stacked_data=stage_template,
+            stage_split_metas=stage_split_metas,
+            common_split_metas=common_split_metas,
+            codebook_dim=int(codebook_dim),
+        )
+        if tuple(stage_common.shape) != (num_blocks, num_models, block_dim):
+            raise ValueError(
+                f"joint restore plan shape mismatch: got {tuple(stage_common.shape)}, "
+                f"expected {(num_blocks, num_models, block_dim)}"
+            )
+        src_idx_flat = stage_common.reshape(-1).to(dtype=torch.long).contiguous()
+        if int(src_idx_flat.min().item()) < 0 or int(src_idx_flat.max().item()) >= int(total_numel):
+            raise ValueError("joint restore plan index out of range.")
+        if not torch.equal(torch.sort(src_idx_flat).values, expected_perm):
+            raise ValueError("joint restore plan index is not bijective.")
+        src_idx_global = src_idx_flat.view(num_blocks, num_models, block_dim).contiguous()
+        stage_plans.append(
+            JointStageRestorePlan(
+                stage_src_idx_global=src_idx_global,
+                stage_src_idx_flat=src_idx_flat,
+            )
+        )
+    return JointRestorePlan(
+        common_shape=(num_blocks, num_models, block_dim),
+        stage_plans=stage_plans,
+    )
+
+
+def _apply_joint_restore_plan_full(
+    *,
+    stage_stacked_data: torch.Tensor,
+    stage_src_idx_flat: torch.Tensor,
+    common_shape: Tuple[int, int, int],
+) -> torch.Tensor:
+    flat = stage_stacked_data.reshape(-1)
+    idx = stage_src_idx_flat
+    if idx.device != flat.device:
+        idx = idx.to(device=flat.device, non_blocking=True)
+    common_flat = torch.take(flat, idx)
+    return common_flat.view(int(common_shape[0]), int(common_shape[1]), int(common_shape[2]))
+
+
+def _joint_finetune_stage_decoders(
+    *,
+    group_tag: str,
+    shared_stage_args,
+    joint_steps: int,
+    joint_lr: float,
+    train_device: str,
+    train_dtype: torch.dtype,
+    log_every: int,
+    codebook_dim: int,
+    recon_loss_type: str,
+    target_common_result,
+    all_stage_bits: Sequence[torch.Tensor],
+    all_stage_decoders: Sequence[Sequence[nn.Module]],
+    all_stage_split_metas: Sequence[Sequence[object]],
+) -> List[List[nn.Module]]:
+    from litebsq.autoencoder import pack_decoders
+
+    if int(joint_steps) <= 0:
+        return [list(stage_decoders) for stage_decoders in all_stage_decoders]
+    if len(all_stage_bits) < 2:
+        return [list(stage_decoders) for stage_decoders in all_stage_decoders]
+
+    target_common = target_common_result.stacked_data.to(device=train_device, dtype=train_dtype, non_blocking=True)
+    joint_restore_plan = _build_joint_restore_plan(
+        common_shape=tuple(int(v) for v in target_common.shape),
+        all_stage_split_metas=all_stage_split_metas,
+        common_split_metas=target_common_result.split_metas,
+        codebook_dim=int(codebook_dim),
+    )
+    if len(joint_restore_plan.stage_plans) != len(all_stage_bits):
+        raise ValueError(
+            f"[{group_tag}] joint restore plan stage count mismatch: "
+            f"plan={len(joint_restore_plan.stage_plans)} vs bits={len(all_stage_bits)}"
+        )
+    act_max_full = None
+    if str(recon_loss_type).strip().lower() == "wa_mse":
+        full_block_idx = torch.arange(target_common.shape[0], dtype=torch.long)
+        act_max_full = gather_wa_mse_act_max_batch(
+            block_idx_batch=full_block_idx,
+            part_metas=target_common_result.part_metas,
+            codebook_dim=int(codebook_dim),
+            train_device=train_device,
+            target_dtype=train_dtype,
+        )
+
+    packed_stage_decoders: List[nn.Module] = []
+    stage_bits_on_device: List[torch.Tensor] = []
+    stage_src_idx_flat_on_device: List[torch.Tensor] = []
+    for stage_bits_cpu, stage_decoders in zip(all_stage_bits, all_stage_decoders):
+        packed_decoder = pack_decoders(list(stage_decoders)).to(train_device)
+        packed_decoder.requires_grad_(True)
+        packed_decoder.train()
+        packed_stage_decoders.append(packed_decoder)
+        stage_bits_on_device.append(stage_bits_cpu.to(device=train_device, non_blocking=True))
+    for stage_plan in joint_restore_plan.stage_plans:
+        stage_src_idx_flat_on_device.append(stage_plan.stage_src_idx_flat.to(device=train_device, non_blocking=True))
+
+    params = []
+    for packed_decoder in packed_stage_decoders:
+        params.extend([param for param in packed_decoder.parameters() if param.requires_grad])
+    if not params:
+        raise RuntimeError(f"[{group_tag}] joint decoder fine-tune has no trainable parameters.")
+    optimizer = create_optimizer(params, shared_stage_args, float(joint_lr))
+    lr_scheduler = None
+    lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "none"))
+    if lr_scheduler_name != "none":
+        import transformers
+
+        lr_scheduler = transformers.get_scheduler(
+            lr_scheduler_name,
+            optimizer,
+            num_warmup_steps=int(getattr(shared_stage_args, "lr_warmup_steps", 0)),
+            num_training_steps=int(joint_steps),
+        )
+
+    start = time.time()
+    for step in range(int(joint_steps)):
+        optimizer.zero_grad(set_to_none=True)
+        total_recon = None
+        for packed_decoder, stage_bits, stage_src_idx_flat in zip(
+            packed_stage_decoders, stage_bits_on_device, stage_src_idx_flat_on_device
+        ):
+            param = next(packed_decoder.parameters(), None)
+            decode_dtype = param.dtype if param is not None else train_dtype
+            stage_out = packed_decoder(stage_bits.to(dtype=decode_dtype))
+            stage_common = _apply_joint_restore_plan_full(
+                stage_stacked_data=stage_out,
+                stage_src_idx_flat=stage_src_idx_flat,
+                common_shape=joint_restore_plan.common_shape,
+            ).to(dtype=train_dtype)
+            total_recon = stage_common if total_recon is None else (total_recon + stage_common)
+        if total_recon is None:
+            raise RuntimeError(f"[{group_tag}] joint decoder fine-tune produced no reconstruction.")
+        loss = _compute_recon_loss(
+            recon_loss_type=recon_loss_type,
+            x_recon=total_recon,
+            x=target_common,
+            act_max=act_max_full,
+        )
+        loss.backward()
+        optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        if log_every > 0 and (step + 1) % int(log_every) == 0:
+            speed = (time.time() - start) / int(log_every)
+            log.info(
+                "[%s/joint] step=%d/%d loss=%.4e speed=%.4fs/it",
+                group_tag,
+                step + 1,
+                int(joint_steps),
+                float(loss.detach().float().item()),
+                speed,
+            )
+            start = time.time()
+
+    updated_stage_decoders: List[List[nn.Module]] = []
+    num_models = int(target_common.shape[1])
+    for packed_decoder in packed_stage_decoders:
+        packed_decoder.eval()
+        updated_stage_decoders.append(
+            [packed_decoder.get_sub_decoder(model_idx).to(device="cpu") for model_idx in range(num_models)]
+        )
+
+    del target_common, act_max_full, stage_bits_on_device, packed_stage_decoders, optimizer, stage_src_idx_flat_on_device
+    if lr_scheduler is not None:
+        del lr_scheduler
+    torch.cuda.empty_cache()
+    return updated_stage_decoders
+
+
+def _build_joint_target_subset(
+    target_common_result,
+    *,
+    linear_start: int,
+    linear_end: int,
+    model_start: int,
+    model_end: int,
+):
+    return SimpleNamespace(
+        stacked_data=target_common_result.stacked_data[:, model_start:model_end, :].contiguous(),
+        part_metas=list(target_common_result.part_metas[model_start:model_end]),
+        split_metas=list(target_common_result.split_metas[linear_start:linear_end]),
+    )
+
+
+def _joint_finetune_stage_decoders_in_subgroups(
+    *,
+    group_tag: str,
+    group_refs: Sequence[LinearRef],
+    shared_stage_args,
+    joint_steps: int,
+    joint_lr: float,
+    joint_group_size: int,
+    train_device: str,
+    train_dtype: torch.dtype,
+    log_every: int,
+    codebook_dim: int,
+    recon_loss_type: str,
+    target_common_result,
+    all_stage_bits: Sequence[torch.Tensor],
+    all_stage_decoders: Sequence[Sequence[nn.Module]],
+    all_stage_split_metas: Sequence[Sequence[object]],
+    parts_per_linear: int,
+) -> List[List[nn.Module]]:
+    num_linears = int(len(group_refs))
+    if num_linears <= 0:
+        return [list(stage_decoders) for stage_decoders in all_stage_decoders]
+    resolved_joint_group_size = max(1, min(int(joint_group_size), num_linears))
+    if resolved_joint_group_size >= num_linears:
+        return _joint_finetune_stage_decoders(
+            group_tag=group_tag,
+            shared_stage_args=shared_stage_args,
+            joint_steps=joint_steps,
+            joint_lr=joint_lr,
+            train_device=train_device,
+            train_dtype=train_dtype,
+            log_every=log_every,
+            codebook_dim=codebook_dim,
+            recon_loss_type=recon_loss_type,
+            target_common_result=target_common_result,
+            all_stage_bits=all_stage_bits,
+            all_stage_decoders=all_stage_decoders,
+            all_stage_split_metas=all_stage_split_metas,
+        )
+
+    resolved_recon_loss = str(recon_loss_type).strip().lower()
+    if resolved_recon_loss in {"cosine", "relative_l1"}:
+        raise ValueError(
+            f"[{group_tag}] joint_decoder_group_size={resolved_joint_group_size} is not supported "
+            f"with recon_loss_type={resolved_recon_loss}. Set --joint_decoder_group_size to the full group size."
+        )
+
+    log.info(
+        "[%s/joint] split full-batch group into subgroups: joint_decoder_group_size=%d linears=%d",
+        group_tag,
+        resolved_joint_group_size,
+        num_linears,
+    )
+
+    updated_stage_decoders: List[List[nn.Module]] = [list(stage_decoders) for stage_decoders in all_stage_decoders]
+    for linear_start in range(0, num_linears, resolved_joint_group_size):
+        linear_end = min(linear_start + resolved_joint_group_size, num_linears)
+        model_start = int(linear_start) * int(parts_per_linear)
+        model_end = int(linear_end) * int(parts_per_linear)
+        subgroup_target_common_result = _build_joint_target_subset(
+            target_common_result,
+            linear_start=linear_start,
+            linear_end=linear_end,
+            model_start=model_start,
+            model_end=model_end,
+        )
+        subgroup_stage_bits = [
+            stage_bits[:, model_start:model_end, :].contiguous()
+            for stage_bits in all_stage_bits
+        ]
+        subgroup_stage_decoders = [
+            list(stage_decoders[model_start:model_end])
+            for stage_decoders in updated_stage_decoders
+        ]
+        subgroup_stage_split_metas = [
+            list(stage_split_metas[linear_start:linear_end])
+            for stage_split_metas in all_stage_split_metas
+        ]
+        start_layer_idx = _extract_layer_idx(group_refs[linear_start].name)
+        end_layer_idx = _extract_layer_idx(group_refs[linear_end - 1].name)
+        if start_layer_idx is not None and end_layer_idx is not None:
+            subgroup_tag = f"{group_tag}.subL{start_layer_idx}-{end_layer_idx}"
+        else:
+            subgroup_tag = f"{group_tag}.sub{linear_start}-{linear_end - 1}"
+        subgroup_updated_decoders = _joint_finetune_stage_decoders(
+            group_tag=subgroup_tag,
+            shared_stage_args=shared_stage_args,
+            joint_steps=joint_steps,
+            joint_lr=joint_lr,
+            train_device=train_device,
+            train_dtype=train_dtype,
+            log_every=log_every,
+            codebook_dim=codebook_dim,
+            recon_loss_type=recon_loss_type,
+            target_common_result=subgroup_target_common_result,
+            all_stage_bits=subgroup_stage_bits,
+            all_stage_decoders=subgroup_stage_decoders,
+            all_stage_split_metas=subgroup_stage_split_metas,
+        )
+        for stage_idx in range(len(updated_stage_decoders)):
+            updated_stage_decoders[stage_idx][model_start:model_end] = subgroup_updated_decoders[stage_idx]
+
+    return updated_stage_decoders
+
+
 def _eval_ppl_after_category(
     model: nn.Module,
     vae_args,
@@ -380,6 +1030,7 @@ def _build_vae_linear_from_stage_payload(
     old_module: nn.Module,
     transpose: bool,
     split_meta,
+    stage_split_metas: Sequence[object],
     stage_part_bits_payload: Sequence[object],
     stage_part_decoders_payload: Sequence[object],
     stage_codebook_dims: Sequence[int],
@@ -411,6 +1062,18 @@ def _build_vae_linear_from_stage_payload(
         restore_row_indices=split_meta.restore_row_indices,
         restore_col_indices=split_meta.restore_col_indices,
         part_restore_col_indices=split_meta.part_restore_col_indices,
+        stage_restore_row_indices=[
+            None if getattr(meta, "restore_row_indices", None) is None else meta.restore_row_indices
+            for meta in stage_split_metas
+        ],
+        stage_restore_col_indices=[
+            None if getattr(meta, "restore_col_indices", None) is None else meta.restore_col_indices
+            for meta in stage_split_metas
+        ],
+        stage_part_restore_col_indices=[
+            None if getattr(meta, "part_restore_col_indices", None) is None else meta.part_restore_col_indices
+            for meta in stage_split_metas
+        ],
         compressed_in_features=int(split_meta.compressed_in_features),
         compressed_out_features=int(split_meta.compressed_out_features),
         protected_input_indices=split_meta.protected_input_indices,
@@ -442,6 +1105,7 @@ def _decode_reconstructed_linear_weight(
     old_module: nn.Module,
     transpose: bool,
     split_meta,
+    stage_split_metas: Sequence[object],
     stage_part_bits_payload: Sequence[object],
     stage_part_decoders_payload: Sequence[object],
     stage_codebook_dims: Sequence[int],
@@ -453,6 +1117,7 @@ def _decode_reconstructed_linear_weight(
         old_module=old_module,
         transpose=transpose,
         split_meta=split_meta,
+        stage_split_metas=stage_split_metas,
         stage_part_bits_payload=stage_part_bits_payload,
         stage_part_decoders_payload=stage_part_decoders_payload,
         stage_codebook_dims=stage_codebook_dims,
@@ -641,6 +1306,8 @@ def _train_group_vae_and_replace(
     outlier_residual_index_bits: int = 8,
     outlier_residual_value_bits: int = 8,
     outlier_residual_block_shape: Tuple[int, int] = (256, 256),
+    sort_executor=None,
+    sort_prep_workers_resolved: int = 1,
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
 
@@ -743,28 +1410,41 @@ def _train_group_vae_and_replace(
         )
         for r in group_refs
     ]
-    prep_result = prepare_group_weight_data(
+    prepared_entries = prepare_group_linear_entries(
         group_refs=prep_refs,
+        activation_weight_by_linear=effective_activation_weight,
+        outlier_protect_count=int(outlier_protect_count) if resolved_outlier_mode == "channel" else 0,
+        outlier_protect_axis=str(outlier_protect_axis),
+        recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
+        intra_part_sort_mode=stage_sort_mode,
+    )
+    target_common_result = materialize_prepared_group_data(
+        prepared_entries=prepared_entries,
         intra_parallel=(row_parts, col_parts),
         codebook_dim=int(stage_codebook_dim),
         batch_size=int(batch_size),
-        # 多阶残差独立 norm：这里保持原始域，后续在每个 stage 内单独做标准化。
         normalize_weight=False,
         recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
-        activation_weight_by_linear=effective_activation_weight,
         train_device=train_device,
-        intra_part_sort_mode=stage_sort_mode,
-        outlier_protect_count=int(outlier_protect_count) if resolved_outlier_mode == "channel" else 0,
-        outlier_protect_axis=str(outlier_protect_axis),
+        intra_part_sort_mode="none",
+        sort_executor=None,
+        split_weights_by_linear=None,
     )
-    num_models = int(prep_result.num_models)
-    stacked_data = prep_result.stacked_data
-    use_wa_mse = bool(prep_result.use_wa_mse)
-    part_metas = prep_result.part_metas
-    split_metas = prep_result.split_metas
+    num_models = int(target_common_result.num_models)
+    target_common_split_metas = target_common_result.split_metas
+    current_residual_weights = [
+        entry.prepared_weight.split_weight.detach().to(device="cpu").contiguous()
+        for entry in prepared_entries
+    ]
+    use_wa_mse = bool(target_common_result.use_wa_mse)
+    if len(target_common_split_metas) != len(group_refs):
+        raise RuntimeError(
+            f"[{group_tag}] split metadata mismatch: len(split_metas)={len(target_common_split_metas)} "
+            f"vs len(group_refs)={len(group_refs)}"
+        )
     if resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0:
         per_linear_protected = []
-        for ref, meta in zip(group_refs, split_metas):
+        for ref, meta in zip(group_refs, target_common_split_metas):
             if str(outlier_protect_axis) == "output":
                 protected_idx = meta.protected_output_indices
                 total_channels = int(ref.module.out_features)
@@ -795,21 +1475,13 @@ def _train_group_vae_and_replace(
             int(outlier_residual_block_shape[0]),
             int(outlier_residual_block_shape[1]),
         )
-    if len(split_metas) != len(group_refs):
-        raise RuntimeError(
-            f"[{group_tag}] split metadata mismatch: len(split_metas)={len(split_metas)} "
-            f"vs len(group_refs)={len(group_refs)}"
-        )
     if use_wa_mse:
         log.info("[%s] wa_mse enabled with online act_max gather.", group_tag)
-
-    residual_data = _reshape_blocks_for_codebook_dim(
-        stacked_data.detach().clone().contiguous(),
-        codebook_dim=int(stage_codebook_dim),
-    )
+    need_stage_payload = bool(do_convert or residual_stages > 1)
     all_stage_bits: List[torch.Tensor] = []
     all_stage_decoders: List[List[nn.Module]] = []
     all_stage_codebook_dims: List[int] = []
+    all_stage_split_metas: List[List[object]] = []
 
     shared_stage_args = _clone_namespace(
         vae_args,
@@ -835,6 +1507,57 @@ def _train_group_vae_and_replace(
     for stage_idx in range(residual_stages):
         stage_tag = f"{group_tag}/stage{stage_idx + 1}"
         stage_vae_args = _clone_namespace(shared_stage_args)
+        common_stage_result = materialize_prepared_group_data(
+            prepared_entries=prepared_entries,
+            intra_parallel=(row_parts, col_parts),
+            codebook_dim=int(stage_codebook_dim),
+            batch_size=int(batch_size),
+            normalize_weight=False,
+            recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
+            train_device=train_device,
+            intra_part_sort_mode="none",
+            sort_executor=None,
+            split_weights_by_linear=current_residual_weights,
+        )
+        stage_prep_result = common_stage_result
+        if sort_mode != "none":
+            prep_start_time = time.time()
+            stage_prep_result = materialize_prepared_group_data(
+                prepared_entries=prepared_entries,
+                intra_parallel=(row_parts, col_parts),
+                codebook_dim=int(stage_codebook_dim),
+                batch_size=int(batch_size),
+                normalize_weight=False,
+                recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
+                train_device=train_device,
+                intra_part_sort_mode=stage_sort_mode,
+                sort_executor=sort_executor,
+                split_weights_by_linear=current_residual_weights,
+            )
+            prep_duration_sec = float(time.time() - prep_start_time)
+            sort_task_count = int(len(group_refs))
+            effective_sort_workers = 1
+            sort_backend = "cpu_serial"
+            if sort_executor is not None and sort_task_count > 1 and int(sort_prep_workers_resolved) > 1:
+                effective_sort_workers = min(int(sort_prep_workers_resolved), sort_task_count)
+                sort_backend = "cpu_process"
+            log.info(
+                "[%s] 排序预处理完成: sort_backend=%s sort_prep_workers_resolved=%d sort_task_count=%d duration_sec=%.2f",
+                stage_tag,
+                sort_backend,
+                effective_sort_workers,
+                sort_task_count,
+                prep_duration_sec,
+            )
+        current_common_stacked = common_stage_result.stacked_data.detach().clone().contiguous()
+        stage_result = stage_prep_result
+        residual_data = _reshape_blocks_for_codebook_dim(
+            stage_result.stacked_data.detach().clone().contiguous(),
+            codebook_dim=int(stage_codebook_dim),
+        )
+        part_metas = stage_result.part_metas
+        stage_split_metas = list(stage_result.split_metas)
+        residual_rms_before = float(current_common_stacked.float().pow(2).mean().sqrt().item())
 
         if use_stage_norm:
             stage_norm_mean, stage_norm_scale = _compute_stage_norm_stats(residual_data)
@@ -865,7 +1588,6 @@ def _train_group_vae_and_replace(
                 num_training_steps=int(stage_steps),
             )
 
-        residual_rms_before = float(residual_data.float().pow(2).mean().sqrt().item())
         log.info(
             "[%s] start (residual_rms=%.6e, steps=%d, blocks=%d, bits=%d, dim=%d, recon_loss=%s, base_ch=%d, num_res_blocks=%d, norm_type=%s, decoder_type=%s, stage_norm=%s)",
             stage_tag,
@@ -913,7 +1635,7 @@ def _train_group_vae_and_replace(
                 recon = loss_dict.get("train/recon_loss")
                 commit = loss_dict.get("train/commitment_loss")
                 log.info(
-                    "[%s] step=%d/%d loss=%.6f recon=%.6f commit=%.6f speed=%.4fs/it",
+                    "[%s] step=%d/%d loss=%.4e recon=%.4e commit=%.4e speed=%.4fs/it",
                     stage_tag,
                     step + 1,
                     stage_steps,
@@ -970,7 +1692,7 @@ def _train_group_vae_and_replace(
                 x_in = x_in_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
                 x_recon, bit_idx = vae(x_in, is_train=False)
                 stage_recon_chunks.append(x_recon.detach().to(device="cpu", dtype=residual_data.dtype))
-                if do_convert:
+                if need_stage_payload:
                     stage_bit_chunks.append(bit_idx.detach().to("cpu"))
 
         stage_recon_full_norm = torch.cat(stage_recon_chunks, dim=0)
@@ -992,8 +1714,18 @@ def _train_group_vae_and_replace(
                 f"[{stage_tag}] denorm recon shape mismatch: recon={tuple(stage_recon_full.shape)} "
                 f"vs residual={tuple(residual_data.shape)}"
             )
-        residual_data = (residual_data - stage_recon_full).contiguous()
-        residual_rms_after = float(residual_data.float().pow(2).mean().sqrt().item())
+        stage_common_recon = _convert_stage_stacked_to_common_stacked(
+            stage_stacked_data=stage_recon_full,
+            stage_split_metas=stage_split_metas,
+            common_split_metas=target_common_split_metas,
+            codebook_dim=int(stage_codebook_dim),
+        ).to(device="cpu", dtype=current_common_stacked.dtype)
+        current_common_stacked = (current_common_stacked - stage_common_recon).contiguous()
+        current_residual_weights = _group_data_to_compressed_weights(
+            stacked_data=current_common_stacked,
+            split_metas=target_common_split_metas,
+        )
+        residual_rms_after = float(current_common_stacked.float().pow(2).mean().sqrt().item())
         log.info(
             "[%s] residual rms: before=%.6e after=%.6e",
             stage_tag,
@@ -1001,12 +1733,13 @@ def _train_group_vae_and_replace(
             residual_rms_after,
         )
 
-        if do_convert:
+        if need_stage_payload:
             if not stage_bit_chunks:
                 raise RuntimeError(f"[{stage_tag}] no bit indices collected during conversion.")
             stage_full_bits = torch.cat(stage_bit_chunks, dim=0)  # [N_blocks, P, latent_dim]
             all_stage_bits.append(stage_full_bits)
             all_stage_codebook_dims.append(int(stage_codebook_dim))
+            all_stage_split_metas.append(stage_split_metas)
 
             decoder_in_dim = int(getattr(vae.model.decoder, "in_dim"))
             use_new_quant = bool(getattr(stage_vae_args, "new_quant", False))
@@ -1027,18 +1760,57 @@ def _train_group_vae_and_replace(
                 decoders.append(dec)
             all_stage_decoders.append(decoders)
 
-        del vae, train_loader, eval_loader, optimizer
+        del vae, train_loader, eval_loader, optimizer, common_stage_result, stage_result
         if lr_scheduler is not None:
             del lr_scheduler
         torch.cuda.empty_cache()
 
-    # # 保存分组 VAE，便于复现实验和离线分析。
-    # group_dir = os.path.join(output_dir, "vae_by_category", group_tag.replace("/", "_"))
-    # os.makedirs(group_dir, exist_ok=True)
-    # torch.save(vae.state_dict(), os.path.join(group_dir, "vae_state.pt"))
+    if residual_stages > 1:
+        if (
+            len(all_stage_bits) != residual_stages
+            or len(all_stage_decoders) != residual_stages
+            or len(all_stage_split_metas) != residual_stages
+            or len(all_stage_codebook_dims) != residual_stages
+        ):
+            raise RuntimeError(
+                f"[{group_tag}] joint fine-tune payload mismatch: bits={len(all_stage_bits)} "
+                f"decoders={len(all_stage_decoders)} split_metas={len(all_stage_split_metas)} "
+                f"codebook_dims={len(all_stage_codebook_dims)} residual_stages={residual_stages}"
+            )
+        joint_steps = int(runtime_cfg.joint_decoder_steps)
+        joint_lr = float(runtime_cfg.joint_decoder_lr)
+        joint_group_size = max(1, min(int(runtime_cfg.joint_decoder_group_size), len(group_refs)))
+        if joint_steps > 0:
+            log.info(
+                "[%s/joint] start (steps=%d, lr=%.3e, recon_loss=%s, stages=%d, joint_group_size=%d)",
+                group_tag,
+                joint_steps,
+                joint_lr,
+                stage_recon_loss,
+                residual_stages,
+                joint_group_size,
+            )
+            all_stage_decoders = _joint_finetune_stage_decoders_in_subgroups(
+                group_tag=group_tag,
+                group_refs=group_refs,
+                shared_stage_args=shared_stage_args,
+                joint_steps=joint_steps,
+                joint_lr=joint_lr,
+                joint_group_size=joint_group_size,
+                train_device=train_device,
+                train_dtype=train_dtype,
+                log_every=log_every,
+                codebook_dim=int(stage_codebook_dim),
+                recon_loss_type=stage_recon_loss,
+                target_common_result=target_common_result,
+                all_stage_bits=all_stage_bits,
+                all_stage_decoders=all_stage_decoders,
+                all_stage_split_metas=all_stage_split_metas,
+                parts_per_linear=parts_per_linear,
+            )
 
     if not do_convert:
-        del stacked_data, residual_data
+        del current_residual_weights, target_common_result, all_stage_bits, all_stage_decoders, all_stage_codebook_dims, all_stage_split_metas
         torch.cuda.empty_cache()
         return
 
@@ -1046,16 +1818,19 @@ def _train_group_vae_and_replace(
         len(all_stage_bits) != residual_stages
         or len(all_stage_decoders) != residual_stages
         or len(all_stage_codebook_dims) != residual_stages
+        or len(all_stage_split_metas) != residual_stages
     ):
         raise RuntimeError(
             f"[{group_tag}] stage payload mismatch: bits={len(all_stage_bits)} "
             f"decoders={len(all_stage_decoders)} codebook_dims={len(all_stage_codebook_dims)} "
+            f"split_metas={len(all_stage_split_metas)} "
             f"residual_stages={residual_stages}"
         )
 
     for i, r in enumerate(group_refs):
         old = r.module
-        split_meta = split_metas[i]
+        split_meta = target_common_split_metas[i]
+        stage_split_metas = [all_stage_split_metas[stage_idx][i] for stage_idx in range(residual_stages)]
         if str(split_meta.linear_name) != str(r.name):
             raise RuntimeError(
                 f"[{group_tag}] split metadata order mismatch at idx={i}: "
@@ -1104,6 +1879,7 @@ def _train_group_vae_and_replace(
                 old_module=old,
                 transpose=r.transpose,
                 split_meta=split_meta,
+                stage_split_metas=stage_split_metas,
                 stage_part_bits_payload=stage_part_bits_payload,
                 stage_part_decoders_payload=stage_part_decoders_payload,
                 stage_codebook_dims=all_stage_codebook_dims,
@@ -1140,6 +1916,7 @@ def _train_group_vae_and_replace(
             old_module=old,
             transpose=r.transpose,
             split_meta=split_meta,
+            stage_split_metas=stage_split_metas,
             stage_part_bits_payload=stage_part_bits_payload,
             stage_part_decoders_payload=stage_part_decoders_payload,
             stage_codebook_dims=all_stage_codebook_dims,
@@ -1155,7 +1932,7 @@ def _train_group_vae_and_replace(
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
 
-    del stacked_data, residual_data, all_stage_bits, all_stage_decoders, all_stage_codebook_dims
+    del current_residual_weights, target_common_result, all_stage_bits, all_stage_decoders, all_stage_codebook_dims, all_stage_split_metas
     torch.cuda.empty_cache()
 
 
@@ -1295,6 +2072,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cat: format_intra_part_sort_mode(category_sort_modes[cat]) for cat in active_categories
     }
     unique_sort_mode_desc = sorted(set(category_sort_mode_desc.values()))
+    any_sort_enabled = any(mode != "none" for mode in category_sort_modes.values())
 
     any_wa_mse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip(
     ).lower() == "wa_mse" for cat in active_categories)
@@ -1423,103 +2201,132 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         log.info("residual_stages 配置: per_category{%s}", per_cat_stage_desc)
 
-    snapshot_path = _save_normalized_cat_train_snapshot(
-        run_output_dir=run_output_dir,
-        cat_args=cat_args,
-        vae_args=vae_args,
-        training_args=training_args,
-        resolved_category_cfgs=resolved_category_cfgs,
-    )
-    log.info("Saved normalized parameter snapshot: %s", snapshot_path)
-    lora_round_idx = 0
-    any_lora_after_overrides = any(table.is_override_enabled() for table, _ in lora_tables)
-    if any_lora_after_overrides:
-        log.info(
-            "LoRA after-category overrides enabled: keys=%s",
-            ",".join(
-                sorted(
-                    {
-                        key
-                        for table, _arg_name in lora_tables
-                        for key in table.by_after_category.keys()
-                    }
-                )
-            ),
+    sort_prep_workers_resolved = 1
+    sort_executor = None
+    if any_sort_enabled:
+        sort_prep_workers_resolved = _resolve_sort_prep_workers(
+            int(cat_args.sort_prep_workers),
+            linear_group_size=int(linear_group_size),
         )
-    for cat in active_categories:
-        refs_sorted, missing = _collect_sorted_category_refs(
-            model,
-            category=cat,
-            transpose_modules=transpose_modules,
-            only_decoder_projections=only_decoder_projections,
-            projection_suffixes=projection_suffixes,
-        )
-        if missing:
-            log.warning("[%s] %d modules missing layer_idx, skipped.", cat, missing)
-        if not refs_sorted:
-            continue
-
-        cat_cfg = resolved_category_cfgs[cat]
-        refs = [ref for _, ref in refs_sorted]
-        cat_row_parts, cat_col_parts = category_intra_parallel[cat]
-        cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
-        cat_parts_per_linear = int(cat_row_parts) * int(cat_col_parts)
-        cat_intra_parallel_desc = _format_intra_parallel_desc(cat_row_parts, cat_col_parts)
-        log.info(
-            "=== Category: %s (%d linears, residual_stages=%d, intra_parallel=%s rows=%d cols=%d, codebook_bits=%d, codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
-            cat,
-            len(refs),
-            int(cat_cfg.residual_stages),
-            cat_intra_parallel_desc,
-            cat_row_parts,
-            cat_col_parts,
-            int(cat_codebook_bits),
-            int(cat_codebook_dim),
-            str(cat_cfg.recon_loss_type),
-            category_sort_mode_desc[cat],
-            int(cat_cfg.steps),
-        )
-        ordered_refs = [r for _, r in refs_sorted]
-
-        for start in range(0, len(ordered_refs), linear_group_size):
-            group_refs = ordered_refs[start:start + linear_group_size]
-            if len(group_refs) < linear_group_size and not cat_args.allow_tail_group:
-                log.info("[%s] tail group size=%d skipped (set --allow_tail_group to include).", cat, len(group_refs))
-                break
-            layer_indices = [idx for idx, _ in refs_sorted[start:start + linear_group_size]]
-            group_tag = f"{cat}.L{layer_indices[0]}-{layer_indices[-1]}"
+        if sort_prep_workers_resolved > 1:
+            sort_executor = ProcessPoolExecutor(
+                max_workers=int(sort_prep_workers_resolved),
+                mp_context=mp.get_context("spawn"),
+                initializer=_init_sort_prep_worker,
+            )
             log.info(
-                "---- Group: %s (linears=%d, intra_parallel=%s, num_models=%d) ----",
-                group_tag,
-                len(group_refs),
+                "排序预处理并行已启用: sort_backend=cpu_process sort_prep_workers_resolved=%d requested=%d",
+                int(sort_prep_workers_resolved),
+                int(cat_args.sort_prep_workers),
+            )
+        else:
+            log.info(
+                "排序预处理使用串行: sort_backend=cpu_serial sort_prep_workers_resolved=1 requested=%d",
+                int(cat_args.sort_prep_workers),
+            )
+
+    try:
+        snapshot_path = _save_normalized_cat_train_snapshot(
+            run_output_dir=run_output_dir,
+            cat_args=cat_args,
+            vae_args=vae_args,
+            training_args=training_args,
+            resolved_category_cfgs=resolved_category_cfgs,
+        )
+        log.info("Saved normalized parameter snapshot: %s", snapshot_path)
+        lora_round_idx = 0
+        any_lora_after_overrides = any(table.is_override_enabled() for table, _ in lora_tables)
+        if any_lora_after_overrides:
+            log.info(
+                "LoRA after-category overrides enabled: keys=%s",
+                ",".join(
+                    sorted(
+                        {
+                            key
+                            for table, _arg_name in lora_tables
+                            for key in table.by_after_category.keys()
+                        }
+                    )
+                ),
+            )
+        for cat in active_categories:
+            refs_sorted, missing = _collect_sorted_category_refs(
+                model,
+                category=cat,
+                transpose_modules=transpose_modules,
+                only_decoder_projections=only_decoder_projections,
+                projection_suffixes=projection_suffixes,
+            )
+            if missing:
+                log.warning("[%s] %d modules missing layer_idx, skipped.", cat, missing)
+            if not refs_sorted:
+                continue
+
+            cat_cfg = resolved_category_cfgs[cat]
+            refs = [ref for _, ref in refs_sorted]
+            cat_row_parts, cat_col_parts = category_intra_parallel[cat]
+            cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
+            cat_parts_per_linear = int(cat_row_parts) * int(cat_col_parts)
+            cat_intra_parallel_desc = _format_intra_parallel_desc(cat_row_parts, cat_col_parts)
+            log.info(
+                "=== Category: %s (%d linears, residual_stages=%d, intra_parallel=%s rows=%d cols=%d, codebook_bits=%d, codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d, joint_lr=%.3e, joint_group=%d) ===",
+                cat,
+                len(refs),
+                int(cat_cfg.residual_stages),
                 cat_intra_parallel_desc,
-                len(group_refs) * cat_parts_per_linear,
+                cat_row_parts,
+                cat_col_parts,
+                int(cat_codebook_bits),
+                int(cat_codebook_dim),
+                str(cat_cfg.recon_loss_type),
+                category_sort_mode_desc[cat],
+                int(cat_cfg.steps),
+                float(cat_cfg.joint_decoder_lr),
+                int(cat_cfg.joint_decoder_group_size),
             )
-            _train_group_vae_and_replace(
-                model=model,
-                group_refs=group_refs,
-                group_tag=group_tag,
-                runtime_cfg=cat_cfg,
-                vae_args=vae_args,
-                training_args=training_args,
-                train_device=cat_args.train_device,
-                convert_device=cat_args.convert_device,
-                do_convert=bool(cat_args.convert),
-                batch_size=cat_args.batch_size,
-                log_every=cat_args.log_every,
-                eval_every=cat_args.eval_every,
-                eval_blocks=cat_args.eval_blocks,
-                skip_layer_keys=skip_layer_keys,
-                activation_runtime=activation_runtime,
-                outlier_protect_mode=resolved_outlier_mode,
-                outlier_residual_score=resolved_residual_score,
-                outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
-                outlier_protect_axis=outlier_protect_axis,
-                outlier_residual_codec=cat_args.outlier_residual_codec,
-                outlier_residual_index_bits=cat_args.outlier_residual_index_bits,
-                outlier_residual_value_bits=cat_args.outlier_residual_value_bits,
-                outlier_residual_block_shape=cat_args.outlier_residual_block_shape,
-            )
+            ordered_refs = [r for _, r in refs_sorted]
+
+            for start in range(0, len(ordered_refs), linear_group_size):
+                group_refs = ordered_refs[start:start + linear_group_size]
+                if len(group_refs) < linear_group_size and not cat_args.allow_tail_group:
+                    log.info("[%s] tail group size=%d skipped (set --allow_tail_group to include).", cat, len(group_refs))
+                    break
+                layer_indices = [idx for idx, _ in refs_sorted[start:start + linear_group_size]]
+                group_tag = f"{cat}.L{layer_indices[0]}-{layer_indices[-1]}"
+                log.info(
+                    "---- Group: %s (linears=%d, intra_parallel=%s, num_models=%d) ----",
+                    group_tag,
+                    len(group_refs),
+                    cat_intra_parallel_desc,
+                    len(group_refs) * cat_parts_per_linear,
+                )
+                _train_group_vae_and_replace(
+                    model=model,
+                    group_refs=group_refs,
+                    group_tag=group_tag,
+                    runtime_cfg=cat_cfg,
+                    vae_args=vae_args,
+                    training_args=training_args,
+                    train_device=cat_args.train_device,
+                    convert_device=cat_args.convert_device,
+                    do_convert=bool(cat_args.convert),
+                    batch_size=cat_args.batch_size,
+                    log_every=cat_args.log_every,
+                    eval_every=cat_args.eval_every,
+                    eval_blocks=cat_args.eval_blocks,
+                    skip_layer_keys=skip_layer_keys,
+                    activation_runtime=activation_runtime,
+                    outlier_protect_mode=resolved_outlier_mode,
+                    outlier_residual_score=resolved_residual_score,
+                    outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
+                    outlier_protect_axis=outlier_protect_axis,
+                    outlier_residual_codec=cat_args.outlier_residual_codec,
+                    outlier_residual_index_bits=cat_args.outlier_residual_index_bits,
+                    outlier_residual_value_bits=cat_args.outlier_residual_value_bits,
+                    outlier_residual_block_shape=cat_args.outlier_residual_block_shape,
+                    sort_executor=sort_executor,
+                    sort_prep_workers_resolved=int(sort_prep_workers_resolved),
+                )
             # _eval_ppl_after_category(
             #     model=model,
             #     vae_args=vae_args,
@@ -1528,10 +2335,40 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             #     eval_device=cat_args.train_device,
             # )
 
-        if cat_args.lora_after_category:
-            from train_utils.lora_utils import lora_finetune_remaining_categories
+            if cat_args.lora_after_category:
+                from train_utils.lora_utils import lora_finetune_remaining_categories
+                if run_ppl_eval:
+                    log.info("LoRA 微调前评估...")
+                    _eval_ppl_after_category(
+                        model=model,
+                        vae_args=vae_args,
+                        ppl_limit=cat_args.ppl_limit,
+                        category=cat,
+                        eval_device=cat_args.train_device,
+                        eval_hif4_act=cat_args.eval_hif4_act,
+                    )
+
+                current_remaining_linears = _collect_current_trainable_linears(
+                    model,
+                    transpose_modules=transpose_modules,
+                    only_decoder_projections=only_decoder_projections,
+                    projection_suffixes=projection_suffixes,
+                )
+                remaining_categories = list(dict.fromkeys(r.category for r in current_remaining_linears))
+                model = lora_finetune_remaining_categories(
+                    model=model,
+                    remaining_categories=remaining_categories,
+                    target_names=[r.name for r in current_remaining_linears],
+                    cat_args=cat_args,
+                    vae_args=vae_args,
+                    training_args=training_args,
+                    logger=log,
+                    lora_round_idx=lora_round_idx,
+                    after_category=cat,
+                )
+                lora_round_idx += 1
+
             if run_ppl_eval:
-                log.info("LoRA 微调前评估...")
                 _eval_ppl_after_category(
                     model=model,
                     vae_args=vae_args,
@@ -1540,82 +2377,56 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     eval_device=cat_args.train_device,
                     eval_hif4_act=cat_args.eval_hif4_act,
                 )
-
-            current_remaining_linears = _collect_current_trainable_linears(
-                model,
-                transpose_modules=transpose_modules,
-                only_decoder_projections=only_decoder_projections,
-                projection_suffixes=projection_suffixes,
-            )
-            remaining_categories = list(dict.fromkeys(r.category for r in current_remaining_linears))
-            model = lora_finetune_remaining_categories(
-                model=model,
-                remaining_categories=remaining_categories,
-                target_names=[r.name for r in current_remaining_linears],
-                cat_args=cat_args,
-                vae_args=vae_args,
-                training_args=training_args,
-                logger=log,
-                lora_round_idx=lora_round_idx,
-                after_category=cat,
-            )
-            lora_round_idx += 1
+            # cat_dir_name = _safe_path_token(cat)
+            # cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
+            # save_paths = save_model_checkpoint(
+            #     model,
+            #     cat_model_dir,
+            #     base_model_path=vae_args.model_path,
+            #     tokenizer=None,
+            #     save_config=True,
+            #     extra_meta={
+            #         "stage": "after_category",
+            #         "category": cat,
+            #         "category_index": int(cat_idx),
+            #         "lora_after_category": bool(cat_args.lora_after_category),
+            #     },
+            # )
+            # log.info("Saved category checkpoint (%s): %s", cat, save_paths["output_dir"])
 
         if run_ppl_eval:
             _eval_ppl_after_category(
                 model=model,
                 vae_args=vae_args,
                 ppl_limit=cat_args.ppl_limit,
-                category=cat,
+                category="none",
                 eval_device=cat_args.train_device,
                 eval_hif4_act=cat_args.eval_hif4_act,
             )
-        # cat_dir_name = _safe_path_token(cat)
-        # cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
-        # save_paths = save_model_checkpoint(
-        #     model,
-        #     cat_model_dir,
-        #     base_model_path=vae_args.model_path,
-        #     tokenizer=None,
-        #     save_config=True,
-        #     extra_meta={
-        #         "stage": "after_category",
-        #         "category": cat,
-        #         "category_index": int(cat_idx),
-        #         "lora_after_category": bool(cat_args.lora_after_category),
-        #     },
-        # )
-        # log.info("Saved category checkpoint (%s): %s", cat, save_paths["output_dir"])
+        if cat_args.save_model:
+            if not cat_args.convert:
+                raise ValueError("--save_model requires --convert")
+            from transformers import AutoTokenizer
+            from litebsq.vae_linear import clear_model_vae_linear_cache
 
-    if run_ppl_eval:
-        _eval_ppl_after_category(
-            model=model,
-            vae_args=vae_args,
-            ppl_limit=cat_args.ppl_limit,
-            category="none",
-            eval_device=cat_args.train_device,
-            eval_hif4_act=cat_args.eval_hif4_act,
-        )
-    if cat_args.save_model:
-        if not cat_args.convert:
-            raise ValueError("--save_model requires --convert")
-        from transformers import AutoTokenizer
-        from litebsq.vae_linear import clear_model_vae_linear_cache
-
-        model_out = os.path.join(run_output_dir, "final_model")
-        tok = AutoTokenizer.from_pretrained(vae_args.model_path, use_fast=True, token=hf_args.access_token)
-        cleared = clear_model_vae_linear_cache(model)
-        log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
-        save_paths = save_model_checkpoint(
-            model,
-            model_out,
-            base_model_path=vae_args.model_path,
-            tokenizer=tok,
-            save_config=True,
-            extra_meta={"stage": "final"},
-            unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
-        )
-        log.info("Saved final model to %s", save_paths["output_dir"])
+            model_out = os.path.join(run_output_dir, "final_model")
+            tok = AutoTokenizer.from_pretrained(vae_args.model_path, use_fast=True, token=hf_args.access_token)
+            cleared = clear_model_vae_linear_cache(model)
+            log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
+            save_paths = save_model_checkpoint(
+                model,
+                model_out,
+                base_model_path=vae_args.model_path,
+                tokenizer=tok,
+                save_config=True,
+                extra_meta={"stage": "final"},
+                unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
+            )
+            log.info("Saved final model to %s", save_paths["output_dir"])
+    finally:
+        if sort_executor is not None:
+            sort_executor.shutdown(wait=True, cancel_futures=False)
+            log.info("排序预处理进程池已关闭。")
 
     log.info("Done.")
 
