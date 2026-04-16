@@ -1049,11 +1049,14 @@ def materialize_peft_proxy_decoded_linears(
             f"Proxy materialize result count mismatch: decoded={len(decoded_by_name)} expected={len(proxy_refs)}."
         )
 
+    preserve_peft_dense_bias = bool(getattr(model, "_e2e_vae_lora_tune_bias", False))
     refreshed = 0
     for name, proxy in proxy_refs:
         if name not in decoded_by_name:
             raise RuntimeError(f"Missing grouped decode result for proxy '{name}'.")
         decoded_item = decoded_by_name[name]
+        peft_linear = proxy.per_decoded_linear
+        peft_wrapped = is_peft_proxy_adapter_linear(peft_linear)
         decoded_linear = _resolve_proxy_base_linear(name, proxy)
         target_device = decoded_linear.weight.device
         target_dtype = decoded_linear.weight.dtype
@@ -1068,15 +1071,20 @@ def materialize_peft_proxy_decoded_linears(
                     f"Decoded linear under '{name}.per_decoded_linear' is missing bias while base_layer has bias."
                 )
         else:
-            if base_bias is None:
-                decoded_linear.bias.zero_()
-            else:
-                decoded_linear.bias.copy_(
-                    base_bias.detach().to(
-                        device=decoded_linear.bias.device,
-                        dtype=decoded_linear.bias.dtype,
+            # Bias alignment rule:
+            # - tune_bias=true  : keep loaded PEFT dense bias from checkpoint.
+            # - tune_bias=false : reconstruct dense bias from VAELinear base bias.
+            should_keep_loaded_bias = bool(peft_wrapped and preserve_peft_dense_bias)
+            if not should_keep_loaded_bias:
+                if base_bias is None:
+                    decoded_linear.bias.zero_()
+                else:
+                    decoded_linear.bias.copy_(
+                        base_bias.detach().to(
+                            device=decoded_linear.bias.device,
+                            dtype=decoded_linear.bias.dtype,
+                        )
                     )
-                )
         proxy.base_layer.clear_decoded_weight_cache()
         proxy._dense_base_materialized = True
         refreshed += 1

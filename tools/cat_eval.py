@@ -39,11 +39,6 @@ def applied_hif4_act(model, *, enabled: bool, **kwargs):
     return _applied_hif4_act(model, enabled=enabled, **kwargs)
 
 
-def _json_dump(path: str, payload: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
-
-
 def _build_logger(log_dir: str) -> Tuple[logging.Logger, str, str]:
     os.makedirs(log_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
@@ -322,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = build_parser().parse_args(argv)
-    logger, eval_run_ts, log_path = _build_logger(args.eval_log_dir)
+    logger, _eval_run_ts, log_path = _build_logger(args.eval_log_dir)
     logger.info("Eval log file: %s", log_path)
     logger.info("Input args:\n%s", json.dumps(vars(args), ensure_ascii=False, indent=2))
 
@@ -341,6 +336,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     logger.info("Loading evaluated model from checkpoint...")
     if checkpoint_loader == "e2e":
         from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint
+        from e2e_fintuning.trainer import set_model_temporary
+        from litebsq.vae_linear import clear_model_vae_linear_cache
 
         model, meta, load_result = load_e2e_model_checkpoint(
             ckpt_dir,
@@ -351,6 +348,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             materialize_proxy_decoded_linears=False,
             proxy_group_size=int(args.prewarm_group_size),
         )
+        set_model_temporary(model, True)
+        clear_model_vae_linear_cache(model)
+        logger.info("Applied e2e student mode and cleared VAELinear cache after checkpoint load.")
     else:
         from train_utils.model_checkpoint_io import load_model_checkpoint
 
@@ -466,8 +466,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             batch_size=str(args.lm_batch_size),
             lm_limit=args.lm_limit,
             model_path=tokenizer_name,
-            eval_log_dir=args.eval_log_dir,
-            eval_run_ts=eval_run_ts,
+            eval_log_dir=None,
+            eval_run_ts=None,
         )
         with applied_hif4_act(
             model,
@@ -482,11 +482,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             logger.info("[lm_eval] Summary table:\n%s", summary_table)
         summary["evals"]["lm_eval"] = lm_result
 
-    summary_path = os.path.join(args.eval_log_dir, f"cat_eval_summary_{eval_run_ts}.json")
-    _json_dump(summary_path, summary)
     compact_summary = _build_compact_eval_summary(summary)
     logger.info("Evaluation summary:\n%s", json.dumps(compact_summary, ensure_ascii=False, indent=2))
-    logger.info("Saved evaluation summary: %s", summary_path)
     logger.info("All evaluations completed.")
 
 

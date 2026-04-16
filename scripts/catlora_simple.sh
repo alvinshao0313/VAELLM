@@ -41,7 +41,7 @@ python tools/cat_train.py \
   --skip_layers "" \
   --linear_group_size "32" \
   --steps_per_category "default=5000" \
-  --joint_decoder_steps "default=5000" \
+  --joint_decoder_steps "default=1000" \
   --joint_decoder_lr "default=1e-2" \
   --joint_decoder_group_size "default=32" \
   --batch_size "2048" \
