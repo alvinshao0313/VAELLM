@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3,4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3,2}"
 
 # 说明：
 # - 这是 OpenOrca 蒸馏脚本，序列长度固定为 4096，本身显存压力就很高。
@@ -21,6 +21,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3,4}"
 #   --ddp_find_unused_parameters true \
 
 torchrun --standalone --nproc_per_node=2 -m e2e_fintuning.main \
+  --gradient_checkpointing true \
+  --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
+  --ddp_find_unused_parameters true \
+  --report_to none \
   --student_checkpoint_dir .result/meta-llama_Llama-2-7b-hf_20260323_071142/final_model \
   --teacher_model_path meta-llama/Llama-2-7b-hf \
   --run_root_dir .result/e2e_vae_lora_openorca \
@@ -35,7 +39,7 @@ torchrun --standalone --nproc_per_node=2 -m e2e_fintuning.main \
   --model_max_length 4096 \
   --decoder_layers 0-31 \
   --target_modules all \
-  --vae_lora_variant plain \
+  --vae_lora_variant dora \
   --vae_lora_rank 8 \
   --vae_lora_alpha 16 \
   --vae_lora_dropout 0.0 \

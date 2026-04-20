@@ -72,6 +72,8 @@ class NormalizedCatArgs:
     wa_mse_calib_seed: int
     wa_mse_calib_device: str
     wa_mse_calib_log_every: int
+    eval_ppl: bool
+    eval_tasks: str
     ppl_limit: int
     eval_hif4_act: bool
     lora_after_category: bool
@@ -574,6 +576,8 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         wa_mse_calib_seed=int(raw_args.wa_mse_calib_seed),
         wa_mse_calib_device=str(raw_args.wa_mse_calib_device),
         wa_mse_calib_log_every=int(raw_args.wa_mse_calib_log_every),
+        eval_ppl=bool(raw_args.eval_ppl),
+        eval_tasks=str(raw_args.eval_tasks),
         ppl_limit=int(raw_args.ppl_limit),
         eval_hif4_act=bool(raw_args.eval_hif4_act),
         lora_after_category=bool(raw_args.lora_after_category),
@@ -892,6 +896,18 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wa_mse_calib_seed", type=int, default=0, help="Calibration sampling seed used for wa_mse dynamic act-max recomputation.")
     parser.add_argument("--wa_mse_calib_device", type=str, default="", help="Device for wa_mse dynamic act-max recomputation. Empty means use --train_device.")
     parser.add_argument("--wa_mse_calib_log_every", type=int, default=0, help="Log interval for wa_mse dynamic act-max recomputation progress (0 to disable).")
+    parser.add_argument(
+        "--eval_ppl",
+        type=lambda v: _parse_bool_like(v, arg_name="--eval_ppl"),
+        default=True,
+        help="是否在 cat_train 内部的类别后评估阶段运行 PPL。",
+    )
+    parser.add_argument(
+        "--eval_tasks",
+        type=str,
+        default="",
+        help="类别后评估的 lm_eval 任务列表，逗号分隔；空串表示不跑下游任务。",
+    )
     parser.add_argument("--ppl_limit", type=int, default=-1, help="每类训练后 PPL 评估样本上限，-1 为全量。")
     parser.add_argument(
         "--eval_hif4_act",

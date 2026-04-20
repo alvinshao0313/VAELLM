@@ -164,6 +164,8 @@
 | `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_device` | `""` | 动态采集设备 | 为空时回退 `train_device` |
 | `--wa_mse_calib_log_every` | `0` | 动态采集日志间隔 | `0` 表示关闭 |
+| `--eval_ppl` | `true` | 是否在类别后评估阶段运行 PPL | 现在和 `convert` 解耦；`false` 时不跑 PPL |
+| `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
 | `--lora_after_category` | `False` | 每训练完一个类别后，对剩余类别做一次 LoRA 微调并融合 | 开启后才会进入 LoRA 阶段 |
 | `--lora_dataset` | `wiki` | LoRA 补偿训练数据集 | 支持 `wiki / fineweb_edu / openorca / redpajama / alpaca` |
@@ -181,12 +183,12 @@
 | `--lora_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override |
 | `--lora_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
-| `--eval_hif4_act` | `false` | 是否在 cat_train 内部 PPL 评估阶段启用 HiFloat4 激活伪量化 | 只影响评测，不影响训练 |
+| `--eval_hif4_act` | `false` | 是否在 cat_train 内部类别后评估阶段启用 HiFloat4 激活伪量化 | 同时作用于 PPL 和 lm_eval；不影响训练 |
 | `--seed` | `0` | 全流程随机种子 | LoRA 每轮会叠加轮次偏移 |
 | `--train_device` | `cuda` | VAE 训练与评估设备 | 例如 `cuda` / `cuda:0` / `cpu` |
 | `--rot_llm` | `False` | 压缩前先做一次离线旋转融合 | 调用 rotation 流程 |
 | `--resume_from_checkpoint` | `None` | 从已有 `cat_train` checkpoint 继续训练 | 可传 run 目录、`final_model` 目录，或 `checkpoint_meta.json` |
-| `--convert` | `False` | 训练后把目标 Linear 替换为压缩后的 `VAELinear` | 不开则只训练不替换 |
+| `--convert` | `False` | 训练后把目标 Linear 替换为压缩后的 `VAELinear` | 只控制是否替换模型权重；不再隐式控制 PPL |
 | `--convert_device` | `cuda` | 构建 `VAELinear` 时的设备 | 替换完成后会移回 CPU |
 | `--save_model` | `False` | 最终保存模型 state_dict / config / tokenizer | 需要同时开启 `convert` |
 | `--unload_vae_original_weights_on_final_save` | `False` | 最终保存前卸载 `VAELinear` 中缓存的原始权重 | 用于减小保存体积 |
@@ -291,7 +293,7 @@
 | `--lora_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型 |
 | `--lora_model_max_length` | LoRA trainer | LoRA 样本最大长度 |
 | `--lora_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |
-| `--eval_hif4_act` | cat_train eval | 是否在内部 PPL 评估时启用 HiFloat4 激活伪量化；默认 `false` |
+| `--eval_hif4_act` | cat_train eval | 是否在内部类别后评估时启用 HiFloat4 激活伪量化；默认 `false` |
 
 ## 6. 关键运行时语义
 
@@ -338,13 +340,31 @@
 - 它控制“全部 stage 训练完之后”的 decoder 联合微调学习率。
 - `default=none` 表示自动回退到全局 `--lr`。
 
-### 6.7 `normalize_weight`
+### 6.7 类别后评估
+
+- 类别后评估由 `--eval_ppl` 和 `--eval_tasks` 共同控制。
+- `--eval_ppl=true` 时跑 PPL。
+- `--eval_tasks` 非空时跑 lm_eval，并在日志里记录：
+  - 每个任务的 `metric_key` 和分数
+  - 所有有效任务分数的简单平均值（忽略 `N/A`）
+- `--eval_ppl=false` 且 `--eval_tasks=""` 时，整个类别后评估阶段直接跳过。
+- 如果配置了 `--eval_tasks`，但所有任务结果都是 `N/A`，脚本会直接报错。
+
+### 6.8 `convert` 与评估的关系
+
+- `--convert` 只控制是否把训练出的压缩结果替换回模型里的目标 `Linear`。
+- 不开 `--convert` 时：
+  - 不会把模块替换成 `VAELinear`
+  - 仍然可以按 `--eval_ppl/--eval_tasks` 跑类别后评估
+- `--lora_after_category` 和 `--save_model` 仍然要求 `--convert` 开启，因为它们依赖“压缩结果已经写回模型”。
+
+### 6.9 `normalize_weight`
 
 - 训练时会对当前 stage 的 residual 计算 `(mean, std)` 并标准化训练
 - 转换时会把该 stage 的 `(mean, std)` 融合进 decoder
 - 多阶 residual 会分别计算和融合各自的标准化统计量
 
-### 6.8 `wa_mse` 与 activation 依赖
+### 6.10 `wa_mse` 与 activation 依赖
 
 - `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
 - `outlier_protect_mode=channel` 且 `outlier_protect_count > 0` 时，也复用同一条动态 activation 路径
@@ -352,7 +372,7 @@
 - `intra_part_sort_mode` 若启用 `act_spectral_cosine`，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
-### 6.9 保存与输出目录
+### 6.11 保存与输出目录
 
 - `save_model` 需要同时开启 `convert`
 - 真实运行目录会自动变成：
@@ -374,7 +394,7 @@
 - `training_args`
 - 每个类别的 resolved runtime config
 
-### 6.9 从已保存 checkpoint 继续训练
+### 6.12 从已保存 checkpoint 继续训练
 
 - `--resume_from_checkpoint` 会优先加载已有 checkpoint，而不是重新从 `--model_path` 拉起纯基座模型
 - 支持三种输入：
@@ -499,6 +519,8 @@ python tools/cat_train.py \
   --lora_dataset openorca \
   --lora_rank default=8,after:q_proj=16 \
   --lora_steps default=50,after:q_proj=200 \
+  --eval_ppl true \
+  --eval_tasks boolq,rte,piqa \
   --lora_hif4_act false \
   --eval_hif4_act false \
   --lora_use_dora default=true,after:q_proj=false
@@ -520,3 +542,14 @@ python tools/cat_train.py \
 
 - 如果上一次已经把 `q_proj` 转成了 `VAELinear` 并保存，这次恢复后 `q_proj` 会自动跳过
 - 脚本会继续训练还保持为 `nn.Linear` 的类别
+
+### 9.7 只跑下游任务，不跑 PPL
+
+```bash
+python tools/cat_train.py \
+  --model_path meta-llama/Llama-2-7b-hf \
+  --convert \
+  --eval_ppl false \
+  --eval_tasks boolq,rte,piqa \
+  --train_device cuda
+```

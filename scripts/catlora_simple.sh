@@ -24,6 +24,8 @@ export CUDA_VISIBLE_DEVICES=1
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
+# --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
+# --eval_tasks "boolq,rte,piqa"       # 可选：类别后下游任务评估；空串表示不跑
 # --lora_after_category \
 
 python tools/cat_train.py \
@@ -36,7 +38,7 @@ python tools/cat_train.py \
   --save_model \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --category_order "k_proj,v_proj,q_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --category_order "down_proj" \
   --transpose_modules "v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
@@ -49,6 +51,8 @@ python tools/cat_train.py \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
+  --eval_ppl "false" \
+  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
   --intra_part_sort_mode "default=none" \
@@ -56,8 +60,8 @@ python tools/cat_train.py \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
   --outlier_protect_mode "residual_sparse" \
-  --outlier_residual_top_p "default=0.05" \
-  --outlier_residual_score "input_act_weighted_original_weight_abs" \
+  --outlier_residual_top_p "default=0.01" \
+  --outlier_residual_score "input_act_weighted_abs" \
   --outlier_residual_min_abs "1e-8" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \

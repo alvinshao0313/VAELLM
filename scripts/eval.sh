@@ -13,7 +13,7 @@ export CUDA_VISIBLE_DEVICES=0
 # - 非 proxy checkpoint 才走普通 VAELinear cache warmup。
 
 python tools/cat_eval.py \
-  --checkpoint_dir ".result/meta-llama_Llama-3.1-8B_20260417_084044/final_model" \
+  --checkpoint_dir "meta-llama/Llama-3.1-8B" \
   --eval_ppl \
   --eval_lm_eval \
   --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \

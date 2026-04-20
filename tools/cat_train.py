@@ -46,7 +46,14 @@ from train_utils.activation_utils import (
     collect_act_max_for_linears,
 )
 from train_utils.cat_arg_overrides import validate_category_keys
-from train_utils.hif4_act import applied_hif4_act
+from train_utils.cat_train_data import (
+    apply_stage_norm as _apply_stage_norm,
+    build_block_data_loaders as _build_block_data_loaders,
+    compute_stage_norm_stats as _compute_stage_norm_stats,
+    reshape_blocks_for_codebook_dim as _reshape_blocks_for_codebook_dim,
+    restore_stage_norm as _restore_stage_norm,
+)
+from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
     _build_run_output_dir,
@@ -287,91 +294,6 @@ def _fuse_norm_into_decoder(decoder: nn.Module, mean: float, std: float) -> None
         last.bias.mul_(std).add_(mean)
 
 
-def _build_block_data_loaders(
-    stacked_data: torch.Tensor,
-    batch_size: int,
-) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    block_indices = torch.arange(stacked_data.shape[0], dtype=torch.long)
-    dataset = torch.utils.data.TensorDataset(stacked_data, block_indices)
-    train_loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=int(batch_size),
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-    )
-    eval_loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=int(batch_size),
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
-    return train_loader, eval_loader
-
-
-def _reshape_blocks_for_codebook_dim(
-    stacked_data: torch.Tensor,
-    *,
-    codebook_dim: int,
-) -> torch.Tensor:
-    target_dim = int(codebook_dim)
-    if target_dim < 1:
-        raise ValueError(f"codebook_dim must be >=1, got {target_dim}")
-    if int(stacked_data.shape[-1]) == target_dim:
-        return stacked_data
-    num_models = int(stacked_data.shape[1])
-    flat = stacked_data.permute(1, 0, 2).contiguous().view(num_models, -1)
-    total_numel = int(flat.shape[1])
-    if total_numel % target_dim != 0:
-        raise ValueError(
-            f"Cannot reshape residual blocks: total_numel_per_model={total_numel} not divisible by codebook_dim={target_dim}"
-        )
-    return flat.view(num_models, -1, target_dim).permute(1, 0, 2).contiguous()
-
-
-def _compute_stage_norm_stats(
-    stage_data: torch.Tensor,
-    *,
-    eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if stage_data.ndim != 3:
-        raise ValueError(f"stage_data must be 3D [N_blocks, P, C], got shape={tuple(stage_data.shape)}")
-    num_models = int(stage_data.shape[1])
-    flat = stage_data.permute(1, 0, 2).contiguous().view(num_models, -1)
-    mean = flat.mean(dim=1, keepdim=True)
-    scale = flat.std(dim=1, keepdim=True).clamp_min(float(eps))
-    return mean, scale
-
-
-def _apply_stage_norm(
-    stage_data: torch.Tensor,
-    *,
-    mean: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    num_blocks = int(stage_data.shape[0])
-    num_models = int(stage_data.shape[1])
-    codebook_dim = int(stage_data.shape[2])
-    flat = stage_data.permute(1, 0, 2).contiguous().view(num_models, -1)
-    norm_flat = (flat - mean) / scale
-    return norm_flat.view(num_models, num_blocks, codebook_dim).permute(1, 0, 2).contiguous()
-
-
-def _restore_stage_norm(
-    stage_data_norm: torch.Tensor,
-    *,
-    mean: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    num_blocks = int(stage_data_norm.shape[0])
-    num_models = int(stage_data_norm.shape[1])
-    codebook_dim = int(stage_data_norm.shape[2])
-    flat = stage_data_norm.permute(1, 0, 2).contiguous().view(num_models, -1)
-    raw_flat = flat * scale + mean
-    return raw_flat.view(num_models, num_blocks, codebook_dim).permute(1, 0, 2).contiguous()
-
-
 def _compute_recon_loss(
     *,
     recon_loss_type: str,
@@ -495,8 +417,10 @@ def _restore_split_weight_from_part_flats_with_meta(
     parallel_rows = int(split_meta.parallel_rows)
     parallel_cols = int(split_meta.parallel_cols)
     parallel_parts = int(parallel_rows) * int(parallel_cols)
-    split_rows = int(split_meta.compressed_in_features) if bool(split_meta.transpose) else int(split_meta.compressed_out_features)
-    split_cols = int(split_meta.compressed_out_features) if bool(split_meta.transpose) else int(split_meta.compressed_in_features)
+    split_rows = int(split_meta.compressed_in_features) if bool(
+        split_meta.transpose) else int(split_meta.compressed_out_features)
+    split_cols = int(split_meta.compressed_out_features) if bool(
+        split_meta.transpose) else int(split_meta.compressed_in_features)
     part_flats = part_flats.reshape(parallel_parts, -1).contiguous()
     if parallel_parts == 1:
         w_split = part_flats[0].view(split_rows, split_cols)
@@ -946,33 +870,6 @@ def _joint_finetune_stage_decoders_in_subgroups(
             updated_stage_decoders[stage_idx][model_start:model_end] = subgroup_updated_decoders[stage_idx]
 
     return updated_stage_decoders
-
-
-def _eval_ppl_after_category(
-    model: nn.Module,
-    vae_args,
-    ppl_limit: int,
-    category: str,
-    eval_device: str = "cuda",
-    eval_hif4_act: bool = False,
-) -> None:
-    from train_utils.eval_utils import calculate_ppl
-
-    log.info("开始类别 %s 的 PPL 评估...", category)
-    model.eval()
-    model.to(eval_device)
-    with applied_hif4_act(
-        model,
-        enabled=bool(eval_hif4_act),
-        logger=log,
-        log_prefix=f"[ppl:{category}] ",
-    ):
-        with torch.no_grad():
-            ppl_args = _clone_namespace(vae_args, limit=int(ppl_limit))
-            ppl_result = calculate_ppl(model, ppl_args)
-    model.to("cpu")
-    torch.cuda.empty_cache()
-    log.info("类别 %s 训练后 PPL: %.2f", category, float(ppl_result.get("wiki_ppl", float("nan"))))
 
 
 def _resolve_train_dtype(training_args) -> torch.dtype:
@@ -1965,9 +1862,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     transpose_modules = _split_csv(cat_args.transpose_modules)
     projection_suffixes = _split_csv(cat_args.projection_suffixes)
     only_decoder_projections = not bool(cat_args.include_all_linears)
-    run_ppl_eval = bool(cat_args.convert)
-    if not run_ppl_eval:
-        log.info("跳过 PPL 评估：--convert=false 时模型权重不会被替换。")
+    eval_tasks_text = str(getattr(cat_args, "eval_tasks", "")).strip()
+    run_task_eval = bool(eval_tasks_text)
+    run_category_eval = bool(cat_args.eval_ppl) or run_task_eval
+    if not run_category_eval:
+        log.info("跳过类别后评估：--eval_ppl=false 且 --eval_tasks 为空。")
+    elif not bool(cat_args.convert):
+        log.info("未开启 --convert；类别后评估会直接针对当前模型状态执行。")
     all_linears = _collect_current_trainable_linears(
         model,
         transpose_modules=transpose_modules,
@@ -2226,6 +2127,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
 
     try:
+        eval_tokenizer = None
+        if run_task_eval:
+            from transformers import AutoTokenizer
+
+            log.info("加载类别后下游任务评估 tokenizer: %s", vae_args.model_path)
+            eval_tokenizer = AutoTokenizer.from_pretrained(
+                vae_args.model_path,
+                use_fast=True,
+                token=hf_args.access_token,
+            )
+
         snapshot_path = _save_normalized_cat_train_snapshot(
             run_output_dir=run_output_dir,
             cat_args=cat_args,
@@ -2327,27 +2239,37 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     sort_executor=sort_executor,
                     sort_prep_workers_resolved=int(sort_prep_workers_resolved),
                 )
-            # _eval_ppl_after_category(
-            #     model=model,
-            #     vae_args=vae_args,
-            #     ppl_limit=cat_args.ppl_limit,
-            #     category=cat,
-            #     eval_device=cat_args.train_device,
-            # )
+            if run_category_eval and not bool(cat_args.lora_after_category):
+                log.info("类别训练后评估...")
+                _eval_after_category(
+                    model=model,
+                    vae_args=vae_args,
+                    ppl_limit=cat_args.ppl_limit,
+                    category=cat,
+                    logger=log,
+                    eval_device=cat_args.train_device,
+                    eval_hif4_act=cat_args.eval_hif4_act,
+                    eval_ppl=cat_args.eval_ppl,
+                    eval_tasks=eval_tasks_text,
+                    tokenizer=eval_tokenizer,
+                )
 
             if cat_args.lora_after_category:
                 from train_utils.lora_utils import lora_finetune_remaining_categories
-                if run_ppl_eval:
+                if run_category_eval:
                     log.info("LoRA 微调前评估...")
-                    _eval_ppl_after_category(
+                    _eval_after_category(
                         model=model,
                         vae_args=vae_args,
                         ppl_limit=cat_args.ppl_limit,
                         category=cat,
+                        logger=log,
                         eval_device=cat_args.train_device,
                         eval_hif4_act=cat_args.eval_hif4_act,
+                        eval_ppl=cat_args.eval_ppl,
+                        eval_tasks=eval_tasks_text,
+                        tokenizer=eval_tokenizer,
                     )
-
                 current_remaining_linears = _collect_current_trainable_linears(
                     model,
                     transpose_modules=transpose_modules,
@@ -2368,40 +2290,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 )
                 lora_round_idx += 1
 
-            if run_ppl_eval:
-                _eval_ppl_after_category(
+            if run_category_eval and bool(cat_args.lora_after_category):
+                log.info("LoRA 微调后评估...")
+                _eval_after_category(
                     model=model,
                     vae_args=vae_args,
                     ppl_limit=cat_args.ppl_limit,
                     category=cat,
+                    logger=log,
                     eval_device=cat_args.train_device,
                     eval_hif4_act=cat_args.eval_hif4_act,
+                    eval_ppl=cat_args.eval_ppl,
+                    eval_tasks=eval_tasks_text,
+                    tokenizer=eval_tokenizer,
                 )
-            # cat_dir_name = _safe_path_token(cat)
-            # cat_model_dir = os.path.join(run_output_dir, cat_dir_name)
-            # save_paths = save_model_checkpoint(
-            #     model,
-            #     cat_model_dir,
-            #     base_model_path=vae_args.model_path,
-            #     tokenizer=None,
-            #     save_config=True,
-            #     extra_meta={
-            #         "stage": "after_category",
-            #         "category": cat,
-            #         "category_index": int(cat_idx),
-            #         "lora_after_category": bool(cat_args.lora_after_category),
-            #     },
-            # )
-            # log.info("Saved category checkpoint (%s): %s", cat, save_paths["output_dir"])
 
-        if run_ppl_eval:
-            _eval_ppl_after_category(
+        if run_category_eval:
+            log.info("所有类别训练完成后最终评估...")
+            _eval_after_category(
                 model=model,
                 vae_args=vae_args,
                 ppl_limit=cat_args.ppl_limit,
                 category="none",
+                logger=log,
                 eval_device=cat_args.train_device,
                 eval_hif4_act=cat_args.eval_hif4_act,
+                eval_ppl=cat_args.eval_ppl,
+                eval_tasks=eval_tasks_text,
+                tokenizer=eval_tokenizer,
             )
         if cat_args.save_model:
             if not cat_args.convert:
