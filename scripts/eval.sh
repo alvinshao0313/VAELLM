@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=0
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
@@ -13,7 +13,7 @@ export CUDA_VISIBLE_DEVICES=5
 # - 非 proxy checkpoint 才走普通 VAELinear cache warmup。
 
 python tools/cat_eval.py \
-  --checkpoint_dir ".result/e2e_vae_lora_openorca/final_model_20260415_123052/final_model" \
+  --checkpoint_dir ".result/meta-llama_Llama-3.1-8B_20260417_084044/final_model" \
   --eval_ppl \
   --eval_lm_eval \
   --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
@@ -23,6 +23,6 @@ python tools/cat_eval.py \
   --prewarm_group_size "8" \
   --ppl_seqlen "2048" \
   --ppl_limit "-1" \
-  --eval_hif4_act "false" \
+  --eval_hif4_act "true" \
   --eval_log_dir "./eval_log" \
   "$@"

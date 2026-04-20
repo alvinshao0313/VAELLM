@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=1
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
@@ -24,6 +24,7 @@ export CUDA_VISIBLE_DEVICES=3
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
+# --lora_after_category \
 
 python tools/cat_train.py \
   --model_path "meta-llama/Llama-3.1-8B" \
@@ -41,21 +42,21 @@ python tools/cat_train.py \
   --skip_layers "" \
   --linear_group_size "32" \
   --steps_per_category "default=5000" \
-  --joint_decoder_steps "default=1000" \
+  --joint_decoder_steps "default=0" \
   --joint_decoder_lr "default=1e-2" \
-  --joint_decoder_group_size "default=32" \
+  --joint_decoder_group_size "default=32,cat:down_proj=8" \
   --batch_size "2048" \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
-  --intra_part_sort_mode "default=spectral_cosine" \
+  --intra_part_sort_mode "default=none" \
   --sort_prep_workers "0" \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
   --outlier_protect_mode "residual_sparse" \
-  --outlier_residual_top_p "default=0.01" \
+  --outlier_residual_top_p "default=0.05" \
   --outlier_residual_score "input_act_weighted_original_weight_abs" \
   --outlier_residual_min_abs "1e-8" \
   --outlier_residual_codec "blocked_quantized" \
@@ -70,12 +71,12 @@ python tools/cat_train.py \
   --codebook_bits "default=32" \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
-  --base_ch "default=256" \
-  --num_res_blocks "default=2" \
+  --base_ch "default=128" \
+  --num_res_blocks "default=1" \
   --decoder_base_ch "default=128" \
   --decoder_num_res_blocks "default=1" \
   --norm_type "default=layer" \
-  --decoder_type "default=asymmetric" \
+  --decoder_type "default=symmetric" \
   --recon_loss_type "default=wa_mse" \
   --quantizer_type "BSQ" \
   --gamma0 "1.0" \
@@ -112,8 +113,8 @@ python tools/cat_train.py \
   --lora_loss_alpha "default=0.5" \
   --lora_loss_type "default=kd_top_1000" \
   --lora_use_dora "default=false" \
-  --lora_hif4_act "true" \
-  --eval_hif4_act "true" \
+  --lora_hif4_act "false" \
+  --eval_hif4_act "false" \
   --lora_gradient_accumulation_steps "1" \
   --lora_optim "adamw_torch" \
   --lora_max_grad_norm "0.333" \

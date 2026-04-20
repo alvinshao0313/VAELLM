@@ -132,6 +132,71 @@ def _build_part_restore_placeholder(shape: Sequence[int], *, dtype: torch.dtype,
     return base.unsqueeze(0).expand(rows, cols).contiguous()
 
 
+def _prepare_blocked_sparse_placeholder_for_rebuild(
+    *,
+    module_name: str,
+    index_bits: Any,
+    value_bits: Any,
+    active_block_ids: Optional[torch.Tensor],
+    block_ptr: Optional[torch.Tensor],
+    local_indices: Optional[torch.Tensor],
+    qvalues: Optional[torch.Tensor],
+) -> None:
+    if (
+        active_block_ids is None
+        or block_ptr is None
+        or local_indices is None
+        or qvalues is None
+    ):
+        return
+
+    index_bits = int(index_bits)
+    value_bits = int(value_bits)
+    local_len = int(local_indices.numel())
+    qvalues_len = int(qvalues.numel())
+
+    if index_bits == 8:
+        if (local_len % 2) != 0:
+            raise ValueError(
+                f"[{module_name}] sparse_residual_local_indices length {local_len} is invalid for index_bits=8."
+            )
+        nnz = local_len // 2
+    elif index_bits == 4:
+        nnz = local_len
+    else:
+        raise ValueError(f"[{module_name}] unsupported sparse_residual_index_bits={index_bits}.")
+
+    if value_bits == 8:
+        expected_qvalues_len = nnz
+    elif value_bits == 4:
+        expected_qvalues_len = (nnz + 1) // 2
+    else:
+        raise ValueError(f"[{module_name}] unsupported sparse_residual_value_bits={value_bits}.")
+    if qvalues_len != expected_qvalues_len:
+        raise ValueError(
+            f"[{module_name}] sparse_residual_qvalues length mismatch: got {qvalues_len}, "
+            f"expected {expected_qvalues_len}."
+        )
+
+    active_block_count = int(active_block_ids.numel())
+    block_ptr_len = int(block_ptr.numel())
+    if block_ptr_len != active_block_count + 1:
+        raise ValueError(
+            f"[{module_name}] sparse_residual_block_ptr length mismatch: got {block_ptr_len}, "
+            f"expected {active_block_count + 1}."
+        )
+    if active_block_count == 0 and nnz != 0:
+        raise ValueError(
+            f"[{module_name}] sparse residual has nnz={nnz} but sparse_residual_active_block_ids is empty."
+        )
+
+    # VAELinear validates blocked sparse payload in __init__ before load_state_dict fills real tensors.
+    # Prime a monotonic placeholder block_ptr with the inferred nnz so constructor-time checks can pass.
+    block_ptr.zero_()
+    if block_ptr_len > 1:
+        block_ptr[1:] = int(nnz)
+
+
 def _normalize_stage_spec_list(
     stage_specs: Any,
     *,
@@ -769,6 +834,16 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 raise ValueError(f"[{name}] sparse_residual_zero_points shape must be 1D, got {shape}")
             sparse_zero_points_dtype = _name_to_dtype(str(sparse_zero_points_spec.get("dtype", "float16")))
             sparse_zero_points_payload = torch.zeros(shape, dtype=sparse_zero_points_dtype, device=device)
+        if str(spec.get("sparse_residual_format", "")).strip().lower() == "blocked_quantized":
+            _prepare_blocked_sparse_placeholder_for_rebuild(
+                module_name=name,
+                index_bits=spec.get("sparse_residual_index_bits"),
+                value_bits=spec.get("sparse_residual_value_bits"),
+                active_block_ids=sparse_active_block_ids_payload,
+                block_ptr=sparse_block_ptr_payload,
+                local_indices=sparse_local_indices_payload,
+                qvalues=sparse_qvalues_payload,
+            )
 
         new_module = VAELinear(
             in_features=int(spec["in_features"]),
