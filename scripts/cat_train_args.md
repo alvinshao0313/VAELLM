@@ -553,3 +553,30 @@ python tools/cat_train.py \
   --eval_tasks boolq,rte,piqa \
   --train_device cuda
 ```
+
+## 10. 评估脚本（`scripts/eval.sh`）
+
+`scripts/eval.sh` 是对 [tools/cat_eval.py](/home/shaoyuantian/program/VAELLM/tools/cat_eval.py) 的一层薄封装。
+
+- 必填环境变量：`CHECKPOINT_DIR`
+- 可选环境变量：`ADAPTER_DIR`
+
+示例：
+
+```bash
+CHECKPOINT_DIR=.result/your_cat_run/final_model \
+bash scripts/eval.sh
+```
+
+评估 dense e2e adapter（先重建 dense 再 merge adapter）：
+
+```bash
+CHECKPOINT_DIR=.result/your_cat_run/final_model \
+ADAPTER_DIR=.result/dense_e2e_run/final_adapter \
+bash scripts/eval.sh
+```
+
+约束：
+
+- 传 `ADAPTER_DIR` 时，`cat_eval` 会做 checkpoint 与 adapter 的指纹匹配，不匹配直接报错。
+- 传 `ADAPTER_DIR` 时，不支持 `--eval_linear_mse`。
