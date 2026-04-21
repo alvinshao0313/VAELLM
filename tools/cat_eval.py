@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 META_FILENAME = "checkpoint_meta.json"
+ADAPTER_META_FILENAME = "dense_adapter_meta.json"
 
 
 def _parse_bool_like(value, *, arg_name: str) -> bool:
@@ -124,6 +126,87 @@ def _read_checkpoint_meta(checkpoint_dir: str) -> Dict[str, Any]:
         return json.load(handle)
 
 
+def _compute_file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_adapter_dir(path: str) -> str:
+    abs_path = os.path.abspath(path)
+    if not os.path.isdir(abs_path):
+        raise FileNotFoundError(f"Adapter path does not exist: {abs_path}")
+    direct_cfg = os.path.join(abs_path, "adapter_config.json")
+    if os.path.exists(direct_cfg):
+        return abs_path
+    final_adapter_cfg = os.path.join(abs_path, "final_adapter", "adapter_config.json")
+    if os.path.exists(final_adapter_cfg):
+        return os.path.join(abs_path, "final_adapter")
+    raise FileNotFoundError(
+        f"Cannot resolve adapter dir from {abs_path}. "
+        "Expected adapter_config.json under the provided dir or its final_adapter/ child."
+    )
+
+
+def _read_dense_adapter_meta(adapter_dir: str) -> Dict[str, Any]:
+    meta_path = os.path.join(str(adapter_dir), ADAPTER_META_FILENAME)
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Missing adapter meta file: {meta_path}")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    if not isinstance(meta, dict):
+        raise TypeError(f"Adapter meta must be a dict, got {type(meta)}.")
+    if str(meta.get("format", "")).strip().lower() != "dense_e2e_adapter_meta":
+        raise ValueError(
+            f"Unsupported adapter meta format: {meta.get('format')}. "
+            "Expected dense_e2e_adapter_meta."
+        )
+    return meta
+
+
+def _compute_checkpoint_fingerprint(checkpoint_dir: str, checkpoint_meta: Dict[str, Any]) -> Dict[str, str]:
+    state_dict_file = str(checkpoint_meta.get("state_dict_file", "pytorch_model.bin"))
+    meta_path = os.path.join(str(checkpoint_dir), META_FILENAME)
+    state_path = os.path.join(str(checkpoint_dir), state_dict_file)
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Missing checkpoint meta for fingerprint: {meta_path}")
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(f"Missing checkpoint state_dict for fingerprint: {state_path}")
+    return {
+        "meta_sha256": _compute_file_sha256(meta_path),
+        "state_sha256": _compute_file_sha256(state_path),
+        "state_dict_file": state_dict_file,
+    }
+
+
+def _validate_adapter_checkpoint_match(
+    *,
+    checkpoint_dir: str,
+    checkpoint_meta: Dict[str, Any],
+    adapter_meta: Dict[str, Any],
+) -> Dict[str, str]:
+    actual = _compute_checkpoint_fingerprint(checkpoint_dir, checkpoint_meta)
+    expected_meta_sha = str(adapter_meta.get("source_checkpoint_meta_sha256", "")).strip().lower()
+    expected_state_sha = str(adapter_meta.get("source_checkpoint_state_sha256", "")).strip().lower()
+    if not expected_meta_sha or not expected_state_sha:
+        raise ValueError(
+            "Adapter meta is missing source checkpoint fingerprint fields: "
+            "source_checkpoint_meta_sha256/source_checkpoint_state_sha256."
+        )
+    if actual["meta_sha256"] != expected_meta_sha or actual["state_sha256"] != expected_state_sha:
+        raise ValueError(
+            "Adapter does not match the provided compressed checkpoint. "
+            f"Expected(meta={expected_meta_sha}, state={expected_state_sha}), "
+            f"got(meta={actual['meta_sha256']}, state={actual['state_sha256']})."
+        )
+    return actual
+
+
 def _resolve_checkpoint_loader(meta: Dict[str, Any]) -> str:
     adapter_modules = meta.get("adapter_modules")
     adapter_module_count = int(meta.get("adapter_module_count", 0) or 0)
@@ -219,6 +302,7 @@ def _build_compact_eval_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
         "checkpoint_dir": summary.get("checkpoint_dir"),
         "base_model_path": summary.get("base_model_path"),
         "checkpoint_loader": summary.get("checkpoint_loader"),
+        "adapter_dir": summary.get("adapter_dir"),
         "evals": {},
     }
 
@@ -266,6 +350,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         required=True,
         help=f"Path to checkpoint dir (contains {META_FILENAME}) or a cat_train run directory.",
+    )
+    parser.add_argument(
+        "--adapter_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional dense_e2e adapter dir. "
+            "When provided, cat_eval rebuilds dense model from compressed checkpoint, "
+            "loads and merges adapter, then evaluates merged model."
+        ),
     )
     parser.add_argument("--base_model_path", type=str, default=None, help="Override base model path in checkpoint meta.")
     parser.add_argument("--access_token", type=str, default=None, help="Hugging Face access token.")
@@ -320,6 +414,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     logger, _eval_run_ts, log_path = _build_logger(args.eval_log_dir)
     logger.info("Eval log file: %s", log_path)
     logger.info("Input args:\n%s", json.dumps(vars(args), ensure_ascii=False, indent=2))
+    adapter_dir = None if args.adapter_dir is None else _resolve_adapter_dir(args.adapter_dir)
+    if adapter_dir is not None and bool(args.eval_linear_mse):
+        raise ValueError("--eval_linear_mse is not supported when --adapter_dir is provided.")
 
     if not (args.eval_ppl or args.eval_lm_eval or args.eval_linear_mse):
         raise ValueError("No evaluation selected. Please enable at least one of: --eval_ppl, --eval_lm_eval, --eval_linear_mse")
@@ -334,7 +431,42 @@ def main(argv: Optional[List[str]] = None) -> None:
     checkpoint_loader = _resolve_checkpoint_loader(meta_preview)
 
     logger.info("Loading evaluated model from checkpoint...")
-    if checkpoint_loader == "e2e":
+    if adapter_dir is not None:
+        if checkpoint_loader != "cat":
+            raise ValueError(
+                "--adapter_dir requires a compressed cat checkpoint as --checkpoint_dir. "
+                f"Current checkpoint loader detected: {checkpoint_loader}."
+            )
+        adapter_meta = _read_dense_adapter_meta(adapter_dir)
+        fingerprint = _validate_adapter_checkpoint_match(
+            checkpoint_dir=ckpt_dir,
+            checkpoint_meta=meta_preview,
+            adapter_meta=adapter_meta,
+        )
+        logger.info(
+            "Adapter match check passed: adapter_dir=%s meta_sha256=%s state_sha256=%s",
+            adapter_dir,
+            fingerprint["meta_sha256"],
+            fingerprint["state_sha256"],
+        )
+        from dense_e2e_fintuning.checkpoint_bridge import build_dense_model_from_checkpoint
+        from peft import PeftModel
+
+        model, meta, _resolved_ckpt_dir = build_dense_model_from_checkpoint(
+            ckpt_dir,
+            access_token=args.access_token,
+            base_model_path=args.base_model_path,
+            logger=logger,
+            decode_group_size=int(args.prewarm_group_size),
+            decode_device="cpu",
+        )
+        peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
+        model = peft_model.merge_and_unload()
+        model.eval()
+        load_result = None
+        checkpoint_loader = "cat+adapter"
+        logger.info("Loaded and merged adapter into dense rebuilt model for evaluation.")
+    elif checkpoint_loader == "e2e":
         from e2e_common.checkpoint_io import load_e2e_model_checkpoint
         from e2e_common.temporary_mode import set_model_temporary
         from litebsq.vae_linear import clear_model_vae_linear_cache
@@ -361,14 +493,22 @@ def main(argv: Optional[List[str]] = None) -> None:
             map_location=args.map_location,
             strict=args.strict,
         )
-    logger.info(
-        "Checkpoint loaded via %s loader. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
-        checkpoint_loader,
-        len(getattr(load_result, "missing_keys", [])),
-        len(getattr(load_result, "unexpected_keys", [])),
-        str(meta.get("converted_module_count")),
-        str(meta.get("adapter_module_count", 0)),
-    )
+    if load_result is None:
+        logger.info(
+            "Checkpoint loaded via %s loader. converted_module_count=%s adapter_module_count=%s",
+            checkpoint_loader,
+            str(meta.get("converted_module_count")),
+            str(meta.get("adapter_module_count", 0)),
+        )
+    else:
+        logger.info(
+            "Checkpoint loaded via %s loader. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
+            checkpoint_loader,
+            len(getattr(load_result, "missing_keys", [])),
+            len(getattr(load_result, "unexpected_keys", [])),
+            str(meta.get("converted_module_count")),
+            str(meta.get("adapter_module_count", 0)),
+        )
 
     base_model_path = args.base_model_path or meta.get("base_model_path")
     if not base_model_path:
@@ -380,6 +520,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "checkpoint_dir": ckpt_dir,
         "base_model_path": base_model_path,
         "checkpoint_loader": checkpoint_loader,
+        "adapter_dir": adapter_dir,
         "evals": {},
     }
     prepared_eval_devices: Dict[str, Dict[str, Any]] = {}

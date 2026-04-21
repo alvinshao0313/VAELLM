@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 from dataclasses import asdict, is_dataclass
@@ -12,7 +13,6 @@ from transformers import default_data_collator
 from dense_e2e_fintuning.args import needs_teacher
 from dense_e2e_fintuning.checkpoint_bridge import (
     build_dense_model_from_checkpoint,
-    export_dense_peft_to_compact_checkpoint,
     rebuild_dense_peft_model_for_export,
     resolve_base_model_path,
     resolve_decode_device,
@@ -32,7 +32,7 @@ from train_utils.hif4_act import (
     register_hif4_act_hooks,
     remove_hif4_act_hooks,
 )
-from train_utils.model_checkpoint_io import _build_run_output_dir
+from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME, _build_run_output_dir
 from train_utils.utils import get_logger, pt_fsdp_state_dict
 
 
@@ -185,6 +185,48 @@ def _save_dense_adapter(
     return output_dir
 
 
+def _compute_file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _compute_checkpoint_fingerprint(
+    checkpoint_dir: str,
+    *,
+    state_dict_file: str,
+) -> Dict[str, str]:
+    meta_path = os.path.join(str(checkpoint_dir), META_FILENAME)
+    state_dict_path = os.path.join(str(checkpoint_dir), str(state_dict_file))
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Missing source checkpoint meta for adapter fingerprint: {meta_path}")
+    if not os.path.exists(state_dict_path):
+        raise FileNotFoundError(
+            f"Missing source checkpoint state_dict for adapter fingerprint: {state_dict_path}"
+        )
+    return {
+        "source_checkpoint_meta_sha256": _compute_file_sha256(meta_path),
+        "source_checkpoint_state_sha256": _compute_file_sha256(state_dict_path),
+        "source_checkpoint_state_dict_file": str(state_dict_file),
+    }
+
+
+def _write_dense_adapter_meta(
+    *,
+    adapter_dir: str,
+    payload: Dict[str, Any],
+) -> str:
+    output_path = os.path.join(str(adapter_dir), "dense_adapter_meta.json")
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    return output_path
+
+
 def run(args, hf_args, training_args):
     run_output_dir = _build_run_output_dir(args.run_root_dir, os.path.basename(args.student_checkpoint_dir))
     os.environ["LOG_FILE"] = os.path.join(run_output_dir, "dense_e2e_fintuning.log")
@@ -205,12 +247,17 @@ def run(args, hf_args, training_args):
         int(args.decode_group_size),
     )
 
-    dense_model, meta, _resolved_dir = build_dense_model_from_checkpoint(
+    dense_model, meta, resolved_student_checkpoint_dir = build_dense_model_from_checkpoint(
         args.student_checkpoint_dir,
         access_token=hf_args.access_token,
         logger=log,
         decode_group_size=int(args.decode_group_size),
         decode_device=requested_decode_device,
+    )
+    source_state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
+    source_checkpoint_fingerprint = _compute_checkpoint_fingerprint(
+        resolved_student_checkpoint_dir,
+        state_dict_file=source_state_dict_file,
     )
     base_model_path = resolve_base_model_path(meta, args.teacher_model_path)
 
@@ -354,8 +401,8 @@ def run(args, hf_args, training_args):
         export_model.to("cpu")
 
     adapter_dir = None
-    compact_dir = None
     run_meta_path = None
+    adapter_meta_path = None
     if should_save:
         adapter_dir = _save_dense_adapter(
             model=export_model,
@@ -363,10 +410,16 @@ def run(args, hf_args, training_args):
             tokenizer=tokenizer,
             save_tokenizer=bool(args.save_tokenizer),
         )
-        compact_extra_meta = {
+        adapter_meta = {
+            "format": "dense_e2e_adapter_meta",
+            "version": 1,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "stage": "dense_e2e_fintuning",
             "teacher_source": str(teacher_source),
-            "source_checkpoint_dir": str(args.student_checkpoint_dir),
+            "source_checkpoint_dir": str(resolved_student_checkpoint_dir),
+            "source_checkpoint_loader": "cat",
+            "base_model_path": str(base_model_path),
+            **source_checkpoint_fingerprint,
             "target_decoder_layers": list(selection.decoder_layer_ids),
             "target_module_names": None if args.target_module_names is None else list(args.target_module_names),
             "lora_variant": str(args.lora_variant),
@@ -377,21 +430,10 @@ def run(args, hf_args, training_args):
             "tune_final_norm": bool(args.tune_final_norm),
             "use_post_norm_head_linear": bool(args.use_post_norm_head_linear),
         }
-        compact_dir = export_dense_peft_to_compact_checkpoint(
-            export_model,
-            student_checkpoint_dir=args.student_checkpoint_dir,
-            access_token=hf_args.access_token,
-            output_dir=os.path.join(run_output_dir, "final_model"),
-            args=args,
-            training_args=training_args,
-            base_model_path=str(base_model_path),
-            tokenizer=tokenizer,
-            save_tokenizer=bool(args.save_tokenizer),
-            extra_meta=compact_extra_meta,
-            decode_group_size=int(args.decode_group_size),
-            decode_device=requested_decode_device,
-            logger=log,
-        )["output_dir"]
+        adapter_meta_path = _write_dense_adapter_meta(
+            adapter_dir=str(adapter_dir),
+            payload=adapter_meta,
+        )
 
         run_meta = _build_run_meta(
             dense_args=args,
@@ -411,9 +453,9 @@ def run(args, hf_args, training_args):
         with open(run_meta_path, "w", encoding="utf-8") as handle:
             json.dump(run_meta, handle, ensure_ascii=False, indent=2)
         log.info(
-            "Saved final artifacts: adapter=%s compact=%s run_meta=%s",
+            "Saved final artifacts: adapter=%s adapter_meta=%s run_meta=%s",
             adapter_dir,
-            compact_dir,
+            adapter_meta_path,
             run_meta_path,
         )
     else:
@@ -422,7 +464,7 @@ def run(args, hf_args, training_args):
     return {
         "run_output_dir": run_output_dir,
         "saved_adapter_dir": adapter_dir,
-        "saved_compact_dir": compact_dir,
+        "saved_compact_dir": None,
         "teacher_source": teacher_source,
         "final_ppl": None if ppl_eval is None else ppl_eval["result"],
         "final_ppl_path": None if ppl_eval is None else ppl_eval["path"],

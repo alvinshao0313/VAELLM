@@ -28,6 +28,7 @@ from train_utils.model_checkpoint_io import (
     _dtype_to_name,
     _get_module_by_name,
     _materialize_missing_bias_params_from_state_dict,
+    _remap_legacy_parallel_linear_state_dict_keys,
     _rebuild_converted_modules,
     _torch_load_state_dict,
     unload_vae_original_linear_weights,
@@ -59,26 +60,23 @@ def _reject_removed_extra_lora_checkpoint(meta: Dict[str, Any]) -> None:
             raise ValueError(f"Unsupported adapter_type for e2e_common: {adapter_type}")
 
 
-def _ensure_no_legacy_decoder_key_style(state_dict: Dict[str, torch.Tensor]) -> None:
-    legacy_suffixes = (
-        ".decoder.linear_in.weight",
-        ".decoder.linear_in.bias",
-        ".decoder.linear_out.weight",
-        ".decoder.linear_out.bias",
-        ".decoder.blocks.0.linear1.weight",
-        ".decoder.blocks.0.linear1.bias",
+def _remap_legacy_decoder_keys_if_needed(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    logger=None,
+) -> Dict[str, torch.Tensor]:
+    model_state_keys = tuple(model.state_dict().keys())
+    remapped_state_dict, remap_count = _remap_legacy_parallel_linear_state_dict_keys(
+        state_dict,
+        model_state_keys,
     )
-    for key in state_dict.keys():
-        name = str(key)
-        if ".linear." in name:
-            continue
-        for suffix in legacy_suffixes:
-            if name.endswith(suffix):
-                raise ValueError(
-                    "Detected legacy decoder key format in checkpoint state_dict. "
-                    "This hard-cut loader no longer supports legacy key remap. "
-                    "Please convert first: `python -m tools.convert_legacy_checkpoint ...`."
-                )
+    if int(remap_count) > 0 and logger is not None:
+        logger.info(
+            "Detected legacy cat checkpoint decoder key layout. Applied automatic key remap count=%d.",
+            int(remap_count),
+        )
+    return remapped_state_dict
 
 
 def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
@@ -462,7 +460,7 @@ def load_e2e_checkpoint_into_model(
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)
     state_dict = _torch_load_state_dict(state_dict_path, map_location=map_location)
-    _ensure_no_legacy_decoder_key_style(state_dict)
+    state_dict = _remap_legacy_decoder_keys_if_needed(model, state_dict, logger=proxy_logger)
     if any(str(key).startswith("lm_head.post_norm_linear.") for key in state_dict.keys()):
         ensure_post_norm_head_linear(model)
     adalora_runtime_state = pop_peft_proxy_adalora_runtime_state_dict(state_dict)

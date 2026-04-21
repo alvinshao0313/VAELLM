@@ -25,11 +25,11 @@ export PYTHONPATH=.
 - `scripts/eval.sh`
   - 入口：`tools/cat_eval.py`
   - 用途：对保存好的 checkpoint 做 PPL 和 lm-eval
-- `dense_e2e_fintuning/scripts/e2e_dense_lora_mix.sh`
+- `dense_e2e_fintuning/scripts/e2e_dense_lora.sh`
   - 压缩模型 checkpoint（`S`）重建 dense 模型（`C`）后做标准 PEFT 蒸馏
   - 入口参数是 `--student_checkpoint_dir`，不接受 `--student_model_path`
-  - 默认混合池：`openorca=0.45,fineweb_edu=0.30,race=0.15,sciq=0.07,alpaca=0.03`
-  - 导出两份产物：`final_adapter/` 与回写后的紧凑 `final_model/`
+  - 默认是单数据源脚本（可按需改 `--dataset_mix`）
+  - 默认导出 `final_adapter/` + `run_meta.json` + `final_adapter/dense_adapter_meta.json`
 - `raw_e2e_fintuning/scripts/e2e_raw_lora.sh`
   - 原模型（非 VAE）LoRA 基线
   - 入口参数是 `--student_model_path`，不接受 `--student_checkpoint_dir`
@@ -56,7 +56,7 @@ bash scripts/catlora_simple.sh
 2. 如果是压缩 checkpoint（`S`），使用 dense e2e 继续训练：
 
 ```bash
-bash dense_e2e_fintuning/scripts/e2e_dense_lora_mix.sh
+bash dense_e2e_fintuning/scripts/e2e_dense_lora.sh
 ```
 
 如果你要直接训练原始模型（不经过 VAE 压缩）：
@@ -83,8 +83,12 @@ bash scripts/eval.sh
 - `cat_train -> dense_e2e_fintuning -> cat_eval` 是压缩模型的推荐链路。
 - `raw_e2e_fintuning` 是原始模型独立训练链路，输入输出保持 HF/PEFT 格式。
 - 两条训练轨完全隔离，不互相 import：
-  - `dense_e2e_fintuning`：输入 `--student_checkpoint_dir`，输出 `final_adapter/` + 回写后的 `final_model/`
+  - `dense_e2e_fintuning`：输入 `--student_checkpoint_dir`，输出 `final_adapter/` + `run_meta.json`
   - `raw_e2e_fintuning`：输入 `--student_model_path`，输出 `final_adapter/` + `run_meta.json`（可选 `final_merged_model/`）
+- `dense_e2e_fintuning` 可以直接加载 `tools/cat_train.py` 产出的旧 cat checkpoint（旧 decoder key 会在加载时自动 remap）。
+- `tools/cat_eval.py` 支持 `--adapter_dir`：
+  - 不传 `--adapter_dir`：评估压缩模型原始结果
+  - 传 `--adapter_dir`：先从压缩模型重建 dense，再挂载并 merge adapter，评估端到端微调结果
 - 历史 `e2e_fintuning` 已移除；旧 checkpoint 需要先执行：
   - `python -m tools.convert_legacy_checkpoint ...`
 - `tools/cat_eval.py`、`tools/collect_activation_absmax.py`、激活统计相关工具现在要求设备配置和实际硬件一致；请求 CUDA 但机器没有 CUDA 时会直接报错，不再静默回退到 CPU。

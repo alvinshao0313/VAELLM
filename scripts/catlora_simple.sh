@@ -27,14 +27,15 @@ export CUDA_VISIBLE_DEVICES=1
 # --wa_mse_calib_dataset "wikitext2"  # 支持 wiki/wikitext2/fineweb_edu/openorca/redpajama/alpaca
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,piqa"       # 可选：类别后下游任务评估；空串表示不跑
-# --lora_after_category \
+# --lora_after_category \ boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa
 
 python tools/cat_train.py \
-  --model_path "meta-llama/Llama-3.1-8B" \
+  --model_path "Qwen/Qwen3-8B" \
   --output_dir ".result" \
   --seed "0" \
   --train_device "cuda" \
   --convert \
+  --save_model \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
@@ -43,7 +44,7 @@ python tools/cat_train.py \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "32" \
-  --steps_per_category "default=20000" \
+  --steps_per_category "default=20" \
   --joint_decoder_steps "default=0" \
   --joint_decoder_lr "default=1e-2" \
   --joint_decoder_group_size "default=32,cat:down_proj=8" \
@@ -51,8 +52,8 @@ python tools/cat_train.py \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
-  --eval_ppl "true" \
-  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
+  --eval_ppl "false" \
+  --eval_tasks "" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
   --intra_part_sort_mode "default=none" \
@@ -103,13 +104,13 @@ python tools/cat_train.py \
   --use_checkpoint \
   --new_quant \
   --lora_dataset "wiki" \
-  --lora_rank "default=32" \
-  --lora_alpha "default=64.0" \
+  --lora_rank "default=12" \
+  --lora_alpha "default=24.0" \
   --lora_dropout "default=0.0" \
-  --lora_steps "default=3000" \
+  --lora_steps "default=5000" \
   --lora_batch_size "default=2" \
   --lora_nsamples "default=10000000" \
-  --lora_lr "default=1e-5" \
+  --lora_lr "default=8e-5" \
   --lora_weight_decay "default=0.001" \
   --lora_log_every "default=2" \
   --lora_post_attn "false" \

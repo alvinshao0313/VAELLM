@@ -27,9 +27,6 @@ prepares
 *.h5
 tests/
 test/
-!tests/
-tests/*
-!tests/test_e2e_dataset_mix.py
 .pytest_cache/
 eval_log/
 wandb/

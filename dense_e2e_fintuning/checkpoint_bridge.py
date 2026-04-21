@@ -149,6 +149,7 @@ def load_compressed_student_checkpoint(
     student_checkpoint_dir: str,
     *,
     access_token: Optional[str] = None,
+    base_model_path: Optional[str] = None,
     logger=None,
 ) -> Tuple[nn.Module, Dict[str, object], str]:
     resolved_dir, meta = load_checkpoint_meta(student_checkpoint_dir)
@@ -156,6 +157,7 @@ def load_compressed_student_checkpoint(
     model, loaded_meta, _load_result = load_e2e_model_checkpoint(
         resolved_dir,
         access_token=access_token,
+        base_model_path=base_model_path,
         map_location="cpu",
         strict=True,
         materialize_proxy_decoded_linears=False,
@@ -233,6 +235,7 @@ def build_dense_model_from_checkpoint(
     student_checkpoint_dir: str,
     *,
     access_token: Optional[str] = None,
+    base_model_path: Optional[str] = None,
     logger=None,
     decode_group_size: int = 8,
     decode_device: str = "auto",
@@ -248,6 +251,7 @@ def build_dense_model_from_checkpoint(
     model, meta, resolved_dir = load_compressed_student_checkpoint(
         student_checkpoint_dir,
         access_token=access_token,
+        base_model_path=base_model_path,
         logger=logger,
     )
     converted = materialize_vae_linears_to_dense(
