@@ -4,9 +4,8 @@ from unittest import mock
 
 from datasets import Dataset, DatasetDict
 
-from e2e_fintuning.args import parse_args
-from e2e_fintuning.data import _record_to_text, build_datasets
-from e2e_fintuning.runtime import _validate_resume_checkpoint_config
+from e2e_common.data import _record_to_text, build_datasets
+from raw_e2e_fintuning.args import parse_args
 
 
 class DummyTokenizer:
@@ -42,12 +41,12 @@ def _make_text_dataset(prefix: str, count: int, *, words: int = 8):
 class DatasetMixArgsTest(unittest.TestCase):
     def test_parse_args_normalizes_dataset_mix(self):
         e2e_args, _hf_args, training_args = parse_args(
-            [
-                "--student_checkpoint_dir",
-                "dummy-checkpoint",
-                "--dataset_mix",
-                "openorca=3,fineweb_edu=1",
-                "--max_steps",
+                [
+                    "--student_model_path",
+                    "dummy-model",
+                    "--dataset_mix",
+                    "openorca=3,fineweb_edu=1",
+                    "--max_steps",
                 "10",
             ]
         )
@@ -61,8 +60,8 @@ class DatasetMixArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(
                 [
-                    "--student_checkpoint_dir",
-                    "dummy-checkpoint",
+                    "--student_model_path",
+                    "dummy-model",
                     "--dataset_mix",
                     "openorca=1,openorca=1",
                     "--max_steps",
@@ -74,8 +73,8 @@ class DatasetMixArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(
                 [
-                    "--student_checkpoint_dir",
-                    "dummy-checkpoint",
+                    "--student_model_path",
+                    "dummy-model",
                     "--dataset_mix",
                     "openorca=1",
                     "--text_field",
@@ -87,12 +86,12 @@ class DatasetMixArgsTest(unittest.TestCase):
 
     def test_parse_args_accepts_long_dataset_aliases(self):
         e2e_args, _hf_args, _training_args = parse_args(
-            [
-                "--student_checkpoint_dir",
-                "dummy-checkpoint",
-                "--dataset_mix",
-                "longalpaca=2,longalign=1",
-                "--max_steps",
+                [
+                    "--student_model_path",
+                    "dummy-model",
+                    "--dataset_mix",
+                    "longalpaca=2,longalign=1",
+                    "--max_steps",
                 "10",
             ]
         )
@@ -211,7 +210,7 @@ class DatasetMixBuilderTest(unittest.TestCase):
                 )
             raise AssertionError(f"unexpected dataset path: {path}")
 
-        with mock.patch("e2e_fintuning.data.load_dataset", side_effect=fake_load_dataset):
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
             train_dataset, eval_dataset, data_info = build_datasets(args, self.training_args, self.tokenizer)
 
         self.assertEqual(data_info["dataset_mode"], "mix")
@@ -282,7 +281,7 @@ class DatasetMixBuilderTest(unittest.TestCase):
                 )
             raise AssertionError(f"unexpected dataset path: {path}")
 
-        with mock.patch("e2e_fintuning.data.load_dataset", side_effect=fake_load_dataset):
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
             with self.assertRaises(ValueError):
                 build_datasets(args, training_args, self.tokenizer)
 
@@ -329,7 +328,7 @@ class DatasetMixBuilderTest(unittest.TestCase):
                 )
             raise AssertionError(f"unexpected dataset path: {path}")
 
-        with mock.patch("e2e_fintuning.data.load_dataset", side_effect=fake_load_dataset):
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
             train_dataset, eval_dataset, data_info = build_datasets(args, self.training_args, self.tokenizer)
 
         self.assertEqual(data_info["dataset_mode"], "mix")
@@ -340,70 +339,6 @@ class DatasetMixBuilderTest(unittest.TestCase):
         for source_stat in data_info["source_stats"]:
             self.assertIn(source_stat["alias"], {"longalpaca", "longalign"})
             self.assertGreaterEqual(source_stat["packed_rows"], 1)
-
-
-class DatasetMixResumeValidationTest(unittest.TestCase):
-    def test_resume_config_rejects_dataset_mix_mismatch(self):
-        args = SimpleNamespace(
-            target_module_names=None,
-            vae_lora_rank=8,
-            vae_lora_alpha=16.0,
-            vae_lora_dropout=0.0,
-            vae_lora_tune_bias=False,
-            vae_lora_variant="plain",
-            vae_lora_init_mode="zero",
-            vae_lora_use_rslora=False,
-            vae_lora_use_dora=False,
-            tune_final_norm=False,
-            use_post_norm_head_linear=False,
-            vae_adalora_target_r=8,
-            vae_adalora_init_r=12,
-            vae_adalora_tinit=0,
-            vae_adalora_tfinal=0,
-            vae_adalora_delta_t=1,
-            vae_adalora_beta1=0.85,
-            vae_adalora_beta2=0.85,
-            vae_adalora_orth_reg_weight=0.5,
-            loss_type="kd_top_1000",
-            post_attn=False,
-            lora_hif4_act=False,
-            prewarm_frozen_vae=True,
-            dataset_mix_spec="openorca=0.5,alpaca=0.5",
-            dataset_mix_sources=["openorca", "alpaca"],
-            dataset_mix_weights=[0.5, 0.5],
-        )
-        training_args = SimpleNamespace(max_steps=10, model_max_length=4096)
-        meta = {
-            "extra_meta": {
-                "stage": "e2e_fintuning",
-                "target_decoder_layers": [0, 1],
-                "target_module_names": None,
-                "vae_lora_rank": 8,
-                "vae_lora_alpha": 16.0,
-                "vae_lora_dropout": 0.0,
-                "vae_lora_tune_bias": False,
-                "vae_lora_bias_mode": "none",
-                "tune_final_norm": False,
-                "use_post_norm_head_linear": False,
-                "vae_lora_variant": "plain",
-                "vae_lora_init_mode": "zero",
-                "vae_lora_use_rslora": False,
-                "vae_lora_use_dora": False,
-                "dataset_mode": "mix",
-                "dataset_mix_spec": "openorca=0.6,alpaca=0.4",
-                "dataset_mix_sources": ["openorca", "alpaca"],
-                "dataset_mix_weights": [0.6, 0.4],
-                "dataset_mix_block_size": 4096,
-            }
-        }
-        with self.assertRaises(ValueError):
-            _validate_resume_checkpoint_config(
-                args=args,
-                meta=meta,
-                decoder_layer_ids=[0, 1],
-                training_args=training_args,
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

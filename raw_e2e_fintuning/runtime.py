@@ -8,9 +8,9 @@ import torch
 from torch import nn
 from transformers import default_data_collator
 
-from e2e_fintuning.args import needs_teacher
-from e2e_fintuning.data import build_datasets, build_tokenizer
-from e2e_fintuning.post_norm_head import ensure_post_norm_head_linear
+from e2e_common.data import build_datasets, build_tokenizer
+from e2e_common.post_norm_head import ensure_post_norm_head_linear
+from raw_e2e_fintuning.args import needs_teacher
 from raw_e2e_fintuning.checkpoint_io import save_final_artifacts
 from raw_e2e_fintuning.trainables import inject_raw_peft_adapters, resolve_target_layer_ids
 from raw_e2e_fintuning.trainer import (

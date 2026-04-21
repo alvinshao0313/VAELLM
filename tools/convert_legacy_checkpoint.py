@@ -7,20 +7,29 @@ from typing import Dict, List, Optional
 
 from transformers.modeling_utils import load_sharded_checkpoint
 
-from e2e_fintuning.args import (
-    parse_decoder_layers,
-    parse_target_modules,
-    parse_vae_lora_init_mode,
-    parse_vae_lora_variant,
-)
-from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
-from e2e_fintuning.peft_proxy import ensure_peft_vae_proxy_adapter
-from e2e_fintuning.trainables import resolve_target_layer_ids, select_e2e_trainables_peft_proxy
+from e2e_common.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
+from e2e_common.peft_proxy import ensure_peft_vae_proxy_adapter
+from e2e_common.proxy_trainables import resolve_target_layer_ids, select_e2e_trainables_peft_proxy
 from rotation.model_utils import get_layers
 from train_utils.train_args import _parse_bool_like
 
 
 _E2E_FINETUNE_MODE = "vae_lora"
+_VALID_VAE_LORA_VARIANTS = {"plain", "rslora", "dora", "adalora"}
+_VALID_VAE_LORA_INIT_MODES = {"zero", "gaussian", "residual_svd"}
+_TARGET_MODULE_ALIASES = {
+    "q": "q_proj",
+    "query": "q_proj",
+    "k": "k_proj",
+    "key": "k_proj",
+    "v": "v_proj",
+    "value": "v_proj",
+    "o": "o_proj",
+    "out": "o_proj",
+    "gate": "gate_proj",
+    "up": "up_proj",
+    "down": "down_proj",
+}
 _COPY_FILES = (
     "trainer_state.json",
     "optimizer.pt",
@@ -28,6 +37,78 @@ _COPY_FILES = (
     "training_args.bin",
     "scaler.pt",
 )
+
+
+def parse_decoder_layers(value: Optional[str]) -> Optional[List[int]]:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "all", "*"}:
+        return None
+    out = set()
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "-" in token:
+            begin_text, end_text = [part.strip() for part in token.split("-", 1)]
+            begin = int(begin_text)
+            end = int(end_text)
+            if begin < 0 or end < 0 or end < begin:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid --decoder_layers range '{token}'. Expected non-negative begin <= end."
+                )
+            out.update(range(begin, end + 1))
+            continue
+        idx = int(token)
+        if idx < 0:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --decoder_layers token '{token}'. Expected non-negative layer index."
+            )
+        out.add(idx)
+    if not out:
+        raise argparse.ArgumentTypeError("--decoder_layers cannot be empty.")
+    return sorted(out)
+
+
+def parse_target_modules(value: Optional[str]) -> Optional[List[str]]:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "all", "*"}:
+        return None
+    out = []
+    seen = set()
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        normalized = _TARGET_MODULE_ALIASES.get(token, token)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    if not out:
+        raise argparse.ArgumentTypeError("--target_modules cannot be empty.")
+    return out
+
+
+def parse_vae_lora_variant(value: Optional[str]) -> str:
+    norm = str(value or "").strip().lower()
+    if not norm:
+        norm = "plain"
+    if norm not in _VALID_VAE_LORA_VARIANTS:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --vae_lora_variant '{value}'. Expected one of: {sorted(_VALID_VAE_LORA_VARIANTS)}."
+        )
+    return norm
+
+
+def parse_vae_lora_init_mode(value: Optional[str]) -> str:
+    norm = str(value or "").strip().lower()
+    if not norm:
+        norm = "zero"
+    if norm not in _VALID_VAE_LORA_INIT_MODES:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --vae_lora_init_mode '{value}'. Expected one of: {sorted(_VALID_VAE_LORA_INIT_MODES)}."
+        )
+    return norm
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -139,7 +220,7 @@ def _build_extra_meta(args, selection) -> Dict[str, object]:
     use_rslora = str(args.vae_lora_variant) == "rslora"
     use_dora = str(args.vae_lora_variant) == "dora"
     extra_meta: Dict[str, object] = {
-        "stage": "e2e_fintuning",
+        "stage": "dense_e2e_fintuning",
         "source_checkpoint_dir": args.student_checkpoint_dir,
         "legacy_hf_checkpoint_dir": args.legacy_checkpoint_dir,
         "conversion_source_format": "legacy_hf_trainer_sharded_checkpoint",

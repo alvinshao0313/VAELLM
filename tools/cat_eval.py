@@ -133,7 +133,7 @@ def _resolve_checkpoint_loader(meta: Dict[str, Any]) -> str:
         return "e2e"
     if isinstance(adapter_modules, list) and len(adapter_modules) > 0:
         return "e2e"
-    if stage == "e2e_fintuning":
+    if stage in {"e2e_fintuning", "dense_e2e_fintuning"}:
         return "e2e"
     return "cat"
 
@@ -169,8 +169,8 @@ def _prepare_model_for_eval(
     logger.info("[warmup] Moving model to %s ...", device)
     model.to(device)
 
-    from e2e_fintuning.lora import iter_named_vae_module_refs
-    from e2e_fintuning.peft_proxy import iter_named_peft_vae_proxies, materialize_peft_proxy_decoded_linears
+    from e2e_common.peft_proxy import iter_named_peft_vae_proxies, materialize_peft_proxy_decoded_linears
+    from e2e_common.proxy_trainables import iter_named_vae_module_refs
     from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
 
     start_time = time.time()
@@ -335,8 +335,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     logger.info("Loading evaluated model from checkpoint...")
     if checkpoint_loader == "e2e":
-        from e2e_fintuning.checkpoint_io import load_e2e_model_checkpoint
-        from e2e_fintuning.trainer import set_model_temporary
+        from e2e_common.checkpoint_io import load_e2e_model_checkpoint
+        from e2e_common.temporary_mode import set_model_temporary
         from litebsq.vae_linear import clear_model_vae_linear_cache
 
         model, meta, load_result = load_e2e_model_checkpoint(

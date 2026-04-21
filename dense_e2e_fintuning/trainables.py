@@ -14,7 +14,7 @@ except ImportError as exc:  # pragma: no cover - import-time environment guard
 
 
 @dataclass
-class RawTrainableSelection:
+class DenseTrainableSelection:
     decoder_layer_ids: List[int]
     target_modules: List[str]
     target_module_suffixes: List[str]
@@ -167,7 +167,7 @@ def _build_peft_config(
     )
 
 
-def inject_raw_peft_adapters(
+def inject_dense_peft_adapters(
     model: nn.Module,
     *,
     args,
@@ -202,7 +202,7 @@ def inject_raw_peft_adapters(
     if trainable_parameter_count < 1:
         raise RuntimeError("No trainable parameters found after PEFT adapter injection.")
 
-    selection = RawTrainableSelection(
+    selection = DenseTrainableSelection(
         decoder_layer_ids=[int(idx) for idx in decoder_layer_ids],
         target_modules=list(target_modules),
         target_module_suffixes=list(target_module_suffixes),

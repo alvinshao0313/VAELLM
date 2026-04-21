@@ -38,12 +38,12 @@ python tools/cat_train.py \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --category_order "down_proj" \
+  --category_order "k_proj,v_proj,q_proj,o_proj,gate_proj,up_proj,down_proj" \
   --transpose_modules "v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "32" \
-  --steps_per_category "default=5000" \
+  --steps_per_category "default=20000" \
   --joint_decoder_steps "default=0" \
   --joint_decoder_lr "default=1e-2" \
   --joint_decoder_group_size "default=32,cat:down_proj=8" \

@@ -1,6 +1,6 @@
-import logging
+import os
 import warnings
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -8,13 +8,6 @@ from torch import nn
 from transformers import Trainer, TrainerCallback
 from transformers.trainer import SCHEDULER_NAME, reissue_pt_warnings, save_fsdp_optimizer
 
-from e2e_fintuning.checkpoint_io import save_e2e_model_checkpoint
-from e2e_fintuning.lora import LoRAVAELinear, iter_named_vae_module_refs
-from e2e_fintuning.peft_proxy import (
-    PeftVAELinearProxy,
-    update_peft_vae_proxy_adalora,
-)
-from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
 from train_utils.distill_losses import (
     build_distill_token_mask,
     compute_dual_kl_loss,
@@ -24,39 +17,6 @@ from train_utils.distill_losses import (
 )
 from train_utils.fsdp_trainer import FSDPTrainer
 from train_utils.hif4_act import build_hif4_act_controller
-from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME
-from train_utils.utils import pt_fsdp_state_dict
-
-
-def _iter_named_temporary_modules(model: nn.Module):
-    skip_prefixes = []
-    for name, module in model.named_modules():
-        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in skip_prefixes):
-            continue
-        if isinstance(module, LoRAVAELinear):
-            skip_prefixes.append(f"{name}.base_layer")
-        if isinstance(module, PeftVAELinearProxy):
-            skip_prefixes.append(f"{name}.base_layer")
-            skip_prefixes.append(f"{name}.per_decoded_linear")
-        if callable(getattr(module, "set_temporary", None)):
-            yield name, module
-
-
-def set_model_temporary(model: nn.Module, temporary: bool) -> None:
-    for _name, module in _iter_named_temporary_modules(model):
-        module.set_temporary(bool(temporary))
-
-
-class E2EAdaLoraCallback(TrainerCallback):
-    def __init__(self, trainer: "_E2ELossMixin"):
-        self.trainer = trainer
-
-    def on_optimizer_step(self, args, state, control, **kwargs):
-        update_peft_vae_proxy_adalora(
-            self.trainer._unwrap_student_model(),
-            global_step=int(state.global_step) + 1,
-        )
-        return control
 
 
 def _get_output_logits(outputs) -> torch.Tensor:
@@ -67,7 +27,18 @@ def _get_output_logits(outputs) -> torch.Tensor:
     raise AttributeError("Model outputs do not contain `logits`.")
 
 
-def compute_e2e_loss_from_logits(
+def _parse_topk(value: str, *, prefix: str, default_k: int) -> int:
+    if value == prefix:
+        return int(default_k)
+    suffix = value[len(prefix):]
+    if suffix.startswith("_"):
+        suffix = suffix[1:]
+    if not suffix:
+        return int(default_k)
+    return max(1, int(suffix))
+
+
+def compute_dense_loss_from_logits(
     *,
     loss_type: str,
     student_logits: torch.Tensor,
@@ -206,24 +177,25 @@ def compute_e2e_loss_from_logits(
         return ce_loss * (1.0 - float(alpha)) + kd_loss * float(alpha)
 
     raise ValueError(
-        f"Unsupported e2e loss type: {loss_type}. "
+        f"Unsupported dense loss type: {loss_type}. "
         "Supported: sft/origin, kl, rkl, dual_rkl, mse, kd, kd_top[_K], dual_kd_top[_K], "
         "dual_kl, dual_kd, kl_top[_K], r_kl_top[_K], dual_r_kl_top[_K], dual_kl_top[_K]."
     )
 
 
-def _parse_topk(value: str, *, prefix: str, default_k: int) -> int:
-    if value == prefix:
-        return int(default_k)
-    suffix = value[len(prefix):]
-    if suffix.startswith("_"):
-        suffix = suffix[1:]
-    if not suffix:
-        return int(default_k)
-    return max(1, int(suffix))
+class DenseAdaLoraCallback(TrainerCallback):
+    def __init__(self, trainer: "_DenseLossMixin"):
+        self.trainer = trainer
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        model = self.trainer._unwrap_student_model()
+        updater = getattr(model, "update_and_allocate", None)
+        if callable(updater):
+            updater(global_step=int(state.global_step) + 1)
+        return control
 
 
-class _E2ELossMixin:
+class _DenseLossMixin:
     def __init__(
         self,
         *args,
@@ -233,10 +205,6 @@ class _E2ELossMixin:
         distill_alpha: float = 0.5,
         post_attn: bool = False,
         lora_hif4_act: bool = False,
-        prewarm_frozen_vae: bool = True,
-        prewarm_log_every: int = 32,
-        prewarm_group_size: int = 8,
-        prewarm_module_names: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         self.loss_type = str(loss_type).strip().lower()
@@ -246,17 +214,7 @@ class _E2ELossMixin:
         self.post_attn = bool(post_attn)
         self.lora_hif4_act = bool(lora_hif4_act)
         self.lora_hif4_act_controller = build_hif4_act_controller(self.lora_hif4_act)
-        self.prewarm_frozen_vae = bool(prewarm_frozen_vae)
-        self.prewarm_log_every = max(1, int(prewarm_log_every))
-        self.prewarm_group_size = max(1, int(prewarm_group_size))
-        self.prewarm_module_names = (
-            None
-            if prewarm_module_names is None
-            else {str(name) for name in prewarm_module_names if str(name)}
-        )
         self._teacher_device = None
-        self._vae_cache_prepared = False
-        self._logger = logging.getLogger("e2e_fintuning")
         super().__init__(*args, **kwargs)
 
     def _unwrap_student_model(self):
@@ -264,52 +222,6 @@ class _E2ELossMixin:
         if getattr(self, "accelerator", None) is not None:
             model = self.accelerator.unwrap_model(model)
         return model
-
-    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        if output_dir is None:
-            output_dir = self.args.output_dir
-
-        base_model_path = getattr(self, "_e2e_base_model_path", None)
-        extra_meta = getattr(self, "_e2e_checkpoint_extra_meta", None)
-        model = self._unwrap_student_model()
-
-        if getattr(self, "is_fsdp_enabled", False):
-            state_dict = pt_fsdp_state_dict(self.model)
-            if self.args.should_save:
-                save_e2e_model_checkpoint(
-                    model,
-                    output_dir,
-                    base_model_path=base_model_path,
-                    save_config=False,
-                    extra_meta=extra_meta,
-                    state_dict=state_dict,
-                    compact_unload_vae_original_weights=True,
-                )
-            return
-
-        if self.args.should_save:
-            save_e2e_model_checkpoint(
-                model,
-                output_dir,
-                base_model_path=base_model_path,
-                save_config=False,
-                extra_meta=extra_meta,
-                state_dict=model.state_dict(),
-                compact_unload_vae_original_weights=True,
-            )
-
-    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        if (
-            os.path.isdir(resume_from_checkpoint)
-            and os.path.exists(os.path.join(resume_from_checkpoint, META_FILENAME))
-            and os.path.exists(os.path.join(resume_from_checkpoint, STATE_DICT_FILENAME))
-        ):
-            self._logger.info(
-                "Skipping Trainer model reload for compact e2e checkpoint: %s",
-                resume_from_checkpoint,
-            )
-            return
-        return super()._load_from_checkpoint(resume_from_checkpoint, model=model)
 
     def _set_hif4_act_enabled(self, enabled: bool) -> None:
         if self.lora_hif4_act_controller is not None:
@@ -324,70 +236,17 @@ class _E2ELossMixin:
         self.teacher_model.eval()
         self._teacher_device = device
 
-    def _infer_cache_dtype(self, model: nn.Module) -> torch.dtype:
-        for param in model.parameters():
-            if param.is_floating_point():
-                return param.dtype
-        return torch.float32
-
-    def prepare_frozen_vae_cache_once(self, model: nn.Module) -> None:
-        if self._vae_cache_prepared or not self.prewarm_frozen_vae:
-            return
-
-        target_dtype = self._infer_cache_dtype(model)
-        named_targets: List[NamedVAELinearTarget] = []
-        for ref in iter_named_vae_module_refs(model):
-            if isinstance(ref.module, PeftVAELinearProxy):
-                continue
-            if self.prewarm_module_names is not None and ref.name not in self.prewarm_module_names:
-                continue
-            named_targets.append(NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer))
-
-        self._logger.info(
-            "Start VAELinear prewarm: total=%d dtype=%s prewarm_group_size=%d",
-            len(named_targets),
-            str(target_dtype),
-            int(self.prewarm_group_size),
-        )
-        stats = prime_named_vae_linear_cache(
-            named_targets,
-            dtype=target_dtype,
-            clear_existing=True,
-            group_size=int(self.prewarm_group_size),
-            logger=self._logger,
-        )
-
-        self._vae_cache_prepared = True
-        self._logger.info(
-            "VAELinear prewarm complete: total=%d warmed=%d skipped=%d failed=%d dtype=%s prewarm_group_size=%d",
-            int(stats.get("total", 0)),
-            int(stats.get("warmed", 0)),
-            int(stats.get("skipped", 0)),
-            int(stats.get("failed", 0)),
-            str(target_dtype),
-            int(self.prewarm_group_size),
-        )
-        self._logger.info("Finished VAELinear prewarm.")
-
-    def _compute_teacher_outputs(
-        self,
-        teacher_inputs: Dict[str, torch.Tensor],
-    ):
+    def _compute_teacher_outputs(self, teacher_inputs: Dict[str, torch.Tensor]):
         self._set_hif4_act_enabled(False)
         if self.teacher_model is None:
-            raise RuntimeError("当前 e2e 蒸馏已强制使用外部 teacher，但 trainer.teacher_model 为空。")
+            raise RuntimeError("当前 loss_type 需要 teacher，但 trainer.teacher_model 为空。")
         input_tensor = next(value for value in teacher_inputs.values() if torch.is_tensor(value))
         self._ensure_teacher_device(device=input_tensor.device)
         with torch.no_grad():
             return self.teacher_model(**teacher_inputs, output_hidden_states=False)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
-        unwrapped_model = model
-        if getattr(self, "accelerator", None) is not None:
-            unwrapped_model = self.accelerator.unwrap_model(model)
-        self.prepare_frozen_vae_cache_once(unwrapped_model)
         previous_hif4_enabled = bool(getattr(self.lora_hif4_act_controller, "enabled", False))
-
         loss_type = self.loss_type
         try:
             if loss_type in {"sft", "origin"}:
@@ -413,9 +272,7 @@ class _E2ELossMixin:
                 student_inputs.pop("labels", None)
             full_inputs = dict(inputs)
 
-            teacher_outputs = self._compute_teacher_outputs(
-                teacher_inputs,
-            )
+            teacher_outputs = self._compute_teacher_outputs(teacher_inputs)
             self._set_hif4_act_enabled(previous_hif4_enabled)
             if (
                 loss_type in {"kd", "dual_kd"}
@@ -434,7 +291,7 @@ class _E2ELossMixin:
                 reference_logits=logits,
             )
 
-            loss = compute_e2e_loss_from_logits(
+            loss = compute_dense_loss_from_logits(
                 loss_type=loss_type,
                 student_logits=logits,
                 teacher_logits=_get_output_logits(teacher_outputs),
@@ -449,11 +306,11 @@ class _E2ELossMixin:
             self._set_hif4_act_enabled(previous_hif4_enabled)
 
 
-class E2EFinetuneTrainer(_E2ELossMixin, Trainer):
+class DenseFinetuneTrainer(_DenseLossMixin, Trainer):
     pass
 
 
-class E2EFSDPFinetuneTrainer(_E2ELossMixin, FSDPTrainer):
+class DenseFSDPFinetuneTrainer(_DenseLossMixin, FSDPTrainer):
     def _save_optimizer_and_scheduler(self, output_dir):
         if self.args.should_save:
             save_fsdp_optimizer(

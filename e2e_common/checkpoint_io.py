@@ -6,9 +6,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
-from e2e_fintuning.lora import LoRAVAELinear, ensure_lora_vae_linear, iter_named_vae_module_refs
-from e2e_fintuning.post_norm_head import ensure_post_norm_head_linear
-from e2e_fintuning.peft_proxy import (
+from e2e_common.post_norm_head import ensure_post_norm_head_linear
+from e2e_common.peft_proxy import (
     collect_peft_vae_proxy_adapter_specs,
     ensure_peft_vae_linear_proxy,
     ensure_peft_vae_proxy_adapter,
@@ -19,6 +18,7 @@ from e2e_fintuning.peft_proxy import (
     restore_peft_proxy_adalora_runtime_state_dict,
     strip_proxy_dense_base_from_state_dict,
 )
+from e2e_common.proxy_trainables import iter_named_vae_module_refs
 from rotation.model_utils import get_model
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
@@ -29,11 +29,9 @@ from train_utils.model_checkpoint_io import (
     _get_module_by_name,
     _materialize_missing_bias_params_from_state_dict,
     _rebuild_converted_modules,
-    _remap_legacy_parallel_linear_state_dict_keys,
     _torch_load_state_dict,
     unload_vae_original_linear_weights,
 )
-from train_utils.utils import extract_layer_idx
 
 
 _E2E_FINETUNE_MODE = "vae_lora"
@@ -51,14 +49,36 @@ def _tensor_spec(tensor: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
 def _reject_removed_extra_lora_checkpoint(meta: Dict[str, Any]) -> None:
     extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
     if bool(extra_meta.get("lora_embedding", False)) or bool(extra_meta.get("lora_lm_head", False)):
-        raise ValueError("embedding/head LoRA checkpoint is no longer supported in e2e_fintuning.")
+        raise ValueError("embedding/head LoRA checkpoint is no longer supported in e2e_common.")
     adapter_modules = meta.get("adapter_modules", [])
     if not isinstance(adapter_modules, list):
         return
     for spec in adapter_modules:
         adapter_type = str(spec.get("adapter_type"))
-        if adapter_type in {"linear_lora", "embedding_lora"}:
-            raise ValueError(f"Unsupported legacy adapter_type for e2e_fintuning: {adapter_type}")
+        if adapter_type not in {"peft_proxy_lora", "peft_proxy_adalora"}:
+            raise ValueError(f"Unsupported adapter_type for e2e_common: {adapter_type}")
+
+
+def _ensure_no_legacy_decoder_key_style(state_dict: Dict[str, torch.Tensor]) -> None:
+    legacy_suffixes = (
+        ".decoder.linear_in.weight",
+        ".decoder.linear_in.bias",
+        ".decoder.linear_out.weight",
+        ".decoder.linear_out.bias",
+        ".decoder.blocks.0.linear1.weight",
+        ".decoder.blocks.0.linear1.bias",
+    )
+    for key in state_dict.keys():
+        name = str(key)
+        if ".linear." in name:
+            continue
+        for suffix in legacy_suffixes:
+            if name.endswith(suffix):
+                raise ValueError(
+                    "Detected legacy decoder key format in checkpoint state_dict. "
+                    "This hard-cut loader no longer supports legacy key remap. "
+                    "Please convert first: `python -m tools.convert_legacy_checkpoint ...`."
+                )
 
 
 def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
@@ -156,27 +176,11 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
 
 def _collect_e2e_module_specs(model: nn.Module):
     converted_modules: List[Dict[str, Any]] = []
-    adapter_modules: List[Dict[str, Any]] = []
     for ref in iter_named_vae_module_refs(model):
         converted_modules.append(_collect_single_vae_linear_spec(ref.name, ref.base_layer))
-        if isinstance(ref.adapter, LoRAVAELinear):
-            adapter_modules.append(
-                {
-                    "name": ref.name,
-                    "adapter_type": "vae_lora",
-                    "base_type": "VAELinear",
-                    "r": int(ref.adapter.rank),
-                    "alpha": float(ref.adapter.lora_alpha),
-                    "dropout": float(ref.adapter.lora_dropout_p),
-                    "target_layer": extract_layer_idx(ref.name),
-                    "train_mode_at_save": str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
-                }
-            )
-    adapter_modules.extend(
-        collect_peft_vae_proxy_adapter_specs(
-            model,
-            train_mode=str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
-        )
+    adapter_modules = collect_peft_vae_proxy_adapter_specs(
+        model,
+        train_mode=str(getattr(model, "_e2e_finetune_mode", _E2E_FINETUNE_MODE)),
     )
     return converted_modules, adapter_modules
 
@@ -396,21 +400,7 @@ def _rebuild_adapter_modules(
         adapter_type = str(spec.get("adapter_type"))
         if adapter_type in {"peft_proxy_lora", "peft_proxy_adalora"}:
             continue
-        if adapter_type == "vae_lora":
-            name = str(spec["name"])
-            module = _get_module_by_name(model, name)
-            ensure_lora_vae_linear(
-                model,
-                name,
-                module,
-                rank=int(spec["r"]),
-                alpha=float(spec["alpha"]),
-                dropout=float(spec.get("dropout", 0.0)),
-            )
-            continue
-        if adapter_type in {"linear_lora", "embedding_lora"}:
-            raise ValueError(f"Unsupported adapter_type for e2e_fintuning: {adapter_type}")
-        raise ValueError(f"Unsupported adapter_type: {spec.get('adapter_type')}")
+        raise ValueError(f"Unsupported adapter_type for e2e_common: {spec.get('adapter_type')}")
 
 
 def _infer_lora_tune_bias_from_adapter_specs(adapter_modules: Sequence[Dict[str, Any]]) -> bool:
@@ -472,11 +462,10 @@ def load_e2e_checkpoint_into_model(
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)
     state_dict = _torch_load_state_dict(state_dict_path, map_location=map_location)
+    _ensure_no_legacy_decoder_key_style(state_dict)
     if any(str(key).startswith("lm_head.post_norm_linear.") for key in state_dict.keys()):
         ensure_post_norm_head_linear(model)
     adalora_runtime_state = pop_peft_proxy_adalora_runtime_state_dict(state_dict)
-    model_state_keys = tuple(model.state_dict().keys())
-    state_dict, _remap_count = _remap_legacy_parallel_linear_state_dict_keys(state_dict, model_state_keys)
     _materialize_missing_bias_params_from_state_dict(model, state_dict)
     _materialize_missing_proxy_dense_base_from_model(model, state_dict)
 

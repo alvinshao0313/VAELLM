@@ -6,7 +6,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from transformers import HfArgumentParser
 
-from e2e_fintuning.data import normalize_dataset_mix_spec
+from e2e_common.data import normalize_dataset_mix_spec
 from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_like, _parse_lora_loss_type
 
 

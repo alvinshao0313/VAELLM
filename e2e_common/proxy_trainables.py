@@ -1,13 +1,20 @@
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Set
+from typing import Iterator, List, Optional, Sequence, Set
 
 from torch import nn
 
-from e2e_fintuning.lora import LoRAVAELinear, iter_named_vae_module_refs
-from e2e_fintuning.post_norm_head import resolve_post_norm_linear
-from e2e_fintuning.peft_proxy import PeftVAELinearProxy, ensure_peft_vae_linear_proxy
+from e2e_common.peft_proxy import PeftVAELinearProxy, ensure_peft_vae_linear_proxy
+from e2e_common.post_norm_head import resolve_post_norm_linear
+from litebsq.vae_linear import VAELinear
 from rotation.model_utils import get_model_type, get_pre_head_layernorm
 from train_utils.utils import extract_layer_idx
+
+
+@dataclass(frozen=True)
+class VAEModuleRef:
+    name: str
+    module: nn.Module
+    base_layer: VAELinear
 
 
 @dataclass
@@ -19,6 +26,28 @@ class TrainableSelection:
     frozen_cacheable_vae_modules: List[str]
     final_norm_modules: List[str]
     post_norm_head_modules: List[str]
+
+
+def iter_named_vae_module_refs(model: nn.Module) -> Iterator[VAEModuleRef]:
+    skip_prefixes: List[str] = []
+    for name, module in model.named_modules():
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in skip_prefixes):
+            continue
+        if isinstance(module, PeftVAELinearProxy):
+            skip_prefixes.append(f"{name}.base_layer")
+            skip_prefixes.append(f"{name}.per_decoded_linear")
+            yield VAEModuleRef(
+                name=str(name),
+                module=module,
+                base_layer=module.base_layer,
+            )
+            continue
+        if isinstance(module, VAELinear):
+            yield VAEModuleRef(
+                name=str(name),
+                module=module,
+                base_layer=module,
+            )
 
 
 def resolve_target_layer_ids(requested: Optional[Sequence[int]], num_layers: int) -> List[int]:
@@ -35,9 +64,6 @@ def resolve_target_layer_ids(requested: Optional[Sequence[int]], num_layers: int
 def _freeze_all(model: nn.Module) -> None:
     for param in model.parameters():
         param.requires_grad = False
-    for _name, module in model.named_modules():
-        if isinstance(module, LoRAVAELinear):
-            module.disable_adapter = not bool(getattr(module, "temporary", True))
     for ref in iter_named_vae_module_refs(model):
         ref.base_layer.cache_decoded_weight = not isinstance(ref.module, PeftVAELinearProxy)
         ref.base_layer.clear_decoded_weight_cache()

@@ -11,7 +11,6 @@ _HIF4_GPU_ROOT = os.path.join(_REPO_ROOT, "HiFloat4", "hif4_gpu")
 _HIF4_ACT_QUANTIZER: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 _VAE_LINEAR_TYPE = None
 _PEFT_LORA_LINEAR_TYPE = None
-_LORA_VAE_LINEAR_TYPE = None
 _PEFT_VAE_PROXY_TYPE = None
 _PEFT_PROXY_ADAPTER_PREDICATE = None
 
@@ -96,23 +95,11 @@ def _is_peft_lora_linear(module: nn.Module) -> bool:
     return peft_linear_type is not None and isinstance(module, peft_linear_type)
 
 
-def _get_lora_vae_linear_type():
-    global _LORA_VAE_LINEAR_TYPE
-    if _LORA_VAE_LINEAR_TYPE is None:
-        try:
-            from e2e_fintuning.lora import LoRAVAELinear
-        except Exception:
-            _LORA_VAE_LINEAR_TYPE = False
-        else:
-            _LORA_VAE_LINEAR_TYPE = LoRAVAELinear
-    return None if _LORA_VAE_LINEAR_TYPE is False else _LORA_VAE_LINEAR_TYPE
-
-
 def _get_peft_vae_proxy_type():
     global _PEFT_VAE_PROXY_TYPE
     if _PEFT_VAE_PROXY_TYPE is None:
         try:
-            from e2e_fintuning.peft_proxy import PeftVAELinearProxy
+            from e2e_common.peft_proxy import PeftVAELinearProxy
         except Exception:
             _PEFT_VAE_PROXY_TYPE = False
         else:
@@ -124,7 +111,7 @@ def _get_peft_proxy_adapter_predicate():
     global _PEFT_PROXY_ADAPTER_PREDICATE
     if _PEFT_PROXY_ADAPTER_PREDICATE is None:
         try:
-            from e2e_fintuning.peft_proxy import is_peft_proxy_adapter_linear
+            from e2e_common.peft_proxy import is_peft_proxy_adapter_linear
         except Exception:
             _PEFT_PROXY_ADAPTER_PREDICATE = False
         else:
@@ -140,9 +127,6 @@ def _is_peft_proxy_adapter_linear(module: nn.Module) -> bool:
 def _is_hif4_wrapped_module(module: nn.Module) -> bool:
     vae_linear_type = _get_vae_linear_type()
     if vae_linear_type is not None and isinstance(module, vae_linear_type):
-        return True
-    lora_vae_linear_type = _get_lora_vae_linear_type()
-    if lora_vae_linear_type is not None and isinstance(module, lora_vae_linear_type):
         return True
     peft_vae_proxy_type = _get_peft_vae_proxy_type()
     if peft_vae_proxy_type is not None and isinstance(module, peft_vae_proxy_type):
