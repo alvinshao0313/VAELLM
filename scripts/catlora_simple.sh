@@ -43,7 +43,7 @@ python tools/cat_train.py \
   --transpose_modules "v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
-  --linear_group_size "32" \
+  --linear_group_size "35" \
   --steps_per_category "default=20" \
   --joint_decoder_steps "default=0" \
   --joint_decoder_lr "default=1e-2" \
