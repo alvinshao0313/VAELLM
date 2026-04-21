@@ -46,6 +46,20 @@ export PYTHONPATH=.
   - 四卡 RedPajama SFT
   - `save_strategy steps`
   - `unload_vae_original_weights_on_save false`
+- `e2e_fintuning/scripts/e2e_lora_mix.sh`
+  - 单卡 mixed-dataset 蒸馏基线
+  - 默认混合池：`openorca=0.45,fineweb_edu=0.30,race=0.15,sciq=0.07,alpaca=0.03`
+  - 通过 `--dataset_mix` 一次训练完成单次混合采样
+- `raw_e2e_fintuning/scripts/e2e_raw_lora.sh`
+  - 原模型（非 VAE）LoRA 基线
+  - 入口参数是 `--student_model_path`，不接受 `--student_checkpoint_dir`
+  - LoRA/AdaLoRA 参数名用 `--lora_*`、`--adalora_*`，不再使用 `--vae_*`
+  - 最终保存为 HF/PEFT 目录：`final_adapter/`、`run_meta.json`
+- `raw_e2e_fintuning/scripts/e2e_raw_lora_mix.sh`
+  - 原模型（非 VAE）mixed-dataset LoRA 基线
+  - 默认混合池：`openorca=0.45,fineweb_edu=0.30,race=0.15,sciq=0.07,alpaca=0.03`
+  - LoRA/AdaLoRA 参数名用 `--lora_*`、`--adalora_*`，不再使用 `--vae_*`
+  - 同样保存为 HF/PEFT 格式
 - `e2e_fintuning/scripts/export_final_model.sh`
   - 从中间 `checkpoint-*` 目录重新导出最终模型
 - `e2e_fintuning/scripts/convert_legacy_checkpoint.sh`
@@ -73,6 +87,15 @@ bash e2e_fintuning/scripts/e2e_lora.sh
 bash e2e_fintuning/scripts/e2e_lora_openorca.sh
 bash e2e_fintuning/scripts/e2e_lora_fineweb_edu.sh
 bash e2e_fintuning/scripts/e2e_lora_redpajama.sh
+bash e2e_fintuning/scripts/e2e_lora_mix.sh
+```
+
+如果你要直接训练原始模型（不经过 VAE 压缩）：
+
+```bash
+bash raw_e2e_fintuning/scripts/e2e_raw_lora.sh
+# 或
+bash raw_e2e_fintuning/scripts/e2e_raw_lora_mix.sh
 ```
 
 3. 最后评估：
@@ -89,6 +112,14 @@ bash scripts/eval.sh
   - `scripts/lbl_train_tools.sh`
   - `scripts/train_linear_by_category.sh`
 - `cat_train -> e2e_fintuning -> cat_eval` 是当前推荐链路。
+- 单源 e2e 脚本继续保留，适合做对照或单数据集实验。
+- `e2e_lora_mix.sh` 走新的 `--dataset_mix` 入口，会对每个 source 分别做 pack，再按权重 interleave 成一个训练集。
+- 旧轨（`e2e_fintuning/`）和新轨（`raw_e2e_fintuning/`）完全分开：
+  - 旧轨输入：`--student_checkpoint_dir`（VAE checkpoint）
+  - 旧轨输出：紧凑 checkpoint（含 `checkpoint_meta.json`）
+  - 新轨输入：`--student_model_path`（原始 HF 模型）
+  - 新轨输出：HF/PEFT（`final_adapter/` + `run_meta.json`，可选 `final_merged_model/`）
+  - 两条轨的 checkpoint 格式不兼容，不能互相 resume。
 - `tools/cat_eval.py`、`tools/collect_activation_absmax.py`、激活统计相关工具现在要求设备配置和实际硬件一致；请求 CUDA 但机器没有 CUDA 时会直接报错，不再静默回退到 CPU。
 
 ## License

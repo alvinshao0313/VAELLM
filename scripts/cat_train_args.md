@@ -158,7 +158,7 @@
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
 | `--outlier_residual_value_bits` | `8` | `blocked_quantized` 的残差 value 位宽 | `8` / `4` |
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
-| `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用；支持 `wiki / wikitext2 / fineweb_edu / openorca / redpajama / alpaca`，其中 `wikitext2` 是 `wiki` 别名 |
 | `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |

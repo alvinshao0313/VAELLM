@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from train_utils.data_utils import get_wikitext2
+from train_utils.lora_data import build_calibration_input_ids, normalize_text_dataset_name
 
 
 @dataclass
@@ -27,9 +27,7 @@ def _build_calibration_cache(
     seqlen: int,
     seed: int,
 ) -> ActivationCalibrationCache:
-    dataset_key = str(dataset).strip().lower()
-    if dataset_key != "wikitext2":
-        raise ValueError(f"Unsupported calibration dataset: {dataset}. Only wikitext2 is supported now.")
+    dataset_key = normalize_text_dataset_name(dataset, arg_name="--wa_mse_calib_dataset")
 
     from transformers import AutoTokenizer
 
@@ -39,15 +37,13 @@ def _build_calibration_cache(
         trust_remote_code=True,
         token=access_token,
     )
-    calib_data = get_wikitext2(
-        nsamples=int(nsamples),
-        seed=int(seed),
-        seqlen=int(seqlen),
-        model=model_path,
+    input_ids = build_calibration_input_ids(
+        dataset_name=dataset_key,
         tokenizer=tokenizer,
-        eval_mode=False,
+        nsamples=int(nsamples),
+        seqlen=int(seqlen),
+        seed=int(seed),
     )
-    input_ids = [inp.contiguous().cpu() for inp, _ in calib_data]
     return ActivationCalibrationCache(
         dataset=dataset_key,
         model_path=str(model_path),
@@ -68,7 +64,7 @@ def _cache_matches(
     seed: int,
 ) -> bool:
     return (
-        str(cache.dataset) == str(dataset).strip().lower()
+        str(cache.dataset) == normalize_text_dataset_name(dataset, arg_name="--wa_mse_calib_dataset")
         and str(cache.model_path) == str(model_path)
         and int(cache.nsamples) == int(nsamples)
         and int(cache.seqlen) == int(seqlen)

@@ -14,6 +14,7 @@ from litebsq.sparse_residual import (
     validate_sparse_residual_block_shape,
 )
 from train_utils.cat_data_prep import normalize_intra_part_sort_mode
+from train_utils.lora_data import normalize_text_dataset_name
 from train_utils.cat_arg_overrides import (
     OverrideSpec,
     OverrideTable,
@@ -180,15 +181,6 @@ _OUTLIER_RESIDUAL_SCORE_CHOICES = (
     "original_weight_abs",
     "input_act_weighted_original_weight_abs",
 )
-_LORA_DATASET_ALIASES = {
-    "wiki": "wiki",
-    "wikitext2": "wiki",
-    "fineweb_edu": "fineweb_edu",
-    "openorca": "openorca",
-    "redpajama": "redpajama",
-    "alpaca": "alpaca",
-}
-
 def parse_skip_layers(value: Optional[str]) -> Set[Tuple[int, str]]:
     entries = split_csv(None if value is None else str(value))
     out: Set[Tuple[int, str]] = set()
@@ -226,12 +218,17 @@ def _parse_nonnegative_float_text(raw: str, *, arg_name: str) -> float:
 
 
 def _parse_lora_dataset_text(raw: str, *, arg_name: str) -> str:
-    value = str(raw).strip().lower()
-    if value not in _LORA_DATASET_ALIASES:
-        raise argparse.ArgumentTypeError(
-            f"{arg_name} must be one of: {', '.join(_LORA_DATASET_ALIASES.keys())}. Got {raw!r}."
-        )
-    return str(_LORA_DATASET_ALIASES[value])
+    try:
+        return normalize_text_dataset_name(raw, arg_name=arg_name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _parse_wa_mse_calib_dataset_text(raw: str, *, arg_name: str) -> str:
+    try:
+        return normalize_text_dataset_name(raw, arg_name=arg_name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _make_override_spec(
@@ -570,7 +567,10 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_residual_value_bits=int(raw_args.outlier_residual_value_bits),
         outlier_residual_block_shape=tuple(int(v) for v in resolved_block_shape),
         outlier_protect_axis=str(raw_args.outlier_protect_axis).strip().lower(),
-        wa_mse_calib_dataset=str(raw_args.wa_mse_calib_dataset),
+        wa_mse_calib_dataset=_parse_wa_mse_calib_dataset_text(
+            raw_args.wa_mse_calib_dataset,
+            arg_name="--wa_mse_calib_dataset",
+        ),
         wa_mse_calib_nsamples=int(raw_args.wa_mse_calib_nsamples),
         wa_mse_calib_seqlen=int(raw_args.wa_mse_calib_seqlen),
         wa_mse_calib_seed=int(raw_args.wa_mse_calib_seed),
@@ -890,7 +890,13 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="仅 blocked_quantized 生效。残差 value 量化位宽：4 或 8。",
     )
     parser.add_argument("--outlier_protect_axis", type=str, choices=["input", "output"], default="input", help="Choose whether outlier protection preserves input channels or output channels.")
-    parser.add_argument("--wa_mse_calib_dataset", type=str, default="wikitext2", help="Calibration dataset used for wa_mse dynamic act-max recomputation.")
+    parser.add_argument(
+        "--wa_mse_calib_dataset",
+        type=lambda raw: _parse_wa_mse_calib_dataset_text(raw, arg_name="--wa_mse_calib_dataset"),
+        default="wikitext2",
+        help="Calibration dataset used for wa_mse dynamic act-max recomputation. "
+        "Supported: wiki/wikitext2, fineweb_edu, openorca, redpajama, alpaca.",
+    )
     parser.add_argument("--wa_mse_calib_nsamples", type=int, default=512, help="Calibration sample count used for wa_mse dynamic act-max recomputation.")
     parser.add_argument("--wa_mse_calib_seqlen", type=int, default=512, help="Calibration sequence length used for wa_mse dynamic act-max recomputation.")
     parser.add_argument("--wa_mse_calib_seed", type=int, default=0, help="Calibration sampling seed used for wa_mse dynamic act-max recomputation.")

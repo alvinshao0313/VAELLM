@@ -1,5 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
+import torch
 
 try:
     from datasets import Dataset, DatasetDict, load_dataset
@@ -56,10 +58,48 @@ LORA_DATASET_SPECS = {
     ),
 }
 
+TEXT_DATASET_ALIASES = {
+    "wiki": "wiki",
+    "wikitext2": "wiki",
+    "fineweb_edu": "fineweb_edu",
+    "openorca": "openorca",
+    "redpajama": "redpajama",
+    "alpaca": "alpaca",
+}
+
 
 def ensure_lora_dataset_stack_available() -> None:
     if load_dataset is None or DatasetDict is None:
         raise ImportError("未安装 datasets。请先安装：pip install datasets")
+
+
+def normalize_text_dataset_name(dataset_name: str, *, arg_name: str) -> str:
+    dataset_key = str(dataset_name).strip().lower()
+    canonical = TEXT_DATASET_ALIASES.get(dataset_key)
+    if canonical is None:
+        raise ValueError(
+            f"{arg_name} must be one of: {', '.join(TEXT_DATASET_ALIASES.keys())}. "
+            f"Got {dataset_name!r}."
+        )
+    return str(canonical)
+
+
+def _resolve_dataset_spec(dataset_name: str, *, arg_name: str) -> Tuple[str, LoraDatasetSpec]:
+    dataset_key = normalize_text_dataset_name(dataset_name, arg_name=arg_name)
+    spec = LORA_DATASET_SPECS.get(dataset_key)
+    if spec is None:
+        raise ValueError(f"No dataset spec found for {arg_name}={dataset_name!r}.")
+    return dataset_key, spec
+
+
+def _load_dataset_dict(spec: LoraDatasetSpec):
+    load_kwargs = {"path": str(spec.path)}
+    if spec.config is not None:
+        load_kwargs["name"] = str(spec.config)
+    dataset_dict = load_dataset(**load_kwargs)
+    if not isinstance(dataset_dict, DatasetDict):
+        raise TypeError(f"Expected DatasetDict from load_dataset, got {type(dataset_dict)}")
+    return dataset_dict
 
 
 def _get_nonempty_record_text(record: dict, field_name: str) -> Optional[str]:
@@ -117,6 +157,61 @@ def _prepare_text_dataset(dataset, *, text_format: str):
     return dataset
 
 
+def build_calibration_input_ids(
+    dataset_name: str,
+    *,
+    tokenizer,
+    nsamples: int,
+    seqlen: int,
+    seed: int,
+) -> List[torch.Tensor]:
+    ensure_lora_dataset_stack_available()
+    target_blocks = int(nsamples)
+    block_size = int(seqlen)
+    if target_blocks < 0:
+        raise ValueError(f"--wa_mse_calib_nsamples must be >= 0, got {target_blocks}.")
+    if block_size <= 0:
+        raise ValueError(f"--wa_mse_calib_seqlen must be > 0, got {block_size}.")
+    if target_blocks == 0:
+        return []
+
+    dataset_key, spec = _resolve_dataset_spec(dataset_name, arg_name="--wa_mse_calib_dataset")
+    dataset_dict = _load_dataset_dict(spec)
+    if spec.train_split not in dataset_dict:
+        raise ValueError(f"Calibration dataset {dataset_key} is missing train split '{spec.train_split}'.")
+
+    train_ds = dataset_dict[spec.train_split].shuffle(seed=int(seed))
+    blocks: List[torch.Tensor] = []
+    token_buffer: List[int] = []
+
+    for record in train_ds:
+        text = _record_to_text(record, text_format=str(spec.text_format))
+        if text is None or len(text) == 0:
+            continue
+        encoded = tokenizer(
+            text + "\n\n",
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        input_ids = encoded.get("input_ids")
+        if input_ids is None:
+            raise ValueError(f"Tokenizer output for calibration dataset {dataset_key} is missing input_ids.")
+        token_buffer.extend(int(token) for token in input_ids)
+        while len(token_buffer) >= block_size and len(blocks) < target_blocks:
+            blocks.append(torch.tensor(token_buffer[:block_size], dtype=torch.long).unsqueeze(0))
+            del token_buffer[:block_size]
+        if len(blocks) >= target_blocks:
+            break
+
+    if len(blocks) != target_blocks:
+        raise ValueError(
+            f"Calibration dataset {dataset_key} does not contain enough tokens to build "
+            f"{target_blocks} blocks of length {block_size}. Built only {len(blocks)} blocks."
+        )
+    return blocks
+
+
 def prepare_lora_datasets(
     dataset_name: str,
     *,
@@ -125,20 +220,8 @@ def prepare_lora_datasets(
 ):
     ensure_lora_dataset_stack_available()
 
-    dataset_key = str(dataset_name).strip().lower()
-    spec = LORA_DATASET_SPECS.get(dataset_key)
-    if spec is None:
-        raise ValueError(
-            "Unsupported --lora_dataset: "
-            f"{dataset_name}. Supported values: {', '.join(LORA_DATASET_SPECS.keys())}."
-        )
-
-    load_kwargs = {"path": str(spec.path)}
-    if spec.config is not None:
-        load_kwargs["name"] = str(spec.config)
-    dataset_dict = load_dataset(**load_kwargs)
-    if not isinstance(dataset_dict, DatasetDict):
-        raise TypeError(f"Expected DatasetDict from load_dataset, got {type(dataset_dict)}")
+    dataset_key, spec = _resolve_dataset_spec(dataset_name, arg_name="--lora_dataset")
+    dataset_dict = _load_dataset_dict(spec)
 
     if spec.train_split not in dataset_dict:
         raise ValueError(f"LoRA dataset {dataset_key} is missing train split '{spec.train_split}'.")

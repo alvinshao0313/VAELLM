@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import math
 import os
 from typing import Dict, Optional, Tuple
 
@@ -168,6 +169,40 @@ def _validate_resume_checkpoint_config(*, args, meta, decoder_layer_ids, trainin
     if str(extra_meta.get("stage", "")).strip().lower() != "e2e_fintuning":
         raise ValueError("resume checkpoint 缺少有效的 e2e_fintuning stage 元信息。")
 
+    current_dataset_mode = "mix" if getattr(args, "dataset_mix_spec", None) else "single"
+    saved_dataset_mode = extra_meta.get("dataset_mode")
+    if saved_dataset_mode is not None and str(saved_dataset_mode).strip().lower() != current_dataset_mode:
+        raise ValueError(
+            f"resume checkpoint 的 dataset_mode={saved_dataset_mode} 与当前参数 {current_dataset_mode} 不一致。"
+        )
+    if current_dataset_mode == "mix":
+        if str(saved_dataset_mode or "").strip().lower() != "mix":
+            raise ValueError("resume checkpoint 缺少有效的 mixed dataset 配置元信息。")
+        saved_mix_spec = extra_meta.get("dataset_mix_spec")
+        if saved_mix_spec is None or str(saved_mix_spec).strip() != str(args.dataset_mix_spec):
+            raise ValueError("resume checkpoint 的 dataset_mix_spec 与当前参数不一致。")
+        saved_mix_sources = extra_meta.get("dataset_mix_sources")
+        current_mix_sources = list(getattr(args, "dataset_mix_sources", []) or [])
+        if list(saved_mix_sources or []) != current_mix_sources:
+            raise ValueError(
+                f"resume checkpoint 的 dataset_mix_sources={saved_mix_sources} 与当前参数 {current_mix_sources} 不一致。"
+            )
+        saved_mix_weights = extra_meta.get("dataset_mix_weights")
+        current_mix_weights = list(getattr(args, "dataset_mix_weights", []) or [])
+        if not isinstance(saved_mix_weights, list) or len(saved_mix_weights) != len(current_mix_weights):
+            raise ValueError("resume checkpoint 的 dataset_mix_weights 与当前参数不一致。")
+        for idx, (saved_weight, current_weight) in enumerate(zip(saved_mix_weights, current_mix_weights)):
+            if not math.isclose(float(saved_weight), float(current_weight), rel_tol=1e-9, abs_tol=1e-9):
+                raise ValueError(
+                    f"resume checkpoint 的 dataset_mix_weights[{idx}]={saved_weight} 与当前参数 {current_weight} 不一致。"
+                )
+        saved_block_size = extra_meta.get("dataset_mix_block_size")
+        if saved_block_size is not None and int(saved_block_size) != int(getattr(training_args, "model_max_length", 0)):
+            raise ValueError(
+                f"resume checkpoint 的 dataset_mix_block_size={saved_block_size} "
+                f"与当前 TrainingArguments.model_max_length={getattr(training_args, 'model_max_length', 0)} 不一致。"
+            )
+
     expected_layers = extra_meta.get("target_decoder_layers")
     if expected_layers is not None:
         expected_layers = [int(idx) for idx in expected_layers]
@@ -320,6 +355,7 @@ def _build_checkpoint_extra_meta(
     saved_variant: str,
     saved_init_mode: Optional[str],
     training_args,
+    data_info: Dict[str, object],
 ) -> Dict[str, object]:
     use_rslora, use_dora = _variant_flags(saved_variant)
     extra_meta: Dict[str, object] = {
@@ -343,7 +379,18 @@ def _build_checkpoint_extra_meta(
         "vae_lora_use_dora": bool(use_dora),
         "tune_final_norm": bool(args.tune_final_norm),
         "use_post_norm_head_linear": bool(args.use_post_norm_head_linear),
+        "dataset_mode": str(data_info.get("dataset_mode", "single")),
     }
+    if str(data_info.get("dataset_mode", "single")) == "mix":
+        extra_meta.update(
+            {
+                "dataset_mix_spec": str(data_info["dataset_mix_spec"]),
+                "dataset_mix_weights": [float(weight) for weight in data_info["dataset_mix_weights"]],
+                "dataset_mix_sources": list(data_info["dataset_mix_sources"]),
+                "dataset_mix_target_examples": int(data_info["dataset_mix_target_examples"]),
+                "dataset_mix_block_size": int(data_info["block_size"]),
+            }
+        )
     if saved_init_mode is not None:
         extra_meta["vae_lora_init_mode"] = str(saved_init_mode)
     if str(saved_variant) == "adalora":
@@ -622,6 +669,25 @@ def run(args, hf_args, training_args):
         "none" if eval_dataset is None else str(len(eval_dataset)),
         int(data_info["block_size"]),
     )
+    if str(data_info.get("dataset_mode", "single")) == "mix":
+        log.info(
+            "Mixed dataset config: spec=%s target_examples=%d required_examples=%d",
+            str(data_info["dataset_mix_spec"]),
+            int(data_info["dataset_mix_target_examples"]),
+            int(data_info["required_train_examples"]),
+        )
+        for source_stat in data_info.get("source_stats", []):
+            log.info(
+                "Mixed dataset source: alias=%s weight=%.6f raw_rows=%d text_rows=%d packed_rows=%d target_rows=%d repeat_factor=%.4f eval_packed_rows=%d",
+                str(source_stat["alias"]),
+                float(source_stat["weight"]),
+                int(source_stat["raw_rows"]),
+                int(source_stat["text_rows"]),
+                int(source_stat["packed_rows"]),
+                int(source_stat["target_rows"]),
+                float(source_stat["repeat_factor"]),
+                int(source_stat.get("eval_packed_rows", 0)),
+            )
 
     log.info("Teacher source: %s", teacher_source)
 
@@ -669,6 +735,7 @@ def run(args, hf_args, training_args):
         saved_variant=saved_variant,
         saved_init_mode=saved_init_mode,
         training_args=training_args,
+        data_info=data_info,
     )
     trainer._e2e_base_model_path = str(base_model_path)
     trainer._e2e_checkpoint_extra_meta = checkpoint_extra_meta

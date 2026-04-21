@@ -24,6 +24,7 @@ export CUDA_VISIBLE_DEVICES=1
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
+# --wa_mse_calib_dataset "wikitext2"  # 支持 wiki/wikitext2/fineweb_edu/openorca/redpajama/alpaca
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,piqa"       # 可选：类别后下游任务评估；空串表示不跑
 # --lora_after_category \
@@ -35,7 +36,6 @@ python tools/cat_train.py \
   --train_device "cuda" \
   --convert \
   --convert_device "cuda" \
-  --save_model \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
   --category_order "down_proj" \
@@ -51,7 +51,7 @@ python tools/cat_train.py \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
-  --eval_ppl "false" \
+  --eval_ppl "true" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
@@ -68,7 +68,7 @@ python tools/cat_train.py \
   --outlier_residual_value_bits "8" \
   --wa_mse_calib_dataset "wikitext2" \
   --wa_mse_calib_nsamples "512" \
-  --wa_mse_calib_seqlen "512" \
+  --wa_mse_calib_seqlen "4096" \
   --wa_mse_calib_seed "0" \
   --wa_mse_calib_device "" \
   --wa_mse_calib_log_every "0" \
@@ -81,7 +81,7 @@ python tools/cat_train.py \
   --decoder_num_res_blocks "default=1" \
   --norm_type "default=layer" \
   --decoder_type "default=symmetric" \
-  --recon_loss_type "default=wa_mse" \
+  --recon_loss_type "default=mse" \
   --quantizer_type "BSQ" \
   --gamma0 "1.0" \
   --gamma "1.0" \
@@ -102,7 +102,7 @@ python tools/cat_train.py \
   --normalize_weight \
   --use_checkpoint \
   --new_quant \
-  --lora_after_category \
+  --lora_dataset "wiki" \
   --lora_rank "default=32" \
   --lora_alpha "default=64.0" \
   --lora_dropout "default=0.0" \
