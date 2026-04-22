@@ -33,7 +33,7 @@ if [[ -n "${ADAPTER_DIR}" ]]; then
     --prewarm_group_size "8" \
     --ppl_seqlen "2048" \
     --ppl_limit "-1" \
-    --eval_hif4_act "true" \
+    --eval_hif4_act "false" \
     --eval_log_dir "./eval_log" \
     "$@"
 else
@@ -48,7 +48,7 @@ else
     --prewarm_group_size "8" \
     --ppl_seqlen "2048" \
     --ppl_limit "-1" \
-    --eval_hif4_act "true" \
+    --eval_hif4_act "false" \
     --eval_log_dir "./eval_log" \
     "$@"
 fi

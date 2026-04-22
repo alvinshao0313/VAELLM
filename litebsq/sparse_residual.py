@@ -168,8 +168,11 @@ def encode_blocked_quantized_sparse_residual(
 
     qmax = (1 << value_bits) - 1
     qvalue_chunks = []
-    scales = torch.empty(active_block_count, dtype=torch.float16)
-    zero_points = torch.empty(active_block_count, dtype=torch.float16)
+    # TODO: Revisit the blocked quantization formula itself. We keep per-block
+    # stats in fp32 for now because the current affine zero_point can overflow
+    # in fp16 when the residual range is narrow but far from zero.
+    scales = torch.empty(active_block_count, dtype=torch.float32)
+    zero_points = torch.empty(active_block_count, dtype=torch.float32)
     start = 0
     for block_idx in range(active_block_count):
         count = int(counts[block_idx].item())
@@ -186,8 +189,8 @@ def encode_blocked_quantized_sparse_residual(
         zero_point = -float(vmin) / float(scale)
         q = torch.round(block_values / float(scale) + float(zero_point)).clamp_(0.0, float(qmax)).to(dtype=torch.uint8)
         qvalue_chunks.append(q)
-        scales[block_idx] = torch.tensor(scale, dtype=torch.float16)
-        zero_points[block_idx] = torch.tensor(zero_point, dtype=torch.float16)
+        scales[block_idx] = torch.tensor(scale, dtype=torch.float32)
+        zero_points[block_idx] = torch.tensor(zero_point, dtype=torch.float32)
         start = end
     if start != nnz:
         raise RuntimeError(f"Blocked sparse residual block count mismatch: consumed={start}, nnz={nnz}.")
@@ -244,16 +247,16 @@ def decode_blocked_quantized_sparse_residual(
     ptr = block_ptr.detach().reshape(-1).contiguous()
     local = local_indices.detach().reshape(-1).contiguous()
     qpacked = qvalues.detach().reshape(-1).contiguous()
-    scale_fp16 = scales.detach().reshape(-1).contiguous()
-    zero_fp16 = zero_points.detach().reshape(-1).contiguous()
+    scale_values = scales.detach().reshape(-1).contiguous()
+    zero_values = zero_points.detach().reshape(-1).contiguous()
 
     active_block_count = int(active_blocks.numel())
     if int(ptr.numel()) != active_block_count + 1:
         raise ValueError(f"block_ptr length mismatch: got {int(ptr.numel())}, expected {active_block_count + 1}.")
-    if int(scale_fp16.numel()) != active_block_count or int(zero_fp16.numel()) != active_block_count:
+    if int(scale_values.numel()) != active_block_count or int(zero_values.numel()) != active_block_count:
         raise ValueError(
             f"Per-block quant stats length mismatch: active_blocks={active_block_count} "
-            f"scales={int(scale_fp16.numel())} zero_points={int(zero_fp16.numel())}."
+            f"scales={int(scale_values.numel())} zero_points={int(zero_values.numel())}."
     )
     if active_block_count == 0:
         empty_idx = torch.zeros(0, dtype=torch.int64, device=target_device)
@@ -273,8 +276,8 @@ def decode_blocked_quantized_sparse_residual(
     ptr_i64 = ptr_i64.to(device=target_device, dtype=torch.int64, non_blocking=True)
     local = local.to(device=target_device, dtype=torch.uint8, non_blocking=True)
     qpacked = qpacked.to(device=target_device, dtype=torch.uint8, non_blocking=True)
-    scale_fp16 = scale_fp16.to(device=target_device, dtype=torch.float16, non_blocking=True)
-    zero_fp16 = zero_fp16.to(device=target_device, dtype=torch.float16, non_blocking=True)
+    scale_values = scale_values.to(device=target_device, dtype=torch.float32, non_blocking=True)
+    zero_values = zero_values.to(device=target_device, dtype=torch.float32, non_blocking=True)
 
     if index_bits == 8:
         expected_local_len = nnz * 2
@@ -335,8 +338,8 @@ def decode_blocked_quantized_sparse_residual(
                 f"[{int(col_idx.min().item())}, {int(col_idx.max().item())}] vs in_features={int(in_features)}."
             )
 
-    expanded_scales = torch.repeat_interleave(scale_fp16.to(dtype=torch.float32), counts)
-    expanded_zero = torch.repeat_interleave(zero_fp16.to(dtype=torch.float32), counts)
+    expanded_scales = torch.repeat_interleave(scale_values, counts)
+    expanded_zero = torch.repeat_interleave(zero_values, counts)
     values = expanded_scales * (q.to(dtype=torch.float32) - expanded_zero)
 
     return (

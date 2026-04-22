@@ -39,8 +39,8 @@ python tools/cat_train.py \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --category_order "k_proj,v_proj,q_proj,o_proj,gate_proj,up_proj,down_proj" \
-  --transpose_modules "v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --category_order "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
@@ -52,7 +52,7 @@ python tools/cat_train.py \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
-  --eval_ppl "false" \
+  --eval_ppl "true" \
   --eval_tasks "" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
@@ -63,7 +63,7 @@ python tools/cat_train.py \
   --outlier_protect_mode "residual_sparse" \
   --outlier_residual_top_p "default=0.01" \
   --outlier_residual_score "input_act_weighted_abs" \
-  --outlier_residual_min_abs "1e-8" \
+  --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
@@ -103,6 +103,7 @@ python tools/cat_train.py \
   --normalize_weight \
   --use_checkpoint \
   --new_quant \
+  --lora_after_category \
   --lora_dataset "wiki" \
   --lora_rank "default=12" \
   --lora_alpha "default=24.0" \
