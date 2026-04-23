@@ -45,6 +45,29 @@ def _build_run_output_dir(root_output_dir: str, model_path: str) -> str:
     return run_dir
 
 
+def _build_distributed_run_output_dir(root_output_dir: str, model_path: str) -> str:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1:
+            raise RuntimeError(
+                "Distributed run output dir creation requires torch.distributed to be initialized."
+            )
+        return _build_run_output_dir(root_output_dir, model_path)
+
+    if int(torch.distributed.get_world_size()) <= 1:
+        return _build_run_output_dir(root_output_dir, model_path)
+
+    payload = [None]
+    if int(torch.distributed.get_rank()) == 0:
+        payload[0] = _build_run_output_dir(root_output_dir, model_path)
+    torch.distributed.broadcast_object_list(payload, src=0)
+    run_dir = payload[0]
+    if not isinstance(run_dir, str) or not run_dir:
+        raise RuntimeError(f"Invalid distributed run output dir broadcast payload: {run_dir!r}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
 def resolve_checkpoint_dir(path: str) -> str:
     abs_path = os.path.abspath(path)
     if os.path.isfile(abs_path):

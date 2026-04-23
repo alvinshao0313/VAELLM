@@ -25,7 +25,7 @@ from train_utils.hif4_act import (
     register_hif4_act_hooks,
     remove_hif4_act_hooks,
 )
-from train_utils.model_checkpoint_io import _build_run_output_dir
+from train_utils.model_checkpoint_io import _build_distributed_run_output_dir
 from train_utils.utils import get_logger, pt_fsdp_state_dict
 
 
@@ -134,7 +134,7 @@ def _build_datasets_with_main_process_first(args, training_args, tokenizer, log)
 
 
 def run(args, hf_args, training_args):
-    run_output_dir = _build_run_output_dir(args.run_root_dir, args.student_model_path)
+    run_output_dir = _build_distributed_run_output_dir(args.run_root_dir, args.student_model_path)
     os.environ["LOG_FILE"] = os.path.join(run_output_dir, "e2e_raw_fintuning.log")
     log = get_logger("e2e_raw_fintuning")
     resume_from_checkpoint = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()

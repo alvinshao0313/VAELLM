@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
@@ -16,7 +17,12 @@ from litebsq.bitpack import (
 )
 from litebsq.vae_linear import VAELinear
 from tools.convert_cat_checkpoint_to_bitpack import convert_checkpoint
-from train_utils.model_checkpoint_io import _decoder_to_spec, load_checkpoint_into_model, save_model_checkpoint
+from train_utils.model_checkpoint_io import (
+    _build_distributed_run_output_dir,
+    _decoder_to_spec,
+    load_checkpoint_into_model,
+    save_model_checkpoint,
+)
 
 
 class _DummyDecoderModel(nn.Module):
@@ -101,6 +107,32 @@ class LegacyCheckpointRemapTest(unittest.TestCase):
         self.assertIn("decoder.linear_in.linear.weight", remapped)
         self.assertIn("decoder.linear_in.linear.bias", remapped)
         self.assertEqual(set(remapped.keys()), set(new_style_state.keys()))
+
+
+class DistributedRunOutputDirTest(unittest.TestCase):
+    def test_nonzero_rank_uses_broadcast_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared_run_dir = os.path.join(tmpdir, "shared_run")
+            os.makedirs(shared_run_dir)
+
+            def _broadcast(payload, src):
+                self.assertEqual(src, 0)
+                payload[0] = shared_run_dir
+
+            with mock.patch("train_utils.model_checkpoint_io.torch.distributed.is_available", return_value=True), mock.patch(
+                "train_utils.model_checkpoint_io.torch.distributed.is_initialized", return_value=True
+            ), mock.patch(
+                "train_utils.model_checkpoint_io.torch.distributed.get_world_size", return_value=2
+            ), mock.patch(
+                "train_utils.model_checkpoint_io.torch.distributed.get_rank", return_value=1
+            ), mock.patch(
+                "train_utils.model_checkpoint_io.torch.distributed.broadcast_object_list", side_effect=_broadcast
+            ), mock.patch(
+                "train_utils.model_checkpoint_io._build_run_output_dir", side_effect=AssertionError("rank1 must not create run dir")
+            ):
+                got = _build_distributed_run_output_dir(tmpdir, "model")
+
+        self.assertEqual(got, shared_run_dir)
 
 
 class BitpackUtilityTest(unittest.TestCase):

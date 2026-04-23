@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 MAX_STEPS="${MAX_STEPS:-20000}"
 STUDENT_CKPT="${STUDENT_CKPT:-.result/meta-llama_Llama-3.1-8B_20260421_113551/final_model}"
+RUN_ROOT_DIR="${RUN_ROOT_DIR:-.result/dense_e2e_fintuning_alpaca}"
+DATASET_MIX="${DATASET_MIX:-alpaca=1.0}"
+DATASET_NUM_PROC="${DATASET_NUM_PROC:-8}"
+DECODE_DEVICE="${DECODE_DEVICE:-auto}"
+DECODE_GROUP_SIZE="${DECODE_GROUP_SIZE:-8}"
 
 if [[ "${DISABLE_PROXY:-1}" == "1" ]]; then
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
@@ -11,17 +17,19 @@ if [[ "${DISABLE_PROXY:-1}" == "1" ]]; then
 fi
 
 # 说明：
-# - 压缩 checkpoint -> dense 重建 -> 标准 PEFT 训练 -> 回写压缩 checkpoint。
-# - 不依赖 raw_e2e_fintuning。
-# - 冒烟建议：MAX_STEPS=30 bash dense_e2e_fintuning/scripts/e2e_dense_lora_mix.sh
-#   --dataset_mix "openorca=0.33,fineweb_edu=0.30,race=0.20,sciq=0.06,alpaca=0.02,longalpaca=0.05,longalign=0.04" \
+# - 压缩 checkpoint -> dense 重建 -> 标准 PEFT 训练。
+# - 多卡时 `decode_device=auto` 会按当前 rank 的可见设备选卡，不再全部挤到 0 卡。
+# - 数据预处理支持 `DATASET_NUM_PROC`，并且只让主进程先写 datasets cache，其余 rank 复用。
+# - `--eval_strategy no` 时会直接跳过 eval 数据预处理。
+# - 冒烟建议：MAX_STEPS=30 NPROC_PER_NODE=1 DATASET_NUM_PROC=1 bash dense_e2e_fintuning/scripts/e2e_dense_lora.sh
 
-torchrun --standalone --nproc_per_node=1 -m dense_e2e_fintuning.main \
+torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" -m dense_e2e_fintuning.main \
   --gradient_checkpointing true \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --student_checkpoint_dir "${STUDENT_CKPT}" \
-  --run_root_dir .result/dense_e2e_fintuning_alpaca \
-  --dataset_mix "alpaca=1.0" \
+  --run_root_dir "${RUN_ROOT_DIR}" \
+  --dataset_mix "${DATASET_MIX}" \
+  --dataset_num_proc "${DATASET_NUM_PROC}" \
   --loss_type sft \
   --distill_temperature 1.0 \
   --distill_alpha 0.3 \
@@ -29,8 +37,8 @@ torchrun --standalone --nproc_per_node=1 -m dense_e2e_fintuning.main \
   --model_max_length 8192 \
   --decoder_layers 0-31 \
   --target_modules all \
-  --decode_device "auto" \
-  --decode_group_size 8 \
+  --decode_device "${DECODE_DEVICE}" \
+  --decode_group_size "${DECODE_GROUP_SIZE}" \
   --lora_variant dora \
   --lora_rank 16 \
   --lora_alpha 32 \
