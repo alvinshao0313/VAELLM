@@ -3,9 +3,9 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/Qwen_Qwen3-8B_20260422_070608/final_model2}"
 ADAPTER_DIR="${ADAPTER_DIR:-}"
 
 if [[ -z "${CHECKPOINT_DIR}" ]]; then

@@ -5,6 +5,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from litebsq.autoencoder import Decoder
+from litebsq.bitpack import (
+    build_bitpack_u8_spec,
+    pack_bool_tensor_to_uint8,
+    unpack_uint8_tensor_to_bool,
+    validate_bitpack_u8_spec,
+)
 
 from litebsq.sparse_residual import (
     SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED,
@@ -18,9 +24,10 @@ from litebsq.sparse_residual import (
 
 class VAELinear(nn.Module):
     """
-    Inference-only Linear replacement using (bit_indices + decoder) to reconstruct weights on the fly.
+    Inference-only Linear replacement using packed VQ bits + decoder to reconstruct weights on the fly.
 
     `vq_weight` 可以是单个 Tensor（单分块）或 Tensor 列表（多分块）。
+    不传 `vq_storage_specs` / `stage_vq_storage_specs` 时，默认把逻辑 bool bits 打包成 uint8 存储。
     `decoder` 可以是单个 decoder（单分块）或 decoder 列表（多分块）。
     """
 
@@ -32,8 +39,10 @@ class VAELinear(nn.Module):
         bias,
         original_weight=None,
         vq_weight=None,
+        vq_storage_specs: Optional[Sequence[Any]] = None,
         decoder=None,
         stage_vq_weights: Optional[Sequence[Any]] = None,
+        stage_vq_storage_specs: Optional[Sequence[Any]] = None,
         stage_decoders: Optional[Sequence[Any]] = None,
         codebook_dim: int,
         stage_codebook_dims: Optional[Sequence[int]] = None,
@@ -533,11 +542,20 @@ class VAELinear(nn.Module):
         if use_stage_payload:
             if stage_vq_weights is None or stage_decoders is None:
                 raise ValueError("stage_vq_weights and stage_decoders must be provided together.")
+            if vq_storage_specs is not None:
+                raise ValueError("vq_storage_specs cannot be used together with stage_vq_weights/stage_decoders.")
             stage_vq_payload = self._normalize_stage_payload(
                 stage_vq_weights,
                 parallel_parts=self.parallel_parts,
                 payload_name="stage_vq_weights",
             )
+            normalized_stage_vq_storage_specs = None
+            if stage_vq_storage_specs is not None:
+                normalized_stage_vq_storage_specs = self._normalize_stage_payload(
+                    stage_vq_storage_specs,
+                    parallel_parts=self.parallel_parts,
+                    payload_name="stage_vq_storage_specs",
+                )
             stage_decoder_payload = self._normalize_stage_payload(
                 stage_decoders,
                 parallel_parts=self.parallel_parts,
@@ -546,29 +564,44 @@ class VAELinear(nn.Module):
         else:
             if vq_weight is None or decoder is None:
                 raise ValueError("vq_weight and decoder are required when stage payloads are not provided.")
+            if stage_vq_storage_specs is not None:
+                raise ValueError("stage_vq_storage_specs cannot be used when stage_vq_weights is not provided.")
             if self.parallel_parts == 1:
                 stage_vq_payload = [[vq_weight]]
+                normalized_stage_vq_storage_specs = None if vq_storage_specs is None else [[vq_storage_specs]]
                 stage_decoder_payload = [[decoder]]
             else:
                 if not isinstance(vq_weight, (list, tuple)):
                     raise ValueError("multi-part mode requires vq_weight list/tuple.")
+                if vq_storage_specs is not None and not isinstance(vq_storage_specs, (list, tuple)):
+                    raise ValueError("multi-part mode requires vq_storage_specs list/tuple.")
                 if not isinstance(decoder, (list, tuple)):
                     raise ValueError("multi-part mode requires decoder list/tuple.")
                 if len(vq_weight) != self.parallel_parts:
                     raise ValueError(
                         f"vq_weight length {len(vq_weight)} != parallel_parts {self.parallel_parts}"
                     )
+                if vq_storage_specs is not None and len(vq_storage_specs) != self.parallel_parts:
+                    raise ValueError(
+                        f"vq_storage_specs length {len(vq_storage_specs)} != parallel_parts {self.parallel_parts}"
+                    )
                 if len(decoder) != self.parallel_parts:
                     raise ValueError(
                         f"decoder length {len(decoder)} != parallel_parts {self.parallel_parts}"
                     )
                 stage_vq_payload = [list(vq_weight)]
+                normalized_stage_vq_storage_specs = None if vq_storage_specs is None else [list(vq_storage_specs)]
                 stage_decoder_payload = [list(decoder)]
 
         if len(stage_vq_payload) != len(stage_decoder_payload):
             raise ValueError(
                 f"stage payload length mismatch: "
                 f"stage_vq_weights={len(stage_vq_payload)} vs stage_decoders={len(stage_decoder_payload)}"
+            )
+        if normalized_stage_vq_storage_specs is not None and len(normalized_stage_vq_storage_specs) != len(stage_vq_payload):
+            raise ValueError(
+                f"stage_vq_storage_specs length {len(normalized_stage_vq_storage_specs)} != "
+                f"stage_vq_weights {len(stage_vq_payload)}"
             )
         self.residual_stages = int(len(stage_vq_payload))
         if self.residual_stages < 1:
@@ -679,22 +712,50 @@ class VAELinear(nn.Module):
             self.register_buffer(f"restore_col_indices_s{stage_idx}", stage_restore_cols[stage_idx], persistent=True)
             self.register_buffer(f"part_restore_col_indices_s{stage_idx}", stage_part_restore_cols[stage_idx], persistent=True)
 
+        self._stage_vq_storage_specs: List[List[Dict[str, Any]]] = []
         for stage_idx, stage_parts in enumerate(stage_vq_payload):
+            stage_specs: List[Dict[str, Any]] = []
+            spec_parts = None if normalized_stage_vq_storage_specs is None else normalized_stage_vq_storage_specs[stage_idx]
             for part_idx, w in enumerate(stage_parts):
                 if not isinstance(w, torch.Tensor):
                     raise TypeError(
                         f"stage_vq_weights[{stage_idx}][{part_idx}] must be Tensor, got {type(w)}"
                     )
+                if spec_parts is None:
+                    logical_shape = tuple(int(v) for v in w.shape)
+                    packed_storage = pack_bool_tensor_to_uint8(
+                        w.detach().contiguous(),
+                        logical_shape=logical_shape,
+                    )
+                    storage_spec = build_bitpack_u8_spec(logical_shape=logical_shape)
+                else:
+                    storage_spec = validate_bitpack_u8_spec(
+                        spec_parts[part_idx],
+                        arg_name=f"stage_vq_storage_specs[{stage_idx}][{part_idx}]",
+                    )
+                    if w.dtype != torch.uint8:
+                        raise ValueError(
+                            f"stage_vq_weights[{stage_idx}][{part_idx}] must be torch.uint8 when "
+                            "stage_vq_storage_specs is provided."
+                        )
+                    if tuple(int(v) for v in w.shape) != tuple(int(v) for v in storage_spec["shape"]):
+                        raise ValueError(
+                            f"stage_vq_weights[{stage_idx}][{part_idx}] shape {tuple(int(v) for v in w.shape)} != "
+                            f"storage spec shape {tuple(int(v) for v in storage_spec['shape'])}"
+                        )
+                    packed_storage = w.detach().contiguous()
+                stage_specs.append(dict(storage_spec))
                 if stage_idx == 0:
                     if self._multi_parts:
-                        self.register_buffer(f"vq_weight_{part_idx}", w, persistent=True)
+                        self.register_buffer(f"vq_weight_{part_idx}", packed_storage, persistent=True)
                     else:
-                        self.register_buffer("vq_weight", w, persistent=True)
+                        self.register_buffer("vq_weight", packed_storage, persistent=True)
                 else:
                     if self._multi_parts:
-                        self.register_buffer(f"vq_weight_s{stage_idx}_{part_idx}", w, persistent=True)
+                        self.register_buffer(f"vq_weight_s{stage_idx}_{part_idx}", packed_storage, persistent=True)
                     else:
-                        self.register_buffer(f"vq_weight_s{stage_idx}", w, persistent=True)
+                        self.register_buffer(f"vq_weight_s{stage_idx}", packed_storage, persistent=True)
+            self._stage_vq_storage_specs.append(stage_specs)
 
         for stage_idx, stage_parts in enumerate(stage_decoder_payload):
             for part_idx, dec in enumerate(stage_parts):
@@ -718,8 +779,14 @@ class VAELinear(nn.Module):
             stage_codebook_dim = int(self.stage_codebook_dims[stage_idx])
             total_numel = 0
             for part_idx in range(self.parallel_parts):
-                w = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
-                total_numel += int(w.shape[0]) * stage_codebook_dim
+                vq_spec = self.get_stage_part_vq_spec(stage_idx=stage_idx, part_idx=part_idx)
+                logical_shape = tuple(int(v) for v in vq_spec["logical_shape"])
+                if len(logical_shape) != 3 or int(logical_shape[1]) != 1:
+                    raise ValueError(
+                        f"stage {stage_idx} part {part_idx} logical_shape must be [N_blocks, 1, latent_dim], "
+                        f"got {logical_shape}"
+                    )
+                total_numel += int(logical_shape[0]) * stage_codebook_dim
             if total_numel != expected_numel:
                 raise ValueError(
                     f"stage {stage_idx} vq_weight total mismatch: total={total_numel} "
@@ -785,6 +852,14 @@ class VAELinear(nn.Module):
         return list(payload_items)
 
     def get_stage_part_vq_weight(self, stage_idx: int, part_idx: int = 0) -> torch.Tensor:
+        storage = self.get_stage_part_vq_storage(stage_idx=stage_idx, part_idx=part_idx)
+        spec = self.get_stage_part_vq_spec(stage_idx=stage_idx, part_idx=part_idx)
+        return unpack_uint8_tensor_to_bool(
+            storage,
+            logical_shape=tuple(int(v) for v in spec["logical_shape"]),
+        )
+
+    def get_stage_part_vq_storage(self, stage_idx: int, part_idx: int = 0) -> torch.Tensor:
         stage_idx = int(stage_idx)
         part_idx = int(part_idx)
         if stage_idx < 0 or stage_idx >= self.residual_stages:
@@ -800,6 +875,17 @@ class VAELinear(nn.Module):
         if part_idx != 0:
             raise IndexError("single-part VAELinear only supports part_idx=0")
         return getattr(self, f"vq_weight_s{stage_idx}")
+
+    def get_stage_part_vq_spec(self, stage_idx: int, part_idx: int = 0) -> Dict[str, Any]:
+        stage_idx = int(stage_idx)
+        part_idx = int(part_idx)
+        if stage_idx < 0 or stage_idx >= len(self._stage_vq_storage_specs):
+            raise IndexError(f"stage_idx out of range: {stage_idx} vs residual_stages={len(self._stage_vq_storage_specs)}")
+        if part_idx < 0 or part_idx >= len(self._stage_vq_storage_specs[stage_idx]):
+            raise IndexError(
+                f"part_idx out of range: {part_idx} vs stage_vq_storage_specs[{stage_idx}]={len(self._stage_vq_storage_specs[stage_idx])}"
+            )
+        return dict(self._stage_vq_storage_specs[stage_idx][part_idx])
 
     def get_stage_part_decoder(self, stage_idx: int, part_idx: int = 0) -> nn.Module:
         stage_idx = int(stage_idx)

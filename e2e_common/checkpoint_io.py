@@ -23,6 +23,7 @@ from rotation.model_utils import get_model
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
     STATE_DICT_FILENAME,
+    _assert_supported_converted_modules_meta,
     _collect_sparse_residual_specs,
     _decoder_to_spec,
     _dtype_to_name,
@@ -31,6 +32,7 @@ from train_utils.model_checkpoint_io import (
     _remap_legacy_parallel_linear_state_dict_keys,
     _rebuild_converted_modules,
     _torch_load_state_dict,
+    _vq_storage_spec_from_module,
     unload_vae_original_linear_weights,
 )
 
@@ -98,13 +100,7 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
         stage_vq_parts = []
         stage_decoder_parts = []
         for part_idx in range(parallel_parts):
-            weight = module.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
-            stage_vq_parts.append(
-                {
-                    "shape": list(weight.shape),
-                    "dtype": _dtype_to_name(weight.dtype),
-                }
-            )
+            stage_vq_parts.append(_vq_storage_spec_from_module(module, stage_idx=stage_idx, part_idx=part_idx))
             decoder = module.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
             stage_decoder_parts.append(_decoder_to_spec(decoder))
         if parallel_parts == 1:
@@ -440,6 +436,7 @@ def load_e2e_checkpoint_into_model(
     with open(meta_path, "r", encoding="utf-8") as handle:
         meta = json.load(handle)
     _reject_removed_extra_lora_checkpoint(meta)
+    _assert_supported_converted_modules_meta(meta)
 
     converted_modules = meta.get("converted_modules", [])
     if converted_modules:

@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
+from litebsq.bitpack import (
+    validate_bitpack_u8_spec,
+)
 from litebsq.misc import set_module_by_name
 from litebsq.llm_vae import Decoder
 from litebsq.vae_linear import VAELinear
@@ -107,6 +110,21 @@ def _tensor_spec(tensor: Optional[torch.Tensor]) -> Optional[Dict[str, Any]]:
 
 def _tensor_spec_list(tensors: Sequence[Optional[torch.Tensor]]) -> List[Optional[Dict[str, Any]]]:
     return [_tensor_spec(tensor) for tensor in tensors]
+
+
+def _vq_storage_spec_from_module(module: VAELinear, *, stage_idx: int, part_idx: int) -> Dict[str, Any]:
+    spec = module.get_stage_part_vq_spec(stage_idx=stage_idx, part_idx=part_idx)
+    return validate_bitpack_u8_spec(spec, arg_name=f"module_vq_spec[{stage_idx}][{part_idx}]")
+
+
+def _validate_packed_vq_spec(spec: Dict[str, Any], *, module_name: str, field_name: str) -> Dict[str, Any]:
+    try:
+        return validate_bitpack_u8_spec(spec, arg_name=f"[{module_name}] {field_name}")
+    except Exception as exc:
+        raise ValueError(
+            f"[{module_name}] only packed VQ checkpoint is supported. "
+            "Please convert the old checkpoint with `tools/convert_cat_checkpoint_to_bitpack.py`."
+        ) from exc
 
 
 def _get_module_by_name(model: nn.Module, name: str) -> nn.Module:
@@ -307,13 +325,7 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
             stage_vq_parts = []
             stage_decoder_parts = []
             for part_idx in range(parallel_parts):
-                w = module.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
-                stage_vq_parts.append(
-                    {
-                        "shape": list(w.shape),
-                        "dtype": _dtype_to_name(w.dtype),
-                    }
-                )
+                stage_vq_parts.append(_vq_storage_spec_from_module(module, stage_idx=stage_idx, part_idx=part_idx))
                 dec = module.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
                 stage_decoder_parts.append(_decoder_to_spec(dec))
             if parallel_parts == 1:
@@ -470,7 +482,7 @@ def save_model_checkpoint(
     vae_specs = _collect_vae_linear_specs(model)
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
-        "version": 4,
+        "version": 5,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_model_path": base_model_path,
         "state_dict_file": STATE_DICT_FILENAME,
@@ -494,8 +506,9 @@ def save_model_checkpoint(
 def _make_vq_placeholders(vq_specs: Sequence[Dict[str, Any]], device: torch.device) -> List[torch.Tensor]:
     tensors: List[torch.Tensor] = []
     for spec in vq_specs:
-        shape = tuple(int(x) for x in spec["shape"])
-        dtype = _name_to_dtype(str(spec["dtype"]))
+        normalized_spec = validate_bitpack_u8_spec(spec)
+        shape = tuple(int(x) for x in normalized_spec["shape"])
+        dtype = _name_to_dtype(str(normalized_spec["dtype"]))
         tensors.append(torch.zeros(shape, dtype=dtype, device=device))
     return tensors
 
@@ -548,8 +561,10 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             stage_codebook_dims = [int(spec["codebook_dim"]) for _ in range(residual_stages)]
 
         stage_vq_payload = None
+        stage_vq_storage_specs = None
         stage_decoder_payload = None
         vq_payload = None
+        vq_storage_specs = None
         decoder_payload = None
 
         if residual_stages > 1:
@@ -569,6 +584,7 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 )
 
             stage_vq_payload = []
+            stage_vq_storage_specs = []
             stage_decoder_payload = []
             for stage_idx in range(residual_stages):
                 stage_vq_spec = stage_vq_specs[stage_idx]
@@ -578,7 +594,13 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                         raise ValueError(f"[{name}] stage_vq_weights[{stage_idx}] must be a dict for single-part mode.")
                     if not isinstance(stage_decoder_spec, dict):
                         raise ValueError(f"[{name}] stage_decoders[{stage_idx}] must be a dict for single-part mode.")
-                    stage_vq_payload.append(_make_vq_placeholders([stage_vq_spec], device=device)[0])
+                    normalized_vq_spec = _validate_packed_vq_spec(
+                        stage_vq_spec,
+                        module_name=name,
+                        field_name=f"stage_vq_weights[{stage_idx}]",
+                    )
+                    stage_vq_payload.append(_make_vq_placeholders([normalized_vq_spec], device=device)[0])
+                    stage_vq_storage_specs.append([normalized_vq_spec])
                     stage_decoder_payload.append(_build_decoder_from_spec(stage_decoder_spec))
                 else:
                     if not isinstance(stage_vq_spec, (list, tuple)):
@@ -597,10 +619,23 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                         raise ValueError(
                             f"[{name}] stage_decoders[{stage_idx}] length {len(stage_decoder_spec)} != parallel_parts {parallel_parts}"
                         )
-                    stage_vq_payload.append(_make_vq_placeholders(stage_vq_spec, device=device))
+                    normalized_stage_vq_specs = [
+                        _validate_packed_vq_spec(
+                            one_spec,
+                            module_name=name,
+                            field_name=f"stage_vq_weights[{stage_idx}]",
+                        )
+                        for one_spec in stage_vq_spec
+                    ]
+                    stage_vq_payload.append(_make_vq_placeholders(normalized_stage_vq_specs, device=device))
+                    stage_vq_storage_specs.append(normalized_stage_vq_specs)
                     stage_decoder_payload.append([_build_decoder_from_spec(s) for s in stage_decoder_spec])
         else:
-            vq_placeholders = _make_vq_placeholders(spec["vq_weights"], device=device)
+            vq_storage_specs = [
+                _validate_packed_vq_spec(one_spec, module_name=name, field_name="vq_weights")
+                for one_spec in spec["vq_weights"]
+            ]
+            vq_placeholders = _make_vq_placeholders(vq_storage_specs, device=device)
             decoders = [_build_decoder_from_spec(s) for s in spec["decoders"]]
 
             if len(vq_placeholders) != parallel_parts:
@@ -612,6 +647,7 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
 
             if parallel_parts == 1:
                 vq_payload = vq_placeholders[0]
+                vq_storage_specs = vq_storage_specs[0]
                 decoder_payload = decoders[0]
             else:
                 vq_payload = vq_placeholders
@@ -855,8 +891,10 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             ),
             original_weight=getattr(old_module, "weight", None) if bool(spec.get("has_original_weight", False)) else None,
             vq_weight=vq_payload,
+            vq_storage_specs=vq_storage_specs,
             decoder=decoder_payload,
             stage_vq_weights=stage_vq_payload,
+            stage_vq_storage_specs=stage_vq_storage_specs,
             stage_decoders=stage_decoder_payload,
             codebook_dim=int(spec["codebook_dim"]),
             stage_codebook_dims=stage_codebook_dims,
@@ -976,6 +1014,55 @@ def _remap_legacy_parallel_linear_state_dict_keys(
     return remapped, converted
 
 
+def _assert_supported_converted_modules_meta(meta: Dict[str, Any]) -> None:
+    converted_modules = meta.get("converted_modules", [])
+    if not converted_modules:
+        return
+    version = int(meta.get("version", 0))
+    if version < 5:
+        raise ValueError(
+            "Old VQ checkpoint format is no longer loaded directly. "
+            "Please convert it with `tools/convert_cat_checkpoint_to_bitpack.py`."
+        )
+    for spec in converted_modules:
+        name = str(spec.get("name", "<unknown>"))
+        residual_stages = int(spec.get("residual_stages", 1))
+        if residual_stages > 1:
+            stage_vq_specs = spec.get("stage_vq_weights")
+            if not isinstance(stage_vq_specs, (list, tuple)):
+                raise ValueError(
+                    f"[{name}] invalid packed VQ metadata. Please run `tools/convert_cat_checkpoint_to_bitpack.py`."
+                )
+            for stage_idx, stage_item in enumerate(stage_vq_specs):
+                if isinstance(stage_item, dict):
+                    _validate_packed_vq_spec(
+                        stage_item,
+                        module_name=name,
+                        field_name=f"stage_vq_weights[{stage_idx}]",
+                    )
+                elif isinstance(stage_item, (list, tuple)):
+                    for part_idx, part_item in enumerate(stage_item):
+                        _validate_packed_vq_spec(
+                            part_item,
+                            module_name=name,
+                            field_name=f"stage_vq_weights[{stage_idx}][{part_idx}]",
+                        )
+                else:
+                    raise ValueError(
+                        f"[{name}] invalid packed VQ metadata. Please run `tools/convert_cat_checkpoint_to_bitpack.py`."
+                    )
+            continue
+        vq_specs = spec.get("vq_weights")
+        if not isinstance(vq_specs, (list, tuple)):
+            raise ValueError(f"[{name}] invalid packed VQ metadata. Please run `tools/convert_cat_checkpoint_to_bitpack.py`.")
+        for part_idx, part_item in enumerate(vq_specs):
+            _validate_packed_vq_spec(
+                part_item,
+                module_name=name,
+                field_name=f"vq_weights[{part_idx}]",
+            )
+
+
 def load_checkpoint_into_model(
     model: nn.Module,
     model_dir: str,
@@ -989,6 +1076,8 @@ def load_checkpoint_into_model(
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
+
+    _assert_supported_converted_modules_meta(meta)
 
     converted_modules = meta.get("converted_modules", [])
     if converted_modules:
