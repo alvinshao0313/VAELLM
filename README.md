@@ -28,6 +28,7 @@ export PYTHONPATH=.
 - `dense_e2e_fintuning/scripts/e2e_dense_lora.sh`
   - 压缩模型 checkpoint（`S`）重建 dense 模型（`C`）后做标准 PEFT 蒸馏
   - 入口参数是 `--student_checkpoint_dir`，不接受 `--student_model_path`
+  - `--decode_device auto` 会按当前进程可见设备解析：单卡可见时用 `cuda:0`，多卡可见时按 `LOCAL_RANK` 选卡
   - 默认是单数据源脚本（可按需改 `--dataset_mix`）
   - 默认导出 `final_adapter/` + `run_meta.json` + `final_adapter/dense_adapter_meta.json`
 - `raw_e2e_fintuning/scripts/e2e_raw_lora.sh`
@@ -100,6 +101,10 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - `dense_e2e_fintuning`：输入 `--student_checkpoint_dir`，输出 `final_adapter/` + `run_meta.json`
   - `raw_e2e_fintuning`：输入 `--student_model_path`，输出 `final_adapter/` + `run_meta.json`（可选 `final_merged_model/`）
 - `dense_e2e_fintuning` 可以直接加载当前 `tools/cat_train.py` 产出的 packed cat checkpoint；部分历史 decoder key 布局在加载时仍会自动 remap。
+- `dense_e2e_fintuning` 的 `decode_device=auto` 不再等价于“统一 0 卡”：
+  - 当前进程只看见 1 张卡：解析到 `cuda:0`
+  - 当前进程看见多张卡：解析到 `cuda:{LOCAL_RANK}`
+  - 如果想强制固定设备，请显式传 `cuda:N`
 - 新版 cat checkpoint 加载器只接受 packed 格式：
   - 旧版 `version=4` cat checkpoint 不再直接加载
   - 需要先执行 `python tools/convert_cat_checkpoint_to_bitpack.py ...`

@@ -13,9 +13,9 @@ from transformers import default_data_collator
 from dense_e2e_fintuning.args import needs_teacher
 from dense_e2e_fintuning.checkpoint_bridge import (
     build_dense_model_from_checkpoint,
+    get_decode_device_diagnostics,
     rebuild_dense_peft_model_for_export,
     resolve_base_model_path,
-    resolve_decode_device,
 )
 from dense_e2e_fintuning.trainables import inject_dense_peft_adapters, resolve_target_layer_ids
 from dense_e2e_fintuning.trainer import (
@@ -239,12 +239,21 @@ def run(args, hf_args, training_args):
     if resume_from_checkpoint:
         log.info("Resuming Trainer state from checkpoint: %s", resume_from_checkpoint)
     requested_decode_device = str(getattr(args, "decode_device", "auto"))
-    resolved_decode_device = resolve_decode_device(requested_decode_device)
+    decode_device_diag = get_decode_device_diagnostics(requested_decode_device)
+    resolved_decode_device = str(decode_device_diag["resolved_device"])
     log.info(
         "Decode config: requested_device=%s resolved_device=%s group_size=%d",
         requested_decode_device,
         resolved_decode_device,
         int(args.decode_group_size),
+    )
+    log.info(
+        "Decode device diagnostics: LOCAL_RANK=%s CUDA_VISIBLE_DEVICES=%s visible_cuda_count=%d requested_device=%s resolved_device=%s",
+        str(decode_device_diag["local_rank"]),
+        str(decode_device_diag["cuda_visible_devices"]),
+        int(decode_device_diag["visible_cuda_count"]),
+        requested_decode_device,
+        resolved_decode_device,
     )
 
     dense_model, meta, resolved_student_checkpoint_dir = build_dense_model_from_checkpoint(

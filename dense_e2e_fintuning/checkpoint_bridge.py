@@ -67,29 +67,74 @@ def resolve_base_model_path(meta: Dict[str, object], teacher_model_path: Optiona
     raise ValueError("Cannot resolve base model path from checkpoint meta or --teacher_model_path.")
 
 
-def resolve_decode_device(requested: Optional[str]) -> str:
+def _read_local_rank_from_env() -> Optional[int]:
+    raw = os.environ.get("LOCAL_RANK")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid LOCAL_RANK value '{raw}'. Expected an integer.") from exc
+
+
+def get_decode_device_diagnostics(requested: Optional[str]) -> Dict[str, object]:
     normalized = "auto" if requested is None else str(requested).strip().lower()
+    local_rank = _read_local_rank_from_env()
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    cuda_available = bool(torch.cuda.is_available())
+    visible_cuda_count = int(torch.cuda.device_count()) if cuda_available else 0
+
+    resolved_device: Optional[str] = None
     if normalized == "auto":
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
-    if normalized == "cpu":
-        return "cpu"
-    if normalized == "cuda":
-        if not torch.cuda.is_available():
+        if not cuda_available:
+            resolved_device = "cpu"
+        elif visible_cuda_count == 1:
+            resolved_device = "cuda:0"
+        else:
+            if local_rank is None:
+                raise ValueError(
+                    "decode_device=auto requires LOCAL_RANK when the current process sees multiple CUDA devices."
+                )
+            if local_rank < 0 or local_rank >= visible_cuda_count:
+                raise ValueError(
+                    f"LOCAL_RANK={local_rank} is out of range for visible CUDA device count={visible_cuda_count}."
+                )
+            resolved_device = f"cuda:{local_rank}"
+    elif normalized == "cpu":
+        resolved_device = "cpu"
+    elif normalized == "cuda":
+        if not cuda_available:
             raise RuntimeError("decode_device=cuda requested, but CUDA is unavailable.")
-        return "cuda:0"
-    if normalized.startswith("cuda:"):
-        if not torch.cuda.is_available():
+        resolved_device = "cuda:0"
+    elif normalized.startswith("cuda:"):
+        if not cuda_available:
             raise RuntimeError(f"decode_device={normalized} requested, but CUDA is unavailable.")
         try:
             device_idx = int(normalized.split(":", 1)[1])
         except ValueError as exc:
             raise ValueError(f"Invalid decode device '{requested}'.") from exc
-        if device_idx < 0 or device_idx >= torch.cuda.device_count():
+        if device_idx < 0 or device_idx >= visible_cuda_count:
             raise ValueError(
-                f"decode_device={normalized} is out of range for visible CUDA device count={torch.cuda.device_count()}."
+                f"decode_device={normalized} is out of range for visible CUDA device count={visible_cuda_count}."
             )
-        return f"cuda:{device_idx}"
-    raise ValueError(f"Invalid decode device '{requested}'.")
+        resolved_device = f"cuda:{device_idx}"
+    else:
+        raise ValueError(f"Invalid decode device '{requested}'.")
+    return {
+        "requested_device": normalized,
+        "resolved_device": resolved_device,
+        "local_rank": local_rank,
+        "cuda_visible_devices": None if cuda_visible_devices is None else str(cuda_visible_devices),
+        "visible_cuda_count": visible_cuda_count,
+    }
+
+
+def resolve_decode_device(requested: Optional[str]) -> str:
+    diagnostics = get_decode_device_diagnostics(requested)
+    resolved_device = diagnostics["resolved_device"]
+    if not isinstance(resolved_device, str):
+        raise RuntimeError(f"Resolved decode device must be str, got {type(resolved_device)}")
+    return resolved_device
 
 
 def load_compressed_student_checkpoint(
