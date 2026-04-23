@@ -72,6 +72,7 @@ class DenseE2EFinetuneArguments:
     train_file: Optional[str] = None
     eval_file: Optional[str] = None
     text_field: str = "text"
+    dataset_num_proc: int = 1
     max_train_samples: Optional[int] = None
     max_eval_samples: Optional[int] = None
     save_tokenizer: bool = False
@@ -254,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_file", type=str, default=None)
     parser.add_argument("--eval_file", type=str, default=None)
     parser.add_argument("--text_field", type=str, default="text")
+    parser.add_argument("--dataset_num_proc", type=int, default=1)
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_eval_samples", type=int, default=None)
     parser.add_argument(
@@ -348,6 +350,8 @@ def _validate_numeric_inputs(parser: argparse.ArgumentParser, args: DenseE2EFine
         parser.error("--max_train_samples must be >= 1 when provided.")
     if args.max_eval_samples is not None and int(args.max_eval_samples) < 1:
         parser.error("--max_eval_samples must be >= 1 when provided.")
+    if int(args.dataset_num_proc) < 1:
+        parser.error("--dataset_num_proc must be >= 1.")
 
 
 def _validate_variant_inputs(

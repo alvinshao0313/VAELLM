@@ -111,6 +111,28 @@ def _selection_to_meta(selection) -> Dict[str, object]:
     return data
 
 
+def _normalized_eval_strategy(training_args) -> str:
+    eval_strategy = getattr(training_args, "eval_strategy", None)
+    normalized = getattr(eval_strategy, "value", eval_strategy)
+    if normalized is None:
+        return "none"
+    return str(normalized).strip().lower()
+
+
+def _build_datasets_with_main_process_first(args, training_args, tokenizer, log):
+    eval_strategy = _normalized_eval_strategy(training_args)
+    skip_eval_preprocessing = eval_strategy == "no"
+    log.info(
+        "Dataset preprocess config: dataset_num_proc=%d eval_strategy=%s skip_eval_preprocessing=%s main_process_first=%s",
+        int(getattr(args, "dataset_num_proc", 1)),
+        eval_strategy,
+        str(skip_eval_preprocessing).lower(),
+        "true",
+    )
+    with training_args.main_process_first(local=False, desc="dataset preprocessing"):
+        return build_datasets(args, training_args, tokenizer)
+
+
 def run(args, hf_args, training_args):
     run_output_dir = _build_run_output_dir(args.run_root_dir, args.student_model_path)
     os.environ["LOG_FILE"] = os.path.join(run_output_dir, "e2e_raw_fintuning.log")
@@ -153,7 +175,12 @@ def run(args, hf_args, training_args):
     if getattr(peft_model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
         peft_model.config.pad_token_id = tokenizer.pad_token_id
 
-    train_dataset, eval_dataset, data_info = build_datasets(args, training_args, tokenizer)
+    train_dataset, eval_dataset, data_info = _build_datasets_with_main_process_first(
+        args,
+        training_args,
+        tokenizer,
+        log,
+    )
     if len(train_dataset) < 1:
         raise ValueError(
             "Packed training dataset is empty. Increase input text volume or lower --model_max_length."

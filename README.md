@@ -29,6 +29,9 @@ export PYTHONPATH=.
   - 压缩模型 checkpoint（`S`）重建 dense 模型（`C`）后做标准 PEFT 蒸馏
   - 入口参数是 `--student_checkpoint_dir`，不接受 `--student_model_path`
   - `--decode_device auto` 会按当前进程可见设备解析：单卡可见时用 `cuda:0`，多卡可见时按 `LOCAL_RANK` 选卡
+  - `--dataset_num_proc` 控制数据预处理阶段的 `datasets.map(num_proc=...)`
+  - 多卡下只有主进程先做数据预处理并写 cache，其他 rank 等待后复用
+  - `--eval_strategy no` 会直接跳过 eval 数据的 prepare/tokenize/pack
   - 默认是单数据源脚本（可按需改 `--dataset_mix`）
   - 默认导出 `final_adapter/` + `run_meta.json` + `final_adapter/dense_adapter_meta.json`
 - `raw_e2e_fintuning/scripts/e2e_raw_lora.sh`
@@ -40,6 +43,7 @@ export PYTHONPATH=.
   - 原模型（非 VAE）mixed-dataset LoRA 基线
   - 默认混合池：`openorca=0.45,fineweb_edu=0.30,race=0.15,sciq=0.07,alpaca=0.03`
   - LoRA/AdaLoRA 参数名用 `--lora_*`、`--adalora_*`，不再使用 `--vae_*`
+  - 同样支持 `--dataset_num_proc`、主进程优先预处理、以及 `--eval_strategy no` 跳过 eval 预处理
   - 同样保存为 HF/PEFT 格式
 - `tools/convert_legacy_checkpoint.py`
   - 把旧格式 e2e checkpoint 转成当前紧凑格式
@@ -105,6 +109,11 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - 当前进程只看见 1 张卡：解析到 `cuda:0`
   - 当前进程看见多张卡：解析到 `cuda:{LOCAL_RANK}`
   - 如果想强制固定设备，请显式传 `cuda:N`
+- `dense_e2e_fintuning` 和 `raw_e2e_fintuning` 现在都支持 `--dataset_num_proc`：
+  - 只影响数据预处理阶段的 `datasets.map(num_proc=...)`
+  - 不影响 DataLoader worker，不影响训练并行
+  - 多卡时用 `main_process_first` 让主进程先构建 datasets cache，其余 rank 复用
+  - `--eval_strategy no` 时不会再预处理 eval 数据
 - 新版 cat checkpoint 加载器只接受 packed 格式：
   - 旧版 `version=4` cat checkpoint 不再直接加载
   - 需要先执行 `python tools/convert_cat_checkpoint_to_bitpack.py ...`

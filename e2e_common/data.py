@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, interleave_datasets, load_dataset
 from transformers import AutoTokenizer
+from transformers.trainer_utils import IntervalStrategy
 
 
 @dataclass(frozen=True)
@@ -391,10 +392,35 @@ def _apply_sample_limit(dataset: Optional[Dataset], max_samples: Optional[int]) 
     return dataset.select(range(int(max_samples)))
 
 
-def _prepare_text_dataset(dataset: Dataset, *, text_field: str, text_format: str = "auto") -> Dataset:
+def _records_to_text_batch(
+    examples: Dict[str, Sequence[object]],
+    *,
+    text_field: str,
+    text_format: str = "auto",
+) -> Dict[str, List[Optional[str]]]:
+    if not examples:
+        return {"text": []}
+    keys = list(examples.keys())
+    batch_size = len(examples[keys[0]])
+    out: List[Optional[str]] = []
+    for idx in range(batch_size):
+        record = {key: examples[key][idx] for key in keys}
+        out.append(_record_to_text(record, text_field=text_field, text_format=text_format))
+    return {"text": out}
+
+
+def _prepare_text_dataset(
+    dataset: Dataset,
+    *,
+    text_field: str,
+    text_format: str = "auto",
+    num_proc: int = 1,
+) -> Dataset:
     prepared = dataset.map(
-        lambda rec: {"text": _record_to_text(rec, text_field=text_field, text_format=text_format)},
+        lambda batch: _records_to_text_batch(batch, text_field=text_field, text_format=text_format),
+        batched=True,
         remove_columns=list(dataset.column_names),
+        num_proc=None if int(num_proc) == 1 else int(num_proc),
     )
     prepared = prepared.filter(lambda rec: rec["text"] is not None and len(str(rec["text"]).strip()) > 0)
     return prepared
@@ -424,17 +450,35 @@ def _set_torch_columns(dataset: Dataset) -> Dataset:
     return dataset
 
 
-def _tokenize_and_pack(dataset: Dataset, tokenizer, *, block_size: int) -> Dataset:
+def _tokenize_and_pack(dataset: Dataset, tokenizer, *, block_size: int, num_proc: int = 1) -> Dataset:
     tokenized = dataset.map(
         lambda rec: tokenizer(rec["text"]),
         batched=True,
         remove_columns=list(dataset.column_names),
+        num_proc=None if int(num_proc) == 1 else int(num_proc),
     )
     packed = tokenized.map(
         lambda rec: _group_texts(rec, block_size=int(block_size)),
         batched=True,
+        num_proc=None if int(num_proc) == 1 else int(num_proc),
     )
     return _set_torch_columns(packed)
+
+
+def _resolve_dataset_num_proc(args) -> int:
+    raw_num_proc = getattr(args, "dataset_num_proc", 1)
+    num_proc = int(raw_num_proc)
+    if num_proc < 1:
+        raise ValueError(f"dataset_num_proc must be >= 1, got {raw_num_proc}")
+    return num_proc
+
+
+def _should_prepare_eval_dataset(training_args) -> bool:
+    eval_strategy = getattr(training_args, "eval_strategy", None)
+    normalized = getattr(eval_strategy, "value", eval_strategy)
+    if normalized == IntervalStrategy.NO or str(normalized).strip().lower() == "no":
+        return False
+    return True
 
 
 def _resolve_training_world_size(training_args) -> int:
@@ -511,6 +555,8 @@ def _load_preset_raw_datasets(preset: DatasetMixSourcePreset) -> Tuple[Dataset, 
 
 def _build_mixed_datasets(args, training_args, tokenizer):
     block_size = int(training_args.model_max_length)
+    dataset_num_proc = _resolve_dataset_num_proc(args)
+    prepare_eval = _should_prepare_eval_dataset(training_args)
     sources = list(getattr(args, "dataset_mix_sources", []) or [])
     weights = list(getattr(args, "dataset_mix_weights", []) or [])
     if not sources or not weights or len(sources) != len(weights):
@@ -530,16 +576,18 @@ def _build_mixed_datasets(args, training_args, tokenizer):
             train_raw,
             text_field=str(preset.text_field),
             text_format=str(preset.text_format),
+            num_proc=dataset_num_proc,
         )
         eval_text = None
-        if eval_raw is not None:
+        if prepare_eval and eval_raw is not None:
             eval_text = _prepare_text_dataset(
                 eval_raw,
                 text_field=str(preset.text_field),
                 text_format=str(preset.text_format),
+                num_proc=dataset_num_proc,
             )
 
-        train_packed = _tokenize_and_pack(train_text, tokenizer, block_size=block_size)
+        train_packed = _tokenize_and_pack(train_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
         packed_rows = len(train_packed)
         if packed_rows < 1:
             raise ValueError(
@@ -555,7 +603,7 @@ def _build_mixed_datasets(args, training_args, tokenizer):
 
         eval_packed_rows = 0
         if eval_text is not None:
-            eval_packed = _tokenize_and_pack(eval_text, tokenizer, block_size=block_size)
+            eval_packed = _tokenize_and_pack(eval_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
             eval_packed_rows = len(eval_packed)
             if eval_packed_rows > 0:
                 eval_datasets.append(eval_packed)
@@ -603,16 +651,26 @@ def build_datasets(args, training_args, tokenizer):
         return _build_mixed_datasets(args, training_args, tokenizer)
 
     block_size = int(training_args.model_max_length)
+    dataset_num_proc = _resolve_dataset_num_proc(args)
+    prepare_eval = _should_prepare_eval_dataset(training_args)
 
     train_raw, eval_raw = _load_raw_datasets(args)
     train_raw = _apply_sample_limit(train_raw, args.max_train_samples)
     eval_raw = _apply_sample_limit(eval_raw, args.max_eval_samples)
 
-    train_text = _prepare_text_dataset(train_raw, text_field=str(args.text_field))
-    eval_text = _prepare_text_dataset(eval_raw, text_field=str(args.text_field)) if eval_raw is not None else None
+    train_text = _prepare_text_dataset(train_raw, text_field=str(args.text_field), num_proc=dataset_num_proc)
+    eval_text = (
+        _prepare_text_dataset(eval_raw, text_field=str(args.text_field), num_proc=dataset_num_proc)
+        if prepare_eval and eval_raw is not None
+        else None
+    )
 
-    train_dataset = _tokenize_and_pack(train_text, tokenizer, block_size=block_size)
-    eval_dataset = _tokenize_and_pack(eval_text, tokenizer, block_size=block_size) if eval_text is not None else None
+    train_dataset = _tokenize_and_pack(train_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
+    eval_dataset = (
+        _tokenize_and_pack(eval_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
+        if eval_text is not None
+        else None
+    )
     return train_dataset, eval_dataset, {
         "dataset_mode": "single",
         "block_size": int(block_size),
