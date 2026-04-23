@@ -5,8 +5,9 @@ export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/Qwen_Qwen3-8B_20260422_070608/final_model2}"
-ADAPTER_DIR="${ADAPTER_DIR:-}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/Qwen_Qwen3-8B_20260422_070608/final_model}"
+ADAPTER_DIR="${ADAPTER_DIR:-.result/e2e_vae_lora/checkpoint-500}"
+EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 
 if [[ -z "${CHECKPOINT_DIR}" ]]; then
   echo "CHECKPOINT_DIR is required, e.g. CHECKPOINT_DIR=.result/<run>/final_model bash scripts/eval.sh" >&2
@@ -27,7 +28,7 @@ if [[ -n "${ADAPTER_DIR}" ]]; then
     --eval_ppl \
     --eval_lm_eval \
     --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
-    --eval_device "cuda" \
+    --eval_device "${EVAL_DEVICE}" \
     --lm_batch_size "auto" \
     --num_fewshot "0" \
     --prewarm_group_size "8" \
@@ -42,7 +43,7 @@ else
     --eval_ppl \
     --eval_lm_eval \
     --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
-    --eval_device "cuda" \
+    --eval_device "${EVAL_DEVICE}" \
     --lm_batch_size "auto" \
     --num_fewshot "0" \
     --prewarm_group_size "8" \

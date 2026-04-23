@@ -273,6 +273,7 @@ def _prepare_model_for_eval(
         stats = prime_named_vae_linear_cache(
             named_targets,
             group_size=int(prewarm_group_size),
+            compute_device=device,
             logger=logger,
         )
     duration_sec = float(time.time() - start_time)
@@ -458,7 +459,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             base_model_path=args.base_model_path,
             logger=logger,
             decode_group_size=int(args.prewarm_group_size),
-            decode_device="cpu",
+            decode_device=_resolve_eval_device(args.eval_device, logger),
         )
         peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
         model = peft_model.merge_and_unload()

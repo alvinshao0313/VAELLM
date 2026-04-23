@@ -527,6 +527,7 @@ def prime_named_vae_linear_cache(
     dtype: Optional[torch.dtype] = None,
     clear_existing: bool = False,
     group_size: int = 8,
+    compute_device: Optional[Any] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, int]:
     normalized_targets = _normalize_named_vae_targets(named_targets)
@@ -548,7 +549,7 @@ def prime_named_vae_linear_cache(
             normalized_targets,
             dtype=dtype,
             group_size=group_size,
-            compute_device=None,
+            compute_device=compute_device,
             logger=logger,
             respect_cache_policy=True,
         )
@@ -571,6 +572,7 @@ def prime_model_vae_linear_cache(
     dtype: Optional[torch.dtype] = None,
     clear_existing: bool = False,
     group_size: int = 1,
+    compute_device: Optional[Any] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, int]:
     from litebsq.vae_linear import VAELinear
@@ -585,6 +587,7 @@ def prime_model_vae_linear_cache(
         dtype=dtype,
         clear_existing=clear_existing,
         group_size=group_size,
+        compute_device=compute_device,
         logger=logger,
     )
 
