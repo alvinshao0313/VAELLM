@@ -20,6 +20,24 @@ class DatasetMixSourcePreset:
 
 
 DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
+    "wiki": DatasetMixSourcePreset(
+        alias="wiki",
+        path="Salesforce/wikitext",
+        config="wikitext-2-raw-v1",
+        train_split="train",
+        eval_split="validation",
+        text_field="text",
+        text_format="text",
+    ),
+    "wikitext2": DatasetMixSourcePreset(
+        alias="wikitext2",
+        path="Salesforce/wikitext",
+        config="wikitext-2-raw-v1",
+        train_split="train",
+        eval_split="validation",
+        text_field="text",
+        text_format="text",
+    ),
     "openorca": DatasetMixSourcePreset(
         alias="openorca",
         path="Open-Orca/OpenOrca",
@@ -366,14 +384,6 @@ def _load_hf_dataset_splits(
 
 
 def _load_raw_datasets(args) -> Tuple[Dataset, Optional[Dataset]]:
-    if args.dataset_name:
-        return _load_hf_dataset_splits(
-            path=str(args.dataset_name),
-            config=None if args.dataset_config_name is None else str(args.dataset_config_name),
-            train_split=str(args.train_split),
-            eval_split=str(args.eval_split),
-        )
-
     loader = _resolve_local_dataset_loader(str(args.train_file))
     data_files = {"train": str(args.train_file)}
     if args.eval_file:

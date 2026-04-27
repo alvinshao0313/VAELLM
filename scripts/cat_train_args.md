@@ -158,7 +158,7 @@
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
 | `--outlier_residual_value_bits` | `8` | `blocked_quantized` 的残差 value 位宽 | `8` / `4` |
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
-| `--wa_mse_calib_dataset` | `wikitext2` | 动态采集时的校准集 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用；支持 `wiki / wikitext2 / fineweb_edu / openorca / redpajama / alpaca`，其中 `wikitext2` 是 `wiki` 别名 |
+| `--wa_mse_calib_dataset` | `""` | 动态采集时的校准混合数据集 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用；启用动态校准时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5` |
 | `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
@@ -168,7 +168,7 @@
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
 | `--lora_after_category` | `False` | 每训练完一个类别后，对剩余类别做一次 LoRA 微调并融合 | 开启后才会进入 LoRA 阶段 |
-| `--lora_dataset` | `wiki` | LoRA 补偿训练数据集 | 支持 `wiki / fineweb_edu / openorca / redpajama / alpaca` |
+| `--lora_dataset` | `""` | LoRA 补偿训练混合数据集 | 开启 `--lora_after_category` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
 | `--lora_rank` | `default=8` | LoRA rank | after-category override |
 | `--lora_alpha` | `default=16.0` | LoRA alpha | after-category override |
 | `--lora_dropout` | `default=0.0` | LoRA dropout | after-category override |
@@ -504,7 +504,7 @@ python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
   --convert \
   --recon_loss_type default=wa_mse \
-  --wa_mse_calib_dataset wikitext2 \
+  --wa_mse_calib_dataset wiki=1.0 \
   --wa_mse_calib_nsamples 512 \
   --wa_mse_calib_seqlen 512 \
   --train_device cuda
@@ -516,7 +516,7 @@ python tools/cat_train.py \
 python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
   --lora_after_category \
-  --lora_dataset openorca \
+  --lora_dataset wiki=1.0 \
   --lora_rank default=8,after:q_proj=16 \
   --lora_steps default=50,after:q_proj=200 \
   --eval_ppl true \

@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -87,6 +87,7 @@ else:
             temperature: float = 1.0,
             loss_alpha: float = 0.5,
             lora_hif4_act_controller: Optional[Hif4ActController] = None,
+            teacher_param_snapshots: Optional[Sequence[Tuple[nn.Parameter, torch.Tensor]]] = None,
             **kwargs,
         ):
             super().__init__(*args, **kwargs)
@@ -94,6 +95,7 @@ else:
             self.temperature = float(temperature)
             self.loss_alpha = float(loss_alpha)
             self.lora_hif4_act_controller = lora_hif4_act_controller
+            self.teacher_param_snapshots = list(teacher_param_snapshots or [])
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
             args = self.args
@@ -153,6 +155,22 @@ else:
             def use_post_attn() -> bool:
                 return bool(getattr(args, "lora_post_attn", False))
 
+            @contextmanager
+            def teacher_param_context():
+                if not self.teacher_param_snapshots:
+                    yield
+                    return
+
+                current_values: List[torch.Tensor] = []
+                try:
+                    for param, snapshot in self.teacher_param_snapshots:
+                        current_values.append(param.detach().clone())
+                        param.data.copy_(snapshot.to(device=param.device, dtype=param.dtype))
+                    yield
+                finally:
+                    for (param, _snapshot), current in zip(self.teacher_param_snapshots, current_values):
+                        param.data.copy_(current.to(device=param.device, dtype=param.dtype))
+
             @torch.no_grad()
             def get_ori_outputs():
                 set_temporary(False)
@@ -162,7 +180,7 @@ else:
                     if hasattr(peft_model_for_teacher, "disable_adapter")
                     else nullcontext()
                 )
-                with adapter_context:
+                with adapter_context, teacher_param_context():
                     outputs = model(**teacher_inputs, output_hidden_states=False)
                 return outputs
 

@@ -6,15 +6,12 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 # 说明：
 # - 原模型 LoRA/DoRA/AdaLoRA 训练入口（非 VAE 轨）。
 # - 该脚本只走 raw_e2e_fintuning，不读取 student_checkpoint_dir。
-# - 默认使用单源数据集 vicgalle/alpaca-gpt4。
+# - 默认使用 dataset_mix 单源比例 alpaca=1.0。
 
 torchrun --standalone --nproc_per_node=1 -m raw_e2e_fintuning.main \
   --student_model_path meta-llama/Llama-2-7b-hf \
   --run_root_dir .result/e2e_raw_lora \
-  --dataset_name vicgalle/alpaca-gpt4 \
-  --train_split train \
-  --eval_split validation \
-  --text_field text \
+  --dataset_mix "alpaca=1.0" \
   --loss_type sft \
   --distill_temperature 1.0 \
   --distill_alpha 0.3 \
@@ -28,6 +25,7 @@ torchrun --standalone --nproc_per_node=1 -m raw_e2e_fintuning.main \
   --lora_dropout 0.0 \
   --lora_tune_bias true \
   --lora_init_mode zero \
+  --lora_smooth false \
   --tune_final_norm true \
   --use_post_norm_head_linear true \
   --lora_hif4_act false \

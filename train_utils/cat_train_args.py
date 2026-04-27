@@ -14,7 +14,6 @@ from litebsq.sparse_residual import (
     validate_sparse_residual_block_shape,
 )
 from train_utils.cat_data_prep import normalize_intra_part_sort_mode
-from train_utils.lora_data import normalize_text_dataset_name
 from train_utils.cat_arg_overrides import (
     OverrideSpec,
     OverrideTable,
@@ -92,6 +91,8 @@ class NormalizedCatArgs:
     lora_loss_alpha: OverrideTable[float]
     lora_loss_type: OverrideTable[str]
     lora_use_dora: OverrideTable[bool]
+    tune_final_norm: bool
+    use_post_norm_head_linear: bool
     seed: int
     train_device: str
     rot_llm: bool
@@ -181,6 +182,10 @@ _OUTLIER_RESIDUAL_SCORE_CHOICES = (
     "original_weight_abs",
     "input_act_weighted_original_weight_abs",
 )
+_OUTLIER_RESIDUAL_SCORE_MODES_NEED_ACT = (
+    "input_act_weighted_abs",
+    "input_act_weighted_original_weight_abs",
+)
 def parse_skip_layers(value: Optional[str]) -> Set[Tuple[int, str]]:
     entries = split_csv(None if value is None else str(value))
     out: Set[Tuple[int, str]] = set()
@@ -217,18 +222,40 @@ def _parse_nonnegative_float_text(raw: str, *, arg_name: str) -> float:
     return float(parse_float_text(raw, arg_name=arg_name, min_value=0.0, inclusive_min=True))
 
 
-def _parse_lora_dataset_text(raw: str, *, arg_name: str) -> str:
+def _parse_lora_dataset_mix_text(raw: str, *, arg_name: str) -> str:
     try:
-        return normalize_text_dataset_name(raw, arg_name=arg_name)
+        from e2e_common.data import normalize_dataset_mix_spec
+
+        _sources, _weights, normalized_spec = normalize_dataset_mix_spec(raw)
+        return str(normalized_spec)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _normalize_lora_dataset_arg(raw: str, *, lora_after_category: bool) -> str:
+    value = str(raw or "").strip()
+    if not bool(lora_after_category):
+        return value
+    if not value:
+        raise ValueError("--lora_dataset must be set when --lora_after_category is enabled.")
+    if "=" not in value:
+        raise ValueError(
+            "--lora_dataset only accepts ratio-style dataset specs, for example "
+            "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
+        )
+    return _parse_lora_dataset_mix_text(value, arg_name="--lora_dataset")
 
 
 def _parse_wa_mse_calib_dataset_text(raw: str, *, arg_name: str) -> str:
-    try:
-        return normalize_text_dataset_name(raw, arg_name=arg_name)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            f"{arg_name} only accepts ratio-style dataset specs, for example "
+            "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
+        )
+    return _parse_lora_dataset_mix_text(value, arg_name=arg_name)
 
 
 def _make_override_spec(
@@ -581,7 +608,10 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         ppl_limit=int(raw_args.ppl_limit),
         eval_hif4_act=bool(raw_args.eval_hif4_act),
         lora_after_category=bool(raw_args.lora_after_category),
-        lora_dataset=str(raw_args.lora_dataset),
+        lora_dataset=_normalize_lora_dataset_arg(
+            raw_args.lora_dataset,
+            lora_after_category=bool(raw_args.lora_after_category),
+        ),
         lora_rank=_parse_cat_override(raw_args.lora_rank, spec=_LORA_RANK_SPEC),
         lora_alpha=_parse_cat_override(raw_args.lora_alpha, spec=_LORA_ALPHA_SPEC),
         lora_dropout=_parse_cat_override(raw_args.lora_dropout, spec=_LORA_DROPOUT_SPEC),
@@ -595,6 +625,8 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         lora_loss_alpha=_parse_cat_override(raw_args.lora_loss_alpha, spec=_LORA_LOSS_ALPHA_SPEC),
         lora_loss_type=_parse_cat_override(raw_args.lora_loss_type, spec=_LORA_LOSS_TYPE_SPEC),
         lora_use_dora=_parse_cat_override(raw_args.lora_use_dora, spec=_LORA_USE_DORA_SPEC),
+        tune_final_norm=bool(raw_args.tune_final_norm),
+        use_post_norm_head_linear=bool(raw_args.use_post_norm_head_linear),
         seed=int(raw_args.seed),
         train_device=str(raw_args.train_device),
         rot_llm=bool(raw_args.rot_llm),
@@ -615,6 +647,51 @@ def _iter_override_entries(table: OverrideTable[object]):
         yield f"cat:{category}", value
     for category, value in sorted(getattr(table, "by_after_category", {}).items()):
         yield f"after:{category}", value
+
+
+def _override_table_contains(table: OverrideTable[object], predicate) -> bool:
+    return any(bool(predicate(value)) for _selector, value in _iter_override_entries(table))
+
+
+def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) -> None:
+    dynamic_calib_enabled = (
+        _override_table_contains(
+            vae_args.recon_loss_type,
+            lambda value: str(value).strip().lower() == "wa_mse",
+        )
+        or _override_table_contains(
+            cat_args.intra_part_sort_mode,
+            lambda value: str(value).strip().lower() == "act_spectral_cosine",
+        )
+        or _override_table_contains(
+            cat_args.outlier_protect_count,
+            lambda value: int(value) > 0,
+        )
+        or (
+            str(cat_args.outlier_protect_mode).strip().lower() == "residual_sparse"
+            and str(cat_args.outlier_residual_score).strip().lower() in _OUTLIER_RESIDUAL_SCORE_MODES_NEED_ACT
+        )
+    )
+    if dynamic_calib_enabled and not str(cat_args.wa_mse_calib_dataset).strip():
+        raise ValueError(
+            "--wa_mse_calib_dataset must be set when dynamic activation calibration is enabled. "
+            "Use ratio-style dataset specs such as 'wiki=1.0', 'openorca=1.0' or "
+            "'openorca=0.5,fineweb_edu=0.5'."
+        )
+
+
+def _validate_lora_extra_trainable_args(cat_args: NormalizedCatArgs) -> None:
+    if bool(cat_args.lora_after_category):
+        return
+    enabled = []
+    if bool(cat_args.tune_final_norm):
+        enabled.append("--lora_tune_final_norm")
+    if bool(cat_args.use_post_norm_head_linear):
+        enabled.append("--lora_use_post_norm_head_linear")
+    if enabled:
+        raise ValueError(
+            f"{', '.join(enabled)} 仅在 LoRA 补偿阶段生效，因此必须同时开启 --lora_after_category。"
+        )
 
 
 def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
@@ -893,9 +970,10 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wa_mse_calib_dataset",
         type=lambda raw: _parse_wa_mse_calib_dataset_text(raw, arg_name="--wa_mse_calib_dataset"),
-        default="wikitext2",
+        default="",
         help="Calibration dataset used for wa_mse dynamic act-max recomputation. "
-        "Supported: wiki/wikitext2, fineweb_edu, openorca, redpajama, alpaca.",
+        "Required when dynamic calibration is enabled. Format: alias=weight,alias=weight. "
+        "For example: wiki=1.0, openorca=1.0, or openorca=0.5,fineweb_edu=0.5.",
     )
     parser.add_argument("--wa_mse_calib_nsamples", type=int, default=512, help="Calibration sample count used for wa_mse dynamic act-max recomputation.")
     parser.add_argument("--wa_mse_calib_seqlen", type=int, default=512, help="Calibration sequence length used for wa_mse dynamic act-max recomputation.")
@@ -924,9 +1002,13 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_after_category", action="store_true", help="每个类别 VAE 训练后，对剩余类别做一次 LoRA 微调并融合。")
     parser.add_argument(
         "--lora_dataset",
-        type=lambda raw: _parse_lora_dataset_text(raw, arg_name="--lora_dataset"),
-        default="wiki",
-        help="LoRA 补偿训练数据集。支持: wiki, fineweb_edu, openorca, redpajama, alpaca。",
+        type=str,
+        default="",
+        help=(
+            "LoRA 补偿训练数据集比例串。开启 --lora_after_category 时必填；"
+            "格式: alias=weight,alias=weight，例如 wiki=1.0、openorca=1.0 或 "
+            "openorca=0.5,fineweb_edu=0.5。支持 dense_e2e 的 dataset_mix alias。"
+        ),
     )
     parser.add_argument("--lora_rank", type=str, default="default=8", help=f"after_category 覆盖参数。示例：{_LORA_RANK_SPEC.example}")
     parser.add_argument("--lora_alpha", type=str, default="default=16.0", help=f"after_category 覆盖参数。示例：{_LORA_ALPHA_SPEC.example}")
@@ -941,6 +1023,22 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_loss_alpha", type=str, default="default=0.5", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_ALPHA_SPEC.example}")
     parser.add_argument("--lora_loss_type", type=str, default="default=sft", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_TYPE_SPEC.example}")
     parser.add_argument("--lora_use_dora", type=str, default="default=true", help=f"after_category 覆盖参数。示例：{_LORA_USE_DORA_SPEC.example}")
+    parser.add_argument(
+        "--lora_tune_final_norm",
+        "--tune_final_norm",
+        dest="tune_final_norm",
+        type=lambda v: _parse_bool_like(v, arg_name="--tune_final_norm"),
+        default=False,
+        help="LoRA 补偿阶段是否同时微调模型最终 norm。",
+    )
+    parser.add_argument(
+        "--lora_use_post_norm_head_linear",
+        "--use_post_norm_head_linear",
+        dest="use_post_norm_head_linear",
+        type=lambda v: _parse_bool_like(v, arg_name="--use_post_norm_head_linear"),
+        default=False,
+        help="LoRA 补偿阶段是否训练 post-norm head linear；最终保存前会融合回 lm_head。",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train_device", type=str, default="cuda")
     parser.add_argument("--rot_llm", action="store_true", default=False, help="在 VAE 压缩前先对基座 LLM 执行一次离线旋转融合。")
@@ -968,10 +1066,12 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
     raw_script_args, remaining = script_parser.parse_known_args(list(argv))
     cat_args = _normalize_cat_train_script_args(raw_script_args)
     _validate_outlier_protect_mode_args(cat_args)
+    _validate_lora_extra_trainable_args(cat_args)
 
     vae_parser = _build_cat_train_vae_parser()
     raw_vae_args, unknown_args = vae_parser.parse_known_args(remaining)
     vae_args = _normalize_cat_train_vae_args(raw_vae_args)
+    _validate_dynamic_calib_dataset_args(cat_args, vae_args)
 
     hf_parser = transformers.HfArgumentParser((HFArguments, CatTrainHFTrainingArguments))
     hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=unknown_args)

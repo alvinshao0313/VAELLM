@@ -5,6 +5,7 @@ from torch import nn
 
 from e2e_common.post_norm_head import resolve_post_norm_linear
 from rotation.model_utils import get_model_type, get_pre_head_layernorm
+from raw_e2e_fintuning.smooth import apply_lora_smooth
 from train_utils.utils import extract_layer_idx
 
 try:
@@ -21,6 +22,8 @@ class RawTrainableSelection:
     modules_to_save: List[str]
     final_norm_modules: List[str]
     post_norm_head_modules: List[str]
+    lora_smooth_modules: List[str]
+    lora_smooth_parameter_count: int
     trainable_parameter_names: List[str]
     trainable_parameter_count: int
 
@@ -192,6 +195,13 @@ def inject_raw_peft_adapters(
         total_step=int(total_step),
     )
     peft_model = get_peft_model(model, peft_config)
+    if bool(getattr(args, "lora_smooth", False)):
+        smooth_info = apply_lora_smooth(peft_model)
+        lora_smooth_modules = list(smooth_info.module_names)
+        lora_smooth_parameter_count = int(smooth_info.parameter_count)
+    else:
+        lora_smooth_modules = []
+        lora_smooth_parameter_count = 0
 
     trainable_parameter_names = sorted(
         name for name, param in peft_model.named_parameters() if bool(param.requires_grad)
@@ -209,6 +219,8 @@ def inject_raw_peft_adapters(
         modules_to_save=list(modules_to_save),
         final_norm_modules=list(final_norm_modules),
         post_norm_head_modules=list(post_norm_head_modules),
+        lora_smooth_modules=list(lora_smooth_modules),
+        lora_smooth_parameter_count=int(lora_smooth_parameter_count),
         trainable_parameter_names=trainable_parameter_names,
         trainable_parameter_count=int(trainable_parameter_count),
     )

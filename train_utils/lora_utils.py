@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -11,6 +11,8 @@ except ImportError:
     AutoTokenizer = None
     TrainingArguments = None
 
+from e2e_common.post_norm_head import ensure_post_norm_head_linear, resolve_post_norm_linear
+from rotation.model_utils import get_model_type, get_pre_head_layernorm
 from train_utils.cat_train_args import resolve_lora_runtime_config
 from train_utils.hif4_act import (
     build_hif4_act_controller,
@@ -48,6 +50,14 @@ class _ResolvedLoraStageConfig:
     dataset: str
     use_dora: bool
     use_lora_hif4_act: bool
+    tune_final_norm: bool
+    use_post_norm_head_linear: bool
+
+
+@dataclass(frozen=True)
+class _ExtraTrainableModule:
+    name: str
+    module: nn.Module
 
 
 def _ensure_lora_stack_available() -> None:
@@ -65,6 +75,7 @@ def _enum_to_value(value, default: str) -> str:
     if "." in raw:
         raw = raw.split(".")[-1]
     return raw.lower()
+
 
 def _resolve_lora_stage_config(
     *,
@@ -96,10 +107,13 @@ def _resolve_lora_stage_config(
         temperature=float(runtime_cfg.temperature),
         loss_alpha=float(runtime_cfg.loss_alpha),
         loss_type=str(runtime_cfg.loss_type),
-        dataset=str(getattr(cat_args, "lora_dataset", "wiki")).strip().lower(),
+        dataset=str(getattr(cat_args, "lora_dataset", "")).strip().lower(),
         use_dora=bool(runtime_cfg.use_dora),
         use_lora_hif4_act=bool(getattr(training_args, "lora_hif4_act", False)),
+        tune_final_norm=bool(getattr(cat_args, "tune_final_norm", False)),
+        use_post_norm_head_linear=bool(getattr(cat_args, "use_post_norm_head_linear", False)),
     )
+
 
 def _freeze_model_for_lora(model: nn.Module, *, device: str, logger) -> None:
     for param in model.parameters():
@@ -111,6 +125,69 @@ def _freeze_model_for_lora(model: nn.Module, *, device: str, logger) -> None:
     model.train()
 
 
+def _find_module_name(model: nn.Module, target: nn.Module, fallback: str) -> str:
+    for name, module in model.named_modules():
+        if module is target:
+            return str(name)
+    return str(fallback)
+
+
+def _collect_extra_trainable_modules(
+    model: nn.Module,
+    *,
+    cfg: _ResolvedLoraStageConfig,
+    logger,
+) -> List[_ExtraTrainableModule]:
+    modules: List[_ExtraTrainableModule] = []
+
+    if bool(cfg.tune_final_norm):
+        model_type = get_model_type(model)
+        final_norm = get_pre_head_layernorm(model, model_type)
+        final_norm_name = _find_module_name(model, final_norm, "model.norm")
+        modules.append(_ExtraTrainableModule(name=final_norm_name, module=final_norm))
+
+    if bool(cfg.use_post_norm_head_linear):
+        attached = ensure_post_norm_head_linear(model)
+        if attached:
+            logger.info("LoRA: 已为 lm_head 挂载 identity 初始化的 post_norm_linear。")
+        post_norm_linear = resolve_post_norm_linear(model)
+        if post_norm_linear is None:
+            raise ValueError("--use_post_norm_head_linear=true but model.lm_head is not LMHeadWithPostNormLinear.")
+        post_norm_name = _find_module_name(model, post_norm_linear, "lm_head.post_norm_linear")
+        modules.append(_ExtraTrainableModule(name=post_norm_name, module=post_norm_linear))
+
+    return modules
+
+
+def _snapshot_extra_trainable_params(
+    modules: Sequence[_ExtraTrainableModule],
+) -> List[Tuple[nn.Parameter, torch.Tensor]]:
+    snapshots: List[Tuple[nn.Parameter, torch.Tensor]] = []
+    seen = set()
+    for item in modules:
+        for _param_name, param in item.module.named_parameters(recurse=True):
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            snapshots.append((param, param.detach().clone()))
+    return snapshots
+
+
+def _enable_extra_trainable_params(modules: Sequence[_ExtraTrainableModule]) -> List[str]:
+    enabled: List[str] = []
+    seen = set()
+    for item in modules:
+        for param_name, param in item.module.named_parameters(recurse=True):
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            param.requires_grad = True
+            enabled.append(str(item.name) if not param_name else f"{item.name}.{param_name}")
+    return sorted(enabled)
+
+
 def _log_lora_stage_start(
     *,
     logger,
@@ -118,16 +195,18 @@ def _log_lora_stage_start(
     after_category: Optional[str],
     remaining_categories: Sequence[str],
     target_count: int,
+    extra_trainable_names: Sequence[str],
     use_custom_trainer: bool,
 ) -> None:
     if use_custom_trainer:
         logger.info(
-            "LoRA: 使用 CustomSFTTrainer 微调，after_category=%s，loss_type=%s，use_dora=%s，目标类别=%s，目标模块=%d，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
+            "LoRA: 使用 CustomSFTTrainer 微调，after_category=%s，loss_type=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
             str(after_category),
             str(cfg.loss_type).strip().lower(),
             str(cfg.use_dora).lower(),
             ",".join(remaining_categories),
             int(target_count),
+            ",".join(extra_trainable_names) if extra_trainable_names else "none",
             int(cfg.rank),
             float(cfg.alpha),
             int(cfg.steps),
@@ -144,11 +223,12 @@ def _log_lora_stage_start(
         return
 
     logger.info(
-        "LoRA: 使用 SFTTrainer 微调，after_category=%s，use_dora=%s，目标类别=%s，目标模块=%d，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
+        "LoRA: 使用 SFTTrainer 微调，after_category=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
         str(after_category),
         str(cfg.use_dora).lower(),
         ",".join(remaining_categories),
         int(target_count),
+        ",".join(extra_trainable_names) if extra_trainable_names else "none",
         int(cfg.rank),
         float(cfg.alpha),
         int(cfg.steps),
@@ -209,6 +289,7 @@ def _build_lora_trainer(
     lora_config,
     cfg: _ResolvedLoraStageConfig,
     hif4_act_controller,
+    teacher_param_snapshots,
 ):
     trainer_kwargs = dict(
         model=model,
@@ -229,6 +310,7 @@ def _build_lora_trainer(
             temperature=float(cfg.temperature),
             loss_alpha=float(cfg.loss_alpha),
             lora_hif4_act_controller=hif4_act_controller,
+            teacher_param_snapshots=teacher_param_snapshots,
         )
     return SFTTrainer(**trainer_kwargs)
 
@@ -285,15 +367,20 @@ def lora_finetune_remaining_categories(
         after_category=after_category,
         lora_round_idx=lora_round_idx,
     )
-    if cfg.steps <= 0 or not remaining_categories:
+    has_extra_trainables = bool(cfg.tune_final_norm) or bool(cfg.use_post_norm_head_linear)
+    if cfg.steps <= 0:
+        return model
+    if not remaining_categories and not has_extra_trainables:
         return model
     _ensure_lora_stack_available()
 
-    if not target_names:
+    if not target_names and not has_extra_trainables:
         logger.info("LoRA: 没有可微调的剩余 Linear，跳过。")
         return model
 
     _freeze_model_for_lora(model, device=cfg.device, logger=logger)
+    extra_modules = _collect_extra_trainable_modules(model, cfg=cfg, logger=logger)
+    teacher_param_snapshots = _snapshot_extra_trainable_params(extra_modules)
     model, lora_config, unique_target_names = create_lora_adapters(
         model,
         target_names=target_names,
@@ -302,8 +389,12 @@ def lora_finetune_remaining_categories(
         dropout=cfg.dropout,
         use_dora=cfg.use_dora,
     )
+    extra_trainable_names = _enable_extra_trainable_params(extra_modules)
     if lora_config is None:
         logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
+        if not extra_trainable_names:
+            logger.info("LoRA: 没有额外可训练参数，跳过。")
+            return model
 
     resolved_lora_loss = str(cfg.loss_type).strip().lower()
     use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"}
@@ -313,22 +404,33 @@ def lora_finetune_remaining_categories(
         after_category=after_category,
         remaining_categories=remaining_categories,
         target_count=len(unique_target_names),
+        extra_trainable_names=extra_trainable_names,
         use_custom_trainer=use_custom_trainer,
     )
 
-    resolved_dataset_key, dataset_spec, train_ds, eval_ds, eval_split = prepare_lora_datasets(
+    dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_lora_datasets(
         cfg.dataset,
         nsamples=cfg.nsamples,
         seed=cfg.seed,
     )
     logger.info(
-        "LoRA: 补偿训练数据集=%s hf=%s config=%s train_split=%s eval_split=%s",
-        resolved_dataset_key,
-        str(dataset_spec.path),
-        "none" if dataset_spec.config is None else str(dataset_spec.config),
-        str(dataset_spec.train_split),
-        "none" if eval_split is None else str(eval_split),
+        "LoRA: 补偿训练混合数据集=%s nsamples=%d eval_dataset=none",
+        str(dataset_mix_spec),
+        int(cfg.nsamples),
     )
+    for source_info in source_stats:
+        logger.info(
+            "LoRA: 混合数据源 alias=%s weight=%.6f target_rows=%d actual_rows=%d raw_rows=%d text_rows=%d hf=%s config=%s train_split=%s",
+            str(source_info["alias"]),
+            float(source_info["weight"]),
+            int(source_info["target_rows"]),
+            int(source_info["actual_rows"]),
+            int(source_info["raw_rows"]),
+            int(source_info["text_rows"]),
+            str(source_info["path"]),
+            "none" if source_info["config"] is None else str(source_info["config"]),
+            str(source_info["train_split"]),
+        )
     if len(train_ds) == 0:
         logger.warning("LoRA: 数据集为空，跳过。")
         model, _merged_count = merge_all_lora(model)
@@ -346,6 +448,7 @@ def lora_finetune_remaining_categories(
         lora_config=lora_config,
         cfg=cfg,
         hif4_act_controller=hif4_act_controller,
+        teacher_param_snapshots=teacher_param_snapshots,
     )
     return _train_and_merge_lora_model(
         trainer=trainer,

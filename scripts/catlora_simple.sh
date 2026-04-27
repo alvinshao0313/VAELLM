@@ -24,7 +24,7 @@ export CUDA_VISIBLE_DEVICES=1
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
-# --wa_mse_calib_dataset "wikitext2"  # 支持 wiki/wikitext2/fineweb_edu/openorca/redpajama/alpaca
+# --wa_mse_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,piqa"       # 可选：类别后下游任务评估；空串表示不跑
 # --lora_after_category \ boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa
@@ -67,7 +67,7 @@ python tools/cat_train.py \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
-  --wa_mse_calib_dataset "wikitext2" \
+  --wa_mse_calib_dataset "wiki=1.0" \
   --wa_mse_calib_nsamples "512" \
   --wa_mse_calib_seqlen "4096" \
   --wa_mse_calib_seed "0" \
@@ -104,7 +104,7 @@ python tools/cat_train.py \
   --use_checkpoint \
   --new_quant \
   --lora_after_category \
-  --lora_dataset "wiki" \
+  --lora_dataset "wiki=1.0" \
   --lora_rank "default=12" \
   --lora_alpha "default=24.0" \
   --lora_dropout "default=0.0" \
@@ -119,6 +119,8 @@ python tools/cat_train.py \
   --lora_loss_alpha "default=0.5" \
   --lora_loss_type "default=kd_top_1000" \
   --lora_use_dora "default=false" \
+  --lora_tune_final_norm "false" \
+  --lora_use_post_norm_head_linear "false" \
   --lora_hif4_act "false" \
   --eval_hif4_act "false" \
   --lora_gradient_accumulation_steps "1" \

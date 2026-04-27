@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 MAX_STEPS="${MAX_STEPS:-1000}"
 STUDENT_CKPT="${STUDENT_CKPT:-.result/Qwen_Qwen3-8B_20260422_070608/final_model}"
 
@@ -22,8 +22,8 @@ torchrun --standalone --nproc_per_node=4 -m dense_e2e_fintuning.main \
   --gradient_checkpointing true \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --student_checkpoint_dir "${STUDENT_CKPT}" \
-  --run_root_dir .result/dense_e2e_fintuning_alpaca \
-  --dataset_mix "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10" \
+  --run_root_dir .result/dense_e2e_fintuning \
+  --dataset_mix "openorca=1.0" \
   --dataset_num_proc 64 \
   --loss_type kd_top_1000 \
   --distill_temperature 1.0 \

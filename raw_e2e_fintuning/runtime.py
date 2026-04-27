@@ -161,12 +161,14 @@ def run(args, hf_args, training_args):
         total_step=int(training_args.max_steps),
     )
     log.info(
-        "Selected trainables: variant=%s layers=%s targets=%d target_suffixes=%s modules_to_save=%s trainable_tensors=%d trainable_params=%d",
+        "Selected trainables: variant=%s layers=%s targets=%d target_suffixes=%s modules_to_save=%s lora_smooth_modules=%d lora_smooth_params=%d trainable_tensors=%d trainable_params=%d",
         str(args.lora_variant),
         selection.decoder_layer_ids,
         len(selection.target_modules),
         selection.target_module_suffixes,
         selection.modules_to_save,
+        len(selection.lora_smooth_modules),
+        int(selection.lora_smooth_parameter_count),
         len(selection.trainable_parameter_names),
         int(selection.trainable_parameter_count),
     )

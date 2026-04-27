@@ -60,3 +60,25 @@ def resolve_post_norm_linear(model: nn.Module) -> Optional[nn.Linear]:
     if not isinstance(lm_head, LMHeadWithPostNormLinear):
         return None
     return lm_head.post_norm_linear
+
+
+def fuse_post_norm_head_linear(model: nn.Module) -> bool:
+    lm_head = getattr(model, "lm_head", None)
+    if not isinstance(lm_head, LMHeadWithPostNormLinear):
+        return False
+
+    base_lm_head = lm_head.lm_head
+    post_norm_linear = lm_head.post_norm_linear
+    with torch.no_grad():
+        post_weight = post_norm_linear.weight.detach().to(device=base_lm_head.weight.device, dtype=torch.float32)
+        out_features = int(base_lm_head.weight.shape[0])
+        row_chunk_size = 1024
+        for row_begin in range(0, out_features, row_chunk_size):
+            row_end = min(row_begin + row_chunk_size, out_features)
+            weight_chunk = base_lm_head.weight[row_begin:row_end].detach().to(dtype=torch.float32)
+            fused_chunk = torch.matmul(weight_chunk, post_weight)
+            base_lm_head.weight[row_begin:row_end].copy_(fused_chunk.to(dtype=base_lm_head.weight.dtype))
+
+    base_lm_head.train(lm_head.training)
+    model.lm_head = base_lm_head
+    return True

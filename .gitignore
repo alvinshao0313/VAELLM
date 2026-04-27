@@ -46,3 +46,6 @@ HiFloat4/**/dist/
 HiFloat4/**/*.egg-info/
 HiFloat4/**/*.log
 HiFloat4/**/.ipynb_checkpoints/
+
+adapters/
+notebook/

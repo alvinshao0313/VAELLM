@@ -5,7 +5,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from train_utils.lora_data import build_calibration_input_ids, normalize_text_dataset_name
+from e2e_common.data import normalize_dataset_mix_spec
+from train_utils.lora_data import build_calibration_input_ids
 
 
 @dataclass
@@ -18,6 +19,11 @@ class ActivationCalibrationCache:
     input_ids: List[torch.Tensor]
 
 
+def _normalize_calibration_dataset_mix(dataset: str) -> str:
+    _sources, _weights, normalized_spec = normalize_dataset_mix_spec(dataset)
+    return str(normalized_spec)
+
+
 def _build_calibration_cache(
     *,
     dataset: str,
@@ -27,7 +33,7 @@ def _build_calibration_cache(
     seqlen: int,
     seed: int,
 ) -> ActivationCalibrationCache:
-    dataset_key = normalize_text_dataset_name(dataset, arg_name="--wa_mse_calib_dataset")
+    dataset_key = _normalize_calibration_dataset_mix(dataset)
 
     from transformers import AutoTokenizer
 
@@ -64,7 +70,7 @@ def _cache_matches(
     seed: int,
 ) -> bool:
     return (
-        str(cache.dataset) == normalize_text_dataset_name(dataset, arg_name="--wa_mse_calib_dataset")
+        str(cache.dataset) == _normalize_calibration_dataset_mix(dataset)
         and str(cache.model_path) == str(model_path)
         and int(cache.nsamples) == int(nsamples)
         and int(cache.seqlen) == int(seqlen)
@@ -78,7 +84,7 @@ def collect_act_max_for_linears(
     linear_items: Sequence[Tuple[str, nn.Linear]],
     model_path: str,
     access_token: Optional[str],
-    dataset: str = "wikitext2",
+    dataset: str = "",
     nsamples: int = 512,
     seqlen: int = 512,
     seed: int = 0,

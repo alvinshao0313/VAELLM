@@ -65,10 +65,6 @@ class DenseE2EFinetuneArguments:
     ppl_seqlen: int = 2048
     ppl_limit: int = -1
     dataset_mix: Optional[str] = None
-    dataset_name: Optional[str] = None
-    dataset_config_name: Optional[str] = None
-    train_split: str = "train"
-    eval_split: str = "validation"
     train_file: Optional[str] = None
     eval_file: Optional[str] = None
     text_field: str = "text"
@@ -248,10 +244,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ppl_seqlen", type=int, default=2048)
     parser.add_argument("--ppl_limit", type=int, default=-1)
     parser.add_argument("--dataset_mix", type=str, default=None)
-    parser.add_argument("--dataset_name", type=str, default=None)
-    parser.add_argument("--dataset_config_name", type=str, default=None)
-    parser.add_argument("--train_split", type=str, default="train")
-    parser.add_argument("--eval_split", type=str, default="validation")
     parser.add_argument("--train_file", type=str, default=None)
     parser.add_argument("--eval_file", type=str, default=None)
     parser.add_argument("--text_field", type=str, default="text")
@@ -285,10 +277,6 @@ def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: DenseE2EFine
         except ValueError as exc:
             parser.error(str(exc))
         conflicting_flags = [
-            "--dataset_name",
-            "--dataset_config_name",
-            "--train_split",
-            "--eval_split",
             "--train_file",
             "--eval_file",
             "--text_field",
@@ -307,22 +295,16 @@ def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: DenseE2EFine
         args.dataset_mix_spec = dataset_mix_spec
         return
 
-    use_hf_dataset = bool(str(args.dataset_name or "").strip())
     use_local_files = bool(str(args.train_file or "").strip())
-    if use_hf_dataset == use_local_files:
-        parser.error(
-            "Choose exactly one data source mode: either --dataset_name or --train_file."
-        )
-    if use_hf_dataset and (args.train_file or args.eval_file):
-        parser.error("--train_file/--eval_file cannot be combined with --dataset_name.")
-    if use_local_files:
-        train_file = os.path.abspath(str(args.train_file))
-        if not os.path.exists(train_file):
-            parser.error(f"--train_file does not exist: {train_file}")
-        if args.eval_file:
-            eval_file = os.path.abspath(str(args.eval_file))
-            if not os.path.exists(eval_file):
-                parser.error(f"--eval_file does not exist: {eval_file}")
+    if not use_local_files:
+        parser.error("Choose a data source: either --dataset_mix or --train_file.")
+    train_file = os.path.abspath(str(args.train_file))
+    if not os.path.exists(train_file):
+        parser.error(f"--train_file does not exist: {train_file}")
+    if args.eval_file:
+        eval_file = os.path.abspath(str(args.eval_file))
+        if not os.path.exists(eval_file):
+            parser.error(f"--eval_file does not exist: {eval_file}")
     args.dataset_mix = None
     args.dataset_mix_sources = None
     args.dataset_mix_weights = None

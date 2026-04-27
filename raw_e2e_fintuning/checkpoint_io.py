@@ -4,6 +4,8 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from raw_e2e_fintuning.smooth import collect_lora_smooth_fusion_specs, fuse_lora_smooth_into_linear_weights
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -69,6 +71,7 @@ def save_final_artifacts(
     tokenizer_dir = os.path.join(run_output_dir, "tokenizer")
     merged_dir = os.path.join(run_output_dir, "final_merged_model")
     run_meta_path = os.path.join(run_output_dir, "run_meta.json")
+    trainable_info = dict(trainable_info)
 
     if not bool(should_save):
         return {
@@ -79,6 +82,13 @@ def save_final_artifacts(
         }
 
     os.makedirs(run_output_dir, exist_ok=True)
+    use_lora_smooth = bool(getattr(raw_args, "lora_smooth", False))
+    if use_lora_smooth and not bool(getattr(raw_args, "raw_merge_and_save", False)):
+        raise ValueError("lora_smooth=true requires raw_merge_and_save=true.")
+    smooth_fusion_specs = collect_lora_smooth_fusion_specs(model) if use_lora_smooth else []
+    if use_lora_smooth and not smooth_fusion_specs:
+        raise RuntimeError("lora_smooth=true 但保存前未找到任何 LoRA smooth 参数。")
+
     save_kwargs = {"safe_serialization": True}
     if state_dict is not None:
         save_kwargs["state_dict"] = state_dict
@@ -92,10 +102,14 @@ def save_final_artifacts(
         if not callable(merge_fn):
             raise ValueError("raw_merge_and_save=true 但当前模型不支持 merge_and_unload。")
         merged_model = merge_fn()
+        fused_smooth_count = fuse_lora_smooth_into_linear_weights(merged_model, smooth_fusion_specs)
+        trainable_info["lora_smooth_fused_module_count"] = int(fused_smooth_count)
         merged_model.save_pretrained(merged_dir, safe_serialization=True)
         if bool(getattr(raw_args, "save_tokenizer", False)) and tokenizer is not None:
             tokenizer.save_pretrained(merged_dir)
         actual_merged_dir = merged_dir
+    else:
+        trainable_info["lora_smooth_fused_module_count"] = 0
 
     run_meta = build_run_meta(
         raw_args=raw_args,

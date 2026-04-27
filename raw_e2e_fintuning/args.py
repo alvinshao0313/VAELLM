@@ -46,6 +46,7 @@ class RawE2EFinetuneArguments:
     lora_dropout: float = 0.0
     lora_tune_bias: bool = False
     lora_init_mode: str = "zero"
+    lora_smooth: bool = False
     adalora_target_r: int = 8
     adalora_init_r: int = 12
     adalora_tinit: int = 0
@@ -60,10 +61,6 @@ class RawE2EFinetuneArguments:
     ppl_seqlen: int = 2048
     ppl_limit: int = -1
     dataset_mix: Optional[str] = None
-    dataset_name: Optional[str] = None
-    dataset_config_name: Optional[str] = None
-    train_split: str = "train"
-    eval_split: str = "validation"
     train_file: Optional[str] = None
     eval_file: Optional[str] = None
     text_field: str = "text"
@@ -216,6 +213,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--lora_init_mode", type=parse_lora_init_mode, default="zero")
+    parser.add_argument(
+        "--lora_smooth",
+        type=lambda v: _parse_bool_like(v, arg_name="--lora_smooth"),
+        default=False,
+    )
     parser.add_argument("--adalora_target_r", type=int, default=8)
     parser.add_argument("--adalora_init_r", type=int, default=12)
     parser.add_argument("--adalora_tinit", type=int, default=0)
@@ -242,10 +244,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ppl_seqlen", type=int, default=2048)
     parser.add_argument("--ppl_limit", type=int, default=-1)
     parser.add_argument("--dataset_mix", type=str, default=None)
-    parser.add_argument("--dataset_name", type=str, default=None)
-    parser.add_argument("--dataset_config_name", type=str, default=None)
-    parser.add_argument("--train_split", type=str, default="train")
-    parser.add_argument("--eval_split", type=str, default="validation")
     parser.add_argument("--train_file", type=str, default=None)
     parser.add_argument("--eval_file", type=str, default=None)
     parser.add_argument("--text_field", type=str, default="text")
@@ -284,10 +282,6 @@ def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: RawE2EFinetu
         except ValueError as exc:
             parser.error(str(exc))
         conflicting_flags = [
-            "--dataset_name",
-            "--dataset_config_name",
-            "--train_split",
-            "--eval_split",
             "--train_file",
             "--eval_file",
             "--text_field",
@@ -306,22 +300,16 @@ def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: RawE2EFinetu
         args.dataset_mix_spec = dataset_mix_spec
         return
 
-    use_hf_dataset = bool(str(args.dataset_name or "").strip())
     use_local_files = bool(str(args.train_file or "").strip())
-    if use_hf_dataset == use_local_files:
-        parser.error(
-            "Choose exactly one data source mode: either --dataset_name or --train_file."
-        )
-    if use_hf_dataset and (args.train_file or args.eval_file):
-        parser.error("--train_file/--eval_file cannot be combined with --dataset_name.")
-    if use_local_files:
-        train_file = os.path.abspath(str(args.train_file))
-        if not os.path.exists(train_file):
-            parser.error(f"--train_file does not exist: {train_file}")
-        if args.eval_file:
-            eval_file = os.path.abspath(str(args.eval_file))
-            if not os.path.exists(eval_file):
-                parser.error(f"--eval_file does not exist: {eval_file}")
+    if not use_local_files:
+        parser.error("Choose a data source: either --dataset_mix or --train_file.")
+    train_file = os.path.abspath(str(args.train_file))
+    if not os.path.exists(train_file):
+        parser.error(f"--train_file does not exist: {train_file}")
+    if args.eval_file:
+        eval_file = os.path.abspath(str(args.eval_file))
+        if not os.path.exists(eval_file):
+            parser.error(f"--eval_file does not exist: {eval_file}")
     args.dataset_mix = None
     args.dataset_mix_sources = None
     args.dataset_mix_weights = None
@@ -397,6 +385,8 @@ def validate_args(
     _validate_dataset_inputs(parser, args)
     _validate_numeric_inputs(parser, args)
     _validate_variant_inputs(parser, args, training_args)
+    if bool(args.lora_smooth) and not bool(args.raw_merge_and_save):
+        parser.error("--lora_smooth true requires --raw_merge_and_save true.")
 
     resume_path = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
     if resume_path:

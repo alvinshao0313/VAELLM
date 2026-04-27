@@ -1,160 +1,197 @@
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import math
+from typing import Dict, List
 
 import torch
 
 try:
-    from datasets import Dataset, DatasetDict, load_dataset
+    from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 except ImportError:
     Dataset = None
     DatasetDict = None
+    concatenate_datasets = None
     load_dataset = None
 
 
-@dataclass(frozen=True)
-class LoraDatasetSpec:
-    path: str
-    config: Optional[str]
-    train_split: str
-    eval_splits: Tuple[str, ...]
-    text_format: str
-
-
-LORA_DATASET_SPECS = {
-    "wiki": LoraDatasetSpec(
-        path="Salesforce/wikitext",
-        config="wikitext-2-raw-v1",
-        train_split="train",
-        eval_splits=("validation", "test"),
-        text_format="plain_text",
-    ),
-    "fineweb_edu": LoraDatasetSpec(
-        path="HuggingFaceFW/fineweb-edu",
-        config="sample-10BT",
-        train_split="train",
-        eval_splits=("validation", "test"),
-        text_format="plain_text",
-    ),
-    "openorca": LoraDatasetSpec(
-        path="Open-Orca/OpenOrca",
-        config=None,
-        train_split="train",
-        eval_splits=("validation", "test"),
-        text_format="openorca",
-    ),
-    "redpajama": LoraDatasetSpec(
-        path="ZengXiangyu/RedPajama-Data-1T-Sample",
-        config=None,
-        train_split="train",
-        eval_splits=("validation", "test"),
-        text_format="plain_text",
-    ),
-    "alpaca": LoraDatasetSpec(
-        path="vicgalle/alpaca-gpt4",
-        config=None,
-        train_split="train",
-        eval_splits=("validation", "test"),
-        text_format="alpaca",
-    ),
-}
-
-TEXT_DATASET_ALIASES = {
-    "wiki": "wiki",
-    "wikitext2": "wiki",
-    "fineweb_edu": "fineweb_edu",
-    "openorca": "openorca",
-    "redpajama": "redpajama",
-    "alpaca": "alpaca",
-}
-
-
 def ensure_lora_dataset_stack_available() -> None:
-    if load_dataset is None or DatasetDict is None:
+    if load_dataset is None or DatasetDict is None or concatenate_datasets is None:
         raise ImportError("未安装 datasets。请先安装：pip install datasets")
 
 
-def normalize_text_dataset_name(dataset_name: str, *, arg_name: str) -> str:
-    dataset_key = str(dataset_name).strip().lower()
-    canonical = TEXT_DATASET_ALIASES.get(dataset_key)
-    if canonical is None:
+def _split_lora_mix_targets(total_rows: int, weights: List[float]) -> List[int]:
+    if int(total_rows) < 1:
+        raise ValueError(f"--lora_nsamples must be >= 1, got {total_rows}.")
+    if not weights:
+        raise ValueError("--lora_dataset cannot be empty.")
+    targets: List[int] = []
+    allocated = 0
+    for idx, weight in enumerate(weights):
+        if idx == len(weights) - 1:
+            rows = int(total_rows) - int(allocated)
+        else:
+            rows = int(math.floor(float(total_rows) * float(weight)))
+            allocated += int(rows)
+        if rows < 1:
+            raise ValueError(
+                "--lora_nsamples is too small for the requested --lora_dataset mix; "
+                f"source index {idx} got target_rows={rows}."
+            )
+        targets.append(int(rows))
+    return targets
+
+
+def _split_calibration_mix_targets(total_blocks: int, weights: List[float]) -> List[int]:
+    if int(total_blocks) < 0:
+        raise ValueError(f"--wa_mse_calib_nsamples must be >= 0, got {total_blocks}.")
+    if int(total_blocks) == 0:
+        return [0 for _weight in weights]
+    if not weights:
+        raise ValueError("--wa_mse_calib_dataset cannot be empty.")
+    targets: List[int] = []
+    allocated = 0
+    for idx, weight in enumerate(weights):
+        if idx == len(weights) - 1:
+            blocks = int(total_blocks) - int(allocated)
+        else:
+            blocks = int(math.floor(float(total_blocks) * float(weight)))
+            allocated += int(blocks)
+        if blocks < 1:
+            raise ValueError(
+                "--wa_mse_calib_nsamples is too small for the requested --wa_mse_calib_dataset mix; "
+                f"source index {idx} got target_blocks={blocks}."
+            )
+        targets.append(int(blocks))
+    return targets
+
+
+def _prepare_lora_mix_source(
+    *,
+    alias: str,
+    target_rows: int,
+    seed: int,
+):
+    from e2e_common.data import (
+        DATASET_MIX_SOURCE_PRESETS,
+        _load_preset_raw_datasets,
+        _prepare_text_dataset as _prepare_e2e_text_dataset,
+    )
+
+    preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
+    train_raw, _eval_raw = _load_preset_raw_datasets(preset)
+    train_text = _prepare_e2e_text_dataset(
+        train_raw,
+        text_field=str(preset.text_field),
+        text_format=str(preset.text_format),
+        num_proc=1,
+    )
+    text_rows = len(train_text)
+    if text_rows < int(target_rows):
         raise ValueError(
-            f"{arg_name} must be one of: {', '.join(TEXT_DATASET_ALIASES.keys())}. "
-            f"Got {dataset_name!r}."
+            f"LoRA dataset mix source '{alias}' has only {text_rows} usable text rows, "
+            f"but target_rows={int(target_rows)}."
         )
-    return str(canonical)
+    selected = train_text.shuffle(seed=int(seed)).select(range(int(target_rows)))
+    return selected, {
+        "alias": str(alias),
+        "path": str(preset.path),
+        "config": None if preset.config is None else str(preset.config),
+        "train_split": str(preset.train_split),
+        "raw_rows": int(len(train_raw)),
+        "text_rows": int(text_rows),
+        "target_rows": int(target_rows),
+        "actual_rows": int(len(selected)),
+    }
 
 
-def _resolve_dataset_spec(dataset_name: str, *, arg_name: str) -> Tuple[str, LoraDatasetSpec]:
-    dataset_key = normalize_text_dataset_name(dataset_name, arg_name=arg_name)
-    spec = LORA_DATASET_SPECS.get(dataset_key)
-    if spec is None:
-        raise ValueError(f"No dataset spec found for {arg_name}={dataset_name!r}.")
-    return dataset_key, spec
+def _prepare_lora_mixed_dataset(
+    dataset_mix_spec: str,
+    *,
+    nsamples: int,
+    seed: int,
+):
+    from e2e_common.data import normalize_dataset_mix_spec
+
+    sources, weights, normalized_spec = normalize_dataset_mix_spec(dataset_mix_spec)
+    targets = _split_lora_mix_targets(int(nsamples), [float(weight) for weight in weights])
+
+    train_datasets = []
+    source_stats: List[Dict[str, object]] = []
+    for idx, (alias, weight, target_rows) in enumerate(zip(sources, weights, targets)):
+        source_ds, source_info = _prepare_lora_mix_source(
+            alias=str(alias),
+            target_rows=int(target_rows),
+            seed=int(seed) + int(idx),
+        )
+        source_info["weight"] = float(weight)
+        train_datasets.append(source_ds)
+        source_stats.append(source_info)
+
+    train_ds = concatenate_datasets(train_datasets)
+    return str(normalized_spec), source_stats, train_ds
 
 
-def _load_dataset_dict(spec: LoraDatasetSpec):
-    load_kwargs = {"path": str(spec.path)}
-    if spec.config is not None:
-        load_kwargs["name"] = str(spec.config)
-    dataset_dict = load_dataset(**load_kwargs)
-    if not isinstance(dataset_dict, DatasetDict):
-        raise TypeError(f"Expected DatasetDict from load_dataset, got {type(dataset_dict)}")
-    return dataset_dict
+def _iter_calibration_texts_for_source(
+    *,
+    alias: str,
+    seed: int,
+):
+    from e2e_common.data import (
+        DATASET_MIX_SOURCE_PRESETS,
+        _load_preset_raw_datasets,
+        _prepare_text_dataset as _prepare_e2e_text_dataset,
+    )
+
+    preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
+    train_raw, _eval_raw = _load_preset_raw_datasets(preset)
+    train_text = _prepare_e2e_text_dataset(
+        train_raw,
+        text_field=str(preset.text_field),
+        text_format=str(preset.text_format),
+        num_proc=1,
+    )
+    if len(train_text) < 1:
+        raise ValueError(f"Calibration dataset mix source '{alias}' has no usable text rows.")
+    for record in train_text.shuffle(seed=int(seed)):
+        text = record.get("text")
+        if text is None:
+            continue
+        text = str(text).strip()
+        if text:
+            yield text
 
 
-def _get_nonempty_record_text(record: dict, field_name: str) -> Optional[str]:
-    value = record.get(field_name)
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text if text else None
+def _build_calibration_blocks_for_source(
+    *,
+    alias: str,
+    tokenizer,
+    target_blocks: int,
+    block_size: int,
+    seed: int,
+) -> List[torch.Tensor]:
+    blocks: List[torch.Tensor] = []
+    token_buffer: List[int] = []
+    for text in _iter_calibration_texts_for_source(alias=str(alias), seed=int(seed)):
+        encoded = tokenizer(
+            text + "\n\n",
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        input_ids = encoded.get("input_ids")
+        if input_ids is None:
+            raise ValueError(f"Tokenizer output for calibration dataset mix source '{alias}' is missing input_ids.")
+        token_buffer.extend(int(token) for token in input_ids)
+        while len(token_buffer) >= int(block_size) and len(blocks) < int(target_blocks):
+            blocks.append(torch.tensor(token_buffer[:int(block_size)], dtype=torch.long).unsqueeze(0))
+            del token_buffer[:int(block_size)]
+        if len(blocks) >= int(target_blocks):
+            break
 
-
-def _record_to_text(record: dict, *, text_format: str) -> Optional[str]:
-    if text_format == "plain_text":
-        return _get_nonempty_record_text(record, "text")
-
-    if text_format == "openorca":
-        text = _get_nonempty_record_text(record, "text")
-        if text is not None:
-            return text
-        question = _get_nonempty_record_text(record, "question")
-        response = _get_nonempty_record_text(record, "response")
-        system_prompt = _get_nonempty_record_text(record, "system_prompt")
-        if question is None or response is None:
-            return None
-        if system_prompt is not None:
-            return (
-                f"### System:\n{system_prompt}\n\n"
-                f"### User:\n{question}\n\n"
-                f"### Assistant:\n{response}"
-            )
-        return f"### User:\n{question}\n\n### Assistant:\n{response}"
-
-    if text_format == "alpaca":
-        text = _get_nonempty_record_text(record, "text")
-        if text is not None:
-            return text
-        instruction = _get_nonempty_record_text(record, "instruction")
-        output = _get_nonempty_record_text(record, "output")
-        input_text = _get_nonempty_record_text(record, "input")
-        if instruction is None or output is None:
-            return None
-        if input_text is not None:
-            return (
-                f"### Instruction:\n{instruction}\n\n"
-                f"### Input:\n{input_text}\n\n"
-                f"### Response:\n{output}"
-            )
-        return f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
-
-    raise ValueError(f"Unsupported LoRA dataset text format: {text_format}")
-
-
-def _prepare_text_dataset(dataset, *, text_format: str):
-    dataset = dataset.map(lambda rec: {"text": _record_to_text(rec, text_format=text_format)})
-    dataset = dataset.filter(lambda rec: rec["text"] is not None and len(rec["text"]) > 0)
-    return dataset
+    if len(blocks) != int(target_blocks):
+        raise ValueError(
+            f"Calibration dataset mix source '{alias}' does not contain enough tokens to build "
+            f"{int(target_blocks)} blocks of length {int(block_size)}. Built only {len(blocks)} blocks."
+        )
+    return blocks
 
 
 def build_calibration_input_ids(
@@ -168,6 +205,17 @@ def build_calibration_input_ids(
     ensure_lora_dataset_stack_available()
     target_blocks = int(nsamples)
     block_size = int(seqlen)
+    dataset_mix_spec = str(dataset_name or "").strip()
+    if not dataset_mix_spec:
+        raise ValueError("--wa_mse_calib_dataset must be set when dynamic calibration is enabled.")
+    if "=" not in dataset_mix_spec:
+        raise ValueError(
+            "--wa_mse_calib_dataset only accepts ratio-style dataset specs, for example "
+            "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
+        )
+    from e2e_common.data import normalize_dataset_mix_spec
+
+    sources, weights, _normalized_spec = normalize_dataset_mix_spec(dataset_mix_spec)
     if target_blocks < 0:
         raise ValueError(f"--wa_mse_calib_nsamples must be >= 0, got {target_blocks}.")
     if block_size <= 0:
@@ -175,38 +223,24 @@ def build_calibration_input_ids(
     if target_blocks == 0:
         return []
 
-    dataset_key, spec = _resolve_dataset_spec(dataset_name, arg_name="--wa_mse_calib_dataset")
-    dataset_dict = _load_dataset_dict(spec)
-    if spec.train_split not in dataset_dict:
-        raise ValueError(f"Calibration dataset {dataset_key} is missing train split '{spec.train_split}'.")
-
-    train_ds = dataset_dict[spec.train_split].shuffle(seed=int(seed))
+    per_source_targets = _split_calibration_mix_targets(target_blocks, [float(weight) for weight in weights])
     blocks: List[torch.Tensor] = []
-    token_buffer: List[int] = []
-
-    for record in train_ds:
-        text = _record_to_text(record, text_format=str(spec.text_format))
-        if text is None or len(text) == 0:
+    for idx, (alias, source_target_blocks) in enumerate(zip(sources, per_source_targets)):
+        if int(source_target_blocks) == 0:
             continue
-        encoded = tokenizer(
-            text + "\n\n",
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
+        blocks.extend(
+            _build_calibration_blocks_for_source(
+                alias=str(alias),
+                tokenizer=tokenizer,
+                target_blocks=int(source_target_blocks),
+                block_size=int(block_size),
+                seed=int(seed) + int(idx),
+            )
         )
-        input_ids = encoded.get("input_ids")
-        if input_ids is None:
-            raise ValueError(f"Tokenizer output for calibration dataset {dataset_key} is missing input_ids.")
-        token_buffer.extend(int(token) for token in input_ids)
-        while len(token_buffer) >= block_size and len(blocks) < target_blocks:
-            blocks.append(torch.tensor(token_buffer[:block_size], dtype=torch.long).unsqueeze(0))
-            del token_buffer[:block_size]
-        if len(blocks) >= target_blocks:
-            break
 
     if len(blocks) != target_blocks:
         raise ValueError(
-            f"Calibration dataset {dataset_key} does not contain enough tokens to build "
+            f"Calibration dataset mix does not contain enough tokens to build "
             f"{target_blocks} blocks of length {block_size}. Built only {len(blocks)} blocks."
         )
     return blocks
@@ -219,25 +253,14 @@ def prepare_lora_datasets(
     seed: int,
 ):
     ensure_lora_dataset_stack_available()
-
-    dataset_key, spec = _resolve_dataset_spec(dataset_name, arg_name="--lora_dataset")
-    dataset_dict = _load_dataset_dict(spec)
-
-    if spec.train_split not in dataset_dict:
-        raise ValueError(f"LoRA dataset {dataset_key} is missing train split '{spec.train_split}'.")
-    train_ds = dataset_dict[spec.train_split]
-    if int(nsamples) > 0:
-        train_ds = train_ds.shuffle(seed=int(seed)).select(range(min(int(nsamples), len(train_ds))))
-    train_ds = _prepare_text_dataset(train_ds, text_format=str(spec.text_format))
-
-    eval_ds = None
-    eval_split = None
-    for candidate in spec.eval_splits:
-        if candidate in dataset_dict:
-            eval_split = str(candidate)
-            eval_ds = _prepare_text_dataset(dataset_dict[candidate], text_format=str(spec.text_format))
-            if len(eval_ds) == 0:
-                eval_ds = None
-            break
-
-    return dataset_key, spec, train_ds, eval_ds, eval_split
+    if "=" not in str(dataset_name):
+        raise ValueError(
+            "--lora_dataset only accepts ratio-style dataset specs, for example "
+            "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
+        )
+    dataset_mix_spec, source_stats, train_ds = _prepare_lora_mixed_dataset(
+        str(dataset_name),
+        nsamples=int(nsamples),
+        seed=int(seed),
+    )
+    return dataset_mix_spec, source_stats, train_ds, None, None
