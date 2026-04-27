@@ -276,6 +276,8 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedLoraStageConfig):
         disable_tqdm=False,
         save_strategy="no",
         seed=int(cfg.seed),
+        data_seed=int(cfg.seed),
+        full_determinism=bool(getattr(cat_args, "deterministic", False)),
     )
 
 

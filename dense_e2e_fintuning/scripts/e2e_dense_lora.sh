@@ -2,6 +2,10 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+SEED="${SEED:-0}"
+export PYTHONHASHSEED="${SEED}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 MAX_STEPS="${MAX_STEPS:-1000}"
 STUDENT_CKPT="${STUDENT_CKPT:-.result/Qwen_Qwen3-8B_20260422_070608/final_model}"
 
@@ -19,11 +23,14 @@ fi
 
 torchrun --standalone --nproc_per_node=4 -m dense_e2e_fintuning.main \
   --ddp_timeout 14400 \
+  --seed "${SEED}" \
+  --data_seed "${SEED}" \
+  --full_determinism true \
   --gradient_checkpointing true \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --student_checkpoint_dir "${STUDENT_CKPT}" \
   --run_root_dir .result/dense_e2e_fintuning \
-  --dataset_mix "openorca=1.0" \
+  --dataset_mix "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10" \
   --dataset_num_proc 64 \
   --loss_type kd_top_1000 \
   --distill_temperature 1.0 \
@@ -41,7 +48,7 @@ torchrun --standalone --nproc_per_node=4 -m dense_e2e_fintuning.main \
   --lora_tune_bias false \
   --lora_init_mode zero \
   --tune_final_norm true \
-  --use_post_norm_head_linear false \
+  --use_post_norm_head_linear true \
   --lora_hif4_act false \
   --eval_hif4_act false \
   --skip_ppl_eval false \

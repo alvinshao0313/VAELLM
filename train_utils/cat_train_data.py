@@ -6,13 +6,19 @@ import torch
 def build_block_data_loaders(
     stacked_data: torch.Tensor,
     batch_size: int,
+    shuffle_seed: int | None = None,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     block_indices = torch.arange(stacked_data.shape[0], dtype=torch.long)
     dataset = torch.utils.data.TensorDataset(stacked_data, block_indices)
+    generator = None
+    if shuffle_seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(shuffle_seed))
     train_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=int(batch_size),
         shuffle=True,
+        generator=generator,
         num_workers=0,
         pin_memory=False,
     )

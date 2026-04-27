@@ -2,6 +2,13 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+SEED="${SEED:-0}"
+export PYTHONHASHSEED="${SEED}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 MAX_STEPS="${MAX_STEPS:-20000}"
 
 if [[ "${DISABLE_PROXY:-0}" == "1" ]]; then
@@ -18,6 +25,9 @@ fi
 # - 冒烟建议：MAX_STEPS=30 bash raw_e2e_fintuning/scripts/e2e_raw_lora_mix.sh
 
 torchrun --standalone --nproc_per_node=2 -m raw_e2e_fintuning.main \
+  --seed "${SEED}" \
+  --data_seed "${SEED}" \
+  --full_determinism true \
   --gradient_checkpointing true \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --student_model_path meta-llama/Llama-3.1-8B \

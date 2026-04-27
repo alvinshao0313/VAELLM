@@ -3,10 +3,10 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/Qwen_Qwen3-8B_20260422_070608/final_model}"
-ADAPTER_DIR="${ADAPTER_DIR:-.result/dense_e2e_fintuning/final_model_20260425_104121/final_adapter}"
+ADAPTER_DIR="${ADAPTER_DIR:-.result/dense_e2e_fintuning/final_model_20260427_020212/final_adapter}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 
 if [[ -z "${CHECKPOINT_DIR}" ]]; then

@@ -2,6 +2,10 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+SEED="${SEED:-0}"
+export PYTHONHASHSEED="${SEED}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 # 说明：
 # - 原模型 LoRA/DoRA/AdaLoRA 训练入口（非 VAE 轨）。
@@ -9,6 +13,9 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 # - 默认使用 dataset_mix 单源比例 alpaca=1.0。
 
 torchrun --standalone --nproc_per_node=1 -m raw_e2e_fintuning.main \
+  --seed "${SEED}" \
+  --data_seed "${SEED}" \
+  --full_determinism true \
   --student_model_path meta-llama/Llama-2-7b-hf \
   --run_root_dir .result/e2e_raw_lora \
   --dataset_mix "alpaca=1.0" \

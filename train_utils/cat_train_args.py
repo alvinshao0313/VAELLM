@@ -94,6 +94,7 @@ class NormalizedCatArgs:
     tune_final_norm: bool
     use_post_norm_head_linear: bool
     seed: int
+    deterministic: bool
     train_device: str
     rot_llm: bool
     resume_from_checkpoint: Optional[str]
@@ -628,6 +629,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         tune_final_norm=bool(raw_args.tune_final_norm),
         use_post_norm_head_linear=bool(raw_args.use_post_norm_head_linear),
         seed=int(raw_args.seed),
+        deterministic=bool(raw_args.deterministic),
         train_device=str(raw_args.train_device),
         rot_llm=bool(raw_args.rot_llm),
         resume_from_checkpoint=None if raw_args.resume_from_checkpoint is None else str(raw_args.resume_from_checkpoint),
@@ -1040,6 +1042,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="LoRA 补偿阶段是否训练 post-norm head linear；最终保存前会融合回 lm_head。",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--deterministic",
+        type=lambda v: _parse_bool_like(v, arg_name="--deterministic"),
+        default=False,
+        help="启用严格确定性模式；遇到非确定性 CUDA 算子会直接报错。",
+    )
     parser.add_argument("--train_device", type=str, default="cuda")
     parser.add_argument("--rot_llm", action="store_true", default=False, help="在 VAE 压缩前先对基座 LLM 执行一次离线旋转融合。")
     parser.add_argument(

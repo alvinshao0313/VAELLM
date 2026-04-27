@@ -65,6 +65,7 @@ from train_utils.utils import (
     LinearRef,
     clone_namespace as _clone_namespace,
     collect_linears as _collect_linears,
+    configure_deterministic_mode,
     extract_layer_idx as _extract_layer_idx,
     format_intra_parallel_desc as _format_intra_parallel_desc,
     format_namespace as _format_namespace,
@@ -936,6 +937,8 @@ def _train_group_vae_and_replace(
     outlier_residual_block_shape: Tuple[int, int] = (256, 256),
     sort_executor=None,
     sort_prep_workers_resolved: int = 1,
+    deterministic: bool = False,
+    shuffle_seed: int = 0,
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
 
@@ -1057,6 +1060,7 @@ def _train_group_vae_and_replace(
         intra_part_sort_mode="none",
         sort_executor=None,
         split_weights_by_linear=None,
+        shuffle_seed=int(shuffle_seed) if bool(deterministic) else None,
     )
     num_models = int(target_common_result.num_models)
     target_common_split_metas = target_common_result.split_metas
@@ -1146,6 +1150,7 @@ def _train_group_vae_and_replace(
             intra_part_sort_mode="none",
             sort_executor=None,
             split_weights_by_linear=current_residual_weights,
+            shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
         )
         stage_prep_result = common_stage_result
         if sort_mode != "none":
@@ -1161,6 +1166,7 @@ def _train_group_vae_and_replace(
                 intra_part_sort_mode=stage_sort_mode,
                 sort_executor=sort_executor,
                 split_weights_by_linear=current_residual_weights,
+                shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
             )
             prep_duration_sec = float(time.time() - prep_start_time)
             sort_task_count = int(len(group_refs))
@@ -1199,7 +1205,11 @@ def _train_group_vae_and_replace(
             stage_norm_scale = None
             stage_train_data = residual_data
 
-        train_loader, eval_loader = _build_block_data_loaders(stage_train_data, batch_size=int(batch_size))
+        train_loader, eval_loader = _build_block_data_loaders(
+            stage_train_data,
+            batch_size=int(batch_size),
+            shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
+        )
         vae = MultiLayerVAE(stage_vae_args).to(train_device)
 
         # 2) 训练当前 residual stage 对应的 VAE。
@@ -1571,6 +1581,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("--lora_hif4_act 仅在 LoRA 阶段生效，因此必须同时开启 --lora_after_category。")
     if bool(cat_args.lora_after_category) and not bool(cat_args.convert):
         raise ValueError("--lora_after_category requires --convert，因为 LoRA 补偿必须作用在已替换的压缩模型上。")
+    configure_deterministic_mode(bool(getattr(cat_args, "deterministic", False)))
     set_seed(cat_args.seed)
 
     os.makedirs(cat_args.output_dir, exist_ok=True)
@@ -1580,6 +1591,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cat_args.output_dir = run_output_dir
 
     log.info("Run output directory: %s", run_output_dir)
+    if bool(getattr(cat_args, "deterministic", False)):
+        log.info("Deterministic mode enabled: torch deterministic algorithms on, TF32 disabled.")
     log.info(
         "Args:\nscript=%s\nvae=%s\ntraining=%s",
         _format_namespace(cat_args),
@@ -1898,7 +1911,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     )
                 ),
             )
-        for cat in active_categories:
+        for cat_idx, cat in enumerate(active_categories):
             refs_sorted, missing = _collect_sorted_category_refs(
                 model,
                 category=cat,
@@ -1975,6 +1988,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     outlier_residual_block_shape=cat_args.outlier_residual_block_shape,
                     sort_executor=sort_executor,
                     sort_prep_workers_resolved=int(sort_prep_workers_resolved),
+                    deterministic=bool(cat_args.deterministic),
+                    shuffle_seed=int(cat_args.seed) + int(cat_idx) * 100000 + int(start),
                 )
             if run_category_eval and not bool(cat_args.lora_after_category):
                 log.info("类别训练后评估...")

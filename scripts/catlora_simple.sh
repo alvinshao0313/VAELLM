@@ -3,7 +3,11 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=4
+SEED="${SEED:-42}"
+export PYTHONHASHSEED="${SEED}"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export TOKENIZERS_PARALLELISM=false
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
@@ -32,7 +36,8 @@ export CUDA_VISIBLE_DEVICES=1
 python tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
   --output_dir ".result" \
-  --seed "0" \
+  --seed "${SEED}" \
+  --deterministic "true" \
   --train_device "cuda" \
   --convert \
   --save_model \
@@ -70,7 +75,7 @@ python tools/cat_train.py \
   --wa_mse_calib_dataset "wiki=1.0" \
   --wa_mse_calib_nsamples "512" \
   --wa_mse_calib_seqlen "4096" \
-  --wa_mse_calib_seed "0" \
+  --wa_mse_calib_seed "${SEED}" \
   --wa_mse_calib_device "" \
   --wa_mse_calib_log_every "0" \
   --codebook_bits "default=32" \
@@ -110,7 +115,7 @@ python tools/cat_train.py \
   --lora_dropout "default=0.0" \
   --lora_steps "default=5000" \
   --lora_batch_size "default=2" \
-  --lora_nsamples "default=10000000" \
+  --lora_nsamples "default=20000" \
   --lora_lr "default=8e-5" \
   --lora_weight_decay "default=0.001" \
   --lora_log_every "default=2" \

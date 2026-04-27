@@ -730,6 +730,7 @@ def materialize_prepared_group_data(
     intra_part_sort_mode: Union[str, Sequence[str]] = "none",
     sort_executor: Optional[Executor] = None,
     split_weights_by_linear: Optional[Sequence[torch.Tensor]] = None,
+    shuffle_seed: Optional[int] = None,
 ) -> GroupDataPrepResult:
     row_parts, col_parts = resolve_intra_parallel(intra_parallel)
     parts_per_linear = int(row_parts) * int(col_parts)
@@ -875,10 +876,15 @@ def materialize_prepared_group_data(
 
     stacked_data = stacked_flat.view(num_models, -1, int(codebook_dim)).permute(1, 0, 2).contiguous()
     block_indices = torch.arange(stacked_data.shape[0], dtype=torch.long)
+    generator = None
+    if shuffle_seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(shuffle_seed))
     train_loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(stacked_data, block_indices),
         batch_size=int(batch_size),
         shuffle=True,
+        generator=generator,
         num_workers=0,
         pin_memory=False,
     )
