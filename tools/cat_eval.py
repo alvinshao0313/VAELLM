@@ -450,8 +450,30 @@ def main(argv: Optional[List[str]] = None) -> None:
             fingerprint["meta_sha256"],
             fingerprint["state_sha256"],
         )
+        from e2e_common.adapter_loading import (
+            adapter_has_post_norm_head_linear,
+            assert_adapter_load_result_clean,
+            build_peft_model_for_adapter_load,
+            detach_tied_lm_head_weight_if_needed,
+            read_adapter_weight_keys,
+            validate_adapter_modules_to_save,
+        )
+
+        adapter_keys = read_adapter_weight_keys(adapter_dir)
+        adapter_config = validate_adapter_modules_to_save(adapter_dir, adapter_keys)
+        adapter_has_post_norm_head = adapter_has_post_norm_head_linear(adapter_keys)
+        logger.info(
+            "Adapter precheck passed: weight_keys=%d modules_to_save=%s has_post_norm_head_linear=%s",
+            len(adapter_keys),
+            adapter_config.get("modules_to_save"),
+            str(adapter_has_post_norm_head),
+        )
         from dense_e2e_fintuning.checkpoint_bridge import build_dense_model_from_checkpoint
-        from peft import PeftModel
+        from e2e_common.post_norm_head import (
+            ensure_post_norm_head_linear,
+            fuse_post_norm_head_linear,
+            has_post_norm_head_linear,
+        )
 
         model, meta, _resolved_ckpt_dir = build_dense_model_from_checkpoint(
             ckpt_dir,
@@ -461,8 +483,22 @@ def main(argv: Optional[List[str]] = None) -> None:
             decode_group_size=int(args.prewarm_group_size),
             decode_device=_resolve_eval_device(args.eval_device, logger),
         )
-        peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
-        model = peft_model.merge_and_unload()
+        if adapter_has_post_norm_head:
+            attached = ensure_post_norm_head_linear(model)
+            logger.info("Attached post_norm_linear before adapter load: %s", str(attached))
+
+        peft_model = build_peft_model_for_adapter_load(model, adapter_dir)
+        adapter_load_result = peft_model.load_adapter(adapter_dir, adapter_name="default", is_trainable=False)
+        assert_adapter_load_result_clean(adapter_load_result)
+        model = peft_model.merge_and_unload(safe_merge=True)
+        if adapter_has_post_norm_head:
+            detach_tied_lm_head_weight_if_needed(model, logger)
+            fused_post_norm_head = fuse_post_norm_head_linear(model)
+            if not fused_post_norm_head:
+                raise RuntimeError("Adapter has lm_head.post_norm_linear weights, but post_norm_linear fusion failed.")
+            if has_post_norm_head_linear(model):
+                raise RuntimeError("post_norm_linear fusion returned success, but LMHeadWithPostNormLinear remains.")
+            logger.info("Fused adapter post_norm_linear into lm_head.weight.")
         model.eval()
         load_result = None
         checkpoint_loader = "cat+adapter"
