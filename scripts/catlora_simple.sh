@@ -49,15 +49,15 @@ python tools/cat_train.py \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
-  --steps_per_category "default=20000" \
+  --steps_per_category "default=2" \
   --joint_decoder_steps "default=0" \
   --joint_decoder_lr "default=1e-2" \
-  --joint_decoder_group_size "default=32,cat:down_proj=8" \
+  --joint_decoder_group_size "default=32,cat:up_proj=8,cat:gate_proj=8,cat:down_proj=8" \
   --batch_size "2048" \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
-  --eval_ppl "true" \
+  --eval_ppl "false" \
   --eval_tasks "" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
@@ -65,7 +65,7 @@ python tools/cat_train.py \
   --sort_prep_workers "0" \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
-  --outlier_protect_mode "residual_sparse" \
+  --outlier_protect_mode "none" \
   --outlier_residual_top_p "default=0.01" \
   --outlier_residual_score "input_act_weighted_abs" \
   --outlier_residual_min_abs "0.0" \
@@ -109,32 +109,34 @@ python tools/cat_train.py \
   --use_checkpoint \
   --new_quant \
   --lora_after_category \
-  --lora_dataset "wiki=1.0" \
-  --lora_rank "default=12" \
-  --lora_alpha "default=24.0" \
+  --lora_dataset "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10" \
+  --lora_rank "default=24" \
+  --lora_alpha "default=48.0" \
   --lora_dropout "default=0.0" \
   --lora_steps "default=5000" \
-  --lora_batch_size "default=2" \
+  --lora_batch_size "default=1" \
   --lora_nsamples "default=20000" \
-  --lora_lr "default=8e-5" \
+  --lora_lr "default=1e-4" \
   --lora_weight_decay "default=0.001" \
   --lora_log_every "default=2" \
   --lora_post_attn "false" \
   --lora_temperature "default=1.0" \
   --lora_loss_alpha "default=0.5" \
   --lora_loss_type "default=kd_top_1000" \
-  --lora_use_dora "default=false" \
-  --lora_tune_final_norm "false" \
-  --lora_use_post_norm_head_linear "false" \
+  --lora_use_dora "default=true" \
+  --lora_tune_final_norm "true" \
+  --lora_use_post_norm_head_linear "true" \
   --lora_hif4_act "false" \
   --eval_hif4_act "false" \
   --lora_gradient_accumulation_steps "1" \
+  --lora_gradient_checkpointing "true" \
+  --lora_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --lora_optim "adamw_torch" \
   --lora_max_grad_norm "0.333" \
   --lora_warmup_ratio "0.3" \
   --lora_group_by_length "true" \
-  --lora_lr_scheduler_type "linear" \
-  --lora_model_max_length "4096" \
+  --lora_lr_scheduler_type "cosine" \
+  --lora_model_max_length "8192" \
   --fp16 "false" \
   --bf16 "true" \
   "$@"

@@ -150,7 +150,7 @@
 | `--eval_every` | `0` | 每多少 step 做一次 VAE 中间评估 | `0` 表示不做中间评估 |
 | `--eval_blocks` | `256` | 每次中间评估最多评估多少块 | 与 `eval_every` 联动 |
 | `--outlier_protect_count` | `default=0` | `channel` 模式下保护 top-N channel 不参与压缩 | 类别 override；`residual_sparse` 模式要求它对所有类别都为 `0` |
-| `--outlier_protect_mode` | `channel` | 离群值保护模式 | `channel` / `residual_sparse`，两者互斥 |
+| `--outlier_protect_mode` | `channel` | 离群值保护模式 | `none` / `channel` / `residual_sparse`，三者互斥 |
 | `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；对所有参与训练的类别要求 `0 < p <= 1` |
 | `--outlier_residual_score` | `abs` | `residual_sparse` 模式下的选点打分方式 | `abs` / `input_act_weighted_abs` / `original_weight_abs` / `input_act_weighted_original_weight_abs`；原始权重打分只影响选点，最终保存的仍是对应 residual |
 | `--outlier_residual_min_abs` | `1e-6` | `residual_sparse` 模式下 residual 的最小绝对值门槛 | 全局单值；若 `|original-reconstructed| < threshold`，该位置会从 top-p 中剔除，并继续往后补 |

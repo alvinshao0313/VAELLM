@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -115,14 +116,29 @@ def _resolve_lora_stage_config(
     )
 
 
-def _freeze_model_for_lora(model: nn.Module, *, device: str, logger) -> None:
+def _freeze_model_for_lora(model: nn.Module, *, device: str, logger) -> Optional[bool]:
+    previous_use_cache = None
     for param in model.parameters():
         param.requires_grad = False
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        previous_use_cache = bool(model.config.use_cache)
+        model.config.use_cache = False
+        logger.info("LoRA: 已关闭 model.config.use_cache。")
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
         logger.info("LoRA: 已启用输入梯度。")
     model.to(device)
     model.train()
+    return previous_use_cache
+
+
+def _restore_model_use_cache(model: nn.Module, previous_use_cache: Optional[bool], *, logger) -> None:
+    if previous_use_cache is None:
+        return
+    if not hasattr(model, "config") or not hasattr(model.config, "use_cache"):
+        return
+    model.config.use_cache = bool(previous_use_cache)
+    logger.info("LoRA: 已恢复 model.config.use_cache=%s。", str(bool(previous_use_cache)).lower())
 
 
 def _find_module_name(model: nn.Module, target: nn.Module, fallback: str) -> str:
@@ -255,10 +271,19 @@ def _ensure_lora_tokenizer_ready(*, vae_args, model: nn.Module) -> None:
 
 
 def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedLoraStageConfig):
+    gradient_checkpointing_kwargs = None
+    raw_gc_kwargs = getattr(training_args, "lora_gradient_checkpointing_kwargs", None)
+    if raw_gc_kwargs is not None and str(raw_gc_kwargs).strip():
+        gradient_checkpointing_kwargs = json.loads(str(raw_gc_kwargs))
+        if not isinstance(gradient_checkpointing_kwargs, dict):
+            raise ValueError("--lora_gradient_checkpointing_kwargs must be a JSON object.")
+
     return TrainingArguments(
         output_dir=os.path.join(str(getattr(cat_args, "output_dir", ".result")), "lora_trainer_state"),
         per_device_train_batch_size=int(cfg.batch_size),
         gradient_accumulation_steps=int(getattr(training_args, "lora_gradient_accumulation_steps", 1)),
+        gradient_checkpointing=bool(getattr(training_args, "lora_gradient_checkpointing", False)),
+        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         optim=_enum_to_value(getattr(training_args, "lora_optim", "paged_adamw_8bit"), "paged_adamw_8bit"),
         logging_strategy="steps",
         logging_steps=max(1, int(cfg.log_every)),
@@ -380,80 +405,84 @@ def lora_finetune_remaining_categories(
         logger.info("LoRA: 没有可微调的剩余 Linear，跳过。")
         return model
 
-    _freeze_model_for_lora(model, device=cfg.device, logger=logger)
-    extra_modules = _collect_extra_trainable_modules(model, cfg=cfg, logger=logger)
-    teacher_param_snapshots = _snapshot_extra_trainable_params(extra_modules)
-    model, lora_config, unique_target_names = create_lora_adapters(
-        model,
-        target_names=target_names,
-        rank=cfg.rank,
-        alpha=cfg.alpha,
-        dropout=cfg.dropout,
-        use_dora=cfg.use_dora,
-    )
-    extra_trainable_names = _enable_extra_trainable_params(extra_modules)
-    if lora_config is None:
-        logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
-        if not extra_trainable_names:
-            logger.info("LoRA: 没有额外可训练参数，跳过。")
+    previous_use_cache = _freeze_model_for_lora(model, device=cfg.device, logger=logger)
+    try:
+        extra_modules = _collect_extra_trainable_modules(model, cfg=cfg, logger=logger)
+        teacher_param_snapshots = _snapshot_extra_trainable_params(extra_modules)
+        model, lora_config, unique_target_names = create_lora_adapters(
+            model,
+            target_names=target_names,
+            rank=cfg.rank,
+            alpha=cfg.alpha,
+            dropout=cfg.dropout,
+            use_dora=cfg.use_dora,
+        )
+        extra_trainable_names = _enable_extra_trainable_params(extra_modules)
+        if lora_config is None:
+            logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
+            if not extra_trainable_names:
+                logger.info("LoRA: 没有额外可训练参数，跳过。")
+                return model
+
+        resolved_lora_loss = str(cfg.loss_type).strip().lower()
+        use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"}
+        _log_lora_stage_start(
+            logger=logger,
+            cfg=cfg,
+            after_category=after_category,
+            remaining_categories=remaining_categories,
+            target_count=len(unique_target_names),
+            extra_trainable_names=extra_trainable_names,
+            use_custom_trainer=use_custom_trainer,
+        )
+
+        dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_lora_datasets(
+            cfg.dataset,
+            nsamples=cfg.nsamples,
+            seed=cfg.seed,
+        )
+        logger.info(
+            "LoRA: 补偿训练混合数据集=%s nsamples=%d eval_dataset=none",
+            str(dataset_mix_spec),
+            int(cfg.nsamples),
+        )
+        for source_info in source_stats:
+            logger.info(
+                "LoRA: 混合数据源 alias=%s weight=%.6f target_rows=%d actual_rows=%d raw_rows=%d text_rows=%d hf=%s config=%s train_split=%s",
+                str(source_info["alias"]),
+                float(source_info["weight"]),
+                int(source_info["target_rows"]),
+                int(source_info["actual_rows"]),
+                int(source_info["raw_rows"]),
+                int(source_info["text_rows"]),
+                str(source_info["path"]),
+                "none" if source_info["config"] is None else str(source_info["config"]),
+                str(source_info["train_split"]),
+            )
+        if len(train_ds) == 0:
+            logger.warning("LoRA: 数据集为空，跳过。")
+            model, _merged_count = merge_all_lora(model)
             return model
 
-    resolved_lora_loss = str(cfg.loss_type).strip().lower()
-    use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"}
-    _log_lora_stage_start(
-        logger=logger,
-        cfg=cfg,
-        after_category=after_category,
-        remaining_categories=remaining_categories,
-        target_count=len(unique_target_names),
-        extra_trainable_names=extra_trainable_names,
-        use_custom_trainer=use_custom_trainer,
-    )
-
-    dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_lora_datasets(
-        cfg.dataset,
-        nsamples=cfg.nsamples,
-        seed=cfg.seed,
-    )
-    logger.info(
-        "LoRA: 补偿训练混合数据集=%s nsamples=%d eval_dataset=none",
-        str(dataset_mix_spec),
-        int(cfg.nsamples),
-    )
-    for source_info in source_stats:
-        logger.info(
-            "LoRA: 混合数据源 alias=%s weight=%.6f target_rows=%d actual_rows=%d raw_rows=%d text_rows=%d hf=%s config=%s train_split=%s",
-            str(source_info["alias"]),
-            float(source_info["weight"]),
-            int(source_info["target_rows"]),
-            int(source_info["actual_rows"]),
-            int(source_info["raw_rows"]),
-            int(source_info["text_rows"]),
-            str(source_info["path"]),
-            "none" if source_info["config"] is None else str(source_info["config"]),
-            str(source_info["train_split"]),
+        _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
+        sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
+        hif4_act_controller = build_hif4_act_controller(cfg.use_lora_hif4_act)
+        trainer = _build_lora_trainer(
+            model=model,
+            train_ds=train_ds,
+            eval_ds=eval_ds,
+            sft_args=sft_args,
+            training_args=training_args,
+            lora_config=lora_config,
+            cfg=cfg,
+            hif4_act_controller=hif4_act_controller,
+            teacher_param_snapshots=teacher_param_snapshots,
         )
-    if len(train_ds) == 0:
-        logger.warning("LoRA: 数据集为空，跳过。")
-        model, _merged_count = merge_all_lora(model)
+        model = _train_and_merge_lora_model(
+            trainer=trainer,
+            hif4_act_controller=hif4_act_controller,
+            logger=logger,
+        )
         return model
-
-    _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
-    sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
-    hif4_act_controller = build_hif4_act_controller(cfg.use_lora_hif4_act)
-    trainer = _build_lora_trainer(
-        model=model,
-        train_ds=train_ds,
-        eval_ds=eval_ds,
-        sft_args=sft_args,
-        training_args=training_args,
-        lora_config=lora_config,
-        cfg=cfg,
-        hif4_act_controller=hif4_act_controller,
-        teacher_param_snapshots=teacher_param_snapshots,
-    )
-    return _train_and_merge_lora_model(
-        trainer=trainer,
-        hif4_act_controller=hif4_act_controller,
-        logger=logger,
-    )
+    finally:
+        _restore_model_use_cache(model, previous_use_cache, logger=logger)

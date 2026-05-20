@@ -968,10 +968,10 @@ def _train_group_vae_and_replace(
     residual_sparse_needs_activation = (
         residual_sparse_enabled and resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT
     )
-    if resolved_outlier_mode not in {"channel", "residual_sparse"}:
+    if resolved_outlier_mode not in {"none", "channel", "residual_sparse"}:
         raise ValueError(
             f"[{group_tag}] unsupported outlier_protect_mode={outlier_protect_mode!r}. "
-            "Expected channel or residual_sparse."
+            "Expected none, channel, or residual_sparse."
         )
     if residual_sparse_enabled and int(outlier_protect_count) != 0:
         raise ValueError(

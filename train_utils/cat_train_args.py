@@ -118,6 +118,8 @@ class CatTrainHFTrainingArguments:
     lora_warmup_ratio: float = field(default=0.3)
     lora_group_by_length: bool = field(default=True)
     lora_lr_scheduler_type: str = field(default="linear")
+    lora_gradient_checkpointing: bool = field(default=False)
+    lora_gradient_checkpointing_kwargs: Optional[str] = field(default=None)
     lora_post_attn: bool = field(
         default=False,
         metadata={"help": "For *_top LoRA distillation losses, compute KL on gathered full-vocab probabilities instead of renormalizing within the top-k subset."},
@@ -176,7 +178,7 @@ _AFTER_CATEGORY_OVERRIDE_SELECTORS = ("default", "after")
 _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse")
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
-_OUTLIER_PROTECT_MODE_CHOICES = ("channel", "residual_sparse")
+_OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "residual_sparse")
 _OUTLIER_RESIDUAL_SCORE_CHOICES = (
     "abs",
     "input_act_weighted_abs",
@@ -751,13 +753,13 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
             "--outlier_residual_top_p must satisfy 0 <= p <= 1 for every selector. Got: "
             + ",".join(invalid_top_p_entries)
         )
-    if mode == "channel":
+    if mode in {"none", "channel"}:
         nonzero_top_p_entries = [
             f"{selector}={float(value)}"
             for selector, value in _iter_override_entries(top_p_table)
             if float(value) != 0.0
         ]
-        if nonzero_top_p_entries:
+        if mode == "channel" and nonzero_top_p_entries:
             raise ValueError(
                 "--outlier_residual_top_p must be 0 for every selector when "
                 "--outlier_protect_mode=channel. Got: " + ",".join(nonzero_top_p_entries)
@@ -922,7 +924,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         type=str,
         choices=list(_OUTLIER_PROTECT_MODE_CHOICES),
         default="channel",
-        help="离群值保护模式：channel 为压缩前保护通道，residual_sparse 为训练后保存残差 COO 补丁。",
+        help="离群值保护模式：none 为关闭，channel 为压缩前保护通道，residual_sparse 为训练后保存残差 COO 补丁。",
     )
     parser.add_argument(
         "--outlier_residual_top_p",
