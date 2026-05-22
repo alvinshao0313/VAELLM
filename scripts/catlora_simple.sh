@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=7
 SEED="${SEED:-42}"
 export PYTHONHASHSEED="${SEED}"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
@@ -49,10 +49,11 @@ python tools/cat_train.py \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
-  --steps_per_category "default=2" \
-  --joint_decoder_steps "default=0" \
-  --joint_decoder_lr "default=1e-2" \
-  --joint_decoder_group_size "default=32,cat:up_proj=8,cat:gate_proj=8,cat:down_proj=8" \
+  --steps_per_category "default=1000" \
+  --joint_decoder_steps "default=1000" \
+  --joint_decoder_lr "default=5e-3" \
+  --joint_decoder_group_size "default=36" \
+  --joint_decoder_batch_size "default=16384" \
   --batch_size "2048" \
   --log_every "100" \
   --eval_every "0" \

@@ -38,6 +38,7 @@
 - `joint_decoder_steps`
 - `joint_decoder_lr`
 - `joint_decoder_group_size`
+- `joint_decoder_batch_size`
 - `intra_parallel`
 - `intra_part_sort_mode`
 - `outlier_protect_count`
@@ -139,7 +140,8 @@
 | `--steps_per_category` | `default=2000` | 每个 group 的训练步数 | 类别 override；名字保留但语义就是每组步数 |
 | `--joint_decoder_steps` | `default=none` | 多阶段训练完成后的 decoder 联合微调步数 | 类别 override；`none` 表示回退到该类别的 `steps_per_category` |
 | `--joint_decoder_lr` | `default=none` | 多阶段 decoder 联合微调的学习率 | 类别 override；`none` 表示回退到全局 `--lr` |
-| `--joint_decoder_group_size` | `default=none` | 多阶段 decoder 联合微调时的子分组大小 | 类别 override；`none` 表示回退到 `linear_group_size` |
+| `--joint_decoder_group_size` | `default=none` | 多阶段 decoder 联合微调时的 linear 子分组大小 | 类别 override；`none` 表示回退到 `linear_group_size` |
+| `--joint_decoder_batch_size` | `default=none` | 多阶段 decoder 联合微调时每步采样的 block patch 大小 | 类别 override；`none` 表示沿用 full-batch 联合优化；只支持 `intra_part_sort_mode=none` |
 | `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式必须是 `layer_idx.category` |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
 | `--intra_parallel` | `default=1x1` | 单个 Linear 的层内切分 | 类别 override |
@@ -147,8 +149,8 @@
 | `--sort_prep_workers` | `0` | 排序预处理并行 worker 数 | 全局单值；`0=auto, 1=串行, >1=显式 CPU 多进程`；只影响 `spectral_cosine/act_spectral_cosine` |
 | `--batch_size` | `256` | VAE 训练与评估 DataLoader batch 大小 | 作用于块数据，不是 token batch |
 | `--log_every` | `50` | 每多少 step 打印一次训练日志 | `<=0` 等价关闭 |
-| `--eval_every` | `0` | 每多少 step 做一次 VAE 中间评估 | `0` 表示不做中间评估 |
-| `--eval_blocks` | `256` | 每次中间评估最多评估多少块 | 与 `eval_every` 联动 |
+| `--eval_every` | `0` | 每多少 step 做一次 VAE / joint decoder 中间评估 | `0` 表示不做中间评估；joint decoder 前后完整重建损失仍会记录 |
+| `--eval_blocks` | `256` | 每次 VAE / joint decoder 中间评估最多评估多少块 | 与 `eval_every` 联动；joint decoder 前后完整重建损失不受它限制 |
 | `--outlier_protect_count` | `default=0` | `channel` 模式下保护 top-N channel 不参与压缩 | 类别 override；`residual_sparse` 模式要求它对所有类别都为 `0` |
 | `--outlier_protect_mode` | `channel` | 离群值保护模式 | `none` / `channel` / `residual_sparse`，三者互斥 |
 | `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；对所有参与训练的类别要求 `0 < p <= 1` |
@@ -219,6 +221,10 @@
 重要语义：
 
 - `residual_stages` 允许按类别不同。
+- 权重训练数据的基本单位是 block，张量形状是 `[num_blocks, num_models, codebook_dim]`：
+  - 单个模型/part 的 1 个 block 包含 `codebook_dim` 个连续权重元素
+  - 一个 group 的同一个 block 横跨 `num_models = linears_in_group * intra_parallel_parts` 个模型/part
+  - 因此一次评估 `B` 个 blocks，实际覆盖 `B * num_models * codebook_dim` 个权重值
 - 同一类别内，如果 `residual_stages > 1`：
   - 先做逐阶残差量化；若 `intra_part_sort_mode != none`，每个 stage 都会基于当前 residual 重新排序
   - 所有 stage 仍复用同一组已解析结构参数：
@@ -237,6 +243,7 @@
 - `joint_decoder_steps=none` 时，回退到该类别解析后的 `steps_per_category`
 - `joint_decoder_lr=none` 时，回退到全局 `lr`
 - `joint_decoder_group_size=none` 时，联合微调直接沿用当前类别的 `linear_group_size`
+- `joint_decoder_batch_size=none` 时，联合微调每步使用所有 blocks；设置为正整数时，每步只采样对应数量的 block patch，且只允许 `intra_part_sort_mode=none`
 - `decoder_type=linear` 或 `decoder_type=symmetric` 时，decoder 的 hidden dim / residual blocks 会强制对齐 encoder。
 - `decoder_type=asymmetric` 时，才独立使用 `decoder_base_ch` / `decoder_num_res_blocks`。
 
@@ -313,7 +320,7 @@
 - 某类别为 `N>1` 时，会做逐阶残差量化：当前 stage 重建后，从 residual 中扣除该 stage 重建结果，再进入下一 stage。
 - 若 `intra_part_sort_mode != none`，每个 stage 都会基于当前 residual 重新排序，而不是复用 stage1 顺序。
 - 全部 stage 训练完后，会额外做一次 decoder 联合微调。
-- 但同一类别的各个 stage 不再有单独结构参数配置，自由度只剩“stage 数量”、`joint_decoder_steps`、`joint_decoder_lr` 和 `joint_decoder_group_size`。
+- 但同一类别的各个 stage 不再有单独结构参数配置，自由度只剩“stage 数量”、`joint_decoder_steps`、`joint_decoder_lr`、`joint_decoder_group_size` 和 `joint_decoder_batch_size`。
 
 ### 6.3 `steps_per_category`
 
@@ -329,7 +336,7 @@
 ### 6.5 `joint_decoder_group_size`
 
 - 只在 `residual_stages > 1` 时生效。
-- 它控制联合微调时一次打包多少条 linear 一起做 full-batch。
+- 它控制联合微调阶段一次打包多少条 linear 作为子分组优化。
 - `default=none` 表示自动回退到 `linear_group_size`。
 - 当它小于训练 group 时，前面的 VAE stage 训练仍按原 group 跑，只在最后的联合微调阶段拆小。
 - 当前 `recon_loss_type=cosine` 和 `relative_l1` 不支持把联合微调 group 拆小。
@@ -340,7 +347,31 @@
 - 它控制“全部 stage 训练完之后”的 decoder 联合微调学习率。
 - `default=none` 表示自动回退到全局 `--lr`。
 
-### 6.7 类别后评估
+### 6.7 `joint_decoder_batch_size`
+
+- 只在 `residual_stages > 1` 且 `joint_decoder_steps > 0` 时生效。
+- 它控制联合微调时每步采样多少个 block patch。
+- `default=none` 表示保持原来的 full-batch 联合优化。
+- 设置为正整数时，只支持 `intra_part_sort_mode=none`；如果开启排序会直接报错。
+- joint 阶段只优化 decoder：输入是前面各 stage 已经生成好的固定 bit/latent，encoder 不再参与。
+- patch 模式下训练日志里的 `loss` 是“当前随机 patch”的 loss，不是完整权重 loss；它可能下降，但完整权重 loss 仍可能上升。
+- `intra_part_sort_mode=none` 时，joint 阶段不需要恢复排序，直接使用 decoder 输出和目标权重 block 对齐；这样也避免 deterministic 模式下 `torch.take` 反向传播触发非确定性 `put_`。
+
+### 6.8 `eval_every` / `eval_blocks`
+
+- `eval_every` 同时作用于 VAE stage 和 joint decoder 的中间评估。
+- `eval_every=0` 表示不做中间评估。
+- `eval_blocks` 只限制中间评估最多使用多少个 blocks。
+- VAE stage 中间评估会输出当前 stage 的 `mse` 和 `top_k_mse(k=100)`。
+- joint decoder 中间评估会输出当前 `recon_loss_type` 下的 `recon_loss`，并使用前 `eval_blocks` 个 blocks，不是随机采样。
+- joint decoder 在联合优化前后一定会记录完整权重重建损失，不受 `eval_every/eval_blocks` 限制：
+  - `full_recon_loss_before`：联合优化前，全量 blocks 的重建损失
+  - `full_recon_loss_after`：联合优化后，全量 blocks 的重建损失
+  - `delta = after - before`
+  - `ratio = after / before`
+- 因为前后 full loss 都使用完整 `target_common`，所以比较的是同一批权重元素。
+
+### 6.9 类别后评估
 
 - 类别后评估由 `--eval_ppl` 和 `--eval_tasks` 共同控制。
 - `--eval_ppl=true` 时跑 PPL。
@@ -350,7 +381,7 @@
 - `--eval_ppl=false` 且 `--eval_tasks=""` 时，整个类别后评估阶段直接跳过。
 - 如果配置了 `--eval_tasks`，但所有任务结果都是 `N/A`，脚本会直接报错。
 
-### 6.8 `convert` 与评估的关系
+### 6.10 `convert` 与评估的关系
 
 - `--convert` 只控制是否把训练出的压缩结果替换回模型里的目标 `Linear`。
 - 不开 `--convert` 时：
@@ -358,13 +389,13 @@
   - 仍然可以按 `--eval_ppl/--eval_tasks` 跑类别后评估
 - `--lora_after_category` 和 `--save_model` 仍然要求 `--convert` 开启，因为它们依赖“压缩结果已经写回模型”。
 
-### 6.9 `normalize_weight`
+### 6.11 `normalize_weight`
 
 - 训练时会对当前 stage 的 residual 计算 `(mean, std)` 并标准化训练
 - 转换时会把该 stage 的 `(mean, std)` 融合进 decoder
 - 多阶 residual 会分别计算和融合各自的标准化统计量
 
-### 6.10 `wa_mse` 与 activation 依赖
+### 6.12 `wa_mse` 与 activation 依赖
 
 - `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
 - `outlier_protect_mode=channel` 且 `outlier_protect_count > 0` 时，也复用同一条动态 activation 路径
@@ -372,7 +403,7 @@
 - `intra_part_sort_mode` 若启用 `act_spectral_cosine`，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
-### 6.11 保存与输出目录
+### 6.13 保存与输出目录
 
 - `save_model` 需要同时开启 `convert`
 - 真实运行目录会自动变成：
@@ -394,7 +425,7 @@
 - `training_args`
 - 每个类别的 resolved runtime config
 
-### 6.12 从已保存 checkpoint 继续训练
+### 6.14 从已保存 checkpoint 继续训练
 
 - `--resume_from_checkpoint` 会优先加载已有 checkpoint，而不是重新从 `--model_path` 拉起纯基座模型
 - 支持三种输入：
@@ -450,6 +481,7 @@
 6. `outlier_protect_mode=channel` 且 `outlier_protect_count > 0`，或 `act_spectral_cosine`，或 `residual_sparse + activation 加权 score` 启用，但当前 group 的动态 activation 采集失败
 7. 切分后某个 part 的展平长度无法被该类别的 `codebook_dim` 整除
 8. `linear_group_size < 1`
+9. 设置了 `joint_decoder_batch_size`，但当前类别的 `intra_part_sort_mode != none`
 
 ## 9. 快速示例
 
@@ -510,7 +542,31 @@ python tools/cat_train.py \
   --train_device cuda
 ```
 
-### 9.5 LoRA after-category 覆盖
+### 9.5 residual stages + joint decoder patch
+
+```bash
+python tools/cat_train.py \
+  --model_path meta-llama/Llama-2-7b-hf \
+  --convert \
+  --residual_stages default=2 \
+  --intra_part_sort_mode default=none \
+  --joint_decoder_steps default=100 \
+  --joint_decoder_lr default=1e-4 \
+  --joint_decoder_group_size default=32 \
+  --joint_decoder_batch_size default=8192 \
+  --eval_every 100 \
+  --eval_blocks 256 \
+  --train_device cuda
+```
+
+说明：
+
+- `joint_decoder_batch_size` 表示每个 joint step 采样多少个 blocks，不是 token batch，也不是 linear 数量。
+- joint patch 模式只支持 `intra_part_sort_mode=none`。
+- joint 前后会记录完整权重重建损失；`eval_every/eval_blocks` 只控制中间评估。
+- 如果 full loss after 大于 before，说明这组 joint 超参让完整权重重建变差，应先降低 `joint_decoder_lr` 或增大 `joint_decoder_batch_size`。
+
+### 9.6 LoRA after-category 覆盖
 
 ```bash
 python tools/cat_train.py \
@@ -526,7 +582,7 @@ python tools/cat_train.py \
   --lora_use_dora default=true,after:q_proj=false
 ```
 
-### 9.6 从已完成 `q_proj` 的保存结果继续训练其它类别
+### 9.7 从已完成 `q_proj` 的保存结果继续训练其它类别
 
 ```bash
 python tools/cat_train.py \
@@ -543,7 +599,7 @@ python tools/cat_train.py \
 - 如果上一次已经把 `q_proj` 转成了 `VAELinear` 并保存，这次恢复后 `q_proj` 会自动跳过
 - 脚本会继续训练还保持为 `nn.Linear` 的类别
 
-### 9.7 只跑下游任务，不跑 PPL
+### 9.8 只跑下游任务，不跑 PPL
 
 ```bash
 python tools/cat_train.py \

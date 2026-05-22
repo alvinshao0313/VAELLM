@@ -47,6 +47,7 @@ class NormalizedCatArgs:
     joint_decoder_steps: OverrideTable[Optional[int]]
     joint_decoder_lr: OverrideTable[Optional[float]]
     joint_decoder_group_size: OverrideTable[Optional[int]]
+    joint_decoder_batch_size: OverrideTable[Optional[int]]
     skip_layers: str
     linear_group_size: int
     intra_parallel: OverrideTable[Tuple[int, int]]
@@ -140,6 +141,7 @@ class ResolvedCategoryRuntimeConfig:
     joint_decoder_steps: int
     joint_decoder_lr: float
     joint_decoder_group_size: int
+    joint_decoder_batch_size: Optional[int]
     intra_parallel: Tuple[int, int]
     intra_part_sort_mode: str
     codebook_bits: int
@@ -349,6 +351,12 @@ _JOINT_DECODER_GROUP_SIZE_SPEC = _make_optional_int_override_spec(
     arg_name="--joint_decoder_group_size",
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
     example="default=none,cat:down_proj=2",
+    min_value=1,
+)
+_JOINT_DECODER_BATCH_SIZE_SPEC = _make_optional_int_override_spec(
+    arg_name="--joint_decoder_batch_size",
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=none,cat:down_proj=1024",
     min_value=1,
 )
 _INTRA_PARALLEL_SPEC = _make_override_spec(
@@ -578,6 +586,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         joint_decoder_steps=_parse_cat_override(raw_args.joint_decoder_steps, spec=_JOINT_DECODER_STEPS_SPEC),
         joint_decoder_lr=_parse_cat_override(raw_args.joint_decoder_lr, spec=_JOINT_DECODER_LR_SPEC),
         joint_decoder_group_size=_parse_cat_override(raw_args.joint_decoder_group_size, spec=_JOINT_DECODER_GROUP_SIZE_SPEC),
+        joint_decoder_batch_size=_parse_cat_override(raw_args.joint_decoder_batch_size, spec=_JOINT_DECODER_BATCH_SIZE_SPEC),
         skip_layers=str(raw_args.skip_layers),
         linear_group_size=int(raw_args.linear_group_size),
         intra_parallel=_parse_cat_override(raw_args.intra_parallel, spec=_INTRA_PARALLEL_SPEC),
@@ -802,6 +811,7 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
         (cat_args.joint_decoder_steps, "--joint_decoder_steps"),
         (cat_args.joint_decoder_lr, "--joint_decoder_lr"),
         (cat_args.joint_decoder_group_size, "--joint_decoder_group_size"),
+        (cat_args.joint_decoder_batch_size, "--joint_decoder_batch_size"),
         (cat_args.intra_parallel, "--intra_parallel"),
         (cat_args.intra_part_sort_mode, "--intra_part_sort_mode"),
         (cat_args.outlier_protect_count, "--outlier_protect_count"),
@@ -826,12 +836,16 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
         joint_decoder_steps = resolve_category_value(cat_args.joint_decoder_steps, category)
         joint_decoder_lr = resolve_category_value(cat_args.joint_decoder_lr, category)
         joint_decoder_group_size = resolve_category_value(cat_args.joint_decoder_group_size, category)
+        joint_decoder_batch_size = resolve_category_value(cat_args.joint_decoder_batch_size, category)
         resolved_joint_decoder_steps = int(steps_per_category) if joint_decoder_steps is None else int(joint_decoder_steps)
         resolved_joint_decoder_lr = float(vae_args.lr) if joint_decoder_lr is None else float(joint_decoder_lr)
         resolved_joint_decoder_group_size = (
             int(cat_args.linear_group_size)
             if joint_decoder_group_size is None
             else int(joint_decoder_group_size)
+        )
+        resolved_joint_decoder_batch_size = (
+            None if joint_decoder_batch_size is None else int(joint_decoder_batch_size)
         )
         resolved_outlier_residual_top_p = float(resolve_category_value(cat_args.outlier_residual_top_p, category))
         if resolved_outlier_mode == "channel" and resolved_outlier_residual_top_p != 0.0:
@@ -851,6 +865,7 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
             joint_decoder_steps=int(resolved_joint_decoder_steps),
             joint_decoder_lr=float(resolved_joint_decoder_lr),
             joint_decoder_group_size=int(resolved_joint_decoder_group_size),
+            joint_decoder_batch_size=resolved_joint_decoder_batch_size,
             intra_parallel=tuple(resolve_category_value(cat_args.intra_parallel, category)),
             intra_part_sort_mode=normalize_intra_part_sort_mode(
                 resolve_category_value(cat_args.intra_part_sort_mode, category),
@@ -909,6 +924,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--joint_decoder_steps", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_STEPS_SPEC.example}")
     parser.add_argument("--joint_decoder_lr", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_LR_SPEC.example}")
     parser.add_argument("--joint_decoder_group_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_GROUP_SIZE_SPEC.example}")
+    parser.add_argument("--joint_decoder_batch_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_BATCH_SIZE_SPEC.example}")
     parser.add_argument("--skip_layers", type=str, default="", help="指定在 LLM 前向中始终使用原始线性权重的层，格式: layer_idx.category，例如 0.down_proj,30.q_proj。")
     parser.add_argument("--linear_group_size", type=int, default=32, help="跨层分组大小：每组同时训练多少个同类 Linear。")
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"类别覆盖参数。示例：{_INTRA_PARALLEL_SPEC.example}")
