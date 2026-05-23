@@ -8,13 +8,14 @@ from transformers.trainer_utils import IntervalStrategy
 
 from e2e_common.data import _record_to_text, build_datasets
 from raw_e2e_fintuning.args import parse_args
+from train_utils.lora_data import build_calibration_input_ids, prepare_lora_datasets
 
 
 class DummyTokenizer:
     pad_token = "<pad>"
     eos_token = "</s>"
 
-    def __call__(self, texts):
+    def __call__(self, texts, **_kwargs):
         if isinstance(texts, list):
             input_ids = [self._encode(text) for text in texts]
             return {
@@ -38,6 +39,52 @@ def _make_text_dataset(prefix: str, count: int, *, words: int = 8):
     text = " ".join(f"{prefix}_{idx}" for idx in range(words))
     rows = [text for _ in range(count)]
     return Dataset.from_dict({"text": rows})
+
+
+def _make_openorca_dataset(count: int, *, variable_lengths: bool = False):
+    questions = []
+    responses = []
+    for idx in range(count):
+        question_words = (idx % 7) + 1 if variable_lengths else 3
+        response_words = ((idx * 3) % 11) + 1 if variable_lengths else 3
+        questions.append(" ".join(f"q{idx}_{word_idx}" for word_idx in range(question_words)))
+        responses.append(" ".join(f"a{idx}_{word_idx}" for word_idx in range(response_words)))
+    return Dataset.from_dict(
+        {
+            "question": questions,
+            "response": responses,
+            "system_prompt": ["sys"] * count,
+        }
+    )
+
+
+def _make_alpaca_dataset(count: int, *, variable_lengths: bool = False):
+    instructions = []
+    inputs = []
+    outputs = []
+    for idx in range(count):
+        input_words = (idx % 5) + 1 if variable_lengths else 3
+        output_words = ((idx * 2) % 7) + 1 if variable_lengths else 3
+        instructions.append(f"inst{idx}")
+        inputs.append(" ".join(f"in{idx}_{word_idx}" for word_idx in range(input_words)))
+        outputs.append(" ".join(f"out{idx}_{word_idx}" for word_idx in range(output_words)))
+    return Dataset.from_dict(
+        {
+            "instruction": instructions,
+            "input": inputs,
+            "output": outputs,
+        }
+    )
+
+
+def _tensorish_to_tuple(value):
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return tuple(int(item) for item in value)
+
+
+def _dataset_signature(dataset, *, limit: int = 8):
+    return [_tensorish_to_tuple(dataset[idx]["input_ids"]) for idx in range(min(len(dataset), limit))]
 
 
 def _build_datasets_with_recorded_num_proc(args, training_args, tokenizer, dataset):
@@ -246,6 +293,144 @@ class DatasetMixBuilderTest(unittest.TestCase):
         for source_stat in data_info["source_stats"]:
             self.assertEqual(source_stat["target_rows"], 7)
             self.assertGreaterEqual(source_stat["repeat_factor"], 1.0)
+            self.assertEqual(source_stat["sampling_policy"], "shuffled_raw_streaming_pack")
+            self.assertEqual(source_stat["collected_packed_rows"], source_stat["packed_rows"])
+            self.assertGreaterEqual(source_stat["processed_raw_rows"], 1)
+
+    def test_build_datasets_mix_limits_train_preprocessing(self):
+        args = SimpleNamespace(
+            dataset_mix_spec="openorca=0.5,alpaca=0.5",
+            dataset_mix_sources=["openorca", "alpaca"],
+            dataset_mix_weights=[0.5, 0.5],
+            dataset_num_proc=1,
+        )
+        training_args = SimpleNamespace(
+            model_max_length=4,
+            max_steps=1,
+            gradient_accumulation_steps=1,
+            per_device_train_batch_size=1,
+            world_size=1,
+            seed=7,
+            eval_strategy=IntervalStrategy.NO,
+        )
+
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(5000)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(5000)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            _train_dataset, eval_dataset, data_info = build_datasets(args, training_args, self.tokenizer)
+
+        self.assertIsNone(eval_dataset)
+        for source_stat in data_info["source_stats"]:
+            self.assertEqual(source_stat["raw_rows"], 5000)
+            self.assertEqual(source_stat["processed_raw_rows"], 4096)
+            self.assertLess(source_stat["processed_raw_rows"], source_stat["raw_rows"])
+            self.assertTrue(source_stat["limited_preprocessing"])
+            self.assertEqual(source_stat["target_rows"], 1)
+
+    def test_build_datasets_mix_is_deterministic_for_same_seed(self):
+        args = SimpleNamespace(
+            dataset_mix_spec="openorca=0.5,alpaca=0.5",
+            dataset_mix_sources=["openorca", "alpaca"],
+            dataset_mix_weights=[0.5, 0.5],
+            dataset_num_proc=1,
+        )
+
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(128, variable_lengths=True)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(128, variable_lengths=True)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        first_args = SimpleNamespace(
+            model_max_length=4,
+            max_steps=8,
+            gradient_accumulation_steps=1,
+            per_device_train_batch_size=1,
+            world_size=1,
+            seed=17,
+            eval_strategy=IntervalStrategy.NO,
+        )
+        second_args = SimpleNamespace(**first_args.__dict__)
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            first_train, _first_eval, first_info = build_datasets(args, first_args, self.tokenizer)
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            second_train, _second_eval, second_info = build_datasets(args, second_args, self.tokenizer)
+
+        self.assertEqual(_dataset_signature(first_train), _dataset_signature(second_train))
+        self.assertEqual(first_info["source_stats"], second_info["source_stats"])
+
+    def test_build_datasets_mix_changes_with_different_seed(self):
+        args = SimpleNamespace(
+            dataset_mix_spec="openorca=0.5,alpaca=0.5",
+            dataset_mix_sources=["openorca", "alpaca"],
+            dataset_mix_weights=[0.5, 0.5],
+            dataset_num_proc=1,
+        )
+
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(128, variable_lengths=True)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(128, variable_lengths=True)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        seed_17_args = SimpleNamespace(
+            model_max_length=4,
+            max_steps=8,
+            gradient_accumulation_steps=1,
+            per_device_train_batch_size=1,
+            world_size=1,
+            seed=17,
+            eval_strategy=IntervalStrategy.NO,
+        )
+        seed_23_args = SimpleNamespace(**{**seed_17_args.__dict__, "seed": 23})
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            seed_17_train, _seed_17_eval, _seed_17_info = build_datasets(args, seed_17_args, self.tokenizer)
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            seed_23_train, _seed_23_eval, _seed_23_info = build_datasets(args, seed_23_args, self.tokenizer)
+
+        self.assertNotEqual(_dataset_signature(seed_17_train), _dataset_signature(seed_23_train))
+
+    def test_build_datasets_mix_repeats_short_source_to_target(self):
+        args = SimpleNamespace(
+            dataset_mix_spec="openorca=0.5,alpaca=0.5",
+            dataset_mix_sources=["openorca", "alpaca"],
+            dataset_mix_weights=[0.5, 0.5],
+            dataset_num_proc=1,
+        )
+        training_args = SimpleNamespace(
+            model_max_length=4,
+            max_steps=10,
+            gradient_accumulation_steps=1,
+            per_device_train_batch_size=1,
+            world_size=1,
+            seed=7,
+            eval_strategy=IntervalStrategy.NO,
+        )
+
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(1)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(1)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            _train_dataset, _eval_dataset, data_info = build_datasets(args, training_args, self.tokenizer)
+
+        for source_stat in data_info["source_stats"]:
+            self.assertEqual(source_stat["processed_raw_rows"], source_stat["raw_rows"])
+            self.assertFalse(source_stat["limited_preprocessing"])
+            self.assertLess(source_stat["packed_rows"], source_stat["target_rows"])
+            self.assertGreater(source_stat["repeat_factor"], 1.0)
 
     def test_build_datasets_mix_rejects_empty_packed_source(self):
         args = SimpleNamespace(
@@ -368,8 +553,8 @@ class DatasetMixBuilderTest(unittest.TestCase):
             dataset_config_name=None,
             train_split="train",
             eval_split="validation",
-            train_file=None,
-            eval_file=None,
+            train_file="dummy.txt",
+            eval_file="dummy_eval.txt",
             text_field="text",
             max_train_samples=None,
             max_eval_samples=None,
@@ -465,8 +650,8 @@ class DatasetMixBuilderTest(unittest.TestCase):
             "dataset_config_name": None,
             "train_split": "train",
             "eval_split": "validation",
-            "train_file": None,
-            "eval_file": None,
+            "train_file": "dummy.txt",
+            "eval_file": "dummy_eval.txt",
             "text_field": "text",
             "max_train_samples": None,
             "max_eval_samples": None,
@@ -520,8 +705,8 @@ class DatasetMixBuilderTest(unittest.TestCase):
             "dataset_config_name": None,
             "train_split": "train",
             "eval_split": "validation",
-            "train_file": None,
-            "eval_file": None,
+            "train_file": "dummy.txt",
+            "eval_file": "dummy_eval.txt",
             "text_field": "text",
             "max_train_samples": None,
             "max_eval_samples": None,
@@ -570,6 +755,158 @@ class DatasetMixBuilderTest(unittest.TestCase):
         self.assertTrue(torch.equal(eval_single[0]["input_ids"], eval_multi[0]["input_ids"]))
         self.assertNotIn(2, single_requested)
         self.assertIn(2, multi_requested)
+
+
+class LoraDataTest(unittest.TestCase):
+    def setUp(self):
+        self.tokenizer = DummyTokenizer()
+
+    def test_prepare_lora_datasets_limits_source_preprocessing(self):
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(5000)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(5000)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_lora_datasets(
+                "openorca=0.5,alpaca=0.5",
+                nsamples=2,
+                seed=7,
+            )
+
+        self.assertEqual(dataset_mix_spec, "openorca=0.5,alpaca=0.5")
+        self.assertEqual(len(train_ds), 2)
+        self.assertIsNone(eval_ds)
+        for source_info in source_stats:
+            self.assertEqual(source_info["target_rows"], 1)
+            self.assertEqual(source_info["actual_rows"], 1)
+            self.assertEqual(source_info["raw_rows"], 5000)
+            self.assertEqual(source_info["processed_raw_rows"], 4096)
+            self.assertLess(source_info["processed_raw_rows"], source_info["raw_rows"])
+            self.assertTrue(source_info["limited_preprocessing"])
+            self.assertEqual(source_info["sampling_policy"], "shuffled_raw_streaming_text")
+
+    def test_prepare_lora_datasets_is_deterministic_for_same_seed(self):
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(128, variable_lengths=True)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(128, variable_lengths=True)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            _spec_a, stats_a, train_a, _eval_a, _split_a = prepare_lora_datasets(
+                "openorca=0.5,alpaca=0.5",
+                nsamples=10,
+                seed=17,
+            )
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            _spec_b, stats_b, train_b, _eval_b, _split_b = prepare_lora_datasets(
+                "openorca=0.5,alpaca=0.5",
+                nsamples=10,
+                seed=17,
+            )
+
+        self.assertEqual([row["text"] for row in train_a], [row["text"] for row in train_b])
+        self.assertEqual(stats_a, stats_b)
+
+    def test_prepare_lora_datasets_changes_with_different_seed(self):
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(128, variable_lengths=True)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(128, variable_lengths=True)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            _spec_a, _stats_a, train_a, _eval_a, _split_a = prepare_lora_datasets(
+                "openorca=0.5,alpaca=0.5",
+                nsamples=10,
+                seed=17,
+            )
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            _spec_b, _stats_b, train_b, _eval_b, _split_b = prepare_lora_datasets(
+                "openorca=0.5,alpaca=0.5",
+                nsamples=10,
+                seed=23,
+            )
+
+        self.assertNotEqual([row["text"] for row in train_a], [row["text"] for row in train_b])
+
+    def test_prepare_lora_datasets_rejects_short_source(self):
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(1)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(1)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            with self.assertRaises(ValueError):
+                prepare_lora_datasets(
+                    "openorca=0.5,alpaca=0.5",
+                    nsamples=4,
+                    seed=7,
+                )
+
+    def test_build_calibration_input_ids_limits_source_preprocessing(self):
+        prepared_chunk_rows = []
+
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict({"train": _make_openorca_dataset(5000)})
+            if path == "vicgalle/alpaca-gpt4":
+                return DatasetDict({"train": _make_alpaca_dataset(5000)})
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        from e2e_common.data import _prepare_text_dataset as original_prepare_text_dataset
+
+        def wrapped_prepare_text_dataset(dataset, **kwargs):
+            prepared_chunk_rows.append(len(dataset))
+            return original_prepare_text_dataset(dataset, **kwargs)
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset), mock.patch(
+            "e2e_common.data._prepare_text_dataset",
+            side_effect=wrapped_prepare_text_dataset,
+        ):
+            blocks = build_calibration_input_ids(
+                "openorca=0.5,alpaca=0.5",
+                tokenizer=self.tokenizer,
+                nsamples=2,
+                seqlen=4,
+                seed=7,
+            )
+
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(prepared_chunk_rows, [4096, 4096])
+
+    def test_build_calibration_input_ids_rejects_empty_text_source(self):
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            if path == "Open-Orca/OpenOrca":
+                return DatasetDict(
+                    {
+                        "train": Dataset.from_dict(
+                            {
+                                "question": [""],
+                                "response": [""],
+                                "system_prompt": [""],
+                            }
+                        )
+                    }
+                )
+            raise AssertionError(f"unexpected dataset path: {path}")
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            with self.assertRaises(ValueError):
+                build_calibration_input_ids(
+                    "openorca=1.0",
+                    tokenizer=self.tokenizer,
+                    nsamples=1,
+                    seqlen=4,
+                    seed=7,
+                )
 
 if __name__ == "__main__":
     unittest.main()

@@ -534,14 +534,20 @@ def _split_target_rows(total_rows: int, weights: Sequence[float]) -> List[int]:
     return targets
 
 
-def _resize_packed_dataset(dataset: Dataset, *, target_rows: int, seed: int) -> Tuple[Dataset, float]:
+def _resize_packed_dataset(
+    dataset: Dataset,
+    *,
+    target_rows: int,
+    seed: int,
+    shuffle: bool = True,
+) -> Tuple[Dataset, float]:
     current_rows = len(dataset)
     if current_rows < 1:
         raise ValueError("cannot resize an empty packed dataset.")
     if target_rows < 1:
         raise ValueError(f"target_rows must be >= 1, got {target_rows}")
 
-    shuffled = dataset.shuffle(seed=int(seed))
+    shuffled = dataset.shuffle(seed=int(seed)) if bool(shuffle) else dataset
     if current_rows >= target_rows:
         resized = shuffled.select(range(int(target_rows)))
         return _set_torch_columns(resized), 1.0
@@ -552,6 +558,81 @@ def _resize_packed_dataset(dataset: Dataset, *, target_rows: int, seed: int) -> 
         indices.extend(range(int(remainder)))
     resized = shuffled.select(indices)
     return _set_torch_columns(resized), float(target_rows) / float(current_rows)
+
+
+def _sample_and_pack_source(
+    raw_dataset: Dataset,
+    *,
+    target_rows: int,
+    tokenizer,
+    block_size: int,
+    text_field: str,
+    text_format: str,
+    num_proc: int,
+    seed: int,
+) -> Tuple[Dataset, Dict[str, object]]:
+    if int(target_rows) < 1:
+        raise ValueError(f"target_rows must be >= 1, got {target_rows}")
+
+    raw_rows = int(len(raw_dataset))
+    chunk_size = max(4096, int(num_proc) * 256)
+    shuffled_raw = raw_dataset.shuffle(seed=int(seed))
+    packed_chunks: List[Dataset] = []
+    processed_raw_rows = 0
+    text_rows = 0
+    collected_packed_rows = 0
+
+    for start in range(0, raw_rows, chunk_size):
+        stop = min(start + chunk_size, raw_rows)
+        chunk = shuffled_raw.select(range(start, stop))
+        processed_raw_rows += int(len(chunk))
+
+        text_chunk = _prepare_text_dataset(
+            chunk,
+            text_field=str(text_field),
+            text_format=str(text_format),
+            num_proc=int(num_proc),
+        )
+        text_rows += int(len(text_chunk))
+
+        packed_chunk = _tokenize_and_pack(
+            text_chunk,
+            tokenizer,
+            block_size=int(block_size),
+            num_proc=int(num_proc),
+        )
+        if len(packed_chunk) > 0:
+            packed_chunks.append(packed_chunk)
+            collected_packed_rows += int(len(packed_chunk))
+
+        if collected_packed_rows >= int(target_rows):
+            break
+
+    if collected_packed_rows < 1:
+        raise ValueError(
+            "Packed training dataset for mix source is empty. "
+            "Increase source text volume or lower --model_max_length."
+        )
+
+    collected = packed_chunks[0] if len(packed_chunks) == 1 else concatenate_datasets(packed_chunks)
+    collected = _set_torch_columns(collected.shuffle(seed=int(seed)))
+    resized, repeat_factor = _resize_packed_dataset(
+        collected,
+        target_rows=int(target_rows),
+        seed=int(seed),
+        shuffle=False,
+    )
+    return resized, {
+        "raw_rows": int(raw_rows),
+        "text_rows": int(text_rows),
+        "packed_rows": int(collected_packed_rows),
+        "target_rows": int(target_rows),
+        "repeat_factor": float(repeat_factor),
+        "processed_raw_rows": int(processed_raw_rows),
+        "limited_preprocessing": bool(processed_raw_rows < raw_rows),
+        "sampling_policy": "shuffled_raw_streaming_pack",
+        "collected_packed_rows": int(collected_packed_rows),
+    }
 
 
 def _load_preset_raw_datasets(preset: DatasetMixSourcePreset) -> Tuple[Dataset, Optional[Dataset]]:
@@ -582,12 +663,19 @@ def _build_mixed_datasets(args, training_args, tokenizer):
     for idx, (alias, weight, target_rows) in enumerate(zip(sources, weights, per_source_targets)):
         preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
         train_raw, eval_raw = _load_preset_raw_datasets(preset)
-        train_text = _prepare_text_dataset(
+        source_seed = int(seed + idx)
+        resized_train, train_stats = _sample_and_pack_source(
             train_raw,
+            target_rows=int(target_rows),
+            tokenizer=tokenizer,
+            block_size=int(block_size),
             text_field=str(preset.text_field),
             text_format=str(preset.text_format),
             num_proc=dataset_num_proc,
+            seed=int(source_seed),
         )
+        train_datasets.append(resized_train)
+
         eval_text = None
         if prepare_eval and eval_raw is not None:
             eval_text = _prepare_text_dataset(
@@ -597,20 +685,6 @@ def _build_mixed_datasets(args, training_args, tokenizer):
                 num_proc=dataset_num_proc,
             )
 
-        train_packed = _tokenize_and_pack(train_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
-        packed_rows = len(train_packed)
-        if packed_rows < 1:
-            raise ValueError(
-                f"Packed training dataset for mix source '{alias}' is empty. "
-                "Increase source text volume or lower --model_max_length."
-            )
-        resized_train, repeat_factor = _resize_packed_dataset(
-            train_packed,
-            target_rows=int(target_rows),
-            seed=int(seed + idx),
-        )
-        train_datasets.append(resized_train)
-
         eval_packed_rows = 0
         if eval_text is not None:
             eval_packed = _tokenize_and_pack(eval_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
@@ -618,18 +692,13 @@ def _build_mixed_datasets(args, training_args, tokenizer):
             if eval_packed_rows > 0:
                 eval_datasets.append(eval_packed)
 
-        source_stats.append(
-            {
-                "alias": str(alias),
-                "weight": float(weight),
-                "raw_rows": int(len(train_raw)),
-                "text_rows": int(len(train_text)),
-                "packed_rows": int(packed_rows),
-                "target_rows": int(target_rows),
-                "repeat_factor": float(repeat_factor),
-                "eval_packed_rows": int(eval_packed_rows),
-            }
-        )
+        source_stat = {
+            "alias": str(alias),
+            "weight": float(weight),
+            "eval_packed_rows": int(eval_packed_rows),
+        }
+        source_stat.update(train_stats)
+        source_stats.append(source_stat)
 
     train_dataset = interleave_datasets(
         train_datasets,

@@ -77,28 +77,49 @@ def _prepare_lora_mix_source(
 
     preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
     train_raw, _eval_raw = _load_preset_raw_datasets(preset)
-    train_text = _prepare_e2e_text_dataset(
-        train_raw,
-        text_field=str(preset.text_field),
-        text_format=str(preset.text_format),
-        num_proc=1,
-    )
-    text_rows = len(train_text)
-    if text_rows < int(target_rows):
+    raw_rows = int(len(train_raw))
+    chunk_size = 4096
+    shuffled_raw = train_raw.shuffle(seed=int(seed))
+    text_chunks = []
+    processed_raw_rows = 0
+    collected_text_rows = 0
+
+    for start in range(0, raw_rows, chunk_size):
+        stop = min(start + chunk_size, raw_rows)
+        chunk = shuffled_raw.select(range(start, stop))
+        processed_raw_rows += int(len(chunk))
+        text_chunk = _prepare_e2e_text_dataset(
+            chunk,
+            text_field=str(preset.text_field),
+            text_format=str(preset.text_format),
+            num_proc=1,
+        )
+        if len(text_chunk) > 0:
+            text_chunks.append(text_chunk)
+            collected_text_rows += int(len(text_chunk))
+        if collected_text_rows >= int(target_rows):
+            break
+
+    if collected_text_rows < int(target_rows):
         raise ValueError(
-            f"LoRA dataset mix source '{alias}' has only {text_rows} usable text rows, "
+            f"LoRA dataset mix source '{alias}' has only {collected_text_rows} usable text rows, "
             f"but target_rows={int(target_rows)}."
         )
+
+    train_text = text_chunks[0] if len(text_chunks) == 1 else concatenate_datasets(text_chunks)
     selected = train_text.shuffle(seed=int(seed)).select(range(int(target_rows)))
     return selected, {
         "alias": str(alias),
         "path": str(preset.path),
         "config": None if preset.config is None else str(preset.config),
         "train_split": str(preset.train_split),
-        "raw_rows": int(len(train_raw)),
-        "text_rows": int(text_rows),
+        "raw_rows": int(raw_rows),
+        "text_rows": int(collected_text_rows),
         "target_rows": int(target_rows),
         "actual_rows": int(len(selected)),
+        "processed_raw_rows": int(processed_raw_rows),
+        "limited_preprocessing": bool(processed_raw_rows < raw_rows),
+        "sampling_policy": "shuffled_raw_streaming_text",
     }
 
 
@@ -142,21 +163,33 @@ def _iter_calibration_texts_for_source(
 
     preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
     train_raw, _eval_raw = _load_preset_raw_datasets(preset)
-    train_text = _prepare_e2e_text_dataset(
-        train_raw,
-        text_field=str(preset.text_field),
-        text_format=str(preset.text_format),
-        num_proc=1,
-    )
-    if len(train_text) < 1:
-        raise ValueError(f"Calibration dataset mix source '{alias}' has no usable text rows.")
-    for record in train_text.shuffle(seed=int(seed)):
-        text = record.get("text")
-        if text is None:
+    raw_rows = int(len(train_raw))
+    chunk_size = 4096
+    shuffled_raw = train_raw.shuffle(seed=int(seed))
+    yielded_text = False
+
+    for start in range(0, raw_rows, chunk_size):
+        stop = min(start + chunk_size, raw_rows)
+        chunk = shuffled_raw.select(range(start, stop))
+        text_chunk = _prepare_e2e_text_dataset(
+            chunk,
+            text_field=str(preset.text_field),
+            text_format=str(preset.text_format),
+            num_proc=1,
+        )
+        if len(text_chunk) < 1:
             continue
-        text = str(text).strip()
-        if text:
-            yield text
+        for record in text_chunk.shuffle(seed=int(seed)):
+            text = record.get("text")
+            if text is None:
+                continue
+            text = str(text).strip()
+            if text:
+                yielded_text = True
+                yield text
+
+    if not yielded_text:
+        raise ValueError(f"Calibration dataset mix source '{alias}' has no usable text rows.")
 
 
 def _build_calibration_blocks_for_source(

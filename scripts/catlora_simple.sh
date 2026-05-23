@@ -53,7 +53,7 @@ python tools/cat_train.py \
   --joint_decoder_steps "default=1000" \
   --joint_decoder_lr "default=5e-3" \
   --joint_decoder_group_size "default=36" \
-  --joint_decoder_batch_size "default=16384" \
+  --joint_decoder_batch_size "default=524288" \
   --batch_size "2048" \
   --log_every "100" \
   --eval_every "0" \
