@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Dict, List
 
 import torch
@@ -15,6 +16,14 @@ except ImportError:
 def ensure_lora_dataset_stack_available() -> None:
     if load_dataset is None or DatasetDict is None or concatenate_datasets is None:
         raise ImportError("未安装 datasets。请先安装：pip install datasets")
+
+
+def _resolve_lora_dataset_num_proc() -> int:
+    raw_num_proc = os.environ.get("CAT_LORA_DATASET_NUM_PROC", "16")
+    num_proc = int(raw_num_proc)
+    if num_proc < 1:
+        raise ValueError(f"CAT_LORA_DATASET_NUM_PROC must be >= 1, got {raw_num_proc}.")
+    return num_proc
 
 
 def _split_lora_mix_targets(total_rows: int, weights: List[float]) -> List[int]:
@@ -79,6 +88,7 @@ def _prepare_lora_mix_source(
     train_raw, _eval_raw = _load_preset_raw_datasets(preset)
     raw_rows = int(len(train_raw))
     chunk_size = 4096
+    num_proc = _resolve_lora_dataset_num_proc()
     shuffled_raw = train_raw.shuffle(seed=int(seed))
     text_chunks = []
     processed_raw_rows = 0
@@ -92,7 +102,7 @@ def _prepare_lora_mix_source(
             chunk,
             text_field=str(preset.text_field),
             text_format=str(preset.text_format),
-            num_proc=1,
+            num_proc=int(num_proc),
         )
         if len(text_chunk) > 0:
             text_chunks.append(text_chunk)
@@ -165,6 +175,7 @@ def _iter_calibration_texts_for_source(
     train_raw, _eval_raw = _load_preset_raw_datasets(preset)
     raw_rows = int(len(train_raw))
     chunk_size = 4096
+    num_proc = _resolve_lora_dataset_num_proc()
     shuffled_raw = train_raw.shuffle(seed=int(seed))
     yielded_text = False
 
@@ -175,7 +186,7 @@ def _iter_calibration_texts_for_source(
             chunk,
             text_field=str(preset.text_field),
             text_format=str(preset.text_format),
-            num_proc=1,
+            num_proc=int(num_proc),
         )
         if len(text_chunk) < 1:
             continue

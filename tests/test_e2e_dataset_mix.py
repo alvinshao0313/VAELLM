@@ -760,6 +760,9 @@ class DatasetMixBuilderTest(unittest.TestCase):
 class LoraDataTest(unittest.TestCase):
     def setUp(self):
         self.tokenizer = DummyTokenizer()
+        self.num_proc_patch = mock.patch.dict("os.environ", {"CAT_LORA_DATASET_NUM_PROC": "1"})
+        self.num_proc_patch.start()
+        self.addCleanup(self.num_proc_patch.stop)
 
     def test_prepare_lora_datasets_limits_source_preprocessing(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):

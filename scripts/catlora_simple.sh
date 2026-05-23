@@ -8,6 +8,7 @@ SEED="${SEED:-42}"
 export PYTHONHASHSEED="${SEED}"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
+export CAT_LORA_DATASET_NUM_PROC="${CAT_LORA_DATASET_NUM_PROC:-16}"
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
@@ -29,6 +30,7 @@ export TOKENIZERS_PARALLELISM=false
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
 # --wa_mse_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
+# CAT_LORA_DATASET_NUM_PROC=16          # LoRA/校准数据 format 预处理并行进程数 位置在 lora_data.py
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,piqa"       # 可选：类别后下游任务评估；空串表示不跑
 # --lora_after_category \ boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa
