@@ -181,7 +181,12 @@ class Normalize(nn.Module):
             self.total_channels = self.in_channels * self.num_models
             self.norm = nn.BatchNorm1d(self.total_channels)
         elif self.norm_type == "layer":
-            self.norm = nn.LayerNorm(self.in_channels)
+            if self.num_models == 1:
+                self.norm = nn.LayerNorm(self.in_channels)
+            else:
+                self.norm = nn.LayerNorm(self.in_channels, elementwise_affine=False)
+                self.weight = nn.Parameter(torch.ones(self.num_models, self.in_channels))
+                self.bias = nn.Parameter(torch.zeros(self.num_models, self.in_channels))
         else:
             self.norm = nn.Identity()
 
@@ -200,8 +205,13 @@ class Normalize(nn.Module):
         return x.view(batch_size, self.in_channels * self.num_models)
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.norm_type in {"no", "layer"}:
+        if self.norm_type == "no":
             return self.norm(x)
+        if self.norm_type == "layer":
+            out = self.norm(x)
+            if self.num_models == 1:
+                return out
+            return out * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
 
         flat = self._flatten_parallel(x)
         out = self.norm(flat)
@@ -215,6 +225,8 @@ class Normalize(nn.Module):
         ref_weight = getattr(self.norm, "weight", None)
         if isinstance(ref_weight, torch.Tensor):
             new_norm = new_norm.to(device=ref_weight.device, dtype=ref_weight.dtype)
+        elif self.norm_type == "layer" and isinstance(getattr(self, "weight", None), torch.Tensor):
+            new_norm = new_norm.to(device=self.weight.device, dtype=self.weight.dtype)
         elif self.norm_type == "batch":
             new_norm = new_norm.to(device=self.norm.running_mean.device, dtype=self.norm.running_mean.dtype)
         new_norm.train(self.training)
@@ -223,7 +235,12 @@ class Normalize(nn.Module):
             return new_norm
 
         if self.norm_type == "layer":
-            new_norm.norm.load_state_dict(self.norm.state_dict())
+            if self.num_models == 1:
+                new_norm.norm.load_state_dict(self.norm.state_dict())
+            else:
+                with torch.no_grad():
+                    new_norm.norm.weight.copy_(self.weight[model_idx])
+                    new_norm.norm.bias.copy_(self.bias[model_idx])
             return new_norm
 
         start = model_idx * self.in_channels
@@ -318,13 +335,13 @@ def pack_normalizes(norms: Sequence["Normalize"]) -> "Normalize":
         return packed
 
     if norm_type == "layer":
-        first_state = first.norm.state_dict()
-        for idx, norm in enumerate(norms[1:], start=1):
-            if not _state_dict_allclose(first_state, norm.norm.state_dict()):
-                raise ValueError(
-                    f"pack_normalizes requires identical LayerNorm state for all models; mismatch at idx={idx}."
-                )
-        packed.norm.load_state_dict(first_state)
+        if len(norms) == 1:
+            packed.norm.load_state_dict(first.norm.state_dict())
+            return packed
+        for idx, norm in enumerate(norms):
+            with torch.no_grad():
+                packed.weight[idx].copy_(norm.norm.weight)
+                packed.bias[idx].copy_(norm.norm.bias)
         return packed
 
     if norm_type == "group":
