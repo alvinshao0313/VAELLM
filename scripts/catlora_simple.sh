@@ -29,6 +29,9 @@ export CAT_LORA_DATASET_NUM_PROC="${CAT_LORA_DATASET_NUM_PROC:-16}"
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
+# --outlier_protect_mode "per_vae_low_rank" / "post_vae_low_rank"
+# --outlier_low_rank "default=16"
+#   低秩模式需同时设置 --outlier_residual_top_p "default=0"
 # --wa_mse_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
 # CAT_LORA_DATASET_NUM_PROC=16          # LoRA/校准数据 format 预处理并行进程数 位置在 lora_data.py
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
@@ -51,8 +54,8 @@ python tools/cat_train.py \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
-  --steps_per_category "default=1000" \
-  --joint_decoder_steps "default=1000" \
+  --steps_per_category "default=10" \
+  --joint_decoder_steps "default=0" \
   --joint_decoder_lr "default=5e-3" \
   --joint_decoder_group_size "default=36" \
   --joint_decoder_batch_size "default=524288" \
@@ -68,8 +71,9 @@ python tools/cat_train.py \
   --sort_prep_workers "0" \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
-  --outlier_protect_mode "none" \
-  --outlier_residual_top_p "default=0.01" \
+  --outlier_protect_mode "per_vae_low_rank" \
+  --outlier_low_rank "default=16" \
+  --outlier_residual_top_p "default=0.0" \
   --outlier_residual_score "input_act_weighted_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
@@ -112,11 +116,11 @@ python tools/cat_train.py \
   --use_checkpoint \
   --new_quant \
   --lora_after_category \
-  --lora_dataset "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10" \
+  --lora_dataset "wiki=1.0" \
   --lora_rank "default=24" \
   --lora_alpha "default=48.0" \
   --lora_dropout "default=0.0" \
-  --lora_steps "default=5000" \
+  --lora_steps "default=5" \
   --lora_batch_size "default=1" \
   --lora_nsamples "default=20000" \
   --lora_lr "default=1e-4" \

@@ -22,6 +22,8 @@ export PYTHONPATH=.
 - `scripts/catlora_simple.sh`
   - 入口：`tools/cat_train.py`
   - 用途：按类别训练权重 VAE、把 `nn.Linear` 替换成 `VAELinear`、保存压缩模型
+  - residual / low-rank 离群保护逻辑在 `train_utils/cat_train_residual_protection.py`
+  - 多阶 residual 的 joint decoder 联合微调逻辑在 `train_utils/cat_joint_decoder.py`
 - `scripts/eval.sh`
   - 入口：`tools/cat_eval.py`
   - 用途：对保存好的 checkpoint 做 PPL 和 lm-eval
@@ -34,6 +36,10 @@ export PYTHONPATH=.
   - `--eval_strategy no` 会直接跳过 eval 数据的 prepare/tokenize/pack
   - 默认是单数据源脚本（可按需改 `--dataset_mix`）
   - 默认导出 `final_adapter/` + `run_meta.json` + `final_adapter/dense_adapter_meta.json`
+- `vae_e2e_fintuning/scripts/e2e_vae_decoder.sh`
+  - 压缩模型 checkpoint 直接训练 VAELinear 内部参数，最终仍保存压缩 `final_model/`
+  - 支持 `--vae_train_mode decoder|low_rank|both`
+  - 三种模式说明见 `vae_e2e_fintuning/README.md`
 - `raw_e2e_fintuning/scripts/e2e_raw_lora.sh`
   - 原模型（非 VAE）LoRA 基线
   - 入口参数是 `--student_model_path`，不接受 `--student_checkpoint_dir`
@@ -99,7 +105,16 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
 - 当前 `cat_train` 保存的 `final_model/` 是 packed cat checkpoint：
   - `checkpoint_meta.json` 版本为 `5`
   - `vq_weight*` 现在按 `uint8 bit-pack` 落盘，不再按 `torch.bool` 一字节存
+  - checkpoint meta 会记录 `low_rank_a/b` 和 sparse residual payload 的 shape / dtype
   - 这里只压缩 VQ bit payload；`embed_tokens`、`lm_head` 等未压缩 dense 权重仍会保留
+- `cat_train` 当前支持 5 种离群保护模式：
+  - `none`：不做离群保护
+  - `channel`：压缩前保护 top-N channel
+  - `residual_sparse`：训练后保存稀疏残差补丁
+  - `per_vae_low_rank`：VAE 训练前先扣除原始权重的 rank-k SVD 主成分，让 VAE 训练残差
+  - `post_vae_low_rank`：VAE / joint decoder 训练完成后，对最终重建残差做 rank-k SVD 补丁
+- 推理时 `VAELinear` 的权重重建顺序固定为：
+  - `VAE reconstruction -> low_rank patch -> sparse_residual patch`
 - `raw_e2e_fintuning` 是原始模型独立训练链路，输入输出保持 HF/PEFT 格式。
 - 两条训练轨完全隔离，不互相 import：
   - `dense_e2e_fintuning`：输入 `--student_checkpoint_dir`，输出 `final_adapter/` + `run_meta.json`
@@ -118,6 +133,14 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - 旧版 `version=4` cat checkpoint 不再直接加载
   - 需要先执行 `python tools/convert_cat_checkpoint_to_bitpack.py ...`
   - 这个转换脚本是独立工具，不参与运行时 import，删掉它不影响新格式 checkpoint 的训练、保存、加载和评估
+- `train_utils` 当前按扁平模块组织：
+  - `cat_train_args.py`：`tools/cat_train.py` 参数解析和类别 override
+  - `cat_data_prep.py` / `cat_train_data.py`：权重切分、排序、block 数据构造和恢复
+  - `cat_train_residual_protection.py`：sparse residual 与 low-rank outlier protection
+  - `cat_joint_decoder.py`：多阶 residual 的 joint decoder 训练
+  - `model_checkpoint_io.py`：压缩模型 checkpoint 保存和加载
+  - `lora_*`：after-category LoRA 数据、训练和融合
+  - `eval_utils.py` / `cat_train_eval.py`：PPL、lm_eval、MSE 评估
 - `tools/cat_eval.py` 支持 `--adapter_dir`：
   - 不传 `--adapter_dir`：评估压缩模型原始结果
   - 传 `--adapter_dir`：先从压缩模型重建 dense，再挂载并 merge adapter，评估端到端微调结果

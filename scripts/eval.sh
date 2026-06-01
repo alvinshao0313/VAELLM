@@ -5,8 +5,8 @@ export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/Qwen_Qwen3-8B_20260422_070608/final_model}"
-ADAPTER_DIR="${ADAPTER_DIR:-.result/dense_e2e_fintuning/final_model_20260427_020212/final_adapter}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/vae_e2e_fintuning/final_model_20260601_020104/trainer_state/checkpoint-10}"
+ADAPTER_DIR="${ADAPTER_DIR:-}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 
 if [[ -z "${CHECKPOINT_DIR}" ]]; then
@@ -16,7 +16,7 @@ fi
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
-# --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa"
+# --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"
 # --eval_hif4_act "true"
 # - 带 proxy adapter 的 e2e checkpoint 会在 eval_device 上先 grouped materialize。
 # - 非 proxy checkpoint 才走普通 VAELinear cache warmup。
@@ -27,7 +27,7 @@ if [[ -n "${ADAPTER_DIR}" ]]; then
     --adapter_dir "${ADAPTER_DIR}" \
     --eval_ppl \
     --eval_lm_eval \
-    --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
+    --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
     --eval_device "${EVAL_DEVICE}" \
     --lm_batch_size "auto" \
     --num_fewshot "0" \
@@ -42,7 +42,7 @@ else
     --checkpoint_dir "${CHECKPOINT_DIR}" \
     --eval_ppl \
     --eval_lm_eval \
-    --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa" \
+    --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
     --eval_device "${EVAL_DEVICE}" \
     --lm_batch_size "auto" \
     --num_fewshot "0" \

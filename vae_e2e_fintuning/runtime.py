@@ -3,19 +3,24 @@ import json
 import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+from torch import nn
 from transformers import AutoTokenizer, default_data_collator
 
 from dense_e2e_fintuning.args import needs_teacher
 from dense_e2e_fintuning.checkpoint_bridge import (
+    get_decode_device_diagnostics,
     load_compressed_student_checkpoint,
     resolve_base_model_path,
 )
 from dense_e2e_fintuning.runtime import _build_datasets_with_main_process_first, _eval_final_ppl
 from e2e_common.data import build_tokenizer
 from e2e_common.post_norm_head import ensure_post_norm_head_linear
+from litebsq.misc import set_module_by_name
+from litebsq.vae_linear import VAELinear
+from litebsq.vae_linear_prewarm import NamedVAELinearDecodeTarget, decode_named_vae_linear_weights
 from rotation.model_utils import get_layers, get_model
 from train_utils.model_checkpoint_io import (
     STATE_DICT_FILENAME,
@@ -31,9 +36,12 @@ from vae_e2e_fintuning.offload import (
     wrap_model_layers_for_streaming_offload,
 )
 from vae_e2e_fintuning.trainables import (
+    VAEDecoderTrainableSelection,
+    collect_selected_vae_linears,
     resolve_target_layer_ids,
     select_vae_decoder_trainables,
     unpack_parallel_stage_decoders,
+    validate_selected_low_rank_payloads,
 )
 from vae_e2e_fintuning.trainer import VAEDecoderE2ETrainer
 
@@ -63,6 +71,241 @@ def _selection_to_meta(selection) -> Dict[str, object]:
     data["target_module_count"] = len(selection.target_modules)
     data["decoder_layer_count"] = len(selection.decoder_layer_ids)
     return data
+
+
+def _iter_named_vae_linears(model: nn.Module) -> Iterable[Tuple[str, VAELinear]]:
+    for name, module in model.named_modules():
+        if isinstance(module, VAELinear):
+            yield str(name), module
+
+
+def _resolve_reference_dtype(module: nn.Module) -> torch.dtype:
+    for param in module.parameters():
+        if param.is_floating_point():
+            return param.dtype
+    for buffer in module.buffers():
+        if buffer.is_floating_point():
+            return buffer.dtype
+    return torch.float32
+
+
+def _copy_low_rank_payloads(
+    selected_modules: Sequence[Tuple[str, VAELinear]],
+) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    for name, module in selected_modules:
+        low_rank_a = getattr(module, "low_rank_a", None)
+        low_rank_b = getattr(module, "low_rank_b", None)
+        if low_rank_a is None or low_rank_b is None:
+            raise ValueError(f"{name}: selected VAELinear has no complete low_rank_a/low_rank_b payload.")
+        payloads[str(name)] = (
+            low_rank_a.detach().to(device="cpu").contiguous(),
+            low_rank_b.detach().to(device="cpu").contiguous(),
+        )
+    return payloads
+
+
+@torch.no_grad()
+def _materialize_selected_vae_linears_without_low_rank(
+    model: nn.Module,
+    selected_modules: Sequence[Tuple[str, VAELinear]],
+    *,
+    group_size: int,
+    compute_device: str,
+    log,
+) -> int:
+    decode_targets = [
+        NamedVAELinearDecodeTarget(
+            name=name,
+            base_layer=module,
+            target_dtype=_resolve_reference_dtype(module),
+            include_low_rank=False,
+        )
+        for name, module in selected_modules
+    ]
+    if not decode_targets:
+        raise ValueError("No selected VAELinear modules to materialize.")
+    log.info(
+        "Start low-rank dense init: selected=%d group_size=%d compute_device=%s include_low_rank=false",
+        len(decode_targets),
+        int(group_size),
+        str(compute_device),
+    )
+    decoded_results = decode_named_vae_linear_weights(
+        decode_targets,
+        group_size=int(group_size),
+        compute_device=compute_device,
+        logger=log,
+        respect_cache_policy=False,
+    )
+    decoded_by_name = {item.name: item for item in decoded_results}
+    if len(decoded_by_name) != len(selected_modules):
+        raise RuntimeError(
+            f"Low-rank dense init decode count mismatch: decoded={len(decoded_by_name)} expected={len(selected_modules)}."
+        )
+
+    converted = 0
+    for name, old_module in selected_modules:
+        decoded = decoded_by_name[str(name)]
+        dense_linear = nn.Linear(
+            int(old_module.in_features),
+            int(old_module.out_features),
+            bias=old_module.bias is not None,
+            device=decoded.decoded_weight.device,
+            dtype=decoded.decoded_weight.dtype,
+        )
+        dense_linear.weight.copy_(decoded.decoded_weight)
+        if dense_linear.bias is not None and old_module.bias is not None:
+            dense_linear.bias.copy_(
+                old_module.bias.detach().to(device=dense_linear.bias.device, dtype=dense_linear.bias.dtype)
+            )
+        dense_linear.train(old_module.training)
+        dense_linear.to("cpu")
+        set_module_by_name(model, str(name), dense_linear)
+        converted += 1
+    log.info("Finished low-rank dense init: converted=%d", converted)
+    return int(converted)
+
+
+def _strip_peft_module_prefix(name: str) -> str:
+    text = str(name)
+    for prefix in ("base_model.model.", "model."):
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def _iter_lora_target_modules(model: nn.Module):
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+            yield _strip_peft_module_prefix(str(name)), module
+
+
+def _initialize_lora_from_low_rank(
+    peft_model: nn.Module,
+    low_rank_payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+) -> int:
+    initialized = 0
+    for base_name, module in _iter_lora_target_modules(peft_model):
+        if base_name not in low_rank_payloads:
+            continue
+        low_rank_a, low_rank_b = low_rank_payloads[base_name]
+        lora_a = module.lora_A["default"].weight
+        lora_b = module.lora_B["default"].weight
+        if tuple(lora_a.shape) != tuple(low_rank_b.shape):
+            raise RuntimeError(f"{base_name}: lora_A shape {tuple(lora_a.shape)} != low_rank_b {tuple(low_rank_b.shape)}.")
+        if tuple(lora_b.shape) != tuple(low_rank_a.shape):
+            raise RuntimeError(f"{base_name}: lora_B shape {tuple(lora_b.shape)} != low_rank_a {tuple(low_rank_a.shape)}.")
+        lora_a.data.copy_(low_rank_b.to(device=lora_a.device, dtype=lora_a.dtype))
+        lora_b.data.copy_(low_rank_a.to(device=lora_b.device, dtype=lora_b.dtype))
+        initialized += 1
+    if initialized != len(low_rank_payloads):
+        raise RuntimeError(
+            f"LoRA init target count mismatch: initialized={initialized} expected={len(low_rank_payloads)}."
+        )
+    return int(initialized)
+
+
+def _build_low_rank_peft_model(
+    model: nn.Module,
+    *,
+    low_rank_payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    rank: int,
+    decoder_layer_ids: Sequence[int],
+    target_module_suffixes: Sequence[str],
+    parallel_stage_decode: bool,
+    log,
+) -> Tuple[nn.Module, VAEDecoderTrainableSelection]:
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("low_rank 训练需要 peft。请先安装：pip install peft") from exc
+
+    target_modules = sorted(low_rank_payloads.keys())
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=int(rank),
+        target_modules=target_modules,
+        lora_alpha=float(rank),
+        lora_dropout=0.0,
+        bias="none",
+        init_lora_weights=True,
+    )
+    peft_model = get_peft_model(model, peft_config)
+    initialized = _initialize_lora_from_low_rank(peft_model, low_rank_payloads)
+    trainable_names = sorted(name for name, param in peft_model.named_parameters() if bool(param.requires_grad))
+    trainable_count = int(
+        sum(int(param.numel()) for _name, param in peft_model.named_parameters() if bool(param.requires_grad))
+    )
+    if trainable_count < 1:
+        raise RuntimeError("No trainable low-rank LoRA parameters found.")
+    log.info("Initialized low-rank LoRA targets from checkpoint payloads: initialized=%d rank=%d", initialized, int(rank))
+    selection = VAEDecoderTrainableSelection(
+        decoder_layer_ids=[int(idx) for idx in decoder_layer_ids],
+        target_modules=target_modules,
+        target_module_suffixes=list(target_module_suffixes),
+        bias_modules=[],
+        final_norm_modules=[],
+        post_norm_head_modules=[],
+        low_rank_modules=target_modules,
+        trainable_parameter_names=trainable_names,
+        trainable_parameter_count=trainable_count,
+        parallel_stage_decode=bool(parallel_stage_decode),
+        train_mode="low_rank",
+    )
+    return peft_model, selection
+
+
+def _extract_low_rank_payloads_from_lora(
+    peft_model: nn.Module,
+    target_modules: Sequence[str],
+) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    target_set = {str(name) for name in target_modules}
+    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    for base_name, module in _iter_lora_target_modules(peft_model):
+        if base_name not in target_set:
+            continue
+        lora_a = module.lora_A["default"].weight.detach()
+        lora_b = module.lora_B["default"].weight.detach()
+        scaling = float(module.scaling["default"])
+        low_rank_b = lora_a.to(device="cpu").contiguous()
+        low_rank_a = (lora_b.to(device="cpu", dtype=torch.float32) * scaling).to(dtype=lora_b.dtype).contiguous()
+        payloads[base_name] = (low_rank_a, low_rank_b)
+    if len(payloads) != len(target_set):
+        missing = sorted(target_set - set(payloads.keys()))
+        raise RuntimeError(f"Missing trained LoRA payloads for low-rank export: {missing}")
+    return payloads
+
+
+def _write_low_rank_payloads_to_compressed_model(
+    model: nn.Module,
+    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+) -> int:
+    modules = dict(_iter_named_vae_linears(model))
+    written = 0
+    for name, (low_rank_a, low_rank_b) in payloads.items():
+        module = modules.get(str(name))
+        if module is None:
+            raise RuntimeError(f"Cannot export low-rank payload; VAELinear not found: {name}")
+        if getattr(module, "low_rank_a", None) is None or getattr(module, "low_rank_b", None) is None:
+            raise RuntimeError(f"Cannot export low-rank payload; checkpoint module has no low_rank_a/b: {name}")
+        if tuple(module.low_rank_a.shape) != tuple(low_rank_a.shape):
+            raise RuntimeError(f"{name}: low_rank_a shape mismatch: {tuple(module.low_rank_a.shape)} != {tuple(low_rank_a.shape)}.")
+        if tuple(module.low_rank_b.shape) != tuple(low_rank_b.shape):
+            raise RuntimeError(f"{name}: low_rank_b shape mismatch: {tuple(module.low_rank_b.shape)} != {tuple(low_rank_b.shape)}.")
+        module.low_rank_a.data.copy_(low_rank_a.to(device=module.low_rank_a.device, dtype=module.low_rank_a.dtype))
+        module.low_rank_b.data.copy_(low_rank_b.to(device=module.low_rank_b.device, dtype=module.low_rank_b.dtype))
+        module.clear_decoded_weight_cache()
+        written += 1
+    return int(written)
+
+
+def _peft_base_model(model: nn.Module) -> nn.Module:
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        return get_base_model()
+    return model
 
 
 def _load_teacher(*, args, hf_args, base_model_path: str, log):
@@ -96,6 +339,191 @@ def _disable_trainable_decode_for_eval(model: torch.nn.Module) -> int:
             disable_fn()
             count += 1
     return count
+
+
+_SPARSE_RESIDUAL_BUFFER_NAMES = (
+    "sparse_residual_row_indices",
+    "sparse_residual_col_indices",
+    "sparse_residual_values",
+    "sparse_residual_active_block_ids",
+    "sparse_residual_block_ptr",
+    "sparse_residual_local_indices",
+    "sparse_residual_qvalues",
+    "sparse_residual_scales",
+    "sparse_residual_zero_points",
+)
+
+
+def _replace_sparse_residual_payload(
+    module: torch.nn.Module,
+    payload,
+    *,
+    codec: str,
+    index_bits: int,
+    value_bits: int,
+    block_shape,
+) -> None:
+    resolved_codec = str(codec).strip().lower()
+    module.sparse_residual_format = resolved_codec
+    if resolved_codec == "blocked_quantized":
+        module.sparse_residual_index_bits = int(index_bits)
+        module.sparse_residual_value_bits = int(value_bits)
+        module.sparse_residual_block_rows = int(block_shape[0])
+        module.sparse_residual_block_cols = int(block_shape[1])
+    else:
+        module.sparse_residual_index_bits = None
+        module.sparse_residual_value_bits = None
+        module.sparse_residual_block_rows = None
+        module.sparse_residual_block_cols = None
+
+    for name in _SPARSE_RESIDUAL_BUFFER_NAMES:
+        module.register_buffer(name, None, persistent=True)
+
+    if not payload:
+        return
+
+    for key, value in payload.items():
+        if key == "sparse_residual_format":
+            module.sparse_residual_format = str(value).strip().lower()
+        elif key in {
+            "sparse_residual_index_bits",
+            "sparse_residual_value_bits",
+            "sparse_residual_block_rows",
+            "sparse_residual_block_cols",
+        }:
+            setattr(module, key, int(value))
+        elif key in _SPARSE_RESIDUAL_BUFFER_NAMES:
+            module.register_buffer(key, value.detach().to(device="cpu").contiguous(), persistent=True)
+        else:
+            raise ValueError(f"Unsupported sparse residual payload key: {key}")
+
+
+@torch.no_grad()
+def _refresh_sparse_residual_after_train(model: torch.nn.Module, args, log) -> Dict[str, int]:
+    from litebsq.vae_linear import VAELinear
+    from train_utils.cat_train_residual_protection import build_sparse_residual_payload
+
+    top_p = getattr(args, "refresh_sparse_residual_top_p", None)
+    if top_p is None:
+        raise ValueError("--refresh_sparse_residual_top_p is required to refresh sparse residuals.")
+    score_mode = str(getattr(args, "refresh_sparse_residual_score", "abs")).strip().lower()
+    if score_mode != "abs":
+        raise ValueError("--refresh_sparse_residual_score currently supports only: abs.")
+
+    total_sparse = 0
+    refreshed = 0
+    total_nnz = 0
+    total_codec_bytes = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, VAELinear):
+            continue
+        has_sparse_fn = getattr(module, "has_sparse_residual", None)
+        has_sparse = bool(has_sparse_fn()) if callable(has_sparse_fn) else False
+        if not has_sparse:
+            continue
+        total_sparse += 1
+        original_weight = getattr(module, "original_weight", None)
+        if original_weight is None:
+            raise RuntimeError(
+                f"{name}: cannot refresh residual_sparse because original_weight is missing."
+            )
+
+        compressed_weight = module._decode_compressed_weight(dtype=torch.float32)
+        reconstructed_weight = module._materialize_full_weight(
+            compressed_weight,
+            dtype=torch.float32,
+        )
+        reconstructed_weight = module._apply_low_rank_patch(
+            reconstructed_weight,
+            dtype=torch.float32,
+        ).detach().to(device="cpu", dtype=torch.float32).contiguous()
+        payload, nnz, storage = build_sparse_residual_payload(
+            linear_name=name,
+            original_weight=original_weight.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+            reconstructed_weight=reconstructed_weight,
+            activation_weight=None,
+            score_mode=score_mode,
+            top_p=float(top_p),
+            min_abs=float(getattr(args, "refresh_sparse_residual_min_abs", 0.0)),
+            codec=str(getattr(args, "refresh_sparse_residual_codec", "blocked_quantized")),
+            index_bits=int(getattr(args, "refresh_sparse_residual_index_bits", 8)),
+            value_bits=int(getattr(args, "refresh_sparse_residual_value_bits", 8)),
+            block_shape=tuple(int(v) for v in getattr(args, "refresh_sparse_residual_block_shape", (256, 256))),
+        )
+        _replace_sparse_residual_payload(
+            module,
+            payload,
+            codec=str(getattr(args, "refresh_sparse_residual_codec", "blocked_quantized")),
+            index_bits=int(getattr(args, "refresh_sparse_residual_index_bits", 8)),
+            value_bits=int(getattr(args, "refresh_sparse_residual_value_bits", 8)),
+            block_shape=tuple(int(v) for v in getattr(args, "refresh_sparse_residual_block_shape", (256, 256))),
+        )
+        module.clear_decoded_weight_cache()
+        refreshed += 1
+        total_nnz += int(nnz)
+        total_codec_bytes += int(storage.get("codec_bytes", 0))
+        log.info(
+            "[refresh_sparse_residual] %s refreshed: nnz=%d codec_bytes=%d",
+            name,
+            int(nnz),
+            int(storage.get("codec_bytes", 0)),
+        )
+
+    log.info(
+        "[refresh_sparse_residual] done: sparse_modules=%d refreshed=%d total_nnz=%d total_codec_bytes=%d",
+        total_sparse,
+        refreshed,
+        total_nnz,
+        total_codec_bytes,
+    )
+    return {
+        "sparse_modules": int(total_sparse),
+        "refreshed": int(refreshed),
+        "total_nnz": int(total_nnz),
+        "total_codec_bytes": int(total_codec_bytes),
+    }
+
+
+def _clear_vae_linear_cache(model: torch.nn.Module, log, *, reason: str) -> int:
+    from litebsq.vae_linear import clear_model_vae_linear_cache
+
+    cleared = clear_model_vae_linear_cache(model)
+    log.info("%s: cleared decoded cache for %d VAELinear modules.", reason, int(cleared))
+    return int(cleared)
+
+
+def _prewarm_final_eval_model(*, model: torch.nn.Module, args, log) -> Dict[str, int]:
+    device = _resolve_eval_device(str(args.eval_device))
+    group_size = int(getattr(args, "eval_prewarm_group_size", 8))
+    log.info("[eval_prewarm] Moving final model to %s ...", device)
+    model.to(device)
+
+    from e2e_common.proxy_trainables import iter_named_vae_module_refs
+    from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
+
+    named_targets = [
+        NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer)
+        for ref in iter_named_vae_module_refs(model)
+    ]
+    stats = prime_named_vae_linear_cache(
+        named_targets,
+        clear_existing=True,
+        group_size=group_size,
+        compute_device=device,
+        logger=log,
+    )
+    if int(stats.get("failed", 0)) > 0:
+        raise RuntimeError(f"Final eval prewarm failed: {stats}")
+    log.info(
+        "[eval_prewarm] done: total=%d warmed=%d skipped=%d failed=%d group_size=%d device=%s",
+        int(stats.get("total", 0)),
+        int(stats.get("warmed", 0)),
+        int(stats.get("skipped", 0)),
+        int(stats.get("failed", 0)),
+        group_size,
+        device,
+    )
+    return stats
 
 
 def _run_final_lm_eval(*, model, tokenizer, args, base_model_path: str, output_dir: str, log):
@@ -208,21 +636,71 @@ def run(args, hf_args, training_args):
 
     layers = list(get_layers(model))
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(layers))
-    selection = select_vae_decoder_trainables(
-        model,
-        decoder_layer_ids=decoder_layer_ids,
-        target_module_names=args.target_module_names,
-        parallel_stage_decode=bool(args.parallel_stage_decode),
-        tune_final_norm=bool(args.tune_final_norm),
-        use_post_norm_head_linear=bool(args.use_post_norm_head_linear),
-        vae_tune_bias=bool(args.vae_tune_bias),
-    )
+    train_mode = str(getattr(args, "vae_train_mode", "decoder")).strip().lower()
+    low_rank_payloads_for_export: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
+    if train_mode == "low_rank":
+        selected_modules, target_module_suffixes = collect_selected_vae_linears(
+            model,
+            decoder_layer_ids=decoder_layer_ids,
+            target_module_names=args.target_module_names,
+        )
+        if not selected_modules:
+            raise ValueError("No eligible VAELinear modules found for requested decoder_layers / target_modules.")
+        low_rank_rank = validate_selected_low_rank_payloads(
+            selected_modules,
+            require_uniform_rank=True,
+        )
+        low_rank_payloads = _copy_low_rank_payloads(selected_modules)
+        requested_decode_device = str(getattr(args, "decode_device", "auto"))
+        decode_device_diag = get_decode_device_diagnostics(requested_decode_device)
+        resolved_decode_device = str(decode_device_diag["resolved_device"])
+        log.info(
+            "Low-rank dense init decode config: requested_device=%s resolved_device=%s group_size=%d",
+            requested_decode_device,
+            resolved_decode_device,
+            int(args.decode_group_size),
+        )
+        log.info(
+            "Low-rank decode device diagnostics: LOCAL_RANK=%s CUDA_VISIBLE_DEVICES=%s visible_cuda_count=%d",
+            str(decode_device_diag["local_rank"]),
+            str(decode_device_diag["cuda_visible_devices"]),
+            int(decode_device_diag["visible_cuda_count"]),
+        )
+        _materialize_selected_vae_linears_without_low_rank(
+            model,
+            selected_modules,
+            group_size=int(args.decode_group_size),
+            compute_device=resolved_decode_device,
+            log=log,
+        )
+        model, selection = _build_low_rank_peft_model(
+            model,
+            low_rank_payloads=low_rank_payloads,
+            rank=int(low_rank_rank),
+            decoder_layer_ids=decoder_layer_ids,
+            target_module_suffixes=target_module_suffixes,
+            parallel_stage_decode=bool(args.parallel_stage_decode),
+            log=log,
+        )
+    else:
+        selection = select_vae_decoder_trainables(
+            model,
+            decoder_layer_ids=decoder_layer_ids,
+            target_module_names=args.target_module_names,
+            parallel_stage_decode=bool(args.parallel_stage_decode),
+            tune_final_norm=bool(args.tune_final_norm),
+            use_post_norm_head_linear=bool(args.use_post_norm_head_linear),
+            vae_tune_bias=bool(args.vae_tune_bias),
+            train_mode=train_mode,
+        )
     log.info(
-        "Selected VAE decoder trainables: layers=%s targets=%d suffixes=%s bias_modules=%d final_norm=%s post_norm_head=%s trainable_tensors=%d trainable_params=%d parallel_stage_decode=%s",
+        "Selected VAE trainables: mode=%s layers=%s targets=%d suffixes=%s bias_modules=%d low_rank_modules=%d final_norm=%s post_norm_head=%s trainable_tensors=%d trainable_params=%d parallel_stage_decode=%s",
+        selection.train_mode,
         selection.decoder_layer_ids,
         len(selection.target_modules),
         selection.target_module_suffixes,
         len(selection.bias_modules),
+        len(selection.low_rank_modules),
         selection.final_norm_modules,
         selection.post_norm_head_modules,
         len(selection.trainable_parameter_names),
@@ -231,6 +709,7 @@ def run(args, hf_args, training_args):
     )
 
     resolved_layer_device_map = resolve_layer_device_map(args.layer_device_map, len(layers))
+    device_map_model = _peft_base_model(model) if train_mode == "low_rank" else model
     offload_mode = str(args.offload_mode).strip().lower()
     streaming_manager = None
     saved_tensor_offload = None
@@ -241,16 +720,20 @@ def run(args, hf_args, training_args):
                 "offload_mode=streaming manages layer checkpointing itself; overriding HF gradient_checkpointing=false."
             )
             training_args.gradient_checkpointing = False
-        hook_handles, boundary_map = apply_boundary_device_map(model, layer_device_map=resolved_layer_device_map)
+        hook_handles, boundary_map = apply_boundary_device_map(device_map_model, layer_device_map=resolved_layer_device_map)
         streaming_manager, streaming_map = wrap_model_layers_for_streaming_offload(
-            model,
+            device_map_model,
             layer_devices=resolved_layer_device_map,
             prefetch_distance=int(args.offload_prefetch_distance),
             checkpoint_layers=bool(args.offload_checkpoint),
         )
         hf_device_map = {**boundary_map, **streaming_map}
     else:
-        hook_handles, hf_device_map = apply_layer_device_map(model, layer_device_map=resolved_layer_device_map)
+        hook_handles, hf_device_map = apply_layer_device_map(device_map_model, layer_device_map=resolved_layer_device_map)
+    if train_mode == "low_rank":
+        setattr(model, "hf_device_map", hf_device_map)
+        setattr(model, "is_parallelizable", True)
+        setattr(model, "model_parallel", True)
 
     if offload_mode in {"saved_tensors", "streaming"}:
         saved_tensor_offload = SavedTensorOffloadContext(
@@ -300,6 +783,9 @@ def run(args, hf_args, training_args):
     training_args.output_dir = os.path.join(run_output_dir, "trainer_state")
     os.makedirs(training_args.output_dir, exist_ok=True)
     training_args.remove_unused_columns = False
+    if bool(getattr(training_args, "save_safetensors", False)):
+        log.info("Disabling safetensors for Trainer checkpoints; VAE state_dict may contain shared storage.")
+        training_args.save_safetensors = False
 
     trainer = VAEDecoderE2ETrainer(
         model=model,
@@ -330,29 +816,46 @@ def run(args, hf_args, training_args):
     if teacher_model is not None:
         teacher_model.to("cpu")
 
-    ppl_eval = _eval_final_ppl(
-        model=final_model,
-        args=args,
-        model_path=str(base_model_path),
-        output_dir=run_output_dir,
-        log=log,
-    )
-
     for handle in hook_handles:
         handle.remove()
     if streaming_manager is not None:
         streaming_manager.offload_all(synchronize=True)
-        unwrapped_streaming = unwrap_streaming_offload_layers(final_model)
+        unwrap_target = _peft_base_model(final_model) if train_mode == "low_rank" else final_model
+        unwrapped_streaming = unwrap_streaming_offload_layers(unwrap_target)
         log.info("Unwrapped %d streaming offload layers before final save.", unwrapped_streaming)
+    if train_mode == "low_rank":
+        low_rank_payloads_for_export = _extract_low_rank_payloads_from_lora(
+            final_model,
+            selection.target_modules,
+        )
+        export_model, _export_meta, _export_resolved_dir = load_compressed_student_checkpoint(
+            args.student_checkpoint_dir,
+            access_token=hf_args.access_token,
+            logger=log,
+        )
+        written = _write_low_rank_payloads_to_compressed_model(export_model, low_rank_payloads_for_export)
+        log.info("Exported trained LoRA payloads back to compressed low-rank branches: written=%d", written)
+        final_model = export_model
+        if hasattr(final_model, "config"):
+            final_model.config.use_cache = False
+            if getattr(final_model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
+                final_model.config.pad_token_id = tokenizer.pad_token_id
+    else:
+        unpacked = unpack_parallel_stage_decoders(final_model)
+        log.info("Unpacked %d parallel stage decoder modules before final save.", unpacked)
+        disabled_decode = _disable_trainable_decode_for_eval(final_model)
+        log.info("Disabled trainable decode mode on %d VAELinear modules before final save/eval.", disabled_decode)
+    sparse_refresh = None
+    if bool(getattr(args, "refresh_sparse_residual_after_train", False)):
+        sparse_refresh = _refresh_sparse_residual_after_train(final_model, args, log)
+    _clear_vae_linear_cache(final_model, log, reason="Final save/eval prep")
     final_model.to("cpu")
-    unpacked = unpack_parallel_stage_decoders(final_model)
-    log.info("Unpacked %d parallel stage decoder modules before final save.", unpacked)
-    disabled_decode = _disable_trainable_decode_for_eval(final_model)
-    log.info("Disabled trainable decode mode on %d VAELinear modules before final save/eval.", disabled_decode)
 
     model_out = None
     run_meta_path = None
+    ppl_eval = None
     lm_eval = None
+    eval_prewarm = None
     if bool(getattr(training_args, "should_save", True)):
         model_out = os.path.join(run_output_dir, "final_model")
         tok = None
@@ -366,9 +869,12 @@ def run(args, hf_args, training_args):
             save_config=True,
             extra_meta={
                 "stage": "vae_e2e_fintuning",
+                "vae_train_mode": str(train_mode),
                 "tune_final_norm": bool(args.tune_final_norm),
                 "use_post_norm_head_linear": bool(args.use_post_norm_head_linear),
                 "vae_tune_bias": bool(args.vae_tune_bias),
+                "refresh_sparse_residual_after_train": bool(args.refresh_sparse_residual_after_train),
+                "refresh_sparse_residual": sparse_refresh,
             },
             unload_vae_original_weights=False,
         )
@@ -389,6 +895,18 @@ def run(args, hf_args, training_args):
         with open(run_meta_path, "w", encoding="utf-8") as handle:
             json.dump(run_meta, handle, ensure_ascii=False, indent=2)
         log.info("Saved final compressed model to %s", save_paths["output_dir"])
+        eval_prewarm = _prewarm_final_eval_model(
+            model=final_model,
+            args=args,
+            log=log,
+        )
+        ppl_eval = _eval_final_ppl(
+            model=final_model,
+            args=args,
+            model_path=str(base_model_path),
+            output_dir=run_output_dir,
+            log=log,
+        )
         lm_eval = _run_final_lm_eval(
             model=final_model,
             tokenizer=tokenizer,
@@ -408,5 +926,7 @@ def run(args, hf_args, training_args):
         "final_ppl_path": None if ppl_eval is None else ppl_eval["path"],
         "final_lm_eval_path": None if lm_eval is None else lm_eval["json_path"],
         "final_lm_eval_summary_path": None if lm_eval is None else lm_eval["summary_path"],
+        "final_eval_prewarm": eval_prewarm,
+        "refresh_sparse_residual": sparse_refresh,
         "run_meta_path": run_meta_path,
     }

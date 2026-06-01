@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
@@ -13,6 +14,10 @@ from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_l
 
 
 _DEFAULT_RUN_ROOT = ".result/vae_e2e_fintuning"
+_SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"}
+_SPARSE_RESIDUAL_CODECS = {"coo_fp16", "blocked_quantized"}
+_VALID_VAE_TRAIN_MODES = {"decoder", "low_rank", "both"}
+_VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
 
 
 @dataclass
@@ -27,6 +32,9 @@ class VAEDecoderE2EArguments:
     post_attn: bool = False
     decoder_layers: str = "all"
     target_modules: str = "all"
+    vae_train_mode: str = "decoder"
+    decode_device: str = "auto"
+    decode_group_size: int = 8
     layer_device_map: str = "auto"
     parallel_stage_decode: bool = True
     tune_final_norm: bool = False
@@ -43,10 +51,20 @@ class VAEDecoderE2EArguments:
     eval_lm_batch_size: str = "auto"
     eval_lm_limit: Optional[int] = None
     eval_device: str = "cuda"
+    eval_prewarm_group_size: int = 8
     skip_ppl_eval: bool = False
     ppl_seqlen: int = 2048
     ppl_limit: int = -1
+    refresh_sparse_residual_after_train: bool = False
+    refresh_sparse_residual_top_p: Optional[float] = None
+    refresh_sparse_residual_score: str = "abs"
+    refresh_sparse_residual_min_abs: float = 0.0
+    refresh_sparse_residual_codec: str = "blocked_quantized"
+    refresh_sparse_residual_index_bits: int = 8
+    refresh_sparse_residual_value_bits: int = 8
+    refresh_sparse_residual_block_shape: Tuple[int, int] = (256, 256)
     dataset_mix: Optional[str] = None
+    dataset_task: str = "lm"
     train_file: Optional[str] = None
     eval_file: Optional[str] = None
     text_field: str = "text"
@@ -71,6 +89,26 @@ def _collect_explicit_cli_flags(argv: Sequence[str]) -> List[str]:
     return sorted(flag for flag in flags if flag)
 
 
+def _parse_sparse_residual_block_shape(value: str) -> Tuple[int, int]:
+    text = str(value or "").strip().lower().replace("x", ",")
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            "Invalid --refresh_sparse_residual_block_shape. Expected ROWS,COLS, e.g. 256,256."
+        )
+    try:
+        rows, cols = (int(parts[0]), int(parts[1]))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Invalid --refresh_sparse_residual_block_shape. ROWS and COLS must be integers."
+        ) from exc
+    if rows < 1 or cols < 1:
+        raise argparse.ArgumentTypeError(
+            "Invalid --refresh_sparse_residual_block_shape. ROWS and COLS must be >= 1."
+        )
+    return rows, cols
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="End-to-end fine-tune VAELinear decoders from compressed checkpoints.")
     parser.add_argument("--student_checkpoint_dir", type=str, required=True)
@@ -83,6 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--post_attn", type=lambda v: _parse_bool_like(v, arg_name="--post_attn"), default=False)
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
+    parser.add_argument("--vae_train_mode", type=str, default="decoder")
+    parser.add_argument("--decode_device", type=str, default="auto")
+    parser.add_argument("--decode_group_size", type=int, default=8)
     parser.add_argument("--layer_device_map", type=str, default="auto")
     parser.add_argument(
         "--parallel_stage_decode",
@@ -123,10 +164,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_lm_batch_size", "--lm_batch_size", dest="eval_lm_batch_size", type=str, default="auto")
     parser.add_argument("--eval_lm_limit", "--lm_limit", dest="eval_lm_limit", type=int, default=None)
     parser.add_argument("--eval_device", type=str, default="cuda")
+    parser.add_argument("--eval_prewarm_group_size", type=int, default=8)
     parser.add_argument("--skip_ppl_eval", type=lambda v: _parse_bool_like(v, arg_name="--skip_ppl_eval"), default=False)
     parser.add_argument("--ppl_seqlen", type=int, default=2048)
     parser.add_argument("--ppl_limit", type=int, default=-1)
+    parser.add_argument(
+        "--refresh_sparse_residual_after_train",
+        type=lambda v: _parse_bool_like(v, arg_name="--refresh_sparse_residual_after_train"),
+        default=False,
+    )
+    parser.add_argument("--refresh_sparse_residual_top_p", type=float, default=None)
+    parser.add_argument("--refresh_sparse_residual_score", type=str, default="abs")
+    parser.add_argument("--refresh_sparse_residual_min_abs", type=float, default=0.0)
+    parser.add_argument("--refresh_sparse_residual_codec", type=str, default="blocked_quantized")
+    parser.add_argument("--refresh_sparse_residual_index_bits", type=int, default=8)
+    parser.add_argument("--refresh_sparse_residual_value_bits", type=int, default=8)
+    parser.add_argument(
+        "--refresh_sparse_residual_block_shape",
+        type=_parse_sparse_residual_block_shape,
+        default=(256, 256),
+    )
     parser.add_argument("--dataset_mix", type=str, default=None)
+    parser.add_argument("--dataset_task", type=str, default="lm")
     parser.add_argument("--train_file", type=str, default=None)
     parser.add_argument("--eval_file", type=str, default=None)
     parser.add_argument("--text_field", type=str, default="text")
@@ -181,11 +240,44 @@ def validate_args(
     except FileNotFoundError as exc:
         parser.error(str(exc))
 
+    dataset_task = str(args.dataset_task or "lm").strip().lower()
+    if dataset_task not in {"lm", "sft"}:
+        parser.error("--dataset_task must be one of: lm | sft.")
+    args.dataset_task = dataset_task
+
     _validate_dataset_inputs(parser, args)
+    if args.dataset_task == "sft":
+        if not args.dataset_mix_spec:
+            parser.error("--dataset_task sft currently requires --dataset_mix.")
+        unsupported = sorted(set(args.dataset_mix_sources or []) - _SFT_DATASET_MIX_ALIASES)
+        if unsupported:
+            parser.error(
+                "--dataset_task sft supports only these dataset_mix aliases: "
+                + ",".join(sorted(_SFT_DATASET_MIX_ALIASES))
+                + ". Unsupported: "
+                + ",".join(unsupported)
+            )
     if float(args.distill_temperature) <= 0.0:
         parser.error("--distill_temperature must be > 0.")
     if not (0.0 <= float(args.distill_alpha) <= 1.0):
         parser.error("--distill_alpha must satisfy 0 <= alpha <= 1.")
+    train_mode = str(args.vae_train_mode or "").strip().lower()
+    if train_mode not in _VALID_VAE_TRAIN_MODES:
+        parser.error("--vae_train_mode must be one of: decoder | low_rank | both.")
+    args.vae_train_mode = train_mode
+    decode_device = str(args.decode_device or "").strip().lower()
+    if not _VALID_DECODE_DEVICE_PATTERN.fullmatch(decode_device):
+        parser.error("--decode_device only supports: auto | cpu | cuda | cuda:<index>.")
+    args.decode_device = decode_device
+    if int(args.decode_group_size) < 1:
+        parser.error("--decode_group_size must be >= 1.")
+    if train_mode == "low_rank":
+        if bool(args.vae_tune_bias):
+            parser.error("--vae_train_mode low_rank does not support --vae_tune_bias=true.")
+        if bool(args.tune_final_norm):
+            parser.error("--vae_train_mode low_rank does not support --tune_final_norm=true.")
+        if bool(args.use_post_norm_head_linear):
+            parser.error("--vae_train_mode low_rank does not support --use_post_norm_head_linear=true.")
     if int(args.ppl_seqlen) < 1:
         parser.error("--ppl_seqlen must be >= 1.")
     if int(args.ppl_limit) == 0 or int(args.ppl_limit) < -1:
@@ -200,6 +292,30 @@ def validate_args(
         parser.error("--eval_lm_batch_size cannot be empty.")
     if not str(args.eval_device or "").strip():
         parser.error("--eval_device cannot be empty.")
+    if int(args.eval_prewarm_group_size) < 1:
+        parser.error("--eval_prewarm_group_size must be >= 1.")
+    refresh_sparse = bool(args.refresh_sparse_residual_after_train)
+    args.refresh_sparse_residual_score = str(args.refresh_sparse_residual_score or "").strip().lower()
+    if args.refresh_sparse_residual_score != "abs":
+        parser.error("--refresh_sparse_residual_score currently supports only: abs.")
+    args.refresh_sparse_residual_codec = str(args.refresh_sparse_residual_codec or "").strip().lower()
+    if args.refresh_sparse_residual_codec not in _SPARSE_RESIDUAL_CODECS:
+        parser.error("--refresh_sparse_residual_codec must be one of: coo_fp16 | blocked_quantized.")
+    if int(args.refresh_sparse_residual_index_bits) not in {4, 8}:
+        parser.error("--refresh_sparse_residual_index_bits must be one of: 4 | 8.")
+    if int(args.refresh_sparse_residual_value_bits) not in {4, 8}:
+        parser.error("--refresh_sparse_residual_value_bits must be one of: 4 | 8.")
+    if float(args.refresh_sparse_residual_min_abs) < 0.0:
+        parser.error("--refresh_sparse_residual_min_abs must be >= 0.")
+    block_rows, block_cols = tuple(int(v) for v in args.refresh_sparse_residual_block_shape)
+    if block_rows < 1 or block_cols < 1:
+        parser.error("--refresh_sparse_residual_block_shape values must be >= 1.")
+    args.refresh_sparse_residual_block_shape = (block_rows, block_cols)
+    if refresh_sparse:
+        if args.refresh_sparse_residual_top_p is None:
+            parser.error("--refresh_sparse_residual_top_p is required when --refresh_sparse_residual_after_train=true.")
+        if not (0.0 < float(args.refresh_sparse_residual_top_p) <= 1.0):
+            parser.error("--refresh_sparse_residual_top_p must satisfy 0 < p <= 1.")
     if int(args.dataset_num_proc) < 1:
         parser.error("--dataset_num_proc must be >= 1.")
     if args.max_train_samples is not None and int(args.max_train_samples) < 1:

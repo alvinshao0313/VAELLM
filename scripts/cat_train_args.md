@@ -6,6 +6,8 @@
 - [train_utils/cat_train_args.py](/home/shaoyuantian/program/VAELLM/train_utils/cat_train_args.py)
 - [litebsq/vae_args.py](/home/shaoyuantian/program/VAELLM/litebsq/vae_args.py)
 - [litebsq/autoencoder.py](/home/shaoyuantian/program/VAELLM/litebsq/autoencoder.py)
+- [train_utils/cat_train_residual_protection.py](/home/shaoyuantian/program/VAELLM/train_utils/cat_train_residual_protection.py)
+- [train_utils/cat_joint_decoder.py](/home/shaoyuantian/program/VAELLM/train_utils/cat_joint_decoder.py)
 - [train_utils/lora_utils.py](/home/shaoyuantian/program/VAELLM/train_utils/lora_utils.py)
 
 ## 1. 参数来源与解析顺序
@@ -42,6 +44,7 @@
 - `intra_parallel`
 - `intra_part_sort_mode`
 - `outlier_protect_count`
+- `outlier_low_rank`
 - `outlier_residual_top_p`
 - `codebook_bits`
 - `codebook_dim`
@@ -60,6 +63,7 @@
 --codebook_bits default=16,cat:q_proj=24
 --steps_per_category default=2000,cat:q_proj=500
 --intra_parallel default=1x1,cat:q_proj=4x1
+--outlier_low_rank default=16,cat:down_proj=32
 --outlier_residual_top_p default=0.01,cat:down_proj=0.02
 ```
 
@@ -151,9 +155,10 @@
 | `--log_every` | `50` | 每多少 step 打印一次训练日志 | `<=0` 等价关闭 |
 | `--eval_every` | `0` | 每多少 step 做一次 VAE / joint decoder 中间评估 | `0` 表示不做中间评估；joint decoder 前后完整重建损失仍会记录 |
 | `--eval_blocks` | `256` | 每次 VAE / joint decoder 中间评估最多评估多少块 | 与 `eval_every` 联动；joint decoder 前后完整重建损失不受它限制 |
-| `--outlier_protect_count` | `default=0` | `channel` 模式下保护 top-N channel 不参与压缩 | 类别 override；`residual_sparse` 模式要求它对所有类别都为 `0` |
-| `--outlier_protect_mode` | `channel` | 离群值保护模式 | `none` / `channel` / `residual_sparse`，三者互斥 |
-| `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；对所有参与训练的类别要求 `0 < p <= 1` |
+| `--outlier_protect_count` | `default=0` | `channel` 模式下保护 top-N channel 不参与压缩 | 类别 override；`residual_sparse` 和低秩模式要求它对所有类别都为 `0` |
+| `--outlier_protect_mode` | `channel` | 离群值保护模式 | `none` / `channel` / `residual_sparse` / `per_vae_low_rank` / `post_vae_low_rank`，互斥 |
+| `--outlier_low_rank` | `default=0` | 低秩离群保护 rank | 类别 override；仅 `per_vae_low_rank` / `post_vae_low_rank` 生效；低秩模式下要求 `rank > 0` |
+| `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；`residual_sparse` 要求 `0 < p <= 1`；低秩模式要求它对所有类别都为 `0` |
 | `--outlier_residual_score` | `abs` | `residual_sparse` 模式下的选点打分方式 | `abs` / `input_act_weighted_abs` / `original_weight_abs` / `input_act_weighted_original_weight_abs`；原始权重打分只影响选点，最终保存的仍是对应 residual |
 | `--outlier_residual_min_abs` | `1e-6` | `residual_sparse` 模式下 residual 的最小绝对值门槛 | 全局单值；若 `|original-reconstructed| < threshold`，该位置会从 top-p 中剔除，并继续往后补 |
 | `--outlier_residual_codec` | `coo_fp16` | `residual_sparse` 的存储格式 | `coo_fp16` / `blocked_quantized` |
@@ -403,7 +408,33 @@
 - `intra_part_sort_mode` 若启用 `act_spectral_cosine`，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
-### 6.13 保存与输出目录
+### 6.13 离群保护模式
+
+`outlier_protect_mode` 当前支持 5 个值：
+
+- `none`：不做离群保护。
+- `channel`：VAE 压缩前保护 top-N input/output channel，保护数量来自 `outlier_protect_count`。
+- `residual_sparse`：VAE / joint decoder 训练结束后，保存最终重建残差里的 top-p 稀疏补丁。
+- `per_vae_low_rank`：VAE 训练前，对原始权重做 rank-k SVD，扣除主成分 `A @ B`，VAE 只训练剩余残差。
+- `post_vae_low_rank`：VAE / joint decoder 训练结束后，对最终重建残差 `W - W_vae` 做 rank-k SVD，保存主成分补丁。
+
+低秩保护的约束：
+
+- `outlier_low_rank` 必须按类别解析为正整数。
+- 每个 Linear 内要求 `outlier_low_rank <= min(out_features, in_features)`，否则直接报错。
+- `outlier_protect_count` 必须为 `0`。
+- `outlier_residual_top_p` 必须为 `0`。
+- 不依赖 activation 校准。
+
+推理时 `VAELinear` 的重建顺序固定为：
+
+```text
+VAE reconstruction -> low_rank patch -> sparse_residual patch
+```
+
+低秩 payload 的保存字段是 `low_rank_a` 和 `low_rank_b`。SVD 用 fp32 计算，保存 dtype 跟原 linear weight 一致。
+
+### 6.14 保存与输出目录
 
 - `save_model` 需要同时开启 `convert`
 - 真实运行目录会自动变成：
@@ -425,7 +456,7 @@
 - `training_args`
 - 每个类别的 resolved runtime config
 
-### 6.14 从已保存 checkpoint 继续训练
+### 6.15 从已保存 checkpoint 继续训练
 
 - `--resume_from_checkpoint` 会优先加载已有 checkpoint，而不是重新从 `--model_path` 拉起纯基座模型
 - 支持三种输入：
@@ -482,6 +513,9 @@
 7. 切分后某个 part 的展平长度无法被该类别的 `codebook_dim` 整除
 8. `linear_group_size < 1`
 9. 设置了 `joint_decoder_batch_size`，但当前类别的 `intra_part_sort_mode != none`
+10. 低秩模式下 `outlier_low_rank <= 0`
+11. 低秩模式下某个 Linear 的 `outlier_low_rank > min(out_features, in_features)`
+12. 低秩模式下同时设置了非零 `outlier_protect_count` 或非零 `outlier_residual_top_p`
 
 ## 9. 快速示例
 
@@ -566,7 +600,41 @@ python tools/cat_train.py \
 - joint 前后会记录完整权重重建损失；`eval_every/eval_blocks` 只控制中间评估。
 - 如果 full loss after 大于 before，说明这组 joint 超参让完整权重重建变差，应先降低 `joint_decoder_lr` 或增大 `joint_decoder_batch_size`。
 
-### 9.6 LoRA after-category 覆盖
+### 9.6 low-rank outlier protection
+
+per-vae low-rank：VAE 训练前先扣除原始权重主成分，让 VAE 训练残差。
+
+```bash
+python tools/cat_train.py \
+  --model_path meta-llama/Llama-2-7b-hf \
+  --convert \
+  --outlier_protect_mode per_vae_low_rank \
+  --outlier_low_rank default=16 \
+  --outlier_protect_count default=0 \
+  --outlier_residual_top_p default=0 \
+  --train_device cuda
+```
+
+post-vae low-rank：VAE / joint decoder 完成后，对最终重建残差做低秩补丁。
+
+```bash
+python tools/cat_train.py \
+  --model_path meta-llama/Llama-2-7b-hf \
+  --convert \
+  --outlier_protect_mode post_vae_low_rank \
+  --outlier_low_rank default=16 \
+  --outlier_protect_count default=0 \
+  --outlier_residual_top_p default=0 \
+  --train_device cuda
+```
+
+说明：
+
+- `outlier_low_rank` 支持类别覆盖，例如 `default=16,cat:down_proj=32`。
+- 低秩模式和 `channel`、`residual_sparse` 是互斥模式。
+- 最终推理权重等价于 `W_final = W_vae + low_rank_a @ low_rank_b`，若同时存在 sparse residual，则 sparse residual 在 low-rank 后再加。
+
+### 9.7 LoRA after-category 覆盖
 
 ```bash
 python tools/cat_train.py \
@@ -582,7 +650,7 @@ python tools/cat_train.py \
   --lora_use_dora default=true,after:q_proj=false
 ```
 
-### 9.7 从已完成 `q_proj` 的保存结果继续训练其它类别
+### 9.8 从已完成 `q_proj` 的保存结果继续训练其它类别
 
 ```bash
 python tools/cat_train.py \
@@ -599,7 +667,7 @@ python tools/cat_train.py \
 - 如果上一次已经把 `q_proj` 转成了 `VAELinear` 并保存，这次恢复后 `q_proj` 会自动跳过
 - 脚本会继续训练还保持为 `nn.Linear` 的类别
 
-### 9.8 只跑下游任务，不跑 PPL
+### 9.9 只跑下游任务，不跑 PPL
 
 ```bash
 python tools/cat_train.py \

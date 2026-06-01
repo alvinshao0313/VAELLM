@@ -4,8 +4,6 @@ import time
 import math
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -28,7 +26,11 @@ from train_utils.cat_train_runtime import (
     resolve_sort_prep_workers as _resolve_sort_prep_workers,
     save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
 )
-from train_utils.cat_train_sparse_residual import (
+from train_utils.cat_train_residual_protection import (
+    LOW_RANK_OUTLIER_MODES as _LOW_RANK_OUTLIER_MODES,
+    RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT as _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT,
+    build_per_vae_low_rank_payloads as _build_per_vae_low_rank_payloads,
+    build_post_vae_low_rank_payload as _build_post_vae_low_rank_payload,
     build_sparse_residual_payload as _build_sparse_residual_payload,
 )
 from litebsq.vae_args import apply_autoencoder_arch_defaults
@@ -57,9 +59,7 @@ from train_utils.cat_train_data import (
     restore_stage_norm as _restore_stage_norm,
 )
 from train_utils.cat_joint_decoder import (
-    build_block_index_loader as _build_block_index_loader,
-    compute_joint_decoder_recon_loss as _compute_joint_decoder_recon_loss,
-    next_block_index_batch as _next_block_index_batch,
+    finetune_stage_decoders_in_subgroups as _finetune_stage_decoders_in_subgroups,
 )
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.model_checkpoint_io import (
@@ -82,59 +82,6 @@ from train_utils.utils import (
 
 
 log = get_logger("linear_by_category")
-
-
-_RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT = frozenset(
-    {"input_act_weighted_abs", "input_act_weighted_original_weight_abs"}
-)
-
-
-@dataclass
-class JointStageRestorePlan:
-    stage_src_idx_global: torch.Tensor
-    stage_src_idx_flat: torch.Tensor
-
-
-@dataclass
-class JointRestorePlan:
-    common_shape: Tuple[int, int, int]
-    stage_plans: List[JointStageRestorePlan]
-
-    def slice_blocks(self, block_idx: torch.Tensor) -> "JointRestorePlan":
-        if block_idx.ndim != 1:
-            raise ValueError(f"block_idx must be 1D, got shape={tuple(block_idx.shape)}")
-        if block_idx.numel() <= 0:
-            raise ValueError("block_idx cannot be empty.")
-        num_blocks, num_models, codebook_dim = self.common_shape
-        block_idx_cpu = block_idx.to(device="cpu", dtype=torch.long, non_blocking=False).contiguous()
-        if int(block_idx_cpu.min().item()) < 0 or int(block_idx_cpu.max().item()) >= int(num_blocks):
-            raise ValueError(
-                f"block_idx out of range: min={int(block_idx_cpu.min().item())}, "
-                f"max={int(block_idx_cpu.max().item())}, num_blocks={num_blocks}"
-            )
-        block_width = int(num_models) * int(codebook_dim)
-        inverse_block = torch.full((int(num_blocks),), -1, dtype=torch.long)
-        inverse_block[block_idx_cpu] = torch.arange(int(block_idx_cpu.numel()), dtype=torch.long)
-
-        sliced_stage_plans: List[JointStageRestorePlan] = []
-        for stage_plan in self.stage_plans:
-            src_idx = stage_plan.stage_src_idx_global.index_select(0, block_idx_cpu)
-            src_block = torch.div(src_idx, block_width, rounding_mode="floor")
-            src_offset = torch.remainder(src_idx, block_width)
-            local_src_block = inverse_block.index_select(0, src_block.reshape(-1)).view_as(src_block)
-            if bool((local_src_block < 0).any().item()):
-                raise ValueError("slice_blocks got source block outside selected block_idx.")
-            local_src_idx = (local_src_block * block_width + src_offset).contiguous()
-            sliced_stage_plans.append(
-                JointStageRestorePlan(
-                    stage_src_idx_global=local_src_idx.contiguous(),
-                    stage_src_idx_flat=local_src_idx.reshape(-1).contiguous(),
-                )
-            )
-        return JointRestorePlan(
-            common_shape=(int(block_idx_cpu.numel()), int(num_models), int(codebook_dim)),
-            stage_plans=sliced_stage_plans,
-        )
 
 
 def _fuse_q_scale_linear(linear: nn.Linear, q_scale: float) -> None:
@@ -446,479 +393,6 @@ def _convert_stage_stacked_to_common_stacked(
     )
 
 
-def _build_joint_restore_plan(
-    *,
-    common_shape: Tuple[int, int, int],
-    all_stage_split_metas: Sequence[Sequence[object]],
-    common_split_metas: Sequence[object],
-    codebook_dim: int,
-) -> JointRestorePlan:
-    if len(common_shape) != 3:
-        raise ValueError(f"common_shape must be 3D, got {common_shape}")
-    if len(all_stage_split_metas) == 0:
-        raise ValueError("all_stage_split_metas cannot be empty.")
-    num_blocks, num_models, block_dim = [int(v) for v in common_shape]
-    total_numel = int(num_blocks) * int(num_models) * int(block_dim)
-    stage_template = torch.arange(total_numel, dtype=torch.long).view(num_blocks, num_models, block_dim)
-    expected_perm = torch.arange(total_numel, dtype=torch.long)
-    stage_plans: List[JointStageRestorePlan] = []
-    for stage_split_metas in all_stage_split_metas:
-        stage_common = _convert_stage_stacked_to_common_stacked(
-            stage_stacked_data=stage_template,
-            stage_split_metas=stage_split_metas,
-            common_split_metas=common_split_metas,
-            codebook_dim=int(codebook_dim),
-        )
-        if tuple(stage_common.shape) != (num_blocks, num_models, block_dim):
-            raise ValueError(
-                f"joint restore plan shape mismatch: got {tuple(stage_common.shape)}, "
-                f"expected {(num_blocks, num_models, block_dim)}"
-            )
-        src_idx_flat = stage_common.reshape(-1).to(dtype=torch.long).contiguous()
-        if int(src_idx_flat.min().item()) < 0 or int(src_idx_flat.max().item()) >= int(total_numel):
-            raise ValueError("joint restore plan index out of range.")
-        if not torch.equal(torch.sort(src_idx_flat).values, expected_perm):
-            raise ValueError("joint restore plan index is not bijective.")
-        src_idx_global = src_idx_flat.view(num_blocks, num_models, block_dim).contiguous()
-        stage_plans.append(
-            JointStageRestorePlan(
-                stage_src_idx_global=src_idx_global,
-                stage_src_idx_flat=src_idx_flat,
-            )
-        )
-    return JointRestorePlan(
-        common_shape=(num_blocks, num_models, block_dim),
-        stage_plans=stage_plans,
-    )
-
-
-def _apply_joint_restore_plan_full(
-    *,
-    stage_stacked_data: torch.Tensor,
-    stage_src_idx_flat: torch.Tensor,
-    common_shape: Tuple[int, int, int],
-) -> torch.Tensor:
-    flat = stage_stacked_data.reshape(-1)
-    idx = stage_src_idx_flat
-    if idx.device != flat.device:
-        idx = idx.to(device=flat.device, non_blocking=True)
-    common_flat = torch.take(flat, idx)
-    return common_flat.view(int(common_shape[0]), int(common_shape[1]), int(common_shape[2]))
-
-
-def _joint_finetune_stage_decoders(
-    *,
-    group_tag: str,
-    shared_stage_args,
-    joint_steps: int,
-    joint_lr: float,
-    joint_decoder_batch_size: Optional[int],
-    train_device: str,
-    train_dtype: torch.dtype,
-    log_every: int,
-    eval_every: int,
-    eval_blocks: int,
-    codebook_dim: int,
-    recon_loss_type: str,
-    intra_part_sort_mode: str,
-    target_common_result,
-    all_stage_bits: Sequence[torch.Tensor],
-    all_stage_decoders: Sequence[Sequence[nn.Module]],
-    all_stage_split_metas: Sequence[Sequence[object]],
-    shuffle_seed: Optional[int] = None,
-) -> List[List[nn.Module]]:
-    from litebsq.autoencoder import pack_decoders
-
-    if int(joint_steps) <= 0:
-        return [list(stage_decoders) for stage_decoders in all_stage_decoders]
-    if len(all_stage_bits) < 2:
-        return [list(stage_decoders) for stage_decoders in all_stage_decoders]
-
-    resolved_joint_batch_size = None if joint_decoder_batch_size is None else int(joint_decoder_batch_size)
-    if resolved_joint_batch_size is not None and resolved_joint_batch_size < 1:
-        raise ValueError(f"[{group_tag}] joint_decoder_batch_size must be >= 1 or none.")
-    resolved_sort_mode = str(intra_part_sort_mode).strip().lower()
-    if resolved_joint_batch_size is not None and resolved_sort_mode != "none":
-        raise ValueError(
-            f"[{group_tag}] joint_decoder_batch_size is only supported when intra_part_sort_mode=none, "
-            f"got {resolved_sort_mode}."
-        )
-
-    target_common = target_common_result.stacked_data.to(device=train_device, dtype=train_dtype, non_blocking=True)
-    joint_restore_plan = _build_joint_restore_plan(
-        common_shape=tuple(int(v) for v in target_common.shape),
-        all_stage_split_metas=all_stage_split_metas,
-        common_split_metas=target_common_result.split_metas,
-        codebook_dim=int(codebook_dim),
-    )
-    if len(joint_restore_plan.stage_plans) != len(all_stage_bits):
-        raise ValueError(
-            f"[{group_tag}] joint restore plan stage count mismatch: "
-            f"plan={len(joint_restore_plan.stage_plans)} vs bits={len(all_stage_bits)}"
-        )
-    use_patch_joint = resolved_joint_batch_size is not None
-    resolved_recon_loss = str(recon_loss_type).strip().lower()
-    act_max_full = None
-    if resolved_recon_loss == "wa_mse" and not use_patch_joint:
-        full_block_idx = torch.arange(target_common.shape[0], dtype=torch.long)
-        act_max_full = gather_wa_mse_act_max_batch(
-            block_idx_batch=full_block_idx,
-            part_metas=target_common_result.part_metas,
-            codebook_dim=int(codebook_dim),
-            train_device=train_device,
-            target_dtype=train_dtype,
-        )
-
-    packed_stage_decoders: List[nn.Module] = []
-    stage_bits_on_device: List[torch.Tensor] = []
-    stage_src_idx_flat_on_device: List[torch.Tensor] = []
-    for stage_bits_cpu, stage_decoders in zip(all_stage_bits, all_stage_decoders):
-        packed_decoder = pack_decoders(list(stage_decoders)).to(train_device)
-        packed_decoder.requires_grad_(True)
-        packed_decoder.train()
-        packed_stage_decoders.append(packed_decoder)
-        stage_bits_on_device.append(stage_bits_cpu.to(device=train_device, non_blocking=True))
-    if not use_patch_joint:
-        for stage_plan in joint_restore_plan.stage_plans:
-            stage_src_idx_flat_on_device.append(stage_plan.stage_src_idx_flat.to(device=train_device, non_blocking=True))
-
-    joint_train_loader = None
-    joint_train_iter = None
-    if use_patch_joint:
-        joint_train_loader = _build_block_index_loader(
-            num_blocks=int(target_common.shape[0]),
-            batch_size=int(resolved_joint_batch_size),
-            shuffle_seed=shuffle_seed,
-        )
-        joint_train_iter = iter(joint_train_loader)
-
-    params = []
-    for packed_decoder in packed_stage_decoders:
-        params.extend([param for param in packed_decoder.parameters() if param.requires_grad])
-    if not params:
-        raise RuntimeError(f"[{group_tag}] joint decoder fine-tune has no trainable parameters.")
-    optimizer = create_optimizer(params, shared_stage_args, float(joint_lr))
-    lr_scheduler = None
-    lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "none"))
-    if lr_scheduler_name != "none":
-        import transformers
-
-        lr_scheduler = transformers.get_scheduler(
-            lr_scheduler_name,
-            optimizer,
-            num_warmup_steps=int(getattr(shared_stage_args, "lr_warmup_steps", 0)),
-            num_training_steps=int(joint_steps),
-        )
-
-    full_recon_loss_before, full_recon_blocks = _compute_joint_decoder_recon_loss(
-        group_tag=group_tag,
-        packed_stage_decoders=packed_stage_decoders,
-        stage_bits_on_device=stage_bits_on_device,
-        joint_restore_plan=joint_restore_plan,
-        target_common=target_common,
-        target_common_result=target_common_result,
-        codebook_dim=int(codebook_dim),
-        train_device=train_device,
-        train_dtype=train_dtype,
-        recon_loss_type=recon_loss_type,
-        sort_mode=resolved_sort_mode,
-        restore_fn=_apply_joint_restore_plan_full,
-        loss_fn=_compute_recon_loss,
-        max_blocks=None,
-    )
-    log.info(
-        "[%s/joint] full_recon_loss_before=%.6e blocks=%d",
-        group_tag,
-        full_recon_loss_before,
-        full_recon_blocks,
-    )
-
-    start = time.time()
-    for step in range(int(joint_steps)):
-        target_batch = target_common
-        active_restore_plan = joint_restore_plan
-        active_stage_bits = stage_bits_on_device
-        active_stage_src_idx_flat = stage_src_idx_flat_on_device
-        act_max_batch = act_max_full
-        if use_patch_joint:
-            if joint_train_loader is None or joint_train_iter is None:
-                raise RuntimeError(f"[{group_tag}] joint patch DataLoader is not initialized.")
-            joint_train_iter, block_idx_cpu, block_idx_device = _next_block_index_batch(
-                iterator=joint_train_iter,
-                loader=joint_train_loader,
-                device=train_device,
-            )
-            target_batch = target_common.index_select(0, block_idx_device)
-            active_restore_plan = joint_restore_plan.slice_blocks(block_idx_cpu)
-            active_stage_bits = [
-                stage_bits.index_select(0, block_idx_device)
-                for stage_bits in stage_bits_on_device
-            ]
-            active_stage_src_idx_flat = [
-                stage_plan.stage_src_idx_flat.to(device=train_device, non_blocking=True)
-                for stage_plan in active_restore_plan.stage_plans
-            ]
-            if resolved_recon_loss == "wa_mse":
-                act_max_batch = gather_wa_mse_act_max_batch(
-                    block_idx_batch=block_idx_cpu,
-                    part_metas=target_common_result.part_metas,
-                    codebook_dim=int(codebook_dim),
-                    train_device=train_device,
-                    target_dtype=train_dtype,
-                )
-
-        optimizer.zero_grad(set_to_none=True)
-        total_recon = None
-        for packed_decoder, stage_bits, stage_src_idx_flat in zip(
-            packed_stage_decoders, active_stage_bits, active_stage_src_idx_flat
-        ):
-            param = next(packed_decoder.parameters(), None)
-            decode_dtype = param.dtype if param is not None else train_dtype
-            stage_out = packed_decoder(stage_bits.to(dtype=decode_dtype))
-            if resolved_sort_mode == "none":
-                if tuple(stage_out.shape) != tuple(active_restore_plan.common_shape):
-                    raise RuntimeError(
-                        f"[{group_tag}] joint decoder output shape mismatch: "
-                        f"out={tuple(stage_out.shape)} vs common={tuple(active_restore_plan.common_shape)}"
-                    )
-                stage_common = stage_out.to(dtype=train_dtype)
-            else:
-                stage_common = _apply_joint_restore_plan_full(
-                    stage_stacked_data=stage_out,
-                    stage_src_idx_flat=stage_src_idx_flat,
-                    common_shape=active_restore_plan.common_shape,
-                ).to(dtype=train_dtype)
-            total_recon = stage_common if total_recon is None else (total_recon + stage_common)
-        if total_recon is None:
-            raise RuntimeError(f"[{group_tag}] joint decoder fine-tune produced no reconstruction.")
-        loss = _compute_recon_loss(
-            recon_loss_type=recon_loss_type,
-            x_recon=total_recon,
-            x=target_batch,
-            act_max=act_max_batch,
-        )
-        loss.backward()
-        optimizer.step()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
-
-        if log_every > 0 and (step + 1) % int(log_every) == 0:
-            speed = (time.time() - start) / int(log_every)
-            log.info(
-                "[%s/joint] mode=%s step=%d/%d loss=%.4e speed=%.4fs/it",
-                group_tag,
-                "patch" if use_patch_joint else "full",
-                step + 1,
-                int(joint_steps),
-                float(loss.detach().float().item()),
-                speed,
-            )
-            start = time.time()
-
-        if eval_every > 0 and (step + 1) % int(eval_every) == 0:
-            eval_recon_loss, eval_block_count = _compute_joint_decoder_recon_loss(
-                group_tag=group_tag,
-                packed_stage_decoders=packed_stage_decoders,
-                stage_bits_on_device=stage_bits_on_device,
-                joint_restore_plan=joint_restore_plan,
-                target_common=target_common,
-                target_common_result=target_common_result,
-                codebook_dim=int(codebook_dim),
-                train_device=train_device,
-                train_dtype=train_dtype,
-                recon_loss_type=recon_loss_type,
-                sort_mode=resolved_sort_mode,
-                restore_fn=_apply_joint_restore_plan_full,
-                loss_fn=_compute_recon_loss,
-                max_blocks=int(eval_blocks),
-            )
-            log.info(
-                "[%s/joint] eval@step=%d recon_loss=%.6e blocks=%d",
-                group_tag,
-                step + 1,
-                eval_recon_loss,
-                eval_block_count,
-            )
-
-    full_recon_loss_after, full_recon_blocks_after = _compute_joint_decoder_recon_loss(
-        group_tag=group_tag,
-        packed_stage_decoders=packed_stage_decoders,
-        stage_bits_on_device=stage_bits_on_device,
-        joint_restore_plan=joint_restore_plan,
-        target_common=target_common,
-        target_common_result=target_common_result,
-        codebook_dim=int(codebook_dim),
-        train_device=train_device,
-        train_dtype=train_dtype,
-        recon_loss_type=recon_loss_type,
-        sort_mode=resolved_sort_mode,
-        restore_fn=_apply_joint_restore_plan_full,
-        loss_fn=_compute_recon_loss,
-        max_blocks=None,
-    )
-    loss_delta = full_recon_loss_after - full_recon_loss_before
-    loss_ratio = full_recon_loss_after / full_recon_loss_before if full_recon_loss_before != 0.0 else float("nan")
-    log.info(
-        "[%s/joint] full_recon_loss_after=%.6e blocks=%d delta=%.6e ratio=%.6f",
-        group_tag,
-        full_recon_loss_after,
-        full_recon_blocks_after,
-        loss_delta,
-        loss_ratio,
-    )
-
-    updated_stage_decoders: List[List[nn.Module]] = []
-    num_models = int(target_common.shape[1])
-    for packed_decoder in packed_stage_decoders:
-        packed_decoder.eval()
-        updated_stage_decoders.append(
-            [packed_decoder.get_sub_decoder(model_idx).to(device="cpu") for model_idx in range(num_models)]
-        )
-
-    del target_common, act_max_full, stage_bits_on_device, packed_stage_decoders, optimizer, stage_src_idx_flat_on_device
-    if use_patch_joint:
-        del joint_train_loader, joint_train_iter
-    if lr_scheduler is not None:
-        del lr_scheduler
-    torch.cuda.empty_cache()
-    return updated_stage_decoders
-
-
-def _build_joint_target_subset(
-    target_common_result,
-    *,
-    linear_start: int,
-    linear_end: int,
-    model_start: int,
-    model_end: int,
-):
-    return SimpleNamespace(
-        stacked_data=target_common_result.stacked_data[:, model_start:model_end, :].contiguous(),
-        part_metas=list(target_common_result.part_metas[model_start:model_end]),
-        split_metas=list(target_common_result.split_metas[linear_start:linear_end]),
-    )
-
-
-def _joint_finetune_stage_decoders_in_subgroups(
-    *,
-    group_tag: str,
-    group_refs: Sequence[LinearRef],
-    shared_stage_args,
-    joint_steps: int,
-    joint_lr: float,
-    joint_group_size: int,
-    joint_decoder_batch_size: Optional[int],
-    train_device: str,
-    train_dtype: torch.dtype,
-    log_every: int,
-    eval_every: int,
-    eval_blocks: int,
-    codebook_dim: int,
-    recon_loss_type: str,
-    intra_part_sort_mode: str,
-    target_common_result,
-    all_stage_bits: Sequence[torch.Tensor],
-    all_stage_decoders: Sequence[Sequence[nn.Module]],
-    all_stage_split_metas: Sequence[Sequence[object]],
-    parts_per_linear: int,
-    shuffle_seed: Optional[int] = None,
-) -> List[List[nn.Module]]:
-    num_linears = int(len(group_refs))
-    if num_linears <= 0:
-        return [list(stage_decoders) for stage_decoders in all_stage_decoders]
-    resolved_joint_group_size = max(1, min(int(joint_group_size), num_linears))
-    if resolved_joint_group_size >= num_linears:
-        return _joint_finetune_stage_decoders(
-            group_tag=group_tag,
-            shared_stage_args=shared_stage_args,
-            joint_steps=joint_steps,
-            joint_lr=joint_lr,
-            joint_decoder_batch_size=joint_decoder_batch_size,
-            train_device=train_device,
-            train_dtype=train_dtype,
-            log_every=log_every,
-            eval_every=eval_every,
-            eval_blocks=eval_blocks,
-            codebook_dim=codebook_dim,
-            recon_loss_type=recon_loss_type,
-            intra_part_sort_mode=intra_part_sort_mode,
-            target_common_result=target_common_result,
-            all_stage_bits=all_stage_bits,
-            all_stage_decoders=all_stage_decoders,
-            all_stage_split_metas=all_stage_split_metas,
-            shuffle_seed=shuffle_seed,
-        )
-
-    resolved_recon_loss = str(recon_loss_type).strip().lower()
-    if resolved_recon_loss in {"cosine", "relative_l1"}:
-        raise ValueError(
-            f"[{group_tag}] joint_decoder_group_size={resolved_joint_group_size} is not supported "
-            f"with recon_loss_type={resolved_recon_loss}. Set --joint_decoder_group_size to the full group size."
-        )
-
-    log.info(
-        "[%s/joint] split full-batch group into subgroups: joint_decoder_group_size=%d linears=%d",
-        group_tag,
-        resolved_joint_group_size,
-        num_linears,
-    )
-
-    updated_stage_decoders: List[List[nn.Module]] = [list(stage_decoders) for stage_decoders in all_stage_decoders]
-    for linear_start in range(0, num_linears, resolved_joint_group_size):
-        linear_end = min(linear_start + resolved_joint_group_size, num_linears)
-        model_start = int(linear_start) * int(parts_per_linear)
-        model_end = int(linear_end) * int(parts_per_linear)
-        subgroup_target_common_result = _build_joint_target_subset(
-            target_common_result,
-            linear_start=linear_start,
-            linear_end=linear_end,
-            model_start=model_start,
-            model_end=model_end,
-        )
-        subgroup_stage_bits = [
-            stage_bits[:, model_start:model_end, :].contiguous()
-            for stage_bits in all_stage_bits
-        ]
-        subgroup_stage_decoders = [
-            list(stage_decoders[model_start:model_end])
-            for stage_decoders in updated_stage_decoders
-        ]
-        subgroup_stage_split_metas = [
-            list(stage_split_metas[linear_start:linear_end])
-            for stage_split_metas in all_stage_split_metas
-        ]
-        start_layer_idx = _extract_layer_idx(group_refs[linear_start].name)
-        end_layer_idx = _extract_layer_idx(group_refs[linear_end - 1].name)
-        if start_layer_idx is not None and end_layer_idx is not None:
-            subgroup_tag = f"{group_tag}.subL{start_layer_idx}-{end_layer_idx}"
-        else:
-            subgroup_tag = f"{group_tag}.sub{linear_start}-{linear_end - 1}"
-        subgroup_updated_decoders = _joint_finetune_stage_decoders(
-            group_tag=subgroup_tag,
-            shared_stage_args=shared_stage_args,
-            joint_steps=joint_steps,
-            joint_lr=joint_lr,
-            joint_decoder_batch_size=joint_decoder_batch_size,
-            train_device=train_device,
-            train_dtype=train_dtype,
-            log_every=log_every,
-            eval_every=eval_every,
-            eval_blocks=eval_blocks,
-            codebook_dim=codebook_dim,
-            recon_loss_type=recon_loss_type,
-            intra_part_sort_mode=intra_part_sort_mode,
-            target_common_result=subgroup_target_common_result,
-            all_stage_bits=subgroup_stage_bits,
-            all_stage_decoders=subgroup_stage_decoders,
-            all_stage_split_metas=subgroup_stage_split_metas,
-            shuffle_seed=None if shuffle_seed is None else int(shuffle_seed) + int(linear_start),
-        )
-        for stage_idx in range(len(updated_stage_decoders)):
-            updated_stage_decoders[stage_idx][model_start:model_end] = subgroup_updated_decoders[stage_idx]
-
-    return updated_stage_decoders
-
-
 def _resolve_train_dtype(training_args) -> torch.dtype:
     if bool(getattr(training_args, "bf16", False)):
         return torch.bfloat16
@@ -986,6 +460,8 @@ def _build_vae_linear_from_stage_payload(
     always_use_original: bool,
     protect_original_weight: bool,
     sparse_residual_kwargs: Optional[Dict[str, object]] = None,
+    low_rank_a: Optional[torch.Tensor] = None,
+    low_rank_b: Optional[torch.Tensor] = None,
 ):
     from litebsq.vae_linear import VAELinear
 
@@ -1024,6 +500,8 @@ def _build_vae_linear_from_stage_payload(
         protected_input_weight=split_meta.protected_input_weight,
         protected_output_indices=split_meta.protected_output_indices,
         protected_output_weight=split_meta.protected_output_weight,
+        low_rank_a=low_rank_a,
+        low_rank_b=low_rank_b,
         always_use_original=bool(always_use_original),
         protect_original_weight=bool(protect_original_weight),
     )
@@ -1072,6 +550,8 @@ def _decode_reconstructed_linear_weight(
         original_weight=None,
         always_use_original=False,
         protect_original_weight=False,
+        low_rank_a=None,
+        low_rank_b=None,
     )
     return temp_linear._decode_weight(dtype=torch.float32).detach().to(device="cpu", dtype=torch.float32)
 
@@ -1126,18 +606,20 @@ def _train_group_vae_and_replace(
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
     stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
     outlier_protect_count = int(runtime_cfg.outlier_protect_count)
+    outlier_low_rank = int(runtime_cfg.outlier_low_rank)
     outlier_residual_top_p = float(runtime_cfg.outlier_residual_top_p)
     resolved_outlier_mode = str(outlier_protect_mode).strip().lower()
     resolved_residual_score = str(outlier_residual_score).strip().lower()
     resolved_residual_min_abs = float(outlier_residual_min_abs)
     residual_sparse_enabled = resolved_outlier_mode == "residual_sparse"
+    low_rank_enabled = resolved_outlier_mode in _LOW_RANK_OUTLIER_MODES
     residual_sparse_needs_activation = (
         residual_sparse_enabled and resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT
     )
-    if resolved_outlier_mode not in {"none", "channel", "residual_sparse"}:
+    if resolved_outlier_mode not in {"none", "channel", "residual_sparse", "per_vae_low_rank", "post_vae_low_rank"}:
         raise ValueError(
             f"[{group_tag}] unsupported outlier_protect_mode={outlier_protect_mode!r}. "
-            "Expected none, channel, or residual_sparse."
+            "Expected none, channel, residual_sparse, per_vae_low_rank, or post_vae_low_rank."
         )
     if residual_sparse_enabled and int(outlier_protect_count) != 0:
         raise ValueError(
@@ -1153,6 +635,20 @@ def _train_group_vae_and_replace(
             f"[{group_tag}] residual_sparse mode requires outlier_residual_min_abs >= 0, "
             f"got {resolved_residual_min_abs}."
         )
+    if low_rank_enabled:
+        if int(outlier_protect_count) != 0:
+            raise ValueError(
+                f"[{group_tag}] {resolved_outlier_mode} mode requires outlier_protect_count=0, got {outlier_protect_count}."
+            )
+        if float(outlier_residual_top_p) != 0.0:
+            raise ValueError(
+                f"[{group_tag}] {resolved_outlier_mode} mode requires outlier_residual_top_p=0, "
+                f"got {outlier_residual_top_p}."
+            )
+        if int(outlier_low_rank) <= 0:
+            raise ValueError(
+                f"[{group_tag}] {resolved_outlier_mode} mode requires outlier_low_rank > 0, got {outlier_low_rank}."
+            )
     resolved_residual_codec = str(outlier_residual_codec).strip().lower()
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
     row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
@@ -1215,6 +711,19 @@ def _train_group_vae_and_replace(
         recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
         intra_part_sort_mode=stage_sort_mode,
     )
+    low_rank_payloads: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None for _ in prepared_entries]
+    initial_split_weights_by_linear: Optional[List[torch.Tensor]] = None
+    if resolved_outlier_mode == "per_vae_low_rank":
+        low_rank_payloads, initial_split_weights_by_linear = _build_per_vae_low_rank_payloads(
+            prepared_entries=prepared_entries,
+            rank=int(outlier_low_rank),
+        )
+        log.info(
+            "[%s] per-vae low-rank protection enabled: rank=%d linears=%d",
+            group_tag,
+            int(outlier_low_rank),
+            len(prepared_entries),
+        )
     target_common_result = materialize_prepared_group_data(
         prepared_entries=prepared_entries,
         intra_parallel=(row_parts, col_parts),
@@ -1225,15 +734,21 @@ def _train_group_vae_and_replace(
         train_device=train_device,
         intra_part_sort_mode="none",
         sort_executor=None,
-        split_weights_by_linear=None,
+        split_weights_by_linear=initial_split_weights_by_linear,
         shuffle_seed=int(shuffle_seed) if bool(deterministic) else None,
     )
     num_models = int(target_common_result.num_models)
     target_common_split_metas = target_common_result.split_metas
-    current_residual_weights = [
-        entry.prepared_weight.split_weight.detach().to(device="cpu").contiguous()
-        for entry in prepared_entries
-    ]
+    if initial_split_weights_by_linear is None:
+        current_residual_weights = [
+            entry.prepared_weight.split_weight.detach().to(device="cpu").contiguous()
+            for entry in prepared_entries
+        ]
+    else:
+        current_residual_weights = [
+            weight.detach().to(device="cpu").contiguous()
+            for weight in initial_split_weights_by_linear
+        ]
     use_wa_mse = bool(target_common_result.use_wa_mse)
     if len(target_common_split_metas) != len(group_refs):
         raise RuntimeError(
@@ -1272,6 +787,12 @@ def _train_group_vae_and_replace(
             int(outlier_residual_value_bits),
             int(outlier_residual_block_shape[0]),
             int(outlier_residual_block_shape[1]),
+        )
+    if resolved_outlier_mode == "post_vae_low_rank":
+        log.info(
+            "[%s] post-vae low-rank protection enabled: rank=%d",
+            group_tag,
+            int(outlier_low_rank),
         )
     if use_wa_mse:
         log.info("[%s] wa_mse enabled with online act_max gather.", group_tag)
@@ -1597,7 +1118,7 @@ def _train_group_vae_and_replace(
                 joint_group_size,
                 "none" if joint_batch_size is None else str(int(joint_batch_size)),
             )
-            all_stage_decoders = _joint_finetune_stage_decoders_in_subgroups(
+            all_stage_decoders = _finetune_stage_decoders_in_subgroups(
                 group_tag=group_tag,
                 group_refs=group_refs,
                 shared_stage_args=shared_stage_args,
@@ -1618,6 +1139,9 @@ def _train_group_vae_and_replace(
                 all_stage_decoders=all_stage_decoders,
                 all_stage_split_metas=all_stage_split_metas,
                 parts_per_linear=parts_per_linear,
+                convert_stage_to_common_fn=_convert_stage_stacked_to_common_stacked,
+                recon_loss_fn=_compute_recon_loss,
+                logger=log,
                 shuffle_seed=int(shuffle_seed) if bool(deterministic) else None,
             )
 
@@ -1679,14 +1203,10 @@ def _train_group_vae_and_replace(
                 stage_part_decoders_payload.append(part_decoders[0])
 
         sparse_residual_kwargs = None
-        if residual_sparse_enabled:
-            activation_weight = None
-            if resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT:
-                if effective_activation_weight is None or r.name not in effective_activation_weight:
-                    raise ValueError(
-                        f"[{group_tag}] missing activation vector for residual_sparse scoring at linear '{r.name}'."
-                    )
-                activation_weight = effective_activation_weight[r.name]
+        low_rank_a = None
+        low_rank_b = None
+        reconstructed_weight = None
+        if residual_sparse_enabled or resolved_outlier_mode == "post_vae_low_rank":
             reconstructed_weight = _decode_reconstructed_linear_weight(
                 old_module=old,
                 transpose=r.transpose,
@@ -1699,6 +1219,37 @@ def _train_group_vae_and_replace(
                 parallel_cols=col_parts,
                 parallel_parts=parts_per_linear,
             )
+        if resolved_outlier_mode == "per_vae_low_rank":
+            payload = low_rank_payloads[i]
+            if payload is None:
+                raise RuntimeError(f"[{group_tag}] missing per-vae low-rank payload for {r.name}.")
+            low_rank_a, low_rank_b = payload
+        elif resolved_outlier_mode == "post_vae_low_rank":
+            if reconstructed_weight is None:
+                raise RuntimeError(f"[{group_tag}] missing reconstructed weight for post-vae low-rank payload.")
+            low_rank_a, low_rank_b = _build_post_vae_low_rank_payload(
+                linear_name=r.name,
+                original_weight=old.weight,
+                reconstructed_weight=reconstructed_weight,
+                rank=int(outlier_low_rank),
+                target_dtype=old.weight.dtype,
+            )
+            log.info(
+                "[%s] post-vae low-rank patch for %s: rank=%d",
+                group_tag,
+                r.name,
+                int(outlier_low_rank),
+            )
+        if residual_sparse_enabled:
+            activation_weight = None
+            if resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT:
+                if effective_activation_weight is None or r.name not in effective_activation_weight:
+                    raise ValueError(
+                        f"[{group_tag}] missing activation vector for residual_sparse scoring at linear '{r.name}'."
+                    )
+                activation_weight = effective_activation_weight[r.name]
+            if reconstructed_weight is None:
+                raise RuntimeError(f"[{group_tag}] missing reconstructed weight for residual_sparse payload.")
             sparse_residual_kwargs, sparse_nnz, sparse_storage = _build_sparse_residual_payload(
                 linear_name=r.name,
                 original_weight=old.weight,
@@ -1740,6 +1291,8 @@ def _train_group_vae_and_replace(
             always_use_original=skip_this,
             protect_original_weight=skip_this,
             sparse_residual_kwargs=sparse_residual_kwargs,
+            low_rank_a=low_rank_a,
+            low_rank_b=low_rank_b,
         ).to(convert_device)
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
@@ -1883,6 +1436,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     category_outlier_residual_top_p: Dict[str, float] = {
         cat: float(resolved_category_cfgs[cat].outlier_residual_top_p) for cat in active_categories
     }
+    category_outlier_low_rank: Dict[str, int] = {
+        cat: int(resolved_category_cfgs[cat].outlier_low_rank) for cat in active_categories
+    }
     category_sort_modes: Dict[str, str] = {
         cat: str(resolved_category_cfgs[cat].intra_part_sort_mode)
         for cat in active_categories
@@ -1970,6 +1526,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 int(cat_args.outlier_residual_value_bits),
                 int(cat_args.outlier_residual_block_shape[0]),
                 int(cat_args.outlier_residual_block_shape[1]),
+            )
+    if resolved_outlier_mode in _LOW_RANK_OUTLIER_MODES:
+        unique_low_rank = sorted(set(category_outlier_low_rank.values()))
+        if len(unique_low_rank) == 1:
+            log.info(
+                "Low-rank protection enabled: mode=%s rank=%d",
+                resolved_outlier_mode,
+                int(unique_low_rank[0]),
+            )
+        else:
+            log.info(
+                "Low-rank protection enabled: mode=%s rank_by_category={%s}",
+                resolved_outlier_mode,
+                ",".join(f"{cat}:{category_outlier_low_rank[cat]}" for cat in active_categories),
             )
 
     unique_parallel = sorted(set(category_intra_parallel.values()))

@@ -76,6 +76,8 @@ class VAELinear(nn.Module):
         sparse_residual_qvalues: Optional[torch.Tensor] = None,
         sparse_residual_scales: Optional[torch.Tensor] = None,
         sparse_residual_zero_points: Optional[torch.Tensor] = None,
+        low_rank_a: Optional[torch.Tensor] = None,
+        low_rank_b: Optional[torch.Tensor] = None,
         always_use_original: bool = False,
         protect_original_weight: bool = False,
     ):
@@ -514,6 +516,43 @@ class VAELinear(nn.Module):
             self.register_buffer("sparse_residual_qvalues", None, persistent=True)
             self.register_buffer("sparse_residual_scales", None, persistent=True)
             self.register_buffer("sparse_residual_zero_points", None, persistent=True)
+
+        if low_rank_a is None and low_rank_b is None:
+            self.register_parameter("low_rank_a", None)
+            self.register_parameter("low_rank_b", None)
+        elif low_rank_a is None or low_rank_b is None:
+            raise ValueError("low_rank_a and low_rank_b must be provided together.")
+        else:
+            if isinstance(low_rank_a, nn.Parameter):
+                low_rank_a_param = low_rank_a
+            else:
+                low_rank_a_param = nn.Parameter(low_rank_a.detach().contiguous(), requires_grad=False)
+            if isinstance(low_rank_b, nn.Parameter):
+                low_rank_b_param = low_rank_b
+            else:
+                low_rank_b_param = nn.Parameter(low_rank_b.detach().contiguous(), requires_grad=False)
+            if low_rank_a_param.ndim != 2 or low_rank_b_param.ndim != 2:
+                raise ValueError(
+                    f"low_rank_a/low_rank_b must be 2D, got {tuple(low_rank_a_param.shape)} and {tuple(low_rank_b_param.shape)}"
+                )
+            if int(low_rank_a_param.shape[0]) != self.out_features:
+                raise ValueError(
+                    f"low_rank_a rows {int(low_rank_a_param.shape[0])} != out_features {self.out_features}"
+                )
+            if int(low_rank_b_param.shape[1]) != self.in_features:
+                raise ValueError(
+                    f"low_rank_b cols {int(low_rank_b_param.shape[1])} != in_features {self.in_features}"
+                )
+            if int(low_rank_a_param.shape[1]) != int(low_rank_b_param.shape[0]):
+                raise ValueError(
+                    f"low rank inner dim mismatch: {int(low_rank_a_param.shape[1])} != {int(low_rank_b_param.shape[0])}"
+                )
+            if not low_rank_a_param.is_floating_point() or not low_rank_b_param.is_floating_point():
+                raise ValueError("low_rank_a and low_rank_b must be floating tensors.")
+            low_rank_a_param.requires_grad = False
+            low_rank_b_param.requires_grad = False
+            self.register_parameter("low_rank_a", low_rank_a_param)
+            self.register_parameter("low_rank_b", low_rank_b_param)
 
         if bias is None:
             self.register_parameter("bias", None)
@@ -1336,17 +1375,50 @@ class VAELinear(nn.Module):
         self,
         compressed_weight: torch.Tensor,
         dtype: torch.dtype,
+        *,
+        include_low_rank: bool = True,
+        include_sparse_residual: bool = True,
     ) -> torch.Tensor:
         full_weight = self._materialize_full_weight(
             compressed_weight,
             dtype=dtype,
         )
-        full_weight = self._apply_sparse_residual_patch(full_weight, dtype=dtype)
+        if bool(include_low_rank):
+            full_weight = self._apply_low_rank_patch(full_weight, dtype=dtype)
+        if bool(include_sparse_residual):
+            full_weight = self._apply_sparse_residual_patch(full_weight, dtype=dtype)
         return full_weight.contiguous()
 
-    def _decode_weight(self, dtype: torch.dtype) -> torch.Tensor:
+    def _decode_weight(
+        self,
+        dtype: torch.dtype,
+        *,
+        include_low_rank: bool = True,
+        include_sparse_residual: bool = True,
+    ) -> torch.Tensor:
         compressed_weight = self._decode_compressed_weight(dtype=dtype)
-        return self._finalize_decoded_weight_from_compressed(compressed_weight, dtype=dtype)
+        return self._finalize_decoded_weight_from_compressed(
+            compressed_weight,
+            dtype=dtype,
+            include_low_rank=bool(include_low_rank),
+            include_sparse_residual=bool(include_sparse_residual),
+        )
+
+    def _apply_low_rank_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        low_rank_a = getattr(self, "low_rank_a", None)
+        low_rank_b = getattr(self, "low_rank_b", None)
+        if low_rank_a is None and low_rank_b is None:
+            return full_weight
+        if low_rank_a is None or low_rank_b is None:
+            raise RuntimeError("Low-rank payload is incomplete.")
+        low_rank_a = low_rank_a.to(device=full_weight.device, dtype=dtype, non_blocking=True)
+        low_rank_b = low_rank_b.to(device=full_weight.device, dtype=dtype, non_blocking=True)
+        patch = low_rank_a @ low_rank_b
+        if tuple(patch.shape) != (self.out_features, self.in_features):
+            raise RuntimeError(
+                f"low-rank patch shape {tuple(patch.shape)} != ({self.out_features}, {self.in_features})"
+            )
+        return full_weight.add(patch)
 
     def _apply_sparse_residual_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         resolved_format = str(getattr(self, "sparse_residual_format", SPARSE_RESIDUAL_FORMAT_COO_FP16)).strip().lower()
@@ -1401,6 +1473,16 @@ class VAELinear(nn.Module):
             return isinstance(sparse_qvalues, torch.Tensor) and int(sparse_qvalues.numel()) > 0
         sparse_values = getattr(self, "sparse_residual_values", None)
         return isinstance(sparse_values, torch.Tensor) and int(sparse_values.numel()) > 0
+
+    def has_low_rank_residual(self) -> bool:
+        low_rank_a = getattr(self, "low_rank_a", None)
+        low_rank_b = getattr(self, "low_rank_b", None)
+        return (
+            isinstance(low_rank_a, torch.Tensor)
+            and isinstance(low_rank_b, torch.Tensor)
+            and int(low_rank_a.numel()) > 0
+            and int(low_rank_b.numel()) > 0
+        )
 
     def has_original_linear(self) -> bool:
         return self.original_weight is not None

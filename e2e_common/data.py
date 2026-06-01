@@ -321,6 +321,125 @@ def _format_sciq_record(record: Dict[str, object]) -> Optional[str]:
     return f"### Question:\n{question}\n\n### Response:\n{correct_answer}"
 
 
+def _sft_openorca_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bool]]]:
+    question = _stringify_text(record.get("question"))
+    response = _stringify_text(record.get("response"))
+    system_prompt = _stringify_text(record.get("system_prompt"))
+    if not question or not response:
+        return None
+
+    prompt = ""
+    if system_prompt:
+        prompt += f"### System:\n{system_prompt}\n\n"
+    prompt += f"### User:\n{question}\n\n### Assistant:\n"
+    return [(prompt, False), (response, True)]
+
+
+def _sft_alpaca_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bool]]]:
+    instruction = _stringify_text(record.get("instruction"))
+    input_text = _stringify_text(record.get("input"))
+    output_text = _stringify_text(record.get("output"))
+    if not instruction or not output_text:
+        return None
+
+    if input_text:
+        prompt = (
+            f"### Instruction:\n{instruction}\n\n"
+            f"### Input:\n{input_text}\n\n"
+            f"### Response:\n"
+        )
+    else:
+        prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+    return [(prompt, False), (output_text, True)]
+
+
+def _sft_longalign_chat_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bool]]]:
+    messages = record.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    segments: List[Tuple[str, bool]] = []
+    has_assistant = False
+    for idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            return None
+        role = _stringify_text(message.get("role")).lower()
+        content = _stringify_text(message.get("content"))
+        if not role or not content:
+            return None
+        prefix = "" if idx == 0 else "\n\n"
+        if role in {"user", "human"}:
+            segments.append((f"{prefix}### User:\n{content}", False))
+        elif role in {"assistant", "gpt"}:
+            segments.append((f"{prefix}### Assistant:\n", False))
+            segments.append((content, True))
+            has_assistant = True
+        elif role == "system":
+            segments.append((f"{prefix}### System:\n{content}", False))
+        else:
+            return None
+
+    if not has_assistant:
+        return None
+    return segments
+
+
+def _sft_race_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bool]]]:
+    article = _stringify_text(record.get("article"))
+    question = _stringify_text(record.get("question"))
+    options = _normalize_choice_options(record.get("options"))
+    answer_idx = _resolve_choice_index(record.get("answer"), len(options))
+    if not article or not question or not options or answer_idx is None:
+        return None
+
+    option_lines = []
+    for idx, option in enumerate(options):
+        option_lines.append(f"{chr(ord('A') + idx)}. {option}")
+    prompt = (
+        f"### Passage:\n{article}\n\n"
+        f"### Question:\n{question}\n\n"
+        f"### Options:\n" + "\n".join(option_lines) + "\n\n"
+        f"### Response:\n"
+    )
+    return [(prompt, False), (options[answer_idx], True)]
+
+
+def _sft_sciq_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bool]]]:
+    support = _stringify_text(record.get("support"))
+    question = _stringify_text(record.get("question"))
+    correct_answer = _stringify_text(record.get("correct_answer"))
+    if not question or not correct_answer:
+        return None
+
+    if support:
+        prompt = f"### Support:\n{support}\n\n### Question:\n{question}\n\n### Response:\n"
+    else:
+        prompt = f"### Question:\n{question}\n\n### Response:\n"
+    return [(prompt, False), (correct_answer, True)]
+
+
+def _record_to_sft_segments(
+    record: Dict[str, object],
+    *,
+    text_format: str,
+) -> Optional[List[Tuple[str, bool]]]:
+    normalized_text_format = str(text_format).strip().lower()
+    if normalized_text_format == "openorca":
+        return _sft_openorca_segments(record)
+    if normalized_text_format == "alpaca":
+        return _sft_alpaca_segments(record)
+    if normalized_text_format == "longalign_chat":
+        return _sft_longalign_chat_segments(record)
+    if normalized_text_format == "race_mcqa":
+        return _sft_race_segments(record)
+    if normalized_text_format == "sciq_qa":
+        return _sft_sciq_segments(record)
+    raise ValueError(
+        f"SFT dataset_task does not support text_format={text_format!r}. "
+        "Supported formats: openorca, alpaca, longalign_chat, race_mcqa, sciq_qa."
+    )
+
+
 def _record_to_text(
     record: Dict[str, object],
     *,
@@ -475,6 +594,142 @@ def _tokenize_and_pack(dataset: Dataset, tokenizer, *, block_size: int, num_proc
     return _set_torch_columns(packed)
 
 
+def _encode_sft_segments(
+    segments: Sequence[Tuple[str, bool]],
+    tokenizer,
+    *,
+    block_size: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        raise ValueError("SFT dataset_task requires tokenizer.eos_token_id.")
+
+    input_ids: List[int] = []
+    labels: List[int] = []
+    attention_mask: List[int] = []
+
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_token_id is not None:
+        input_ids.append(int(bos_token_id))
+        labels.append(-100)
+        attention_mask.append(1)
+
+    has_trainable_token = False
+    for text, trainable in segments:
+        encoded = tokenizer(
+            str(text),
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        segment_ids = [int(token_id) for token_id in encoded.get("input_ids", [])]
+        if not segment_ids:
+            continue
+        input_ids.extend(segment_ids)
+        attention_mask.extend([1] * len(segment_ids))
+        if bool(trainable):
+            labels.extend(segment_ids)
+            has_trainable_token = True
+        else:
+            labels.extend([-100] * len(segment_ids))
+
+    input_ids.append(int(eos_token_id))
+    labels.append(int(eos_token_id))
+    attention_mask.append(1)
+    has_trainable_token = True
+
+    if not has_trainable_token:
+        raise ValueError("SFT sample has no trainable response tokens.")
+    if len(input_ids) > int(block_size):
+        raise ValueError(
+            f"SFT sample length {len(input_ids)} exceeds --model_max_length={int(block_size)}. "
+            "Increase --model_max_length or remove this over-length sample."
+        )
+    return input_ids, attention_mask, labels
+
+
+def _records_to_sft_blocks_batch(
+    examples: Dict[str, Sequence[object]],
+    *,
+    text_format: str,
+    tokenizer,
+    block_size: int,
+) -> Dict[str, List[List[int]]]:
+    if not examples:
+        return {"input_ids": [], "attention_mask": [], "labels": []}
+
+    keys = list(examples.keys())
+    batch_size = len(examples[keys[0]])
+    buffered_input_ids: List[int] = []
+    buffered_attention_mask: List[int] = []
+    buffered_labels: List[int] = []
+    out_input_ids: List[List[int]] = []
+    out_attention_mask: List[List[int]] = []
+    out_labels: List[List[int]] = []
+    block = int(block_size)
+
+    def emit_full_blocks() -> None:
+        while len(buffered_input_ids) >= block:
+            out_input_ids.append(list(buffered_input_ids[:block]))
+            out_attention_mask.append(list(buffered_attention_mask[:block]))
+            out_labels.append(list(buffered_labels[:block]))
+            del buffered_input_ids[:block]
+            del buffered_attention_mask[:block]
+            del buffered_labels[:block]
+
+    for idx in range(batch_size):
+        record = {key: examples[key][idx] for key in keys}
+        segments = _record_to_sft_segments(record, text_format=text_format)
+        if segments is None:
+            continue
+        input_ids, attention_mask, labels = _encode_sft_segments(
+            segments,
+            tokenizer,
+            block_size=block,
+        )
+        buffered_input_ids.extend(input_ids)
+        buffered_attention_mask.extend(attention_mask)
+        buffered_labels.extend(labels)
+        emit_full_blocks()
+
+    if buffered_input_ids:
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            raise ValueError("SFT dataset_task requires tokenizer.pad_token_id.")
+        pad_len = block - len(buffered_input_ids)
+        out_input_ids.append(list(buffered_input_ids) + [int(pad_token_id)] * pad_len)
+        out_attention_mask.append(list(buffered_attention_mask) + [0] * pad_len)
+        out_labels.append(list(buffered_labels) + [-100] * pad_len)
+
+    return {
+        "input_ids": out_input_ids,
+        "attention_mask": out_attention_mask,
+        "labels": out_labels,
+    }
+
+
+def _tokenize_and_pack_sft(
+    dataset: Dataset,
+    tokenizer,
+    *,
+    block_size: int,
+    text_format: str,
+    num_proc: int = 1,
+) -> Dataset:
+    packed = dataset.map(
+        lambda batch: _records_to_sft_blocks_batch(
+            batch,
+            text_format=str(text_format),
+            tokenizer=tokenizer,
+            block_size=int(block_size),
+        ),
+        batched=True,
+        remove_columns=list(dataset.column_names),
+        num_proc=None if int(num_proc) == 1 else int(num_proc),
+    )
+    return _set_torch_columns(packed)
+
+
 def _resolve_dataset_num_proc(args) -> int:
     raw_num_proc = getattr(args, "dataset_num_proc", 1)
     num_proc = int(raw_num_proc)
@@ -522,15 +777,19 @@ def _split_target_rows(total_rows: int, weights: Sequence[float]) -> List[int]:
         raise ValueError(f"total_rows must be >= 1, got {total_rows}")
     if len(weights) < 1:
         raise ValueError("weights cannot be empty.")
+    if total_rows < len(weights):
+        raise ValueError(f"total_rows={total_rows} is smaller than source count={len(weights)}")
+
+    remaining_rows = int(total_rows) - len(weights)
     targets: List[int] = []
     allocated = 0
     for idx, weight in enumerate(weights):
         if idx == len(weights) - 1:
-            rows = int(total_rows - allocated)
+            rows = int(remaining_rows - allocated)
         else:
-            rows = int(math.floor(float(total_rows) * float(weight)))
+            rows = int(math.floor(float(remaining_rows) * float(weight)))
             allocated += rows
-        targets.append(rows)
+        targets.append(int(rows) + 1)
     return targets
 
 
@@ -635,6 +894,72 @@ def _sample_and_pack_source(
     }
 
 
+def _sample_and_pack_sft_source(
+    raw_dataset: Dataset,
+    *,
+    target_rows: int,
+    tokenizer,
+    block_size: int,
+    text_format: str,
+    num_proc: int,
+    seed: int,
+) -> Tuple[Dataset, Dict[str, object]]:
+    if int(target_rows) < 1:
+        raise ValueError(f"target_rows must be >= 1, got {target_rows}")
+
+    raw_rows = int(len(raw_dataset))
+    chunk_size = max(4096, int(num_proc) * 256)
+    shuffled_raw = raw_dataset.shuffle(seed=int(seed))
+    packed_chunks: List[Dataset] = []
+    processed_raw_rows = 0
+    collected_packed_rows = 0
+
+    for start in range(0, raw_rows, chunk_size):
+        stop = min(start + chunk_size, raw_rows)
+        chunk = shuffled_raw.select(range(start, stop))
+        processed_raw_rows += int(len(chunk))
+
+        packed_chunk = _tokenize_and_pack_sft(
+            chunk,
+            tokenizer,
+            block_size=int(block_size),
+            text_format=str(text_format),
+            num_proc=int(num_proc),
+        )
+        if len(packed_chunk) > 0:
+            packed_chunks.append(packed_chunk)
+            collected_packed_rows += int(len(packed_chunk))
+
+        if collected_packed_rows >= int(target_rows):
+            break
+
+    if collected_packed_rows < 1:
+        raise ValueError(
+            "Packed SFT training dataset for mix source is empty. "
+            "Check the source schema and --dataset_task sft support."
+        )
+
+    collected = packed_chunks[0] if len(packed_chunks) == 1 else concatenate_datasets(packed_chunks)
+    collected = _set_torch_columns(collected.shuffle(seed=int(seed)))
+    resized, repeat_factor = _resize_packed_dataset(
+        collected,
+        target_rows=int(target_rows),
+        seed=int(seed),
+        shuffle=False,
+    )
+    return resized, {
+        "raw_rows": int(raw_rows),
+        "text_rows": int(processed_raw_rows),
+        "packed_rows": int(collected_packed_rows),
+        "target_rows": int(target_rows),
+        "repeat_factor": float(repeat_factor),
+        "processed_raw_rows": int(processed_raw_rows),
+        "limited_preprocessing": bool(processed_raw_rows < raw_rows),
+        "sampling_policy": "shuffled_raw_streaming_sft_pack",
+        "collected_packed_rows": int(collected_packed_rows),
+    }
+
+
 def _load_preset_raw_datasets(preset: DatasetMixSourcePreset) -> Tuple[Dataset, Optional[Dataset]]:
     return _load_hf_dataset_splits(
         path=preset.path,
@@ -648,12 +973,14 @@ def _build_mixed_datasets(args, training_args, tokenizer):
     block_size = int(training_args.model_max_length)
     dataset_num_proc = _resolve_dataset_num_proc(args)
     prepare_eval = _should_prepare_eval_dataset(training_args)
+    dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
     sources = list(getattr(args, "dataset_mix_sources", []) or [])
     weights = list(getattr(args, "dataset_mix_weights", []) or [])
     if not sources or not weights or len(sources) != len(weights):
         raise ValueError("Invalid dataset mix configuration. Run argument validation first.")
 
     required_examples, target_mixed_examples = _compute_mix_target_examples(training_args)
+    target_mixed_examples = max(int(target_mixed_examples), len(sources))
     per_source_targets = _split_target_rows(target_mixed_examples, weights)
     seed = int(getattr(training_args, "seed", 0))
 
@@ -664,20 +991,33 @@ def _build_mixed_datasets(args, training_args, tokenizer):
         preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
         train_raw, eval_raw = _load_preset_raw_datasets(preset)
         source_seed = int(seed + idx)
-        resized_train, train_stats = _sample_and_pack_source(
-            train_raw,
-            target_rows=int(target_rows),
-            tokenizer=tokenizer,
-            block_size=int(block_size),
-            text_field=str(preset.text_field),
-            text_format=str(preset.text_format),
-            num_proc=dataset_num_proc,
-            seed=int(source_seed),
-        )
+        if dataset_task == "sft":
+            resized_train, train_stats = _sample_and_pack_sft_source(
+                train_raw,
+                target_rows=int(target_rows),
+                tokenizer=tokenizer,
+                block_size=int(block_size),
+                text_format=str(preset.text_format),
+                num_proc=dataset_num_proc,
+                seed=int(source_seed),
+            )
+        elif dataset_task == "lm":
+            resized_train, train_stats = _sample_and_pack_source(
+                train_raw,
+                target_rows=int(target_rows),
+                tokenizer=tokenizer,
+                block_size=int(block_size),
+                text_field=str(preset.text_field),
+                text_format=str(preset.text_format),
+                num_proc=dataset_num_proc,
+                seed=int(source_seed),
+            )
+        else:
+            raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm' or 'sft'.")
         train_datasets.append(resized_train)
 
         eval_text = None
-        if prepare_eval and eval_raw is not None:
+        if dataset_task == "lm" and prepare_eval and eval_raw is not None:
             eval_text = _prepare_text_dataset(
                 eval_raw,
                 text_field=str(preset.text_field),
@@ -686,7 +1026,18 @@ def _build_mixed_datasets(args, training_args, tokenizer):
             )
 
         eval_packed_rows = 0
-        if eval_text is not None:
+        if dataset_task == "sft" and prepare_eval and eval_raw is not None:
+            eval_packed = _tokenize_and_pack_sft(
+                eval_raw,
+                tokenizer,
+                block_size=block_size,
+                text_format=str(preset.text_format),
+                num_proc=dataset_num_proc,
+            )
+            eval_packed_rows = len(eval_packed)
+            if eval_packed_rows > 0:
+                eval_datasets.append(eval_packed)
+        elif eval_text is not None:
             eval_packed = _tokenize_and_pack(eval_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
             eval_packed_rows = len(eval_packed)
             if eval_packed_rows > 0:
@@ -715,6 +1066,7 @@ def _build_mixed_datasets(args, training_args, tokenizer):
 
     return train_dataset, eval_dataset, {
         "dataset_mode": "mix",
+        "dataset_task": str(dataset_task),
         "block_size": int(block_size),
         "dataset_mix_spec": str(args.dataset_mix_spec),
         "dataset_mix_sources": list(sources),
@@ -728,6 +1080,12 @@ def _build_mixed_datasets(args, training_args, tokenizer):
 def build_datasets(args, training_args, tokenizer):
     if getattr(args, "dataset_mix_spec", None):
         return _build_mixed_datasets(args, training_args, tokenizer)
+
+    dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
+    if dataset_task == "sft":
+        raise ValueError("--dataset_task sft currently supports --dataset_mix only.")
+    if dataset_task != "lm":
+        raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm' or 'sft'.")
 
     block_size = int(training_args.model_max_length)
     dataset_num_proc = _resolve_dataset_num_proc(args)
@@ -752,6 +1110,7 @@ def build_datasets(args, training_args, tokenizer):
     )
     return train_dataset, eval_dataset, {
         "dataset_mode": "single",
+        "dataset_task": str(dataset_task),
         "block_size": int(block_size),
         "source_stats": [],
     }

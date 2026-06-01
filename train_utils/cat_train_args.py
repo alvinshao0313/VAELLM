@@ -59,6 +59,7 @@ class NormalizedCatArgs:
     sort_prep_workers: int
     outlier_protect_count: OverrideTable[int]
     outlier_protect_mode: str
+    outlier_low_rank: OverrideTable[int]
     outlier_residual_top_p: OverrideTable[float]
     outlier_residual_score: str
     outlier_residual_min_abs: float
@@ -147,6 +148,7 @@ class ResolvedCategoryRuntimeConfig:
     codebook_bits: int
     codebook_dim: int
     outlier_protect_count: int
+    outlier_low_rank: int
     outlier_residual_top_p: float
     recon_loss_type: str
     base_ch: int
@@ -180,7 +182,7 @@ _AFTER_CATEGORY_OVERRIDE_SELECTORS = ("default", "after")
 _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse")
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
-_OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "residual_sparse")
+_OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "residual_sparse", "per_vae_low_rank", "post_vae_low_rank")
 _OUTLIER_RESIDUAL_SCORE_CHOICES = (
     "abs",
     "input_act_weighted_abs",
@@ -375,6 +377,12 @@ _OUTLIER_PROTECT_COUNT_SPEC = _make_positive_int_override_spec(
     arg_name="--outlier_protect_count",
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
     example="default=0,cat:down_proj=64",
+    min_value=0,
+)
+_OUTLIER_LOW_RANK_SPEC = _make_positive_int_override_spec(
+    arg_name="--outlier_low_rank",
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=16,cat:down_proj=32",
     min_value=0,
 )
 _OUTLIER_RESIDUAL_TOP_P_SPEC = _make_override_spec(
@@ -598,6 +606,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         sort_prep_workers=int(raw_args.sort_prep_workers),
         outlier_protect_count=_parse_cat_override(raw_args.outlier_protect_count, spec=_OUTLIER_PROTECT_COUNT_SPEC),
         outlier_protect_mode=str(raw_args.outlier_protect_mode).strip().lower(),
+        outlier_low_rank=_parse_cat_override(raw_args.outlier_low_rank, spec=_OUTLIER_LOW_RANK_SPEC),
         outlier_residual_top_p=_parse_cat_override(raw_args.outlier_residual_top_p, spec=_OUTLIER_RESIDUAL_TOP_P_SPEC),
         outlier_residual_score=str(raw_args.outlier_residual_score).strip().lower(),
         outlier_residual_min_abs=float(raw_args.outlier_residual_min_abs),
@@ -715,6 +724,7 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
     block_rows, block_cols = tuple(int(v) for v in cat_args.outlier_residual_block_shape)
     top_p_table = cat_args.outlier_residual_top_p
     protect_table = cat_args.outlier_protect_count
+    low_rank_table = cat_args.outlier_low_rank
     if int(cat_args.sort_prep_workers) < 0:
         raise ValueError(f"--sort_prep_workers must be >= 0, got {int(cat_args.sort_prep_workers)}.")
     if mode not in _OUTLIER_PROTECT_MODE_CHOICES:
@@ -774,6 +784,41 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
                 "--outlier_protect_mode=channel. Got: " + ",".join(nonzero_top_p_entries)
             )
         return
+    if mode in {"per_vae_low_rank", "post_vae_low_rank"}:
+        nonzero_protect_entries = []
+        if bool(getattr(protect_table, "has_default", False)) and int(getattr(protect_table, "default", 0)) != 0:
+            nonzero_protect_entries.append(f"default={int(getattr(protect_table, 'default', 0))}")
+        nonzero_protect_entries.extend(
+            f"cat:{category}={int(value)}"
+            for category, value in sorted(getattr(protect_table, "by_category", {}).items())
+            if int(value) != 0
+        )
+        if nonzero_protect_entries:
+            raise ValueError(
+                "--outlier_protect_count must be 0 for every selector when "
+                f"--outlier_protect_mode={mode}. Got: " + ",".join(nonzero_protect_entries)
+            )
+        nonzero_top_p_entries = [
+            f"{selector}={float(value)}"
+            for selector, value in _iter_override_entries(top_p_table)
+            if float(value) != 0.0
+        ]
+        if nonzero_top_p_entries:
+            raise ValueError(
+                "--outlier_residual_top_p must be 0 for every selector when "
+                f"--outlier_protect_mode={mode}. Got: " + ",".join(nonzero_top_p_entries)
+            )
+        invalid_rank_entries = [
+            f"{selector}={int(value)}"
+            for selector, value in _iter_override_entries(low_rank_table)
+            if int(value) <= 0
+        ]
+        if invalid_rank_entries:
+            raise ValueError(
+                "--outlier_low_rank must be > 0 for every selector when "
+                f"--outlier_protect_mode={mode}. Got: " + ",".join(invalid_rank_entries)
+            )
+        return
     nonzero_entries = []
     if bool(getattr(protect_table, "has_default", False)) and int(getattr(protect_table, "default", 0)) != 0:
         nonzero_entries.append(f"default={int(getattr(protect_table, 'default', 0))}")
@@ -815,6 +860,7 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
         (cat_args.intra_parallel, "--intra_parallel"),
         (cat_args.intra_part_sort_mode, "--intra_part_sort_mode"),
         (cat_args.outlier_protect_count, "--outlier_protect_count"),
+        (cat_args.outlier_low_rank, "--outlier_low_rank"),
         (cat_args.outlier_residual_top_p, "--outlier_residual_top_p"),
         (vae_args.codebook_bits, "--codebook_bits"),
         (vae_args.codebook_dim, "--codebook_dim"),
@@ -858,6 +904,18 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
                 f"--outlier_residual_top_p resolved to {resolved_outlier_residual_top_p} for category "
                 f"'{category}', but --outlier_protect_mode=residual_sparse requires 0 < p <= 1."
             )
+        resolved_outlier_low_rank = int(resolve_category_value(cat_args.outlier_low_rank, category))
+        if resolved_outlier_mode in {"per_vae_low_rank", "post_vae_low_rank"}:
+            if resolved_outlier_low_rank <= 0:
+                raise ValueError(
+                    f"--outlier_low_rank resolved to {resolved_outlier_low_rank} for category "
+                    f"'{category}', but --outlier_protect_mode={resolved_outlier_mode} requires rank > 0."
+                )
+            if resolved_outlier_residual_top_p != 0.0:
+                raise ValueError(
+                    f"--outlier_residual_top_p resolved to {resolved_outlier_residual_top_p} for category "
+                    f"'{category}', but --outlier_protect_mode={resolved_outlier_mode} requires 0."
+                )
         resolved[category] = ResolvedCategoryRuntimeConfig(
             category=str(category),
             residual_stages=int(resolve_category_value(vae_args.residual_stages, category)),
@@ -874,6 +932,7 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
             codebook_bits=int(resolve_category_value(vae_args.codebook_bits, category)),
             codebook_dim=int(resolve_category_value(vae_args.codebook_dim, category)),
             outlier_protect_count=int(resolve_category_value(cat_args.outlier_protect_count, category)),
+            outlier_low_rank=resolved_outlier_low_rank,
             outlier_residual_top_p=resolved_outlier_residual_top_p,
             recon_loss_type=str(resolve_category_value(vae_args.recon_loss_type, category)).strip().lower(),
             base_ch=int(resolve_category_value(vae_args.base_ch, category)),
@@ -935,12 +994,13 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_blocks", type=int, default=256)
     parser.add_argument("--sort_prep_workers", type=int, default=0, help="排序预处理并行 worker 数。0=auto，1=串行，>1=显式 CPU 多进程。")
     parser.add_argument("--outlier_protect_count", type=str, default="default=0", help=f"类别覆盖参数。示例：{_OUTLIER_PROTECT_COUNT_SPEC.example}")
+    parser.add_argument("--outlier_low_rank", type=str, default="default=0", help=f"类别覆盖参数。示例：{_OUTLIER_LOW_RANK_SPEC.example}")
     parser.add_argument(
         "--outlier_protect_mode",
         type=str,
         choices=list(_OUTLIER_PROTECT_MODE_CHOICES),
         default="channel",
-        help="离群值保护模式：none 为关闭，channel 为压缩前保护通道，residual_sparse 为训练后保存残差 COO 补丁。",
+        help="离群值保护模式：none 为关闭，channel 为压缩前保护通道，residual_sparse 为训练后保存残差补丁，per_vae_low_rank/post_vae_low_rank 为低秩补丁。",
     )
     parser.add_argument(
         "--outlier_residual_top_p",

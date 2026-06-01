@@ -1,0 +1,23 @@
+{
+    "LongBench_2wikimqa": 200,
+    "LongBench_hotpotqa": 200,
+    "LongBench_musique": 200,
+    "LongBench_multifieldqa_en": 150,
+    "LongBench_multifieldqa_zh": 200,
+    "LongBench_narrativeqa": 200,
+    "LongBench_qasper": 200,
+    "LongBench_triviaqa": 200,
+    "LongBench_gov_report": 200,
+    "LongBench_qmsum": 200,
+    "LongBench_vcsum": 200,
+    "LongBench_dureader": 200,
+    "LongBench_lcc": 500,
+    "LongBench_repobench-p": 500,
+    "LongBench_passage_retrieval_en": 200,
+    "LongBench_passage_retrieval_zh": 200,
+    "LongBench_passage_count": 200,
+    "LongBench_trec": 200,
+    "LongBench_lsht": 200,
+    "LongBench_multi_news": 200,
+    "LongBench_samsum": 200
+}

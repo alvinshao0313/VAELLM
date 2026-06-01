@@ -428,6 +428,8 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "shape": list(protected_out_weight.shape),
                 "dtype": _dtype_to_name(protected_out_weight.dtype),
             }
+        low_rank_a_spec = _tensor_spec(getattr(module, "low_rank_a", None))
+        low_rank_b_spec = _tensor_spec(getattr(module, "low_rank_b", None))
         sparse_residual_specs = _collect_sparse_residual_specs(module)
         specs.append(
             {
@@ -461,6 +463,8 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "protected_input_weight": protected_weight_spec,
                 "protected_output_indices": protected_out_idx_spec,
                 "protected_output_weight": protected_out_weight_spec,
+                "low_rank_a": low_rank_a_spec,
+                "low_rank_b": low_rank_b_spec,
                 **sparse_residual_specs,
             }
         )
@@ -505,7 +509,7 @@ def save_model_checkpoint(
     vae_specs = _collect_vae_linear_specs(model)
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
-        "version": 5,
+        "version": 6,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_model_path": base_model_path,
         "state_dict_file": STATE_DICT_FILENAME,
@@ -821,6 +825,24 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 raise ValueError(f"[{name}] protected_output_weight shape must be 2D, got {shape}")
             protected_out_weight_dtype = _name_to_dtype(str(protected_out_weight_spec.get("dtype", "float32")))
             protected_out_weight_payload = torch.zeros(shape, dtype=protected_out_weight_dtype, device=device)
+        low_rank_a_payload = None
+        low_rank_a_spec = spec.get("low_rank_a")
+        if isinstance(low_rank_a_spec, dict):
+            shape = tuple(int(v) for v in low_rank_a_spec.get("shape", []))
+            if len(shape) != 2:
+                raise ValueError(f"[{name}] low_rank_a shape must be 2D, got {shape}")
+            low_rank_a_dtype = _name_to_dtype(str(low_rank_a_spec.get("dtype", "float32")))
+            low_rank_a_payload = torch.zeros(shape, dtype=low_rank_a_dtype, device=device)
+        low_rank_b_payload = None
+        low_rank_b_spec = spec.get("low_rank_b")
+        if isinstance(low_rank_b_spec, dict):
+            shape = tuple(int(v) for v in low_rank_b_spec.get("shape", []))
+            if len(shape) != 2:
+                raise ValueError(f"[{name}] low_rank_b shape must be 2D, got {shape}")
+            low_rank_b_dtype = _name_to_dtype(str(low_rank_b_spec.get("dtype", "float32")))
+            low_rank_b_payload = torch.zeros(shape, dtype=low_rank_b_dtype, device=device)
+        if (low_rank_a_payload is None) != (low_rank_b_payload is None):
+            raise ValueError(f"[{name}] low_rank_a and low_rank_b must be provided together.")
         sparse_row_idx_payload = None
         sparse_row_idx_spec = spec.get("sparse_residual_row_indices")
         if isinstance(sparse_row_idx_spec, dict):
@@ -951,6 +973,8 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             sparse_residual_qvalues=sparse_qvalues_payload,
             sparse_residual_scales=sparse_scales_payload,
             sparse_residual_zero_points=sparse_zero_points_payload,
+            low_rank_a=low_rank_a_payload,
+            low_rank_b=low_rank_b_payload,
             always_use_original=bool(spec.get("always_use_original", False)),
             protect_original_weight=bool(spec.get("protect_original_weight", False)),
         )

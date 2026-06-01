@@ -31,6 +31,7 @@ class NamedVAELinearDecodeTarget:
     name: str
     base_layer: "VAELinear"
     target_dtype: Optional[torch.dtype] = None
+    include_low_rank: bool = True
 
 
 @dataclass(frozen=True)
@@ -138,17 +139,20 @@ def _normalize_named_vae_decode_targets(named_targets: Sequence[Any]) -> List[Na
                 name=str(item.name),
                 base_layer=item.base_layer,
                 target_dtype=None,
+                include_low_rank=True,
             )
         elif isinstance(item, tuple) and len(item) in {2, 3}:
             target = NamedVAELinearDecodeTarget(
                 name=str(item[0]),
                 base_layer=item[1],
                 target_dtype=None if len(item) == 2 else item[2],
+                include_low_rank=True,
             )
         else:
             name = getattr(item, "name", None)
             base_layer = getattr(item, "base_layer", None)
             target_dtype = getattr(item, "target_dtype", None)
+            include_low_rank = getattr(item, "include_low_rank", True)
             if name is None or base_layer is None:
                 raise TypeError(
                     f"Named VAE decode target at idx={idx} must provide 'name' and 'base_layer', got {type(item)}."
@@ -157,6 +161,7 @@ def _normalize_named_vae_decode_targets(named_targets: Sequence[Any]) -> List[Na
                 name=str(name),
                 base_layer=base_layer,
                 target_dtype=target_dtype,
+                include_low_rank=bool(include_low_rank),
             )
         if not isinstance(target.base_layer, VAELinear):
             raise TypeError(
@@ -321,6 +326,7 @@ def _decode_named_vae_linear_weights_chunk(
         decoded_weight = base_layer._finalize_decoded_weight_from_compressed(
             compressed_weight,
             dtype=target_dtype,
+            include_low_rank=bool(target.include_low_rank),
         ).detach()
         decoded_results.append(
             DecodedVAELinearWeight(
@@ -409,6 +415,7 @@ def decode_named_vae_linear_weights(
             name=str(target.name),
             base_layer=target.base_layer,
             target_dtype=target_dtype,
+            include_low_rank=bool(target.include_low_rank),
         )
         signature = _build_vae_linear_prewarm_signature(
             name=resolved_target.name,
