@@ -79,6 +79,20 @@ def _iter_named_vae_linears(model: nn.Module) -> Iterable[Tuple[str, VAELinear]]
             yield str(name), module
 
 
+def _set_vae_decoder_checkpoint(model: nn.Module, enabled: bool) -> Tuple[int, int]:
+    changed = 0
+    total = 0
+    for _name, module in _iter_named_vae_linears(model):
+        for stage_idx in range(int(module.residual_stages)):
+            for part_idx in range(int(module.parallel_parts)):
+                decoder = module.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+                total += 1
+                if bool(getattr(decoder, "use_checkpoint", False)) != bool(enabled):
+                    decoder.use_checkpoint = bool(enabled)
+                    changed += 1
+    return changed, total
+
+
 def _resolve_reference_dtype(module: nn.Module) -> torch.dtype:
     for param in module.parameters():
         if param.is_floating_point():
@@ -633,6 +647,17 @@ def run(args, hf_args, training_args):
         model.enable_input_require_grads()
     if bool(args.use_post_norm_head_linear):
         ensure_post_norm_head_linear(model)
+
+    decoder_ckpt_changed, decoder_ckpt_total = _set_vae_decoder_checkpoint(
+        model,
+        enabled=bool(args.vae_decoder_checkpoint),
+    )
+    log.info(
+        "Applied VAE decoder checkpoint config: enabled=%s changed=%d total=%d",
+        str(bool(args.vae_decoder_checkpoint)).lower(),
+        int(decoder_ckpt_changed),
+        int(decoder_ckpt_total),
+    )
 
     layers = list(get_layers(model))
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(layers))

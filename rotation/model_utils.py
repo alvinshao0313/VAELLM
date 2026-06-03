@@ -109,6 +109,7 @@ def get_qwen3(model_name, hf_token):
     torch.nn.init.normal_ = skip
     model = transformers.Qwen3ForCausalLM.from_pretrained(model_name, torch_dtype='auto',
                                                           use_auth_token=hf_token,
+                                                          attn_implementation="flash_attention_2",
                                                           low_cpu_mem_usage=True)
     model.seqlen = 2048
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))

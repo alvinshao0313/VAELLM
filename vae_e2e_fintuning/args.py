@@ -37,6 +37,7 @@ class VAEDecoderE2EArguments:
     decode_group_size: int = 8
     layer_device_map: str = "auto"
     parallel_stage_decode: bool = True
+    vae_decoder_checkpoint: bool = True
     tune_final_norm: bool = False
     use_post_norm_head_linear: bool = False
     vae_tune_bias: bool = False
@@ -128,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--parallel_stage_decode",
         type=lambda v: _parse_bool_like(v, arg_name="--parallel_stage_decode"),
+        default=True,
+    )
+    parser.add_argument(
+        "--vae_decoder_checkpoint",
+        type=lambda v: _parse_bool_like(v, arg_name="--vae_decoder_checkpoint"),
         default=True,
     )
     parser.add_argument(

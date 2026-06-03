@@ -2,19 +2,19 @@
 set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3,4,5}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 SEED="${SEED:-0}"
 export PYTHONHASHSEED="${SEED}"
-export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
-MAX_STEPS="${MAX_STEPS:-500}"
+FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
+MAX_STEPS="${MAX_STEPS:-5000}"
 STUDENT_CKPT="${STUDENT_CKPT:-.result/final_model}"
-EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa}"
+EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
 OUTLIER_RESIDUAL_TOP_P="${OUTLIER_RESIDUAL_TOP_P:-0.01}"
@@ -23,6 +23,10 @@ OUTLIER_RESIDUAL_CODEC="${OUTLIER_RESIDUAL_CODEC:-blocked_quantized}"
 OUTLIER_RESIDUAL_INDEX_BITS="${OUTLIER_RESIDUAL_INDEX_BITS:-8}"
 OUTLIER_RESIDUAL_VALUE_BITS="${OUTLIER_RESIDUAL_VALUE_BITS:-8}"
 OUTLIER_RESIDUAL_BLOCK_SHAPE="${OUTLIER_RESIDUAL_BLOCK_SHAPE:-256,256}"
+
+if [[ "${FULL_DETERMINISM}" == "true" ]]; then
+  export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+fi
 
 if [[ "${DISABLE_PROXY:-1}" == "1" ]]; then
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
@@ -40,11 +44,13 @@ fi
 # - 训练保存 final_model 后会跑 lm-eval：${EVAL_TASKS}
 # - 冒烟建议：
 #   MAX_STEPS=30 bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh --skip_ppl_eval true --eval_tasks ""
+# - 用显存换速度：
+#   VAE_DECODER_CHECKPOINT=false bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh
 
 python -m vae_e2e_fintuning.main \
   --seed "${SEED}" \
   --data_seed "${SEED}" \
-  --full_determinism true \
+  --full_determinism "${FULL_DETERMINISM}" \
   --gradient_checkpointing false \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --student_checkpoint_dir "${STUDENT_CKPT}" \
@@ -52,14 +58,15 @@ python -m vae_e2e_fintuning.main \
   --dataset_mix "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10" \
   --dataset_num_proc 64 \
   --loss_type kd_top_1000 \
-  --distill_temperature 1.0 \
-  --distill_alpha 0.5 \
+  --distill_temperature 1.5 \
+  --distill_alpha 0.6 \
   --post_attn false \
   --model_max_length 8192 \
   --decoder_layers 0-35 \
-  --target_modules all \
+  --target_modules up_proj,gate_proj,down_proj \
   --layer_device_map auto \
   --parallel_stage_decode true \
+  --vae_decoder_checkpoint true \
   --tune_final_norm true \
   --use_post_norm_head_linear true \
   --vae_tune_bias false \
@@ -89,15 +96,15 @@ python -m vae_e2e_fintuning.main \
   --bf16 true \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
-  --learning_rate 1e-5 \
-  --lr_scheduler_type cosine \
+  --learning_rate 1e-4 \
+  --lr_scheduler_type linear \
   --warmup_ratio 0.03 \
   --weight_decay 0.0 \
   --max_grad_norm 1.0 \
   --logging_steps 10 \
   --eval_strategy no \
   --save_strategy steps \
-  --save_steps 500 \
-  --save_total_limit 10 \
+  --save_steps 1000 \
+  --save_total_limit 2 \
   --max_steps "${MAX_STEPS}" \
   "$@"
