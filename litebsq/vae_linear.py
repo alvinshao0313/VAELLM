@@ -579,6 +579,9 @@ class VAELinear(nn.Module):
         self.parallel_stage_decode = False
         self._parallel_stage_layout: List[Tuple[int, int]] = []
         self.register_buffer("_cached_weight", None, persistent=False)
+        self.register_buffer("_cached_sparse_residual_row_indices", None, persistent=False)
+        self.register_buffer("_cached_sparse_residual_col_indices", None, persistent=False)
+        self.register_buffer("_cached_sparse_residual_values", None, persistent=False)
 
         use_stage_payload = stage_vq_weights is not None or stage_decoders is not None
         if use_stage_payload:
@@ -1420,13 +1423,18 @@ class VAELinear(nn.Module):
             )
         return full_weight.add(patch)
 
-    def _apply_sparse_residual_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def _decode_sparse_residual_patch(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         resolved_format = str(getattr(self, "sparse_residual_format", SPARSE_RESIDUAL_FORMAT_COO_FP16)).strip().lower()
         if resolved_format == SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED:
             active_block_ids = getattr(self, "sparse_residual_active_block_ids", None)
             if active_block_ids is None:
-                return full_weight
-            row_idx, col_idx, values = decode_blocked_quantized_sparse_residual(
+                return None
+            return decode_blocked_quantized_sparse_residual(
                 active_block_ids=active_block_ids,
                 block_ptr=getattr(self, "sparse_residual_block_ptr", None),
                 local_indices=getattr(self, "sparse_residual_local_indices", None),
@@ -1440,21 +1448,55 @@ class VAELinear(nn.Module):
                 index_bits=int(self.sparse_residual_index_bits),
                 value_bits=int(self.sparse_residual_value_bits),
                 value_dtype=dtype,
-                device=full_weight.device,
+                device=device,
             )
-        else:
-            row_idx = getattr(self, "sparse_residual_row_indices", None)
-            if row_idx is None:
-                return full_weight
-            col_idx = getattr(self, "sparse_residual_col_indices", None)
-            values = getattr(self, "sparse_residual_values", None)
-            if col_idx is None or values is None:
-                raise RuntimeError("Sparse residual COO payload is incomplete.")
-            if int(row_idx.numel()) == 0:
-                return full_weight
-            row_idx = row_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
-            col_idx = col_idx.to(device=full_weight.device, dtype=torch.int64, non_blocking=True)
-            values = values.to(device=full_weight.device, dtype=dtype, non_blocking=True)
+
+        row_idx = getattr(self, "sparse_residual_row_indices", None)
+        if row_idx is None:
+            return None
+        col_idx = getattr(self, "sparse_residual_col_indices", None)
+        values = getattr(self, "sparse_residual_values", None)
+        if col_idx is None or values is None:
+            raise RuntimeError("Sparse residual COO payload is incomplete.")
+        row_idx = row_idx.to(device=device, dtype=torch.int64, non_blocking=True)
+        col_idx = col_idx.to(device=device, dtype=torch.int64, non_blocking=True)
+        values = values.to(device=device, dtype=dtype, non_blocking=True)
+        return row_idx, col_idx, values
+
+    def _get_sparse_residual_patch(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        cached_row = getattr(self, "_cached_sparse_residual_row_indices", None)
+        cached_col = getattr(self, "_cached_sparse_residual_col_indices", None)
+        cached_values = getattr(self, "_cached_sparse_residual_values", None)
+        if (
+            isinstance(cached_row, torch.Tensor)
+            and isinstance(cached_col, torch.Tensor)
+            and isinstance(cached_values, torch.Tensor)
+            and cached_row.device == device
+            and cached_col.device == device
+            and cached_values.device == device
+            and cached_values.dtype == dtype
+        ):
+            return cached_row, cached_col, cached_values
+
+        patch = self._decode_sparse_residual_patch(dtype=dtype, device=device)
+        if patch is None:
+            return None
+        row_idx, col_idx, values = patch
+        self._cached_sparse_residual_row_indices = row_idx.detach()
+        self._cached_sparse_residual_col_indices = col_idx.detach()
+        self._cached_sparse_residual_values = values.detach()
+        return row_idx, col_idx, values
+
+    def _apply_sparse_residual_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        patch = self._get_sparse_residual_patch(dtype=dtype, device=full_weight.device)
+        if patch is None:
+            return full_weight
+        row_idx, col_idx, values = patch
         if int(row_idx.numel()) == 0:
             return full_weight
         full_weight.index_put_((row_idx, col_idx), values, accumulate=True)
@@ -1487,8 +1529,44 @@ class VAELinear(nn.Module):
     def has_original_linear(self) -> bool:
         return self.original_weight is not None
 
+    def clear_sparse_residual_cache(self) -> None:
+        self._cached_sparse_residual_row_indices = None
+        self._cached_sparse_residual_col_indices = None
+        self._cached_sparse_residual_values = None
+
     def clear_decoded_weight_cache(self) -> None:
         self._cached_weight = None
+        self.clear_sparse_residual_cache()
+
+    @torch.no_grad()
+    def prime_sparse_residual_cache(
+        self,
+        dtype: Optional[torch.dtype] = None,
+    ) -> bool:
+        if not self.has_sparse_residual():
+            self.clear_sparse_residual_cache()
+            return False
+
+        target_dtype = dtype
+        target_device = None
+        for param in self.parameters():
+            target_device = param.device
+            if target_dtype is None and param.is_floating_point():
+                target_dtype = param.dtype
+            break
+        if target_device is None:
+            for buffer in self.buffers():
+                target_device = buffer.device
+                if target_dtype is None and buffer.is_floating_point():
+                    target_dtype = buffer.dtype
+                break
+        if target_device is None:
+            target_device = torch.device("cpu")
+        if target_dtype is None:
+            target_dtype = torch.float32
+
+        patch = self._get_sparse_residual_patch(dtype=target_dtype, device=torch.device(target_device))
+        return patch is not None
 
     @torch.no_grad()
     def prime_decoded_weight_cache(

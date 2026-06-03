@@ -355,147 +355,58 @@ def _disable_trainable_decode_for_eval(model: torch.nn.Module) -> int:
     return count
 
 
-_SPARSE_RESIDUAL_BUFFER_NAMES = (
-    "sparse_residual_row_indices",
-    "sparse_residual_col_indices",
-    "sparse_residual_values",
-    "sparse_residual_active_block_ids",
-    "sparse_residual_block_ptr",
-    "sparse_residual_local_indices",
-    "sparse_residual_qvalues",
-    "sparse_residual_scales",
-    "sparse_residual_zero_points",
-)
-
-
-def _replace_sparse_residual_payload(
-    module: torch.nn.Module,
-    payload,
-    *,
-    codec: str,
-    index_bits: int,
-    value_bits: int,
-    block_shape,
-) -> None:
-    resolved_codec = str(codec).strip().lower()
-    module.sparse_residual_format = resolved_codec
-    if resolved_codec == "blocked_quantized":
-        module.sparse_residual_index_bits = int(index_bits)
-        module.sparse_residual_value_bits = int(value_bits)
-        module.sparse_residual_block_rows = int(block_shape[0])
-        module.sparse_residual_block_cols = int(block_shape[1])
-    else:
-        module.sparse_residual_index_bits = None
-        module.sparse_residual_value_bits = None
-        module.sparse_residual_block_rows = None
-        module.sparse_residual_block_cols = None
-
-    for name in _SPARSE_RESIDUAL_BUFFER_NAMES:
-        module.register_buffer(name, None, persistent=True)
-
-    if not payload:
-        return
-
-    for key, value in payload.items():
-        if key == "sparse_residual_format":
-            module.sparse_residual_format = str(value).strip().lower()
-        elif key in {
-            "sparse_residual_index_bits",
-            "sparse_residual_value_bits",
-            "sparse_residual_block_rows",
-            "sparse_residual_block_cols",
-        }:
-            setattr(module, key, int(value))
-        elif key in _SPARSE_RESIDUAL_BUFFER_NAMES:
-            module.register_buffer(key, value.detach().to(device="cpu").contiguous(), persistent=True)
-        else:
-            raise ValueError(f"Unsupported sparse residual payload key: {key}")
-
-
 @torch.no_grad()
-def _refresh_sparse_residual_after_train(model: torch.nn.Module, args, log) -> Dict[str, int]:
-    from litebsq.vae_linear import VAELinear
-    from train_utils.cat_train_residual_protection import build_sparse_residual_payload
+def _prewarm_sparse_residual_cache(model: torch.nn.Module, *, dtype: Optional[torch.dtype], log) -> Dict[str, int]:
+    from e2e_common.proxy_trainables import iter_named_vae_module_refs
 
-    top_p = getattr(args, "refresh_sparse_residual_top_p", None)
-    if top_p is None:
-        raise ValueError("--refresh_sparse_residual_top_p is required to refresh sparse residuals.")
-    score_mode = str(getattr(args, "refresh_sparse_residual_score", "abs")).strip().lower()
-    if score_mode != "abs":
-        raise ValueError("--refresh_sparse_residual_score currently supports only: abs.")
-
-    total_sparse = 0
-    refreshed = 0
-    total_nnz = 0
-    total_codec_bytes = 0
-    for name, module in model.named_modules():
-        if not isinstance(module, VAELinear):
-            continue
+    total = 0
+    warmed = 0
+    skipped = 0
+    failed = 0
+    for ref in iter_named_vae_module_refs(model):
+        total += 1
+        module = ref.base_layer
         has_sparse_fn = getattr(module, "has_sparse_residual", None)
         has_sparse = bool(has_sparse_fn()) if callable(has_sparse_fn) else False
         if not has_sparse:
+            skipped += 1
             continue
-        total_sparse += 1
-        original_weight = getattr(module, "original_weight", None)
-        if original_weight is None:
-            raise RuntimeError(
-                f"{name}: cannot refresh residual_sparse because original_weight is missing."
-            )
-
-        compressed_weight = module._decode_compressed_weight(dtype=torch.float32)
-        reconstructed_weight = module._materialize_full_weight(
-            compressed_weight,
-            dtype=torch.float32,
-        )
-        reconstructed_weight = module._apply_low_rank_patch(
-            reconstructed_weight,
-            dtype=torch.float32,
-        ).detach().to(device="cpu", dtype=torch.float32).contiguous()
-        payload, nnz, storage = build_sparse_residual_payload(
-            linear_name=name,
-            original_weight=original_weight.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-            reconstructed_weight=reconstructed_weight,
-            activation_weight=None,
-            score_mode=score_mode,
-            top_p=float(top_p),
-            min_abs=float(getattr(args, "refresh_sparse_residual_min_abs", 0.0)),
-            codec=str(getattr(args, "refresh_sparse_residual_codec", "blocked_quantized")),
-            index_bits=int(getattr(args, "refresh_sparse_residual_index_bits", 8)),
-            value_bits=int(getattr(args, "refresh_sparse_residual_value_bits", 8)),
-            block_shape=tuple(int(v) for v in getattr(args, "refresh_sparse_residual_block_shape", (256, 256))),
-        )
-        _replace_sparse_residual_payload(
-            module,
-            payload,
-            codec=str(getattr(args, "refresh_sparse_residual_codec", "blocked_quantized")),
-            index_bits=int(getattr(args, "refresh_sparse_residual_index_bits", 8)),
-            value_bits=int(getattr(args, "refresh_sparse_residual_value_bits", 8)),
-            block_shape=tuple(int(v) for v in getattr(args, "refresh_sparse_residual_block_shape", (256, 256))),
-        )
-        module.clear_decoded_weight_cache()
-        refreshed += 1
-        total_nnz += int(nnz)
-        total_codec_bytes += int(storage.get("codec_bytes", 0))
-        log.info(
-            "[refresh_sparse_residual] %s refreshed: nnz=%d codec_bytes=%d",
-            name,
-            int(nnz),
-            int(storage.get("codec_bytes", 0)),
-        )
+        prime_fn = getattr(module, "prime_sparse_residual_cache", None)
+        if not callable(prime_fn):
+            failed += 1
+            raise RuntimeError(f"{ref.name}: VAELinear has no prime_sparse_residual_cache method.")
+        try:
+            did_warm = bool(prime_fn(dtype=dtype))
+        except Exception as exc:
+            failed += 1
+            raise RuntimeError(f"Sparse residual prewarm failed for '{ref.name}': {exc}") from exc
+        if did_warm:
+            warmed += 1
+        else:
+            skipped += 1
 
     log.info(
-        "[refresh_sparse_residual] done: sparse_modules=%d refreshed=%d total_nnz=%d total_codec_bytes=%d",
-        total_sparse,
-        refreshed,
-        total_nnz,
-        total_codec_bytes,
+        "[sparse_residual_prewarm] done: total=%d warmed=%d skipped=%d failed=%d dtype=%s",
+        int(total),
+        int(warmed),
+        int(skipped),
+        int(failed),
+        str(dtype),
     )
     return {
-        "sparse_modules": int(total_sparse),
-        "refreshed": int(refreshed),
-        "total_nnz": int(total_nnz),
-        "total_codec_bytes": int(total_codec_bytes),
+        "total": int(total),
+        "warmed": int(warmed),
+        "skipped": int(skipped),
+        "failed": int(failed),
     }
+
+
+def _resolve_train_sparse_residual_dtype(training_args) -> Optional[torch.dtype]:
+    if bool(getattr(training_args, "bf16", False)):
+        return torch.bfloat16
+    if bool(getattr(training_args, "fp16", False)):
+        return torch.float16
+    return None
 
 
 def _clear_vae_linear_cache(model: torch.nn.Module, log, *, reason: str) -> int:
@@ -775,6 +686,11 @@ def run(args, hf_args, training_args):
         int(args.offload_min_tensor_bytes),
         str(bool(args.offload_pin_memory)).lower(),
     )
+    sparse_residual_prewarm = _prewarm_sparse_residual_cache(
+        model,
+        dtype=_resolve_train_sparse_residual_dtype(training_args),
+        log=log,
+    )
 
     tokenizer = build_tokenizer(str(base_model_path), access_token=hf_args.access_token)
     if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
@@ -870,9 +786,6 @@ def run(args, hf_args, training_args):
         log.info("Unpacked %d parallel stage decoder modules before final save.", unpacked)
         disabled_decode = _disable_trainable_decode_for_eval(final_model)
         log.info("Disabled trainable decode mode on %d VAELinear modules before final save/eval.", disabled_decode)
-    sparse_refresh = None
-    if bool(getattr(args, "refresh_sparse_residual_after_train", False)):
-        sparse_refresh = _refresh_sparse_residual_after_train(final_model, args, log)
     _clear_vae_linear_cache(final_model, log, reason="Final save/eval prep")
     final_model.to("cpu")
 
@@ -898,8 +811,7 @@ def run(args, hf_args, training_args):
                 "tune_final_norm": bool(args.tune_final_norm),
                 "use_post_norm_head_linear": bool(args.use_post_norm_head_linear),
                 "vae_tune_bias": bool(args.vae_tune_bias),
-                "refresh_sparse_residual_after_train": bool(args.refresh_sparse_residual_after_train),
-                "refresh_sparse_residual": sparse_refresh,
+                "sparse_residual_prewarm": sparse_residual_prewarm,
             },
             unload_vae_original_weights=False,
         )
@@ -952,6 +864,6 @@ def run(args, hf_args, training_args):
         "final_lm_eval_path": None if lm_eval is None else lm_eval["json_path"],
         "final_lm_eval_summary_path": None if lm_eval is None else lm_eval["summary_path"],
         "final_eval_prewarm": eval_prewarm,
-        "refresh_sparse_residual": sparse_refresh,
+        "sparse_residual_prewarm": sparse_residual_prewarm,
         "run_meta_path": run_meta_path,
     }

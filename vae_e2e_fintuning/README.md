@@ -130,23 +130,11 @@ bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh \
 - 仍是压缩 checkpoint
 - decoder 和 `low_rank_a/b` 都会更新
 
-## sparse residual 刷新
+## sparse residual
 
-如果开启：
+decoder 微调不会重新计算 sparse residual。输入 checkpoint 已有的 sparse residual 会在训练和最终保存中保持固定。
 
-```bash
---refresh_sparse_residual_after_train true
-```
-
-刷新 sparse residual 时，重建基线是：
-
-```text
-VAE reconstruction + low_rank patch
-```
-
-旧 sparse residual 不会参与基线计算，避免训练后重复补偿。
-
-最终推理顺序仍然是：
+训练和最终推理顺序都是：
 
 ```text
 VAE reconstruction -> low_rank patch -> sparse_residual patch

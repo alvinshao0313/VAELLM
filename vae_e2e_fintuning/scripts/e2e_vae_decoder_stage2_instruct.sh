@@ -19,12 +19,6 @@ INSTRUCT_DATASET_MIX="${INSTRUCT_DATASET_MIX:-openorca=0.50,alpaca=0.20,longalpa
 EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
-OUTLIER_RESIDUAL_TOP_P="${OUTLIER_RESIDUAL_TOP_P:-0.01}"
-OUTLIER_RESIDUAL_MIN_ABS="${OUTLIER_RESIDUAL_MIN_ABS:-0.0}"
-OUTLIER_RESIDUAL_CODEC="${OUTLIER_RESIDUAL_CODEC:-blocked_quantized}"
-OUTLIER_RESIDUAL_INDEX_BITS="${OUTLIER_RESIDUAL_INDEX_BITS:-8}"
-OUTLIER_RESIDUAL_VALUE_BITS="${OUTLIER_RESIDUAL_VALUE_BITS:-8}"
-OUTLIER_RESIDUAL_BLOCK_SHAPE="${OUTLIER_RESIDUAL_BLOCK_SHAPE:-256,256}"
 
 if [[ "${DISABLE_PROXY:-1}" == "1" ]]; then
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
@@ -69,14 +63,6 @@ fi
   --skip_ppl_eval false \
   --ppl_seqlen 2048 \
   --ppl_limit -1 \
-  --refresh_sparse_residual_after_train true \
-  --refresh_sparse_residual_top_p "${OUTLIER_RESIDUAL_TOP_P}" \
-  --refresh_sparse_residual_score abs \
-  --refresh_sparse_residual_min_abs "${OUTLIER_RESIDUAL_MIN_ABS}" \
-  --refresh_sparse_residual_codec "${OUTLIER_RESIDUAL_CODEC}" \
-  --refresh_sparse_residual_index_bits "${OUTLIER_RESIDUAL_INDEX_BITS}" \
-  --refresh_sparse_residual_value_bits "${OUTLIER_RESIDUAL_VALUE_BITS}" \
-  --refresh_sparse_residual_block_shape "${OUTLIER_RESIDUAL_BLOCK_SHAPE}" \
   --save_tokenizer true \
   --bf16 true \
   --per_device_train_batch_size 1 \
