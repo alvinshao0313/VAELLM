@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3,4,5}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 SEED="${SEED:-0}"
 export PYTHONHASHSEED="${SEED}"
@@ -12,7 +12,7 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
-MAX_STEPS="${MAX_STEPS:-500}"
+MAX_STEPS="${MAX_STEPS:-100}"
 STUDENT_CKPT="${STUDENT_CKPT:-.result/final_model}"
 EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
@@ -52,12 +52,12 @@ python -m vae_e2e_fintuning.main \
   --dataset_mix "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10" \
   --dataset_num_proc 64 \
   --loss_type kd_top_1000 \
-  --distill_temperature 1.5 \
+  --distill_temperature 1.0 \
   --distill_alpha 0.6 \
   --post_attn false \
   --model_max_length 8192 \
   --decoder_layers 0-35 \
-  --target_modules up_proj,gate_proj,down_proj \
+  --target_modules all \
   --layer_device_map auto \
   --parallel_stage_decode true \
   --vae_decoder_checkpoint true \
@@ -82,11 +82,11 @@ python -m vae_e2e_fintuning.main \
   --bf16 true \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
-  --learning_rate 1e-4 \
+  --learning_rate 1e-5 \
   --lr_scheduler_type linear \
   --warmup_ratio 0.03 \
   --weight_decay 0.0 \
-  --max_grad_norm 1.0 \
+  --max_grad_norm 1.5 \
   --logging_steps 10 \
   --eval_strategy no \
   --save_strategy steps \

@@ -106,6 +106,7 @@ class PeftVAELinearProxy(nn.Module):
         self.temporary = bool(getattr(base_layer, "temporary", True))
         self.per_decoded_linear = self._build_placeholder_decoded_linear()
         self._dense_base_materialized = False
+        self._train_decoder_with_adapter = False
 
         self.base_layer.cache_decoded_weight = False
         self.base_layer.clear_decoded_weight_cache()
@@ -144,7 +145,15 @@ class PeftVAELinearProxy(nn.Module):
             return self.base_layer(x)
         if not bool(self._dense_base_materialized):
             raise RuntimeError("PeftVAELinearProxy dense base has not been materialized.")
-        return self.per_decoded_linear(x)
+        if not bool(getattr(self, "_train_decoder_with_adapter", False)):
+            return self.per_decoded_linear(x)
+        peft_linear = self.per_decoded_linear
+        if not is_peft_proxy_adapter_linear(peft_linear):
+            raise RuntimeError("PeftVAELinearProxy decoder+adapter training requires a PEFT adapter linear.")
+        dense_base = peft_linear.get_base_layer()
+        decoder_out = self.base_layer(x)
+        adapter_delta = peft_linear(x) - dense_base(x)
+        return decoder_out + adapter_delta
 
 
 def ensure_peft_vae_linear_proxy(

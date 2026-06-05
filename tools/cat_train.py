@@ -567,7 +567,7 @@ def _train_group_vae_and_replace(
     train_device: str,
     convert_device: str,
     do_convert: bool,
-    batch_size: int,
+    batch_size: object,
     log_every: int,
     eval_every: int,
     eval_blocks: int,
@@ -587,6 +587,15 @@ def _train_group_vae_and_replace(
     shuffle_seed: int = 0,
 ) -> None:
     from litebsq.llm_vae import MultiLayerVAE
+
+    batch_size_text = str(batch_size).strip().lower()
+    batch_size_is_all = batch_size_text == "all"
+    if batch_size_is_all:
+        materialize_batch_size = 8192
+    else:
+        materialize_batch_size = int(batch_size)
+        if int(materialize_batch_size) < 1:
+            raise ValueError(f"[{group_tag}] batch_size must be >= 1 or 'all', got {batch_size!r}.")
 
     train_dtype = _resolve_train_dtype(training_args)
 
@@ -728,7 +737,7 @@ def _train_group_vae_and_replace(
         prepared_entries=prepared_entries,
         intra_parallel=(row_parts, col_parts),
         codebook_dim=int(stage_codebook_dim),
-        batch_size=int(batch_size),
+        batch_size=int(materialize_batch_size),
         normalize_weight=False,
         recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
         train_device=train_device,
@@ -830,7 +839,7 @@ def _train_group_vae_and_replace(
             prepared_entries=prepared_entries,
             intra_parallel=(row_parts, col_parts),
             codebook_dim=int(stage_codebook_dim),
-            batch_size=int(batch_size),
+            batch_size=int(materialize_batch_size),
             normalize_weight=False,
             recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
             train_device=train_device,
@@ -846,7 +855,7 @@ def _train_group_vae_and_replace(
                 prepared_entries=prepared_entries,
                 intra_parallel=(row_parts, col_parts),
                 codebook_dim=int(stage_codebook_dim),
-                batch_size=int(batch_size),
+                batch_size=int(materialize_batch_size),
                 normalize_weight=False,
                 recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
                 train_device=train_device,
@@ -892,11 +901,29 @@ def _train_group_vae_and_replace(
             stage_norm_scale = None
             stage_train_data = residual_data
 
-        train_loader, eval_loader = _build_block_data_loaders(
+        effective_batch_size = int(stage_train_data.shape[0]) if batch_size_is_all else int(materialize_batch_size)
+        eval_batch_size = int(stage_train_data.shape[0]) if batch_size_is_all else int(materialize_batch_size)
+        all_batch_gpu_cache = bool(batch_size_is_all and stage_recon_loss != "wa_mse")
+        if int(effective_batch_size) < 1:
+            raise RuntimeError(f"[{stage_tag}] effective VAE batch size must be >= 1, got {effective_batch_size}.")
+        if batch_size_is_all:
+            log.info("[%s] VAE batch_size=all(effective=%d)", stage_tag, int(effective_batch_size))
+        if all_batch_gpu_cache:
+            log.info("[%s] VAE all-batch GPU cache enabled.", stage_tag)
+            train_loader = None
+        else:
+            train_loader, _unused_eval_loader = _build_block_data_loaders(
+                stage_train_data,
+                batch_size=int(effective_batch_size),
+                shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
+            )
+            del _unused_eval_loader
+        _unused_train_loader, eval_loader = _build_block_data_loaders(
             stage_train_data,
-            batch_size=int(batch_size),
+            batch_size=int(eval_batch_size),
             shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
         )
+        del _unused_train_loader
         vae = MultiLayerVAE(stage_vae_args).to(train_device)
 
         # 2) 训练当前 residual stage 对应的 VAE。
@@ -929,24 +956,32 @@ def _train_group_vae_and_replace(
             "on" if use_stage_norm else "off",
         )
         start = time.time()
-        train_iter = iter(train_loader)
+        if all_batch_gpu_cache:
+            x_all = stage_train_data.to(device=train_device, dtype=train_dtype, non_blocking=True)
+            train_iter = None
+        else:
+            x_all = None
+            train_iter = iter(train_loader)
         for step in range(int(stage_steps)):
-            try:
-                x_batch, block_idx_batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                x_batch, block_idx_batch = next(train_iter)
-
-            x = x_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
             act_max_batch = None
-            if stage_recon_loss == "wa_mse":
-                act_max_batch = gather_wa_mse_act_max_batch(
-                    block_idx_batch=block_idx_batch,
-                    part_metas=part_metas,
-                    codebook_dim=int(stage_codebook_dim),
-                    train_device=train_device,
-                    target_dtype=train_dtype,
-                )
+            if all_batch_gpu_cache:
+                x = x_all
+            else:
+                try:
+                    x_batch, block_idx_batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    x_batch, block_idx_batch = next(train_iter)
+
+                x = x_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
+                if stage_recon_loss == "wa_mse":
+                    act_max_batch = gather_wa_mse_act_max_batch(
+                        block_idx_batch=block_idx_batch,
+                        part_metas=part_metas,
+                        codebook_dim=int(stage_codebook_dim),
+                        train_device=train_device,
+                        target_dtype=train_dtype,
+                    )
             optimizer.zero_grad(set_to_none=True)
             _, loss_dict = vae(x, is_train=True, act_max=act_max_batch)
             loss = loss_dict["loss"]
@@ -1085,6 +1120,8 @@ def _train_group_vae_and_replace(
                 decoders.append(dec)
             all_stage_decoders.append(decoders)
 
+        if x_all is not None:
+            del x_all
         del vae, train_loader, eval_loader, optimizer, common_stage_result, stage_result
         if lr_scheduler is not None:
             del lr_scheduler
