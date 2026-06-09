@@ -979,7 +979,7 @@ class VAELinear(nn.Module):
         self.clear_decoded_weight_cache()
         self.parallel_stage_decode = bool(parallel_stage_decode)
         if self.parallel_stage_decode:
-            self._enable_parallel_stage_decoder()
+            self.pack_parallel_stage_decoder_(trainable=True)
 
     def disable_trainable_decode(self) -> None:
         self.trainable_decode = False
@@ -987,13 +987,17 @@ class VAELinear(nn.Module):
         self.cache_decoded_weight = True
         self.clear_decoded_weight_cache()
 
-    def _enable_parallel_stage_decoder(self) -> None:
-        if getattr(self, "_parallel_stage_decoder", None) is not None:
-            return
+    def pack_parallel_stage_decoder_(self, *, trainable: bool = False) -> bool:
+        packed_decoder = getattr(self, "_parallel_stage_decoder", None)
+        if packed_decoder is not None:
+            packed_decoder.requires_grad_(bool(trainable))
+            packed_decoder.train(self.training)
+            self.parallel_stage_decode = True
+            return True
         decoders, layout = self._iter_stage_part_decoders_for_pack()
         if len(decoders) <= 1:
             self.parallel_stage_decode = False
-            return
+            return False
         stage_codebook_dims = [int(v) for v in getattr(self, "stage_codebook_dims", [])]
         if len(stage_codebook_dims) != int(self.residual_stages):
             raise ValueError(
@@ -1005,10 +1009,11 @@ class VAELinear(nn.Module):
                 f"got {stage_codebook_dims}."
             )
         packed_decoder = pack_decoders(decoders)
-        packed_decoder.requires_grad_(True)
+        packed_decoder.requires_grad_(bool(trainable))
         packed_decoder.train(self.training)
         self._parallel_stage_layout = list(layout)
         self._parallel_stage_decoder = packed_decoder
+        self.parallel_stage_decode = True
 
         if self._multi_parts:
             del self.decoders
@@ -1018,6 +1023,10 @@ class VAELinear(nn.Module):
             del self.decoder
             for stage_idx in range(1, int(self.residual_stages)):
                 delattr(self, f"decoder_s{stage_idx}")
+        return True
+
+    def _enable_parallel_stage_decoder(self) -> None:
+        self.pack_parallel_stage_decoder_(trainable=True)
 
     def unpack_parallel_stage_decoder_(self) -> bool:
         packed_decoder = getattr(self, "_parallel_stage_decoder", None)

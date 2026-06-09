@@ -10,7 +10,6 @@ from train_utils.cat_arg_overrides import (
     parse_float_text,
     parse_int_text,
     parse_intra_parallel_text,
-    parse_intra_part_sort_mode_text,
     parse_optional_int_text,
     parse_override_table,
     resolve_category_value,
@@ -76,7 +75,6 @@ class BlockVaeLoraArgs:
     vae_log_every: int
     vae_eval_every: int
     intra_parallel: OverrideTable[Tuple[int, int]]
-    intra_part_sort_mode: OverrideTable[str]
     codebook_bits: OverrideTable[int]
     codebook_dim: OverrideTable[int]
     residual_stages: OverrideTable[int]
@@ -213,11 +211,6 @@ _INTRA_PARALLEL_SPEC = _make_override_spec(
     "--intra_parallel",
     lambda raw: parse_intra_parallel_text(raw, arg_name="--intra_parallel"),
     "default=1x1,cat:q_proj=4x1",
-)
-_INTRA_PART_SORT_MODE_SPEC = _make_override_spec(
-    "--intra_part_sort_mode",
-    lambda raw: parse_intra_part_sort_mode_text(raw, arg_name="--intra_part_sort_mode"),
-    "default=none,cat:q_proj=spectral_cosine",
 )
 _CODEBOOK_BITS_SPEC = _make_int_override_spec("--codebook_bits", min_value=1, example="default=32,cat:k_proj=24")
 _CODEBOOK_DIM_SPEC = _make_int_override_spec("--codebook_dim", min_value=1, example="default=32,cat:down_proj=16")
@@ -426,7 +419,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vae_log_every", type=int, default=100)
     parser.add_argument("--vae_eval_every", type=int, default=0)
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"Category override. Example: {_INTRA_PARALLEL_SPEC.example}")
-    parser.add_argument("--intra_part_sort_mode", type=str, default="default=none", help=f"Category override. Example: {_INTRA_PART_SORT_MODE_SPEC.example}")
     parser.add_argument("--codebook_bits", type=str, default="default=32", help=f"Category override. Example: {_CODEBOOK_BITS_SPEC.example}")
     parser.add_argument("--codebook_dim", type=str, default="default=32", help=f"Category override. Example: {_CODEBOOK_DIM_SPEC.example}")
     parser.add_argument("--residual_stages", type=str, default="default=2", help=f"Category override. Example: {_RESIDUAL_STAGES_SPEC.example}")
@@ -572,7 +564,6 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         vae_log_every=int(raw_args.vae_log_every),
         vae_eval_every=int(raw_args.vae_eval_every),
         intra_parallel=parse_override_table(str(raw_args.intra_parallel), spec=_INTRA_PARALLEL_SPEC),
-        intra_part_sort_mode=parse_override_table(str(raw_args.intra_part_sort_mode), spec=_INTRA_PART_SORT_MODE_SPEC),
         codebook_bits=parse_override_table(str(raw_args.codebook_bits), spec=_CODEBOOK_BITS_SPEC),
         codebook_dim=parse_override_table(str(raw_args.codebook_dim), spec=_CODEBOOK_DIM_SPEC),
         residual_stages=parse_override_table(str(raw_args.residual_stages), spec=_RESIDUAL_STAGES_SPEC),
@@ -760,7 +751,6 @@ def resolve_block_runtime_configs(
     tables = (
         (args.vae_steps, "--vae_steps"),
         (args.intra_parallel, "--intra_parallel"),
-        (args.intra_part_sort_mode, "--intra_part_sort_mode"),
         (args.codebook_bits, "--codebook_bits"),
         (args.codebook_dim, "--codebook_dim"),
         (args.residual_stages, "--residual_stages"),
@@ -786,7 +776,7 @@ def resolve_block_runtime_configs(
             joint_decoder_group_size=1,
             joint_decoder_batch_size=None,
             intra_parallel=tuple(resolve_category_value(args.intra_parallel, category)),
-            intra_part_sort_mode=str(resolve_category_value(args.intra_part_sort_mode, category)),
+            intra_part_sort_mode="none",
             codebook_bits=int(resolve_category_value(args.codebook_bits, category)),
             codebook_dim=int(resolve_category_value(args.codebook_dim, category)),
             outlier_protect_count=0,

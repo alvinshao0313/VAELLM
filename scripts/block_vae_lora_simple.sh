@@ -13,8 +13,9 @@ if [[ "${FULL_DETERMINISM:-false}" == "true" ]]; then
   export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 fi
 
-# --block_resume_from_checkpoint 用于从之前的训练中断点继续训练，参数值为checkpoint文件夹路径
-# 
+# 可选参数：
+# --access_token "hf_xxx" 用于私有或 gated 模型。
+# --block_resume_from_checkpoint 只支持 inline/distill 路径；pretrain/pretrain_distill 模式不支持。
 
 python tools/block_vae_lora_train.py \
   --model_path "Qwen/Qwen3-8B" \
@@ -23,7 +24,6 @@ python tools/block_vae_lora_train.py \
   --deterministic "${FULL_DETERMINISM:-false}" \
   --train_device "cuda" \
   --convert_device "cuda" \
-  --unload_vae_original_weights_on_final_save \
   --block_vae_pipeline_mode "pretrain" \
   --vae_pretrained_checkpoint ".result/block_vae_cache" \
   --block_vae_pretrain_devices "cuda" \
@@ -31,6 +31,7 @@ python tools/block_vae_lora_train.py \
   --block_vae_linear_group_size "36" \
   --block_vae_allow_tail_group "true" \
   --block_vae_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --codebook_bits "default=32" \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
@@ -42,9 +43,8 @@ python tools/block_vae_lora_train.py \
   --decoder_type "default=symmetric" \
   --recon_loss_type "default=mse" \
   --intra_parallel "default=1x1" \
-  --intra_part_sort_mode "default=none" \
-  --vae_steps "default=500" \
-  --vae_batch_size "131072" \
+  --vae_steps "default=20000" \
+  --vae_batch_size "16384" \
   --vae_gpu_resident_data "true" \
   --vae_log_every 100 \
   --vae_eval_every 0 \
@@ -53,7 +53,7 @@ python tools/block_vae_lora_train.py \
   --gamma "1.0" \
   --zeta "1.0" \
   --inv_temperature "100.0" \
-  --lr "3e-3" \
+  --lr "1e-2" \
   --beta1 "0.9" \
   --beta2 "0.95" \
   --weight_decay "0.0" \
@@ -66,6 +66,7 @@ python tools/block_vae_lora_train.py \
   --entropy_loss_weight "1e-2" \
   --diversity_gamma "1.0" \
   --normalize_weight \
+  --use_checkpoint \
   --new_quant \
   --block_distill_dataset "openorca=0.24,fineweb_edu=0.18,race=0.24,sciq=0.03,alpaca=0.11,longalpaca=0.10,longalign=0.10" \
   --block_distill_steps "5" \
@@ -91,7 +92,6 @@ python tools/block_vae_lora_train.py \
   --block_attn_query_chunk_size "4096" \
   --block_distill_log_every "10" \
   --block_decode_group_size "8" \
-  --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --block_layers "all" \
   --block_eval_after_each_layer "true" \

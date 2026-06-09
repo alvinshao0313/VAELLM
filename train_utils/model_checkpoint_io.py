@@ -2,8 +2,9 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -445,6 +446,7 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "parallel_cols": int(getattr(module, "parallel_cols", 1)),
                 "residual_stages": residual_stages,
                 "stage_codebook_dims": stage_codebook_dims,
+                "parallel_stage_decode": bool(getattr(module, "_parallel_stage_decoder", None) is not None),
                 "has_bias": bool(module.bias is not None),
                 "has_original_weight": bool(module.original_weight is not None),
                 "always_use_original": bool(getattr(module, "always_use_original", False)),
@@ -479,6 +481,23 @@ def unload_vae_original_linear_weights(model: nn.Module) -> int:
     return unloaded
 
 
+@contextmanager
+def temporarily_pack_parallel_stage_decoders_for_checkpoint(model: nn.Module) -> Iterator[int]:
+    packed_modules: List[VAELinear] = []
+    try:
+        for module in model.modules():
+            if not isinstance(module, VAELinear):
+                continue
+            if getattr(module, "_parallel_stage_decoder", None) is not None:
+                continue
+            if module.pack_parallel_stage_decoder_(trainable=False):
+                packed_modules.append(module)
+        yield int(len(packed_modules))
+    finally:
+        for module in reversed(packed_modules):
+            module.unpack_parallel_stage_decoder_()
+
+
 def save_model_checkpoint(
     model: nn.Module,
     output_dir: str,
@@ -495,7 +514,10 @@ def save_model_checkpoint(
         unload_vae_original_linear_weights(model)
 
     state_path = os.path.join(output_dir, STATE_DICT_FILENAME)
-    torch.save(model.state_dict(), state_path)
+    with temporarily_pack_parallel_stage_decoders_for_checkpoint(model):
+        state_dict = model.state_dict()
+        vae_specs = _collect_vae_linear_specs(model)
+        torch.save(state_dict, state_path)
 
     if save_config and getattr(model, "config", None) is not None:
         model.config.save_pretrained(output_dir)
@@ -506,7 +528,6 @@ def save_model_checkpoint(
     if base_model_path is None and getattr(model, "config", None) is not None:
         base_model_path = getattr(model.config, "_name_or_path", None)
 
-    vae_specs = _collect_vae_linear_specs(model)
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
         "version": 6,
@@ -978,6 +999,8 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
             always_use_original=bool(spec.get("always_use_original", False)),
             protect_original_weight=bool(spec.get("protect_original_weight", False)),
         )
+        if bool(spec.get("parallel_stage_decode", False)):
+            new_module.pack_parallel_stage_decoder_(trainable=False)
         set_module_by_name(model, name, new_module)
 
 

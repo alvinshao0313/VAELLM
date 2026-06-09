@@ -1,5 +1,6 @@
 import json
 import os
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -33,6 +34,7 @@ from train_utils.model_checkpoint_io import (
     _rebuild_converted_modules,
     _torch_load_state_dict,
     _vq_storage_spec_from_module,
+    temporarily_pack_parallel_stage_decoders_for_checkpoint,
     unload_vae_original_linear_weights,
 )
 
@@ -146,6 +148,7 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
         "parallel_cols": int(getattr(module, "parallel_cols", 1)),
         "residual_stages": residual_stages,
         "stage_codebook_dims": stage_codebook_dims,
+        "parallel_stage_decode": bool(getattr(module, "_parallel_stage_decoder", None) is not None),
         "has_bias": bool(module.bias is not None),
         "has_original_weight": bool(module.original_weight is not None),
         "always_use_original": bool(getattr(module, "always_use_original", False)),
@@ -222,17 +225,22 @@ def save_e2e_model_checkpoint(
     if state_dict is None and unload_vae_original_weights:
         unload_vae_original_linear_weights(model)
 
-    if state_dict is None:
-        state_dict = model.state_dict()
-
-    if compact_unload_vae_original_weights:
-        state_dict, converted_modules, adapter_modules = _build_compact_e2e_checkpoint_payload(model, state_dict)
-    else:
-        converted_modules, adapter_modules = _collect_e2e_module_specs(model)
-    inject_peft_proxy_adalora_runtime_state_dict(model, state_dict)
-
     state_path = os.path.join(output_dir, STATE_DICT_FILENAME)
-    torch.save(state_dict, state_path)
+    pack_ctx = (
+        temporarily_pack_parallel_stage_decoders_for_checkpoint(model)
+        if state_dict is None
+        else nullcontext(0)
+    )
+    with pack_ctx:
+        if state_dict is None:
+            state_dict = model.state_dict()
+
+        if compact_unload_vae_original_weights:
+            state_dict, converted_modules, adapter_modules = _build_compact_e2e_checkpoint_payload(model, state_dict)
+        else:
+            converted_modules, adapter_modules = _collect_e2e_module_specs(model)
+        inject_peft_proxy_adalora_runtime_state_dict(model, state_dict)
+        torch.save(state_dict, state_path)
 
     if save_config and getattr(model, "config", None) is not None:
         model.config.save_pretrained(output_dir)
