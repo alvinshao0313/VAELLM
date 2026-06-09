@@ -29,6 +29,7 @@ _QUANTIZER_CHOICES = ("LFQ", "BSQ")
 _BLOCK_LORA_VARIANT_CHOICES = ("plain", "rslora", "dora", "adalora")
 _BLOCK_LORA_BIAS_CHOICES = ("none", "lora_only")
 _BLOCK_DISTILL_TRAIN_MODE_CHOICES = ("lora", "decoder", "both")
+_BLOCK_VAE_PIPELINE_MODE_CHOICES = ("inline", "pretrain", "distill", "pretrain_distill")
 _QWEN3_BLOCK_LINEAR_CATEGORIES = (
     "q_proj",
     "k_proj",
@@ -38,6 +39,7 @@ _QWEN3_BLOCK_LINEAR_CATEGORIES = (
     "up_proj",
     "down_proj",
 )
+_DEFAULT_BLOCK_VAE_CATEGORIES = ",".join(_QWEN3_BLOCK_LINEAR_CATEGORIES)
 _DEFAULT_TRANSPOSE_MODULES = "q_proj,v_proj,o_proj,down_proj"
 
 
@@ -61,8 +63,16 @@ class BlockVaeLoraArgs:
     train_device: str
     convert_device: str
     unload_vae_original_weights_on_final_save: bool
+    block_vae_pipeline_mode: str
+    vae_pretrained_checkpoint: Optional[str]
+    block_vae_pretrain_devices: str
+    block_vae_pretrain_workers: Optional[int]
+    block_vae_linear_group_size: int
+    block_vae_allow_tail_group: bool
+    block_vae_categories: Tuple[str, ...]
     vae_steps: OverrideTable[int]
     vae_batch_size: str
+    vae_gpu_resident_data: bool
     vae_log_every: int
     vae_eval_every: int
     intra_parallel: OverrideTable[Tuple[int, int]]
@@ -259,6 +269,23 @@ def parse_vae_batch_size(raw: str) -> str:
     return str(int(value))
 
 
+def parse_block_vae_categories(raw: str) -> Tuple[str, ...]:
+    text = str(raw).strip()
+    if not text:
+        raise argparse.ArgumentTypeError("--block_vae_categories cannot be empty.")
+    categories = []
+    seen = set()
+    for part in text.split(","):
+        category = part.strip()
+        if not category:
+            raise argparse.ArgumentTypeError(f"Invalid --block_vae_categories={raw!r}: empty segment.")
+        if category in seen:
+            raise argparse.ArgumentTypeError(f"--block_vae_categories contains duplicate category {category!r}.")
+        seen.add(category)
+        categories.append(category)
+    return tuple(categories)
+
+
 def parse_block_layers(raw: str, *, num_layers: Optional[int] = None) -> Tuple[int, ...]:
     text = str(raw).strip().lower()
     if not text:
@@ -360,12 +387,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--block_vae_pipeline_mode",
+        type=lambda raw: _parse_choice(raw, arg_name="--block_vae_pipeline_mode", choices=_BLOCK_VAE_PIPELINE_MODE_CHOICES),
+        default="inline",
+    )
+    parser.add_argument("--vae_pretrained_checkpoint", type=str, default=None)
+    parser.add_argument("--block_vae_pretrain_devices", type=str, default="")
+    parser.add_argument(
+        "--block_vae_pretrain_workers",
+        type=lambda raw: None if str(raw).strip() == "" else int(raw),
+        default=None,
+    )
+    parser.add_argument("--block_vae_linear_group_size", type=int, default=32)
+    parser.add_argument(
+        "--block_vae_allow_tail_group",
+        type=lambda raw: parse_bool_text(raw, arg_name="--block_vae_allow_tail_group"),
+        default=True,
+    )
+    parser.add_argument(
+        "--block_vae_categories",
+        type=parse_block_vae_categories,
+        default=_QWEN3_BLOCK_LINEAR_CATEGORIES,
+        help=f"Comma-separated block Linear categories to VAE-train/distill, in pretrain order. Default: {_DEFAULT_BLOCK_VAE_CATEGORIES}.",
+    )
     parser.add_argument("--access_token", type=str, default=None)
     parser.add_argument("--bf16", type=lambda raw: parse_bool_text(raw, arg_name="--bf16"), default=True)
     parser.add_argument("--fp16", type=lambda raw: parse_bool_text(raw, arg_name="--fp16"), default=False)
 
     parser.add_argument("--vae_steps", type=str, default="default=20000", help=f"Category override. Example: {_VAE_STEPS_SPEC.example}")
     parser.add_argument("--vae_batch_size", type=parse_vae_batch_size, default="8192")
+    parser.add_argument(
+        "--vae_gpu_resident_data",
+        type=lambda raw: parse_bool_text(raw, arg_name="--vae_gpu_resident_data"),
+        default=False,
+        help="Whether to keep each VAE residual stage dataset on GPU during training.",
+    )
     parser.add_argument("--vae_log_every", type=int, default=100)
     parser.add_argument("--vae_eval_every", type=int, default=0)
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"Category override. Example: {_INTRA_PARALLEL_SPEC.example}")
@@ -498,8 +555,20 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         train_device=str(raw_args.train_device),
         convert_device=str(raw_args.convert_device),
         unload_vae_original_weights_on_final_save=bool(raw_args.unload_vae_original_weights_on_final_save),
+        block_vae_pipeline_mode=str(raw_args.block_vae_pipeline_mode).lower(),
+        vae_pretrained_checkpoint=None
+        if raw_args.vae_pretrained_checkpoint is None or str(raw_args.vae_pretrained_checkpoint).strip() == ""
+        else str(raw_args.vae_pretrained_checkpoint),
+        block_vae_pretrain_devices=str(raw_args.block_vae_pretrain_devices),
+        block_vae_pretrain_workers=None
+        if raw_args.block_vae_pretrain_workers is None
+        else int(raw_args.block_vae_pretrain_workers),
+        block_vae_linear_group_size=int(raw_args.block_vae_linear_group_size),
+        block_vae_allow_tail_group=bool(raw_args.block_vae_allow_tail_group),
+        block_vae_categories=tuple(str(category) for category in raw_args.block_vae_categories),
         vae_steps=parse_override_table(str(raw_args.vae_steps), spec=_VAE_STEPS_SPEC),
         vae_batch_size=str(raw_args.vae_batch_size),
+        vae_gpu_resident_data=bool(raw_args.vae_gpu_resident_data),
         vae_log_every=int(raw_args.vae_log_every),
         vae_eval_every=int(raw_args.vae_eval_every),
         intra_parallel=parse_override_table(str(raw_args.intra_parallel), spec=_INTRA_PARALLEL_SPEC),
@@ -585,6 +654,22 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
         parser.error("--vae_log_every must be >= 1.")
     if int(args.vae_eval_every) < 0:
         parser.error("--vae_eval_every must be >= 0.")
+    if str(args.block_vae_pipeline_mode) not in _BLOCK_VAE_PIPELINE_MODE_CHOICES:
+        parser.error(f"--block_vae_pipeline_mode must be one of: {','.join(_BLOCK_VAE_PIPELINE_MODE_CHOICES)}.")
+    if str(args.block_vae_pipeline_mode) in {"pretrain", "distill", "pretrain_distill"} and args.vae_pretrained_checkpoint is None:
+        parser.error("--vae_pretrained_checkpoint is required when --block_vae_pipeline_mode is pretrain, distill, or pretrain_distill.")
+    if args.block_vae_pretrain_workers is not None and int(args.block_vae_pretrain_workers) < 1:
+        parser.error("--block_vae_pretrain_workers must be >= 1.")
+    if int(args.block_vae_linear_group_size) < 1:
+        parser.error("--block_vae_linear_group_size must be >= 1.")
+    allowed_block_categories = set(_QWEN3_BLOCK_LINEAR_CATEGORIES)
+    invalid_block_categories = [category for category in args.block_vae_categories if category not in allowed_block_categories]
+    if invalid_block_categories:
+        parser.error(
+            "--block_vae_categories contains invalid category values for the current Qwen3 block path: "
+            f"{','.join(invalid_block_categories)}. "
+            f"Allowed values: {','.join(_QWEN3_BLOCK_LINEAR_CATEGORIES)}."
+        )
     if int(args.lr_warmup_steps) < 0:
         parser.error("--lr_warmup_steps must be >= 0.")
     if "=" not in str(args.block_distill_dataset):
@@ -637,13 +722,13 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
         skip_layers = parse_skip_layers(str(args.skip_layers))
     except ValueError as exc:
         parser.error(str(exc))
-    allowed_categories = set(_QWEN3_BLOCK_LINEAR_CATEGORIES)
-    invalid_skip_categories = sorted({category for _layer_idx, category in skip_layers if category not in allowed_categories})
+    selected_categories = set(args.block_vae_categories)
+    invalid_skip_categories = sorted({category for _layer_idx, category in skip_layers if category not in selected_categories})
     if invalid_skip_categories:
         parser.error(
             "--skip_layers contains invalid category values: "
             f"{','.join(invalid_skip_categories)}. "
-            f"Allowed values: {','.join(_QWEN3_BLOCK_LINEAR_CATEGORIES)}."
+            f"Allowed values from --block_vae_categories: {','.join(args.block_vae_categories)}."
         )
     try:
         parse_block_layers(str(args.block_layers), num_layers=None)

@@ -79,6 +79,17 @@ def _str_list(value: object, *, field_name: str) -> List[str]:
     return [str(item) for item in value]
 
 
+def _checkpoint_block_vae_categories(extra: Dict[str, Any]) -> Tuple[str, ...]:
+    value = extra.get("block_vae_categories")
+    if value is None:
+        block_args = extra.get("block_distill", {})
+        if isinstance(block_args, dict):
+            value = block_args.get("block_vae_categories")
+    if not isinstance(value, list):
+        raise TypeError("checkpoint extra_meta.block_vae_categories must be a list.")
+    return tuple(str(item) for item in value)
+
+
 def load_block_resume_state(
     path: str,
     *,
@@ -113,6 +124,26 @@ def load_block_resume_state(
             "Resume checkpoint block_distill_train_mode does not match current argument: "
             f"checkpoint={actual_train_mode!r} current={expected_train_mode!r}"
         )
+    actual_categories = _checkpoint_block_vae_categories(extra)
+    expected_categories = tuple(str(category) for category in current_args.block_vae_categories)
+    if actual_categories != expected_categories:
+        raise ValueError(
+            "Resume checkpoint block_vae_categories do not match current argument: "
+            f"checkpoint={list(actual_categories)} current={list(expected_categories)}"
+        )
+    actual_pipeline_mode = extra.get("block_vae_pipeline_mode")
+    if actual_pipeline_mode is not None:
+        actual_pipeline_mode = str(actual_pipeline_mode).strip().lower()
+        expected_pipeline_mode = str(current_args.block_vae_pipeline_mode).strip().lower()
+        compatible_pipeline = (
+            expected_pipeline_mode == "distill"
+            and actual_pipeline_mode in {"distill", "pretrain_distill"}
+        )
+        if actual_pipeline_mode != expected_pipeline_mode and not compatible_pipeline:
+            raise ValueError(
+                "Resume checkpoint block_vae_pipeline_mode does not match current argument: "
+                f"checkpoint={actual_pipeline_mode!r} current={expected_pipeline_mode!r}"
+            )
 
     completed_layer_idx = int(extra.get("completed_block_layer_idx"))
     completed_layers = _int_tuple(extra.get("completed_block_layers"), field_name="extra_meta.completed_block_layers")
@@ -172,12 +203,17 @@ def build_block_checkpoint_meta(
     selected_layers: Sequence[int],
     skip_layer_keys: Sequence[Tuple[int, str]],
     target_module_count: int,
+    block_vae_cache_manifest_hash: str = "",
 ) -> Dict[str, Any]:
     completed_layers = sorted(int(layer_idx) for layer_idx in completed_block_layers)
     return {
         "stage": BLOCK_LAYER_CHECKPOINT_STAGE,
         "block_distill": _to_jsonable(args),
         "block_distill_train_mode": str(args.block_distill_train_mode),
+        "block_vae_pipeline_mode": str(args.block_vae_pipeline_mode),
+        "block_vae_categories": [str(category) for category in args.block_vae_categories],
+        "block_vae_pretrain_manifest_hash": str(block_vae_cache_manifest_hash),
+        "block_vae_cache_manifest_hash": str(block_vae_cache_manifest_hash),
         "completed_block_layer_idx": int(completed_block_layer_idx),
         "completed_block_layers": completed_layers,
         "next_block_layer_idx": int(completed_block_layer_idx) + 1,
@@ -197,6 +233,7 @@ def save_block_layer_checkpoint(
     selected_layers: Sequence[int],
     skip_layer_keys: Sequence[Tuple[int, str]],
     target_module_count: int,
+    block_vae_cache_manifest_hash: str = "",
 ) -> Dict[str, str]:
     checkpoint_dir = os.path.join(
         str(run_output_dir),
@@ -210,6 +247,7 @@ def save_block_layer_checkpoint(
         selected_layers=selected_layers,
         skip_layer_keys=skip_layer_keys,
         target_module_count=int(target_module_count),
+        block_vae_cache_manifest_hash=str(block_vae_cache_manifest_hash),
     )
     return save_e2e_model_checkpoint(
         model,

@@ -53,6 +53,7 @@ class NormalizedCatArgs:
     intra_parallel: OverrideTable[Tuple[int, int]]
     intra_part_sort_mode: OverrideTable[str]
     batch_size: int
+    gpu_resident_data: bool
     log_every: int
     eval_every: int
     eval_blocks: int
@@ -600,6 +601,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         intra_parallel=_parse_cat_override(raw_args.intra_parallel, spec=_INTRA_PARALLEL_SPEC),
         intra_part_sort_mode=_parse_cat_override(raw_args.intra_part_sort_mode, spec=_INTRA_PART_SORT_MODE_SPEC),
         batch_size=int(raw_args.batch_size),
+        gpu_resident_data=bool(raw_args.gpu_resident_data),
         log_every=int(raw_args.log_every),
         eval_every=int(raw_args.eval_every),
         eval_blocks=int(raw_args.eval_blocks),
@@ -989,6 +991,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"类别覆盖参数。示例：{_INTRA_PARALLEL_SPEC.example}")
     parser.add_argument("--intra_part_sort_mode", type=str, default="default=none", help=f"类别覆盖参数。示例：{_INTRA_PART_SORT_MODE_SPEC.example}")
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument(
+        "--gpu_resident_data",
+        type=lambda raw: parse_bool_text(raw, arg_name="--gpu_resident_data"),
+        default=False,
+        help="是否把当前 VAE residual stage 的训练数据常驻 GPU。只影响搬运方式，不改变 batch size。",
+    )
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=0)
     parser.add_argument("--eval_blocks", type=int, default=256)

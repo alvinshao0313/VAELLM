@@ -19,7 +19,6 @@ from e2e_common.post_norm_head import fuse_post_norm_head_linear
 from litebsq.vae_linear import clear_model_vae_linear_cache
 from train_utils.block_distill import (
     BlockDistillConfig,
-    QWEN3_BLOCK_CATEGORIES,
     build_initial_hidden_states,
     prepare_block_eval_decoded_weights,
     train_block_lora_distill,
@@ -42,6 +41,15 @@ from train_utils.block_vae_lora_checkpoint import (
     load_block_resume_state,
     prune_block_layer_checkpoints,
     save_block_layer_checkpoint,
+)
+from train_utils.block_vae_cache import (
+    build_category_pretrain_tasks,
+    compute_block_vae_category_pretrain_hash,
+    collect_block_linear_refs as _collect_block_linear_refs,
+    load_block_vae_category_pretrained_model,
+    planned_block_groups as _planned_block_groups,
+    run_block_vae_category_pretrain,
+    validate_block_vae_category_pretrained_meta,
 )
 from train_utils.cat_train_eval import eval_after_category
 from train_utils.cat_train_args import parse_skip_layers
@@ -117,7 +125,8 @@ def _build_internal_vae_namespace(args: BlockVaeLoraArgs, training_args) -> argp
 
 
 def _build_internal_cat_namespace(args: BlockVaeLoraArgs) -> argparse.Namespace:
-    eval_blocks = 2**63 - 1 if str(args.vae_batch_size).strip().lower() == "all" else int(args.vae_batch_size)
+    # eval_blocks 只保留给 cat_train helper 兼容；VAE 训练中 eval 现在固定扫描完整 residual stage。
+    eval_blocks = 2**63 - 1
     return argparse.Namespace(
         output_dir=str(args.output_dir),
         seed=int(args.seed),
@@ -130,96 +139,11 @@ def _build_internal_cat_namespace(args: BlockVaeLoraArgs) -> argparse.Namespace:
         rot_llm=False,
         resume_from_checkpoint=None,
         batch_size=str(args.vae_batch_size),
+        gpu_resident_data=bool(args.vae_gpu_resident_data),
         log_every=int(args.vae_log_every),
         eval_every=int(args.vae_eval_every),
         eval_blocks=int(eval_blocks),
     )
-
-
-def _module_shape_key(ref: LinearRef, runtime_cfg) -> Tuple[object, ...]:
-    weight = ref.module.weight
-    effective = weight.t() if bool(ref.transpose) else weight
-    row_parts, col_parts = tuple(runtime_cfg.intra_parallel)
-    return (
-        int(effective.numel()),
-        int(row_parts) * int(col_parts),
-        int(runtime_cfg.residual_stages),
-        int(runtime_cfg.steps),
-        int(runtime_cfg.joint_decoder_steps),
-        float(runtime_cfg.joint_decoder_lr),
-        int(runtime_cfg.joint_decoder_group_size),
-        None if runtime_cfg.joint_decoder_batch_size is None else int(runtime_cfg.joint_decoder_batch_size),
-        tuple(runtime_cfg.intra_parallel),
-        str(runtime_cfg.intra_part_sort_mode),
-        int(runtime_cfg.codebook_bits),
-        int(runtime_cfg.codebook_dim),
-        str(runtime_cfg.recon_loss_type),
-        int(runtime_cfg.base_ch),
-        int(runtime_cfg.num_res_blocks),
-        None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch),
-        None if runtime_cfg.decoder_num_res_blocks is None else int(runtime_cfg.decoder_num_res_blocks),
-        str(runtime_cfg.norm_type),
-        str(runtime_cfg.decoder_type),
-    )
-
-
-def _collect_block_linear_refs(
-    model: nn.Module,
-    *,
-    layer_idx: int,
-    transpose_modules: Sequence[str],
-) -> Dict[str, LinearRef]:
-    transpose_set = set(str(item) for item in transpose_modules)
-    layer = model.model.layers[int(layer_idx)]
-    refs = {
-        "q_proj": layer.self_attn.q_proj,
-        "k_proj": layer.self_attn.k_proj,
-        "v_proj": layer.self_attn.v_proj,
-        "o_proj": layer.self_attn.o_proj,
-        "gate_proj": layer.mlp.gate_proj,
-        "up_proj": layer.mlp.up_proj,
-        "down_proj": layer.mlp.down_proj,
-    }
-    out: Dict[str, LinearRef] = {}
-    for category, module in refs.items():
-        if not isinstance(module, nn.Linear):
-            raise TypeError(
-                f"Layer {layer_idx}.{category} must be nn.Linear before VAE conversion, got {type(module)}."
-            )
-        name = f"model.layers.{int(layer_idx)}."
-        if category in {"q_proj", "k_proj", "v_proj", "o_proj"}:
-            name += f"self_attn.{category}"
-        else:
-            name += f"mlp.{category}"
-        out[category] = LinearRef(
-            name=name,
-            module=module,
-            category=category,
-            transpose=category in transpose_set,
-        )
-    return out
-
-
-def _planned_block_groups(
-    refs_by_category: Dict[str, LinearRef],
-    resolved_cfgs,
-) -> List[List[LinearRef]]:
-    preferred_groups = (
-        ("q_proj", "o_proj"),
-        ("k_proj", "v_proj"),
-        ("gate_proj", "up_proj", "down_proj"),
-    )
-    groups: List[List[LinearRef]] = []
-    for categories in preferred_groups:
-        by_key: Dict[Tuple[object, ...], List[LinearRef]] = {}
-        for category in categories:
-            if category not in refs_by_category:
-                continue
-            ref = refs_by_category[category]
-            key = _module_shape_key(ref, resolved_cfgs[category])
-            by_key.setdefault(key, []).append(ref)
-        groups.extend(by_key.values())
-    return groups
 
 
 def _save_block_args_snapshot(
@@ -289,6 +213,7 @@ def _train_block_vae_groups(
             log_every=cat_args.log_every,
             eval_every=cat_args.eval_every,
             eval_blocks=cat_args.eval_blocks,
+            gpu_resident_data=bool(getattr(cat_args, "gpu_resident_data", False)),
             skip_layer_keys=set(),
             activation_runtime=None,
             outlier_protect_mode="none",
@@ -364,9 +289,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         format_namespace(vae_args),
         format_namespace(training_args),
     )
+    pipeline_mode = str(args.block_vae_pipeline_mode).strip().lower()
+    if pipeline_mode in {"pretrain", "pretrain_distill"} and args.block_resume_from_checkpoint is not None:
+        raise ValueError(
+            f"--block_vae_pipeline_mode {pipeline_mode} does not support --block_resume_from_checkpoint."
+        )
 
+    loaded_pretrain_meta = None
+    loaded_resume_meta = None
     if args.block_resume_from_checkpoint is None:
-        model = load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
+        if pipeline_mode == "distill":
+            model, loaded_pretrain_meta, pretrain_load_result = load_block_vae_category_pretrained_model(
+                str(args.vae_pretrained_checkpoint),
+                access_token=hf_args.access_token,
+                proxy_group_size=int(args.block_decode_group_size),
+                proxy_compute_device=str(args.convert_device),
+                logger=logger,
+            )
+            logger.info(
+                "Loaded block VAE category-pretrained checkpoint: %s missing_keys=%d unexpected_keys=%d",
+                str(args.vae_pretrained_checkpoint),
+                len(getattr(pretrain_load_result, "missing_keys", [])),
+                len(getattr(pretrain_load_result, "unexpected_keys", [])),
+            )
+        else:
+            model = load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
     else:
         model, resume_checkpoint_dir, resume_load_meta, resume_load_result = load_block_resume_model(
             str(args.block_resume_from_checkpoint),
@@ -375,6 +322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             proxy_compute_device=str(args.convert_device),
             logger=logger,
         )
+        loaded_resume_meta = resume_load_meta
         logger.info("Resuming block run from checkpoint: %s", resume_checkpoint_dir)
         logger.info(
             "Resume checkpoint loaded. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
@@ -387,8 +335,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     validate_qwen3_model(model)
 
     transpose_modules = parse_transpose_modules(str(args.transpose_modules))
-    active_categories = list(QWEN3_BLOCK_CATEGORIES)
-    resolved_cfgs = resolve_block_runtime_configs(args, active_categories)
+    configured_categories = list(args.block_vae_categories)
+    resolved_cfgs = resolve_block_runtime_configs(args, configured_categories)
     block_snapshot = _save_block_args_snapshot(
         run_output_dir=run_output_dir,
         args=args,
@@ -397,6 +345,121 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         resolved_cfgs=resolved_cfgs,
     )
     logger.info("Saved block parameter snapshot: %s", block_snapshot)
+
+    num_layers = int(model.config.num_hidden_layers)
+    try:
+        selected_layers = set(parse_block_layers(str(args.block_layers), num_layers=int(num_layers)))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    if not selected_layers:
+        raise ValueError("--block_layers resolved to an empty layer set.")
+    skip_layer_keys = parse_skip_layers(str(args.skip_layers))
+    validate_skip_layers_with_block_layers(
+        skip_layer_keys=sorted(skip_layer_keys),
+        selected_layers=sorted(selected_layers),
+    )
+    logger.info(
+        "Selected block layers: %s",
+        ",".join(str(idx) for idx in sorted(selected_layers)),
+    )
+    if skip_layer_keys:
+        logger.info("Block skip_layers: %s", ",".join(format_skip_layers(sorted(skip_layer_keys))))
+    expected_count = sum(
+        1
+        for layer_idx in selected_layers
+        for category in configured_categories
+        if (int(layer_idx), str(category)) not in skip_layer_keys
+    )
+    if int(expected_count) <= 0:
+        raise ValueError(
+            "No effective block VAE targets remain after applying --block_layers, "
+            "--block_vae_categories, and --skip_layers."
+        )
+    block_vae_pretrain_manifest_hash = ""
+    if pipeline_mode == "distill":
+        if loaded_pretrain_meta is not None:
+            block_vae_pretrain_manifest_hash = validate_block_vae_category_pretrained_meta(
+                loaded_pretrain_meta,
+                args=args,
+                selected_layers=sorted(selected_layers),
+                skip_layer_keys=sorted(skip_layer_keys),
+                transpose_modules=transpose_modules,
+                resolved_cfgs=resolved_cfgs,
+            )
+            logger.info(
+                "Validated block VAE category-pretrained checkpoint: manifest_hash=%s",
+                block_vae_pretrain_manifest_hash,
+            )
+        else:
+            extra_meta = loaded_resume_meta.get("extra_meta", {}) if isinstance(loaded_resume_meta, dict) else {}
+            block_vae_pretrain_manifest_hash = compute_block_vae_category_pretrain_hash(
+                args=args,
+                selected_layers=sorted(selected_layers),
+                skip_layer_keys=sorted(skip_layer_keys),
+                transpose_modules=transpose_modules,
+                resolved_cfgs=resolved_cfgs,
+            )
+            checkpoint_hash = str(extra_meta.get("block_vae_cache_manifest_hash", ""))
+            if checkpoint_hash != block_vae_pretrain_manifest_hash:
+                raise ValueError(
+                    "Resume checkpoint block VAE pretrain manifest hash mismatch: "
+                    f"checkpoint={checkpoint_hash!r} current={block_vae_pretrain_manifest_hash!r}."
+                )
+    resume_start_layer = 0
+    completed_block_layers: List[int] = []
+    if args.block_resume_from_checkpoint is not None:
+        resume_state = load_block_resume_state(
+            str(args.block_resume_from_checkpoint),
+            current_args=args,
+            selected_layers=sorted(selected_layers),
+            skip_layer_keys=sorted(skip_layer_keys),
+        )
+        resume_start_layer = int(resume_state.next_block_layer_idx)
+        if int(resume_start_layer) >= int(num_layers):
+            raise ValueError(
+                f"Resume checkpoint already reached layer {int(resume_state.completed_block_layer_idx)}, "
+                f"but model only has {int(num_layers)} layers."
+            )
+        completed_block_layers = list(resume_state.completed_block_layers)
+        logger.info(
+            "Block resume state: completed_layer=%d next_layer=%d completed_layers=%s",
+            int(resume_state.completed_block_layer_idx),
+            int(resume_start_layer),
+            ",".join(str(idx) for idx in completed_block_layers),
+        )
+    if pipeline_mode in {"pretrain", "pretrain_distill"}:
+        category_tasks, block_vae_pretrain_manifest_hash = build_category_pretrain_tasks(
+            model=model,
+            args=args,
+            selected_layers=sorted(selected_layers),
+            skip_layer_keys=sorted(skip_layer_keys),
+            transpose_modules=transpose_modules,
+            resolved_cfgs=resolved_cfgs,
+        )
+        logger.info(
+            "Block VAE category pretrain tasks ready: mode=%s tasks=%d manifest_hash=%s",
+            pipeline_mode,
+            len(category_tasks),
+            block_vae_pretrain_manifest_hash,
+        )
+        run_block_vae_category_pretrain(
+            model=model,
+            tasks=category_tasks,
+            pretrain_hash=block_vae_pretrain_manifest_hash,
+            args=args,
+            hf_args=hf_args,
+            training_args=training_args,
+            vae_args=vae_args,
+            cat_args=cat_args,
+            transpose_modules=transpose_modules,
+            resolved_cfgs=resolved_cfgs,
+            selected_layers=sorted(selected_layers),
+            skip_layer_keys=sorted(skip_layer_keys),
+            logger=logger,
+        )
+        if pipeline_mode == "pretrain":
+            logger.info("Done.")
+            return
 
     from transformers import AutoTokenizer
 
@@ -420,52 +483,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         input_blocks,
         device=str(args.train_device),
     )
-    num_layers = int(model.config.num_hidden_layers)
-    try:
-        selected_layers = set(parse_block_layers(str(args.block_layers), num_layers=int(num_layers)))
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
-    if not selected_layers:
-        raise ValueError("--block_layers resolved to an empty layer set.")
-    skip_layer_keys = parse_skip_layers(str(args.skip_layers))
-    validate_skip_layers_with_block_layers(
-        skip_layer_keys=sorted(skip_layer_keys),
-        selected_layers=sorted(selected_layers),
-    )
-    logger.info(
-        "Selected block layers: %s",
-        ",".join(str(idx) for idx in sorted(selected_layers)),
-    )
-    if skip_layer_keys:
-        logger.info("Block skip_layers: %s", ",".join(format_skip_layers(sorted(skip_layer_keys))))
-    expected_count = sum(
-        1
-        for layer_idx in selected_layers
-        for category in QWEN3_BLOCK_CATEGORIES
-        if (int(layer_idx), str(category)) not in skip_layer_keys
-    )
-    resume_start_layer = 0
-    completed_block_layers: List[int] = []
-    if args.block_resume_from_checkpoint is not None:
-        resume_state = load_block_resume_state(
-            str(args.block_resume_from_checkpoint),
-            current_args=args,
-            selected_layers=sorted(selected_layers),
-            skip_layer_keys=sorted(skip_layer_keys),
-        )
-        resume_start_layer = int(resume_state.next_block_layer_idx)
-        if int(resume_start_layer) >= int(num_layers):
-            raise ValueError(
-                f"Resume checkpoint already reached layer {int(resume_state.completed_block_layer_idx)}, "
-                f"but model only has {int(num_layers)} layers."
-            )
-        completed_block_layers = list(resume_state.completed_block_layers)
-        logger.info(
-            "Block resume state: completed_layer=%d next_layer=%d completed_layers=%s",
-            int(resume_state.completed_block_layer_idx),
-            int(resume_start_layer),
-            ",".join(str(idx) for idx in completed_block_layers),
-        )
     distill_cfg = BlockDistillConfig(
         steps=int(args.block_distill_steps),
         seqlen=int(args.block_distill_seqlen),
@@ -516,20 +533,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             continue
         validate_block_categories(model, layer_idx)
-        refs_by_category = _collect_block_linear_refs(
-            model,
-            layer_idx=int(layer_idx),
-            transpose_modules=transpose_modules,
-        )
         layer_skip_categories = {
             category
             for skip_layer_idx, category in skip_layer_keys
             if int(skip_layer_idx) == int(layer_idx)
-        }
-        active_refs_by_category = {
-            category: ref
-            for category, ref in refs_by_category.items()
-            if category not in layer_skip_categories
         }
         if layer_skip_categories:
             logger.info(
@@ -537,7 +544,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 int(layer_idx),
                 ",".join(sorted(layer_skip_categories)),
             )
-        if not active_refs_by_category:
+        active_categories = [
+            category
+            for category in configured_categories
+            if category not in layer_skip_categories
+        ]
+        active_refs_by_category: Dict[str, LinearRef] = {}
+        if pipeline_mode == "inline":
+            refs_by_category = _collect_block_linear_refs(
+                model,
+                layer_idx=int(layer_idx),
+                transpose_modules=transpose_modules,
+            )
+            active_refs_by_category = {
+                category: ref
+                for category, ref in refs_by_category.items()
+                if category in active_categories
+            }
+            active_categories = list(active_refs_by_category.keys())
+        if not active_categories:
             logger.info("[block %d] all target Linear modules are skipped; advancing hidden states only.", int(layer_idx))
             teacher_hiddens, student_hiddens = _advance_block_hidden_states(
                 model=model,
@@ -548,16 +573,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 student_hif4_act=bool(args.block_lora_hif4_act),
             )
             continue
-        _train_block_vae_groups(
-            model=model,
-            layer_idx=int(layer_idx),
-            refs_by_category=active_refs_by_category,
-            resolved_cfgs=resolved_cfgs,
-            cat_args=cat_args,
-            vae_args=vae_args,
-            training_args=training_args,
-            logger=logger,
-        )
+        if pipeline_mode == "inline":
+            _train_block_vae_groups(
+                model=model,
+                layer_idx=int(layer_idx),
+                refs_by_category=active_refs_by_category,
+                resolved_cfgs=resolved_cfgs,
+                cat_args=cat_args,
+                vae_args=vae_args,
+                training_args=training_args,
+                logger=logger,
+            )
         validate_block_categories(model, layer_idx)
         teacher_hiddens, student_hiddens = train_block_lora_distill(
             model=model,
@@ -565,7 +591,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             teacher_hiddens_cpu=teacher_hiddens,
             student_hiddens_cpu=student_hiddens,
             config=distill_cfg,
-            target_categories=list(active_refs_by_category.keys()),
+            target_categories=list(active_categories),
             logger=logger,
         )
         if int(layer_idx) not in completed_block_layers:
@@ -582,6 +608,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 selected_layers=sorted(selected_layers),
                 skip_layer_keys=sorted(skip_layer_keys),
                 target_module_count=expected_count,
+                block_vae_cache_manifest_hash=block_vae_pretrain_manifest_hash,
             )
             logger.info("[block %d] finished saving layer checkpoint: %s", int(layer_idx), save_paths["output_dir"])
             removed_checkpoints = prune_block_layer_checkpoints(
@@ -647,6 +674,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "target_module_count": expected_count,
             "completed_block_layers": sorted(int(idx) for idx in completed_block_layers),
             "resume_from_checkpoint": args.block_resume_from_checkpoint,
+            "block_vae_pipeline_mode": pipeline_mode,
+            "block_vae_categories": [str(category) for category in args.block_vae_categories],
+            "block_vae_pretrain_manifest_hash": block_vae_pretrain_manifest_hash,
+            "block_vae_cache_manifest_hash": block_vae_pretrain_manifest_hash,
         },
         unload_vae_original_weights=bool(args.unload_vae_original_weights_on_final_save),
         compact_unload_vae_original_weights=True,

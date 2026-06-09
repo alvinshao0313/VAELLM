@@ -14,7 +14,7 @@ if [[ "${FULL_DETERMINISM:-false}" == "true" ]]; then
 fi
 
 # --block_resume_from_checkpoint 用于从之前的训练中断点继续训练，参数值为checkpoint文件夹路径
-# ,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu
+# 
 
 python tools/block_vae_lora_train.py \
   --model_path "Qwen/Qwen3-8B" \
@@ -24,6 +24,13 @@ python tools/block_vae_lora_train.py \
   --train_device "cuda" \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
+  --block_vae_pipeline_mode "pretrain" \
+  --vae_pretrained_checkpoint ".result/block_vae_cache" \
+  --block_vae_pretrain_devices "cuda" \
+  --block_vae_pretrain_workers "1" \
+  --block_vae_linear_group_size "36" \
+  --block_vae_allow_tail_group "true" \
+  --block_vae_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --codebook_bits "default=32" \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
@@ -36,8 +43,9 @@ python tools/block_vae_lora_train.py \
   --recon_loss_type "default=mse" \
   --intra_parallel "default=1x1" \
   --intra_part_sort_mode "default=none" \
-  --vae_steps "default=5" \
-  --vae_batch_size "all" \
+  --vae_steps "default=500" \
+  --vae_batch_size "131072" \
+  --vae_gpu_resident_data "true" \
   --vae_log_every 100 \
   --vae_eval_every 0 \
   --quantizer_type "BSQ" \
@@ -87,7 +95,7 @@ python tools/block_vae_lora_train.py \
   --skip_layers "" \
   --block_layers "all" \
   --block_eval_after_each_layer "true" \
-  --block_eval_tasks "boolq" \
+  --block_eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --block_eval_ppl "false" \
   --block_eval_ppl_limit "-1" \
   --block_eval_device "cuda" \

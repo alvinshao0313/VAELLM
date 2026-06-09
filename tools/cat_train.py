@@ -4,7 +4,7 @@ import time
 import math
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
@@ -556,7 +556,7 @@ def _decode_reconstructed_linear_weight(
     return temp_linear._decode_weight(dtype=torch.float32).detach().to(device="cpu", dtype=torch.float32)
 
 
-def _train_group_vae_and_replace(
+def train_group_vae_payload(
     *,
     model: nn.Module,
     group_refs: Sequence[LinearRef],
@@ -571,6 +571,7 @@ def _train_group_vae_and_replace(
     log_every: int,
     eval_every: int,
     eval_blocks: int,
+    gpu_resident_data: bool = False,
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
     outlier_protect_mode: str = "channel",
@@ -585,7 +586,7 @@ def _train_group_vae_and_replace(
     sort_prep_workers_resolved: int = 1,
     deterministic: bool = False,
     shuffle_seed: int = 0,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     from litebsq.llm_vae import MultiLayerVAE
 
     batch_size_text = str(batch_size).strip().lower()
@@ -901,14 +902,28 @@ def _train_group_vae_and_replace(
             stage_norm_scale = None
             stage_train_data = residual_data
 
+        gpu_resident_enabled = bool(gpu_resident_data)
+        gpu_stage_train_data: Optional[torch.Tensor] = None
+        if gpu_resident_enabled:
+            gpu_stage_train_data = stage_train_data.to(device=train_device, dtype=train_dtype, non_blocking=True).contiguous()
+            log.info(
+                "[%s] VAE gpu_resident_data enabled: blocks=%d batch_size=%s",
+                stage_tag,
+                int(stage_train_data.shape[0]),
+                str(batch_size),
+            )
+
         effective_batch_size = int(stage_train_data.shape[0]) if batch_size_is_all else int(materialize_batch_size)
-        eval_batch_size = int(stage_train_data.shape[0]) if batch_size_is_all else int(materialize_batch_size)
-        all_batch_gpu_cache = bool(batch_size_is_all and stage_recon_loss != "wa_mse")
+        # eval 固定覆盖完整 residual stage，但始终按 batch 重构，避免 all-batch 一次前向 OOM。
+        eval_batch_size = int(materialize_batch_size)
+        all_batch_gpu_cache = bool(batch_size_is_all and stage_recon_loss != "wa_mse" and not gpu_resident_enabled)
         if int(effective_batch_size) < 1:
             raise RuntimeError(f"[{stage_tag}] effective VAE batch size must be >= 1, got {effective_batch_size}.")
         if batch_size_is_all:
             log.info("[%s] VAE batch_size=all(effective=%d)", stage_tag, int(effective_batch_size))
-        if all_batch_gpu_cache:
+        if gpu_resident_enabled:
+            train_loader = None
+        elif all_batch_gpu_cache:
             log.info("[%s] VAE all-batch GPU cache enabled.", stage_tag)
             train_loader = None
         else:
@@ -918,12 +933,15 @@ def _train_group_vae_and_replace(
                 shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
             )
             del _unused_eval_loader
-        _unused_train_loader, eval_loader = _build_block_data_loaders(
-            stage_train_data,
-            batch_size=int(eval_batch_size),
-            shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
-        )
-        del _unused_train_loader
+        if gpu_resident_enabled:
+            eval_loader = None
+        else:
+            _unused_train_loader, eval_loader = _build_block_data_loaders(
+                stage_train_data,
+                batch_size=int(eval_batch_size),
+                shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
+            )
+            del _unused_train_loader
         vae = MultiLayerVAE(stage_vae_args).to(train_device)
 
         # 2) 训练当前 residual stage 对应的 VAE。
@@ -956,7 +974,42 @@ def _train_group_vae_and_replace(
             "on" if use_stage_norm else "off",
         )
         start = time.time()
-        if all_batch_gpu_cache:
+        num_stage_blocks = int(stage_train_data.shape[0])
+        gpu_train_order: Optional[torch.Tensor] = None
+        gpu_train_pos = 0
+        gpu_train_generator = None
+        if gpu_resident_enabled and bool(deterministic):
+            gpu_train_generator = torch.Generator()
+            gpu_train_generator.manual_seed(int(shuffle_seed) + int(stage_idx))
+
+        def _next_gpu_train_indices() -> torch.Tensor:
+            nonlocal gpu_train_order, gpu_train_pos
+            if gpu_train_order is None or int(gpu_train_pos) >= num_stage_blocks:
+                gpu_train_order = torch.randperm(
+                    num_stage_blocks,
+                    generator=gpu_train_generator,
+                    dtype=torch.long,
+                )
+                gpu_train_pos = 0
+            end = min(int(gpu_train_pos) + int(effective_batch_size), num_stage_blocks)
+            batch_idx = gpu_train_order[int(gpu_train_pos):end]
+            gpu_train_pos = int(end)
+            return batch_idx
+
+        def _iter_eval_tensors():
+            if gpu_stage_train_data is not None:
+                for start_idx in range(0, num_stage_blocks, int(eval_batch_size)):
+                    yield gpu_stage_train_data[start_idx:start_idx + int(eval_batch_size)]
+            else:
+                for x_cpu_batch, _eval_idx_batch in eval_loader:
+                    yield x_cpu_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
+
+        if gpu_resident_enabled:
+            x_all = None
+            train_iter = None
+            if batch_size_is_all:
+                x_all = gpu_stage_train_data
+        elif all_batch_gpu_cache:
             x_all = stage_train_data.to(device=train_device, dtype=train_dtype, non_blocking=True)
             train_iter = None
         else:
@@ -964,7 +1017,31 @@ def _train_group_vae_and_replace(
             train_iter = iter(train_loader)
         for step in range(int(stage_steps)):
             act_max_batch = None
-            if all_batch_gpu_cache:
+            if gpu_resident_enabled:
+                if batch_size_is_all:
+                    x = x_all
+                    if stage_recon_loss == "wa_mse":
+                        block_idx_batch = torch.arange(num_stage_blocks, device=train_device, dtype=torch.long)
+                        act_max_batch = gather_wa_mse_act_max_batch(
+                            block_idx_batch=block_idx_batch,
+                            part_metas=part_metas,
+                            codebook_dim=int(stage_codebook_dim),
+                            train_device=train_device,
+                            target_dtype=train_dtype,
+                        )
+                else:
+                    block_idx_batch = _next_gpu_train_indices()
+                    block_idx_gpu = block_idx_batch.to(device=train_device, dtype=torch.long, non_blocking=True)
+                    x = gpu_stage_train_data.index_select(0, block_idx_gpu)
+                    if stage_recon_loss == "wa_mse":
+                        act_max_batch = gather_wa_mse_act_max_batch(
+                            block_idx_batch=block_idx_gpu,
+                            part_metas=part_metas,
+                            codebook_dim=int(stage_codebook_dim),
+                            train_device=train_device,
+                            target_dtype=train_dtype,
+                        )
+            elif all_batch_gpu_cache:
                 x = x_all
             else:
                 try:
@@ -1009,19 +1086,21 @@ def _train_group_vae_and_replace(
             if eval_every > 0 and (step + 1) % int(eval_every) == 0:
                 vae.eval()
                 with torch.no_grad():
-                    mse_acc = []
-                    top_k_mse_acc = []
-                    total = 0
-                    for x_eval_batch, _eval_idx_batch in eval_loader:
-                        if total >= int(eval_blocks):
-                            break
-                        x_eval_batch = x_eval_batch[: max(0, int(eval_blocks) - total)]
-                        total += x_eval_batch.shape[0]
-                        x_eval = x_eval_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
+                    mse_sum = 0.0
+                    mse_numel = 0
+                    top_k_mse_sum = 0.0
+                    top_k_mse_numel = 0
+                    eval_blocks_seen = 0
+                    for x_eval in _iter_eval_tensors():
                         x_recon, _ = vae(x_eval, is_train=False)
                         x_eval_f = x_eval.float()
                         x_recon_f = x_recon.float()
-                        mse_acc.append(torch.nn.functional.mse_loss(x_recon_f, x_eval_f))
+                        batch_numel = int(x_eval_f.numel())
+                        if batch_numel > 0:
+                            batch_mse = torch.nn.functional.mse_loss(x_recon_f, x_eval_f, reduction="mean")
+                            mse_sum += float(batch_mse.detach().cpu().item()) * batch_numel
+                            mse_numel += batch_numel
+                            eval_blocks_seen += int(x_eval_f.shape[0])
 
                         # 对每个并行模型（P 维）独立选 top-k：
                         # x_eval/x_recon: [B, P, C] -> [P, B*C]
@@ -1031,15 +1110,24 @@ def _train_group_vae_and_replace(
                         _, topk_idx = torch.topk(flat_eval.abs(), k=k, dim=1)
                         top_eval = torch.gather(flat_eval, dim=1, index=topk_idx)
                         top_recon = torch.gather(flat_recon, dim=1, index=topk_idx)
-                        top_k_mse_acc.append(torch.nn.functional.mse_loss(top_recon, top_eval))
-                    mse = torch.stack(mse_acc).mean() if mse_acc else torch.tensor(0.0)
-                    top_k_mse = torch.stack(top_k_mse_acc).mean() if top_k_mse_acc else torch.tensor(0.0)
+                        top_k_numel = int(top_eval.numel())
+                        if top_k_numel > 0:
+                            batch_top_k_mse = torch.nn.functional.mse_loss(
+                                top_recon,
+                                top_eval,
+                                reduction="mean",
+                            )
+                            top_k_mse_sum += float(batch_top_k_mse.detach().cpu().item()) * top_k_numel
+                            top_k_mse_numel += top_k_numel
+                    mse = mse_sum / float(mse_numel) if mse_numel > 0 else 0.0
+                    top_k_mse = top_k_mse_sum / float(top_k_mse_numel) if top_k_mse_numel > 0 else 0.0
                 log.info(
-                    "[%s] eval@step=%d mse=%.6e top_k_mse(k=100)=%.6e",
+                    "[%s] eval@step=%d full_residual_blocks=%d mse=%.6e top_k_mse(k=100)=%.6e",
                     stage_tag,
                     step + 1,
-                    float(mse.detach().cpu().item()),
-                    float(top_k_mse.detach().cpu().item()),
+                    int(eval_blocks_seen),
+                    float(mse),
+                    float(top_k_mse),
                 )
                 vae.train()
 
@@ -1048,8 +1136,7 @@ def _train_group_vae_and_replace(
         stage_recon_chunks: List[torch.Tensor] = []
         stage_bit_chunks: List[torch.Tensor] = []
         with torch.no_grad():
-            for x_in_batch, _eval_idx_batch in eval_loader:
-                x_in = x_in_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
+            for x_in in _iter_eval_tensors():
                 x_recon, bit_idx = vae(x_in, is_train=False)
                 stage_recon_chunks.append(x_recon.detach().to(device="cpu", dtype=residual_data.dtype))
                 if need_stage_payload:
@@ -1092,6 +1179,9 @@ def _train_group_vae_and_replace(
             residual_rms_before,
             residual_rms_after,
         )
+        if gpu_stage_train_data is not None:
+            del gpu_stage_train_data
+            gpu_stage_train_data = None
 
         if need_stage_payload:
             if not stage_bit_chunks:
@@ -1185,7 +1275,88 @@ def _train_group_vae_and_replace(
     if not do_convert:
         del current_residual_weights, target_common_result, all_stage_bits, all_stage_decoders, all_stage_codebook_dims, all_stage_split_metas
         torch.cuda.empty_cache()
-        return
+        return None
+
+    if (
+        len(all_stage_bits) != residual_stages
+        or len(all_stage_decoders) != residual_stages
+        or len(all_stage_codebook_dims) != residual_stages
+        or len(all_stage_split_metas) != residual_stages
+    ):
+        raise RuntimeError(
+            f"[{group_tag}] stage payload mismatch: bits={len(all_stage_bits)} "
+            f"decoders={len(all_stage_decoders)} codebook_dims={len(all_stage_codebook_dims)} "
+            f"split_metas={len(all_stage_split_metas)} "
+            f"residual_stages={residual_stages}"
+        )
+
+    for stage_decoders in all_stage_decoders:
+        for decoder in stage_decoders:
+            decoder.to("cpu")
+    payload = {
+        "format": "vaellm_group_vae_payload",
+        "version": 1,
+        "target_common_split_metas": target_common_split_metas,
+        "parts_per_linear": int(parts_per_linear),
+        "row_parts": int(row_parts),
+        "col_parts": int(col_parts),
+        "residual_stages": int(residual_stages),
+        "all_stage_bits": all_stage_bits,
+        "all_stage_decoders": all_stage_decoders,
+        "all_stage_codebook_dims": all_stage_codebook_dims,
+        "all_stage_split_metas": all_stage_split_metas,
+        "low_rank_payloads": low_rank_payloads,
+        "resolved_outlier_mode": resolved_outlier_mode,
+        "residual_sparse_enabled": bool(residual_sparse_enabled),
+        "effective_activation_weight": effective_activation_weight,
+        "outlier_low_rank": int(outlier_low_rank),
+        "outlier_residual_top_p": float(outlier_residual_top_p),
+        "resolved_residual_score": resolved_residual_score,
+        "resolved_residual_min_abs": float(resolved_residual_min_abs),
+        "resolved_residual_codec": resolved_residual_codec,
+        "outlier_residual_index_bits": int(outlier_residual_index_bits),
+        "outlier_residual_value_bits": int(outlier_residual_value_bits),
+        "outlier_residual_block_shape": tuple(int(v) for v in outlier_residual_block_shape),
+    }
+    del current_residual_weights, target_common_result
+    torch.cuda.empty_cache()
+    return payload
+
+
+def apply_group_vae_payload(
+    *,
+    model: nn.Module,
+    group_refs: Sequence[LinearRef],
+    group_tag: str,
+    payload: Dict[str, Any],
+    convert_device: str,
+    skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
+) -> None:
+    if str(payload.get("format", "")) != "vaellm_group_vae_payload":
+        raise ValueError(f"[{group_tag}] invalid VAE payload format: {payload.get('format')!r}.")
+    if int(payload.get("version", 0)) != 1:
+        raise ValueError(f"[{group_tag}] unsupported VAE payload version: {payload.get('version')!r}.")
+    target_common_split_metas = payload["target_common_split_metas"]
+    parts_per_linear = int(payload["parts_per_linear"])
+    row_parts = int(payload["row_parts"])
+    col_parts = int(payload["col_parts"])
+    residual_stages = int(payload["residual_stages"])
+    all_stage_bits = payload["all_stage_bits"]
+    all_stage_decoders = payload["all_stage_decoders"]
+    all_stage_codebook_dims = payload["all_stage_codebook_dims"]
+    all_stage_split_metas = payload["all_stage_split_metas"]
+    low_rank_payloads = payload["low_rank_payloads"]
+    resolved_outlier_mode = str(payload["resolved_outlier_mode"])
+    residual_sparse_enabled = bool(payload["residual_sparse_enabled"])
+    effective_activation_weight = payload.get("effective_activation_weight")
+    outlier_low_rank = int(payload["outlier_low_rank"])
+    outlier_residual_top_p = float(payload["outlier_residual_top_p"])
+    resolved_residual_score = str(payload["resolved_residual_score"])
+    resolved_residual_min_abs = float(payload["resolved_residual_min_abs"])
+    resolved_residual_codec = str(payload["resolved_residual_codec"])
+    outlier_residual_index_bits = int(payload["outlier_residual_index_bits"])
+    outlier_residual_value_bits = int(payload["outlier_residual_value_bits"])
+    outlier_residual_block_shape = tuple(int(v) for v in payload["outlier_residual_block_shape"])
 
     if (
         len(all_stage_bits) != residual_stages
@@ -1334,8 +1505,82 @@ def _train_group_vae_and_replace(
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
 
-    del current_residual_weights, target_common_result, all_stage_bits, all_stage_decoders, all_stage_codebook_dims, all_stage_split_metas
     torch.cuda.empty_cache()
+
+
+def _train_group_vae_and_replace(
+    *,
+    model: nn.Module,
+    group_refs: Sequence[LinearRef],
+    group_tag: str,
+    runtime_cfg: ResolvedCategoryRuntimeConfig,
+    vae_args,
+    training_args,
+    train_device: str,
+    convert_device: str,
+    do_convert: bool,
+    batch_size: object,
+    log_every: int,
+    eval_every: int,
+    eval_blocks: int,
+    gpu_resident_data: bool = False,
+    skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
+    activation_runtime: Optional[Dict[str, object]] = None,
+    outlier_protect_mode: str = "channel",
+    outlier_residual_score: str = "abs",
+    outlier_residual_min_abs: float = 1e-6,
+    outlier_protect_axis: str = "input",
+    outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
+    outlier_residual_index_bits: int = 8,
+    outlier_residual_value_bits: int = 8,
+    outlier_residual_block_shape: Tuple[int, int] = (256, 256),
+    sort_executor=None,
+    sort_prep_workers_resolved: int = 1,
+    deterministic: bool = False,
+    shuffle_seed: int = 0,
+) -> None:
+    payload = train_group_vae_payload(
+        model=model,
+        group_refs=group_refs,
+        group_tag=group_tag,
+        runtime_cfg=runtime_cfg,
+        vae_args=vae_args,
+        training_args=training_args,
+        train_device=train_device,
+        convert_device=convert_device,
+        do_convert=do_convert,
+        batch_size=batch_size,
+        gpu_resident_data=bool(gpu_resident_data),
+        log_every=log_every,
+        eval_every=eval_every,
+        eval_blocks=eval_blocks,
+        skip_layer_keys=skip_layer_keys,
+        activation_runtime=activation_runtime,
+        outlier_protect_mode=outlier_protect_mode,
+        outlier_residual_score=outlier_residual_score,
+        outlier_residual_min_abs=outlier_residual_min_abs,
+        outlier_protect_axis=outlier_protect_axis,
+        outlier_residual_codec=outlier_residual_codec,
+        outlier_residual_index_bits=outlier_residual_index_bits,
+        outlier_residual_value_bits=outlier_residual_value_bits,
+        outlier_residual_block_shape=outlier_residual_block_shape,
+        sort_executor=sort_executor,
+        sort_prep_workers_resolved=sort_prep_workers_resolved,
+        deterministic=deterministic,
+        shuffle_seed=shuffle_seed,
+    )
+    if not do_convert:
+        return
+    if payload is None:
+        raise RuntimeError(f"[{group_tag}] VAE payload is missing while do_convert=True.")
+    apply_group_vae_payload(
+        model=model,
+        group_refs=group_refs,
+        group_tag=group_tag,
+        payload=payload,
+        convert_device=convert_device,
+        skip_layer_keys=skip_layer_keys,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -1758,6 +2003,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     log_every=cat_args.log_every,
                     eval_every=cat_args.eval_every,
                     eval_blocks=cat_args.eval_blocks,
+                    gpu_resident_data=bool(getattr(cat_args, "gpu_resident_data", False)),
                     skip_layer_keys=skip_layer_keys,
                     activation_runtime=activation_runtime,
                     outlier_protect_mode=resolved_outlier_mode,
