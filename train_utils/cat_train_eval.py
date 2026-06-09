@@ -20,6 +20,7 @@ def eval_after_category(
     eval_ppl: bool = True,
     eval_tasks: str = "",
     tokenizer: Optional[object] = None,
+    move_model_to_cpu_after_eval: bool = True,
 ) -> None:
     run_ppl = bool(eval_ppl)
     task_names = [task.strip() for task in str(eval_tasks).split(",") if task.strip()]
@@ -96,6 +97,7 @@ def eval_after_category(
             mean_metric = sum(valid_metrics) / float(len(valid_metrics))
             logger.info("类别 %s 下游任务均值: %.4f (%.2f%%)", category, mean_metric, mean_metric * 100.0)
     finally:
-        model.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if bool(move_model_to_cpu_after_eval):
+            model.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

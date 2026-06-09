@@ -37,6 +37,12 @@ from train_utils.block_vae_lora_args import (
     resolve_block_runtime_configs,
     validate_skip_layers_with_block_layers,
 )
+from train_utils.block_vae_lora_checkpoint import (
+    load_block_resume_model,
+    load_block_resume_state,
+    prune_block_layer_checkpoints,
+    save_block_layer_checkpoint,
+)
 from train_utils.cat_train_eval import eval_after_category
 from train_utils.cat_train_args import parse_skip_layers
 from train_utils.cat_train_runtime import (
@@ -359,7 +365,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         format_namespace(training_args),
     )
 
-    model = load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
+    if args.block_resume_from_checkpoint is None:
+        model = load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
+    else:
+        model, resume_checkpoint_dir, resume_load_meta, resume_load_result = load_block_resume_model(
+            str(args.block_resume_from_checkpoint),
+            access_token=hf_args.access_token,
+            proxy_group_size=int(args.block_decode_group_size),
+            proxy_compute_device=str(args.convert_device),
+            logger=logger,
+        )
+        logger.info("Resuming block run from checkpoint: %s", resume_checkpoint_dir)
+        logger.info(
+            "Resume checkpoint loaded. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
+            len(getattr(resume_load_result, "missing_keys", [])),
+            len(getattr(resume_load_result, "unexpected_keys", [])),
+            str(resume_load_meta.get("converted_module_count")),
+            str(resume_load_meta.get("adapter_module_count")),
+        )
     setattr(model, "_e2e_vae_lora_tune_bias", str(args.block_lora_bias) == "lora_only")
     validate_qwen3_model(model)
 
@@ -415,6 +438,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     if skip_layer_keys:
         logger.info("Block skip_layers: %s", ",".join(format_skip_layers(sorted(skip_layer_keys))))
+    expected_count = sum(
+        1
+        for layer_idx in selected_layers
+        for category in QWEN3_BLOCK_CATEGORIES
+        if (int(layer_idx), str(category)) not in skip_layer_keys
+    )
+    resume_start_layer = 0
+    completed_block_layers: List[int] = []
+    if args.block_resume_from_checkpoint is not None:
+        resume_state = load_block_resume_state(
+            str(args.block_resume_from_checkpoint),
+            current_args=args,
+            selected_layers=sorted(selected_layers),
+            skip_layer_keys=sorted(skip_layer_keys),
+        )
+        resume_start_layer = int(resume_state.next_block_layer_idx)
+        if int(resume_start_layer) >= int(num_layers):
+            raise ValueError(
+                f"Resume checkpoint already reached layer {int(resume_state.completed_block_layer_idx)}, "
+                f"but model only has {int(num_layers)} layers."
+            )
+        completed_block_layers = list(resume_state.completed_block_layers)
+        logger.info(
+            "Block resume state: completed_layer=%d next_layer=%d completed_layers=%s",
+            int(resume_state.completed_block_layer_idx),
+            int(resume_start_layer),
+            ",".join(str(idx) for idx in completed_block_layers),
+        )
     distill_cfg = BlockDistillConfig(
         steps=int(args.block_distill_steps),
         seqlen=int(args.block_distill_seqlen),
@@ -442,6 +493,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
 
     for layer_idx in range(num_layers):
+        if int(layer_idx) < int(resume_start_layer):
+            logger.info("[block %d] resume prefix; advancing hidden states only.", int(layer_idx))
+            teacher_hiddens, student_hiddens = _advance_block_hidden_states(
+                model=model,
+                layer_idx=int(layer_idx),
+                teacher_hiddens_cpu=teacher_hiddens,
+                student_hiddens_cpu=student_hiddens,
+                device=str(args.train_device),
+                student_hif4_act=bool(args.block_lora_hif4_act),
+            )
+            continue
         if int(layer_idx) not in selected_layers:
             logger.info("[block %d] skipped compression; advancing hidden states only.", int(layer_idx))
             teacher_hiddens, student_hiddens = _advance_block_hidden_states(
@@ -506,6 +568,32 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             target_categories=list(active_refs_by_category.keys()),
             logger=logger,
         )
+        if int(layer_idx) not in completed_block_layers:
+            completed_block_layers.append(int(layer_idx))
+            completed_block_layers.sort()
+        if int(args.block_keep_last_checkpoints) > 0:
+            logger.info("[block %d] start saving layer checkpoint.", int(layer_idx))
+            save_paths = save_block_layer_checkpoint(
+                model=model,
+                run_output_dir=run_output_dir,
+                args=args,
+                completed_block_layer_idx=int(layer_idx),
+                completed_block_layers=completed_block_layers,
+                selected_layers=sorted(selected_layers),
+                skip_layer_keys=sorted(skip_layer_keys),
+                target_module_count=expected_count,
+            )
+            logger.info("[block %d] finished saving layer checkpoint: %s", int(layer_idx), save_paths["output_dir"])
+            removed_checkpoints = prune_block_layer_checkpoints(
+                run_output_dir=run_output_dir,
+                keep_last=int(args.block_keep_last_checkpoints),
+            )
+            if removed_checkpoints:
+                logger.info(
+                    "[block %d] pruned old layer checkpoints: %s",
+                    int(layer_idx),
+                    ",".join(removed_checkpoints),
+                )
         if bool(args.block_eval_after_each_layer):
             eval_device = str(args.block_eval_device or args.train_device)
             with prepare_block_eval_decoded_weights(
@@ -526,15 +614,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     eval_ppl=bool(args.block_eval_ppl),
                     eval_tasks=str(args.block_eval_tasks),
                     tokenizer=tokenizer,
+                    move_model_to_cpu_after_eval=False,
                 )
         logger.info("[block %d] finished.", int(layer_idx))
 
-    expected_count = sum(
-        1
-        for layer_idx in selected_layers
-        for category in QWEN3_BLOCK_CATEGORIES
-        if (int(layer_idx), str(category)) not in skip_layer_keys
-    )
     validate_final_block_checkpoint(
         model,
         expected_rank=int(args.block_lora_rank),
@@ -562,6 +645,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "selected_block_layers": sorted(int(idx) for idx in selected_layers),
             "skip_layers": format_skip_layers(sorted(skip_layer_keys)),
             "target_module_count": expected_count,
+            "completed_block_layers": sorted(int(idx) for idx in completed_block_layers),
+            "resume_from_checkpoint": args.block_resume_from_checkpoint,
         },
         unload_vae_original_weights=bool(args.unload_vae_original_weights_on_final_save),
         compact_unload_vae_original_weights=True,

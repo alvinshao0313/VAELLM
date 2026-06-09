@@ -124,6 +124,8 @@ class BlockVaeLoraArgs:
     transpose_modules: str
     skip_layers: str
     block_layers: str
+    block_resume_from_checkpoint: Optional[str]
+    block_keep_last_checkpoints: int
     block_eval_after_each_layer: bool
     block_eval_tasks: str
     block_eval_ppl: bool
@@ -455,6 +457,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--block_layers", type=str, default="all", help="Block layer selector: all or ranges like 0-3,8,12-15.")
     parser.add_argument(
+        "--block_resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Resume block-wise compression from a block layer checkpoint directory or checkpoint_meta.json.",
+    )
+    parser.add_argument(
+        "--block_keep_last_checkpoints",
+        type=int,
+        default=3,
+        help="Keep at most N latest block layer checkpoints. Set 0 to disable intermediate block checkpoints.",
+    )
+    parser.add_argument(
         "--block_eval_after_each_layer",
         type=lambda raw: parse_bool_text(raw, arg_name="--block_eval_after_each_layer"),
         default=False,
@@ -547,6 +561,10 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         transpose_modules=str(raw_args.transpose_modules),
         skip_layers=str(raw_args.skip_layers),
         block_layers=str(raw_args.block_layers),
+        block_resume_from_checkpoint=None
+        if raw_args.block_resume_from_checkpoint is None
+        else str(raw_args.block_resume_from_checkpoint),
+        block_keep_last_checkpoints=int(raw_args.block_keep_last_checkpoints),
         block_eval_after_each_layer=bool(raw_args.block_eval_after_each_layer),
         block_eval_tasks=str(raw_args.block_eval_tasks),
         block_eval_ppl=bool(raw_args.block_eval_ppl),
@@ -631,6 +649,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
         parse_block_layers(str(args.block_layers), num_layers=None)
     except ValueError as exc:
         parser.error(str(exc))
+    if int(args.block_keep_last_checkpoints) < 0:
+        parser.error("--block_keep_last_checkpoints must be >= 0.")
     if bool(args.block_eval_after_each_layer) and not bool(args.block_eval_ppl) and not str(args.block_eval_tasks).strip():
         parser.error("--block_eval_after_each_layer=true requires --block_eval_ppl=true or non-empty --block_eval_tasks.")
     if int(args.block_eval_ppl_limit) == 0 or int(args.block_eval_ppl_limit) < -1:

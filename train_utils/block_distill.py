@@ -273,11 +273,15 @@ def prepare_block_eval_decoded_weights(
             )
         yield stats
     finally:
+        # DoRA 的 merge 缓存不是普通参数，必须在模型仍位于 eval device 时 unmerge。
         for _name, peft_linear in reversed(merged_adapters):
             if bool(getattr(peft_linear, "merged", False)):
                 peft_linear.unmerge()
         for proxy, previous_flag in proxy_decode_flags:
             proxy._train_decoder_with_adapter = bool(previous_flag)
+        model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def relative_mse(student: torch.Tensor, teacher: torch.Tensor, *, eps: float = 1e-6) -> torch.Tensor:
