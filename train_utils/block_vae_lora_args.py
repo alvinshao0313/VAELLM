@@ -647,8 +647,11 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
         parser.error("--vae_eval_every must be >= 0.")
     if str(args.block_vae_pipeline_mode) not in _BLOCK_VAE_PIPELINE_MODE_CHOICES:
         parser.error(f"--block_vae_pipeline_mode must be one of: {','.join(_BLOCK_VAE_PIPELINE_MODE_CHOICES)}.")
-    if str(args.block_vae_pipeline_mode) in {"pretrain", "distill", "pretrain_distill"} and args.vae_pretrained_checkpoint is None:
-        parser.error("--vae_pretrained_checkpoint is required when --block_vae_pipeline_mode is pretrain, distill, or pretrain_distill.")
+    if str(args.block_vae_pipeline_mode) == "distill":
+        if args.vae_pretrained_checkpoint is None:
+            parser.error("--vae_pretrained_checkpoint is required when --block_vae_pipeline_mode is distill.")
+    elif args.vae_pretrained_checkpoint is not None:
+        parser.error("--vae_pretrained_checkpoint is only supported when --block_vae_pipeline_mode is distill.")
     if args.block_vae_pretrain_workers is not None and int(args.block_vae_pretrain_workers) < 1:
         parser.error("--block_vae_pretrain_workers must be >= 1.")
     if int(args.block_vae_linear_group_size) < 1:

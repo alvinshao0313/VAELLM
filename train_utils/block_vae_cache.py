@@ -606,6 +606,7 @@ def run_block_vae_category_pretrain(
     model: nn.Module,
     tasks: Sequence[Dict[str, Any]],
     pretrain_hash: str,
+    output_dir: str,
     args: BlockVaeLoraArgs,
     hf_args,
     training_args,
@@ -617,8 +618,8 @@ def run_block_vae_category_pretrain(
     skip_layer_keys: Sequence[Tuple[int, str]],
     logger,
 ) -> Dict[str, str]:
-    if args.vae_pretrained_checkpoint is None:
-        raise ValueError("--vae_pretrained_checkpoint is required for category VAE pretrain.")
+    if not str(output_dir).strip():
+        raise ValueError("Block VAE category pretrain output_dir must be non-empty.")
     devices = _parse_block_vae_pretrain_devices(args)
     worker_count = max(1, int(args.block_vae_pretrain_workers or len(devices)))
     use_loaded_model_fast_path = int(worker_count) == 1
@@ -689,7 +690,7 @@ def run_block_vae_category_pretrain(
 
     save_paths = save_e2e_model_checkpoint(
         model,
-        str(args.vae_pretrained_checkpoint),
+        str(output_dir),
         base_model_path=str(args.model_path),
         tokenizer=None,
         save_config=True,

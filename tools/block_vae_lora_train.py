@@ -19,7 +19,9 @@ from e2e_common.post_norm_head import fuse_post_norm_head_linear
 from litebsq.vae_linear import clear_model_vae_linear_cache
 from train_utils.block_distill import (
     BlockDistillConfig,
+    block_student_weight_scope,
     build_initial_hidden_states,
+    mark_untrained_block_targets_original_only,
     prepare_block_eval_decoded_weights,
     train_block_lora_distill,
     validate_block_categories,
@@ -59,7 +61,6 @@ from train_utils.cat_train_runtime import (
 from train_utils.hif4_act import applied_hif4_act
 from train_utils.lora_data import build_calibration_input_ids
 from train_utils.model_checkpoint_io import _build_run_output_dir
-from e2e_common.temporary_mode import set_model_temporary
 from train_utils.utils import (
     LinearRef,
     configure_deterministic_mode,
@@ -240,6 +241,7 @@ def _advance_block_hidden_states(
     student_hiddens_cpu: Sequence[torch.Tensor],
     device: str,
     student_hif4_act: bool,
+    active_block_targets: Sequence[Tuple[int, str]],
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     run_device = torch.device(device)
     layer = model.model.layers[int(layer_idx)].to(run_device)
@@ -253,18 +255,49 @@ def _advance_block_hidden_states(
             student_in = student_cpu.to(device=run_device, non_blocking=True)
             if hif4_controller is not None:
                 hif4_controller.enabled = False
-            set_model_temporary(model, False)
-            teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
+            with block_student_weight_scope(model, set()):
+                teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
             if hif4_controller is not None:
                 hif4_controller.enabled = True
-            set_model_temporary(model, True)
-            student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
+            with block_student_weight_scope(model, active_block_targets):
+                student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
             next_teacher.append(teacher_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
             next_student.append(student_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
     layer.to("cpu")
     if run_device.type == "cuda":
         torch.cuda.empty_cache()
     return next_teacher, next_student
+
+
+def _active_categories_for_layer(
+    layer_idx: int,
+    *,
+    configured_categories: Sequence[str],
+    skip_layer_keys: Sequence[Tuple[int, str]],
+) -> List[str]:
+    skip_set = set((int(skip_layer_idx), str(category)) for skip_layer_idx, category in skip_layer_keys)
+    return [
+        str(category)
+        for category in configured_categories
+        if (int(layer_idx), str(category)) not in skip_set
+    ]
+
+
+def _active_targets_for_layers(
+    layer_indices: Sequence[int],
+    *,
+    configured_categories: Sequence[str],
+    skip_layer_keys: Sequence[Tuple[int, str]],
+) -> List[Tuple[int, str]]:
+    out: List[Tuple[int, str]] = []
+    for layer_idx in sorted(int(value) for value in layer_indices):
+        for category in _active_categories_for_layer(
+            int(layer_idx),
+            configured_categories=configured_categories,
+            skip_layer_keys=skip_layer_keys,
+        ):
+            out.append((int(layer_idx), str(category)))
+    return out
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -281,6 +314,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     logger = get_logger("block_vae_lora")
     _set_cat_train_logger(logger)
     cat_args.output_dir = run_output_dir
+    block_vae_pretrain_output_dir = os.path.join(run_output_dir, "block_vae_cache")
 
     logger.info("Run output directory: %s", run_output_dir)
     logger.info(
@@ -427,6 +461,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             int(resume_start_layer),
             ",".join(str(idx) for idx in completed_block_layers),
         )
+    completed_block_targets = set(
+        _active_targets_for_layers(
+            completed_block_layers,
+            configured_categories=configured_categories,
+            skip_layer_keys=sorted(skip_layer_keys),
+        )
+    )
     if pipeline_mode in {"pretrain", "pretrain_distill"}:
         category_tasks, block_vae_pretrain_manifest_hash = build_category_pretrain_tasks(
             model=model,
@@ -446,6 +487,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             model=model,
             tasks=category_tasks,
             pretrain_hash=block_vae_pretrain_manifest_hash,
+            output_dir=block_vae_pretrain_output_dir,
             args=args,
             hf_args=hf_args,
             training_args=training_args,
@@ -519,6 +561,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 student_hiddens_cpu=student_hiddens,
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
+                active_block_targets=sorted(completed_block_targets),
             )
             continue
         if int(layer_idx) not in selected_layers:
@@ -530,6 +573,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 student_hiddens_cpu=student_hiddens,
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
+                active_block_targets=sorted(completed_block_targets),
             )
             continue
         validate_block_categories(model, layer_idx)
@@ -571,6 +615,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 student_hiddens_cpu=student_hiddens,
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
+                active_block_targets=sorted(completed_block_targets),
             )
             continue
         if pipeline_mode == "inline":
@@ -597,6 +642,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if int(layer_idx) not in completed_block_layers:
             completed_block_layers.append(int(layer_idx))
             completed_block_layers.sort()
+        for category in active_categories:
+            completed_block_targets.add((int(layer_idx), str(category)))
         if int(args.block_keep_last_checkpoints) > 0:
             logger.info("[block %d] start saving layer checkpoint.", int(layer_idx))
             save_paths = save_block_layer_checkpoint(
@@ -628,6 +675,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 eval_device=eval_device,
                 group_size=int(args.block_decode_group_size),
                 train_mode=str(args.block_distill_train_mode),
+                active_block_targets=sorted(completed_block_targets),
                 logger=logger,
             ):
                 eval_after_category(
@@ -645,6 +693,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 )
         logger.info("[block %d] finished.", int(layer_idx))
 
+    final_original_only_count = mark_untrained_block_targets_original_only(
+        model,
+        sorted(completed_block_targets),
+    )
+    if final_original_only_count:
+        logger.info(
+            "Final save: marked untrained block targets original-only: %d",
+            int(final_original_only_count),
+        )
     validate_final_block_checkpoint(
         model,
         expected_rank=int(args.block_lora_rank),

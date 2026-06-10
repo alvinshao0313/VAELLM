@@ -1,7 +1,7 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import re
-from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +20,6 @@ from e2e_common.peft_proxy import (
     materialize_peft_proxy_decoded_linears,
     update_peft_vae_proxy_adalora,
 )
-from e2e_common.temporary_mode import set_model_temporary
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import (
     NamedVAELinearDecodeTarget,
@@ -136,6 +135,80 @@ def iter_named_block_peft_proxies(
         yield name, module
 
 
+def _block_target_from_module_name(module_name: str) -> Optional[Tuple[int, str]]:
+    match = re.fullmatch(
+        r"model\.layers\.(\d+)\.(?:self_attn|mlp)\.([^\.]+)",
+        str(module_name),
+    )
+    if match is None:
+        return None
+    category = str(match.group(2))
+    if category not in QWEN3_BLOCK_CATEGORIES:
+        return None
+    return int(match.group(1)), category
+
+
+def _normalize_active_block_targets(
+    active_block_targets: Optional[Collection[Tuple[int, str]]],
+) -> Optional[Set[Tuple[int, str]]]:
+    if active_block_targets is None:
+        return None
+    active: Set[Tuple[int, str]] = set()
+    for layer_idx, category in active_block_targets:
+        category_text = str(category)
+        if category_text not in QWEN3_BLOCK_CATEGORIES:
+            raise ValueError(
+                f"Invalid active block target category {category_text!r}. "
+                f"Allowed values: {','.join(QWEN3_BLOCK_CATEGORIES)}."
+            )
+        active.add((int(layer_idx), category_text))
+    return active
+
+
+def _module_name_matches_active_block_targets(
+    module_name: str,
+    active_block_targets: Optional[Set[Tuple[int, str]]],
+) -> bool:
+    if active_block_targets is None:
+        return True
+    target = _block_target_from_module_name(str(module_name))
+    return target is not None and target in active_block_targets
+
+
+def _iter_named_block_temporary_modules(model: nn.Module) -> Iterator[Tuple[str, nn.Module]]:
+    skip_prefixes: List[str] = []
+    for name, module in model.named_modules():
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in skip_prefixes):
+            continue
+        if isinstance(module, PeftVAELinearProxy):
+            skip_prefixes.append(f"{name}.base_layer")
+            skip_prefixes.append(f"{name}.per_decoded_linear")
+        if _block_target_from_module_name(str(name)) is None:
+            continue
+        if callable(getattr(module, "set_temporary", None)):
+            yield str(name), module
+
+
+@contextmanager
+def block_student_weight_scope(
+    model: nn.Module,
+    active_block_targets: Collection[Tuple[int, str]],
+) -> Iterator[None]:
+    active = _normalize_active_block_targets(active_block_targets)
+    if active is None:
+        raise ValueError("active_block_targets must be provided for block_student_weight_scope.")
+    previous: List[Tuple[nn.Module, Optional[bool]]] = []
+    try:
+        for name, module in _iter_named_block_temporary_modules(model):
+            previous.append((module, getattr(module, "temporary", None)))
+            module.set_temporary(_module_name_matches_active_block_targets(name, active))
+        yield
+    finally:
+        for module, old_temporary in reversed(previous):
+            if old_temporary is not None:
+                module.set_temporary(bool(old_temporary))
+
+
 def validate_qwen3_model(model: nn.Module) -> None:
     config = getattr(model, "config", None)
     model_type = str(getattr(config, "model_type", "")).lower()
@@ -174,6 +247,70 @@ def _iter_plain_named_vae_linears(model: nn.Module) -> Iterator[Tuple[str, VAELi
             yield str(name), module
 
 
+@torch.no_grad()
+def _materialize_selected_peft_proxy_decoded_linears(
+    model: nn.Module,
+    proxy_refs: Sequence[Tuple[str, PeftVAELinearProxy]],
+    *,
+    group_size: int,
+    compute_device: str,
+    logger=None,
+) -> Dict[str, object]:
+    if int(group_size) < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}.")
+    targets = [
+        NamedVAELinearDecodeTarget(
+            name=name,
+            base_layer=proxy.base_layer,
+            target_dtype=_resolve_proxy_base_linear(name, proxy).weight.dtype,
+        )
+        for name, proxy in proxy_refs
+    ]
+    decoded = decode_named_vae_linear_weights(
+        targets,
+        group_size=int(group_size),
+        compute_device=torch.device(compute_device),
+        logger=logger,
+        respect_cache_policy=False,
+    )
+    decoded_by_name = {item.name: item.decoded_weight for item in decoded}
+    preserve_peft_dense_bias = bool(getattr(model, "_e2e_vae_lora_tune_bias", False))
+    refreshed = 0
+    for name, proxy in proxy_refs:
+        if name not in decoded_by_name:
+            raise RuntimeError(f"Missing grouped decode result for proxy '{name}'.")
+        decoded_linear = _resolve_proxy_base_linear(name, proxy)
+        decoded_linear.weight.copy_(
+            decoded_by_name[name].to(device=decoded_linear.weight.device, dtype=decoded_linear.weight.dtype)
+        )
+        base_bias = proxy.base_layer.bias
+        if decoded_linear.bias is None:
+            if base_bias is not None:
+                raise ValueError(f"Decoded linear under '{name}' is missing bias while base VAELinear has bias.")
+        else:
+            peft_wrapped = is_peft_proxy_adapter_linear(proxy.per_decoded_linear)
+            should_keep_loaded_bias = bool(peft_wrapped and preserve_peft_dense_bias)
+            if not should_keep_loaded_bias:
+                if base_bias is None:
+                    decoded_linear.bias.zero_()
+                else:
+                    decoded_linear.bias.copy_(
+                        base_bias.detach().to(device=decoded_linear.bias.device, dtype=decoded_linear.bias.dtype)
+                    )
+        proxy.base_layer.clear_decoded_weight_cache()
+        proxy._dense_base_materialized = True
+        refreshed += 1
+    return {
+        "total": int(len(proxy_refs)),
+        "refreshed": int(refreshed),
+        "warmed": int(refreshed),
+        "skipped": int(len(proxy_refs) - refreshed),
+        "failed": 0,
+        "group_size": int(group_size),
+        "compute_device": str(compute_device),
+    }
+
+
 @contextmanager
 def prepare_block_eval_decoded_weights(
     *,
@@ -181,18 +318,25 @@ def prepare_block_eval_decoded_weights(
     eval_device: str,
     group_size: int,
     train_mode: str = "lora",
+    active_block_targets: Optional[Collection[Tuple[int, str]]] = None,
     logger=None,
 ) -> Iterator[Dict[str, int]]:
     if int(group_size) < 1:
         raise ValueError(f"group_size must be >= 1, got {group_size}.")
     mode = _normalize_block_distill_train_mode(str(train_mode))
+    active_targets = _normalize_active_block_targets(active_block_targets)
     device = str(eval_device)
     model.to(device)
 
-    proxy_refs = list(iter_named_peft_vae_proxies(model))
+    proxy_refs = [
+        (name, proxy)
+        for name, proxy in iter_named_peft_vae_proxies(model)
+        if _module_name_matches_active_block_targets(name, active_targets)
+    ]
     plain_targets = [
         NamedVAELinearTarget(name=name, base_layer=module)
         for name, module in _iter_plain_named_vae_linears(model)
+        if _module_name_matches_active_block_targets(name, active_targets)
     ]
     merged_adapters: List[Tuple[str, nn.Module]] = []
     proxy_decode_flags: List[Tuple[PeftVAELinearProxy, bool]] = []
@@ -200,88 +344,103 @@ def prepare_block_eval_decoded_weights(
     proxy_stats = {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
     proxy_decode_skipped = False
 
-    try:
-        if plain_targets:
-            plain_stats = prime_named_vae_linear_cache(
-                plain_targets,
-                clear_existing=True,
-                group_size=int(group_size),
-                compute_device=device,
-                logger=logger,
-            )
-        if proxy_refs:
-            if mode == "lora":
-                unmaterialized = [
-                    name
-                    for name, proxy in proxy_refs
-                    if not bool(getattr(proxy, "_dense_base_materialized", False))
-                ]
-                if unmaterialized:
-                    raise RuntimeError(
-                        "Block eval lora mode expects pre-materialized PEFT proxy dense bases, "
-                        f"but these proxies are missing decoded weights: {unmaterialized}"
-                    )
-                proxy_stats = {
-                    "total": int(len(proxy_refs)),
-                    "warmed": 0,
-                    "skipped": int(len(proxy_refs)),
-                    "failed": 0,
-                }
-                proxy_decode_skipped = True
-            else:
-                proxy_stats = materialize_peft_proxy_decoded_linears(
-                    model,
+    scope = (
+        block_student_weight_scope(model, active_targets)
+        if active_targets is not None
+        else nullcontext()
+    )
+    with scope:
+        try:
+            if plain_targets:
+                plain_stats = prime_named_vae_linear_cache(
+                    plain_targets,
+                    clear_existing=True,
                     group_size=int(group_size),
                     compute_device=device,
                     logger=logger,
-                    log_prefix="[block-eval-predecode] ",
                 )
-            for name, proxy in proxy_refs:
-                proxy_decode_flags.append((proxy, bool(getattr(proxy, "_train_decoder_with_adapter", False))))
-                proxy._train_decoder_with_adapter = False
-                peft_linear = proxy.per_decoded_linear
-                if not is_peft_proxy_adapter_linear(peft_linear):
-                    continue
-                if bool(getattr(peft_linear, "merged", False)):
-                    raise RuntimeError(f"{name}: PEFT adapter is already merged before block eval predecode.")
-                peft_linear.merge(safe_merge=True)
-                if not bool(getattr(peft_linear, "merged", False)):
-                    raise RuntimeError(f"{name}: PEFT adapter merge did not mark the module as merged.")
-                merged_adapters.append((name, peft_linear))
+            if proxy_refs:
+                if mode == "lora":
+                    unmaterialized = [
+                        name
+                        for name, proxy in proxy_refs
+                        if not bool(getattr(proxy, "_dense_base_materialized", False))
+                    ]
+                    if unmaterialized:
+                        raise RuntimeError(
+                            "Block eval lora mode expects pre-materialized PEFT proxy dense bases, "
+                            f"but these proxies are missing decoded weights: {unmaterialized}"
+                        )
+                    proxy_stats = {
+                        "total": int(len(proxy_refs)),
+                        "warmed": 0,
+                        "skipped": int(len(proxy_refs)),
+                        "failed": 0,
+                    }
+                    proxy_decode_skipped = True
+                elif active_targets is None:
+                    proxy_stats = materialize_peft_proxy_decoded_linears(
+                        model,
+                        group_size=int(group_size),
+                        compute_device=device,
+                        logger=logger,
+                        log_prefix="[block-eval-predecode] ",
+                    )
+                else:
+                    proxy_stats = _materialize_selected_peft_proxy_decoded_linears(
+                        model,
+                        proxy_refs,
+                        group_size=int(group_size),
+                        compute_device=device,
+                        logger=logger,
+                    )
+                for name, proxy in proxy_refs:
+                    proxy_decode_flags.append((proxy, bool(getattr(proxy, "_train_decoder_with_adapter", False))))
+                    proxy._train_decoder_with_adapter = False
+                    peft_linear = proxy.per_decoded_linear
+                    if not is_peft_proxy_adapter_linear(peft_linear):
+                        continue
+                    if bool(getattr(peft_linear, "merged", False)):
+                        raise RuntimeError(f"{name}: PEFT adapter is already merged before block eval predecode.")
+                    peft_linear.merge(safe_merge=True)
+                    if not bool(getattr(peft_linear, "merged", False)):
+                        raise RuntimeError(f"{name}: PEFT adapter merge did not mark the module as merged.")
+                    merged_adapters.append((name, peft_linear))
 
-        stats = {
-            "plain_total": int(plain_stats.get("total", 0)),
-            "plain_warmed": int(plain_stats.get("warmed", 0)),
-            "proxy_total": int(proxy_stats.get("total", 0)),
-            "proxy_warmed": int(proxy_stats.get("warmed", 0)),
-            "merged_adapters": int(len(merged_adapters)),
-            "group_size": int(group_size),
-            "proxy_decode_skipped": int(bool(proxy_decode_skipped)),
-        }
-        if logger is not None:
-            logger.info(
-                "Block eval predecode ready: plain_total=%d plain_warmed=%d proxy_total=%d proxy_warmed=%d merged_adapters=%d proxy_decode_skipped=%s group_size=%d eval_device=%s train_mode=%s",
-                int(stats["plain_total"]),
-                int(stats["plain_warmed"]),
-                int(stats["proxy_total"]),
-                int(stats["proxy_warmed"]),
-                int(stats["merged_adapters"]),
-                str(bool(stats["proxy_decode_skipped"])).lower(),
-                int(stats["group_size"]),
-                device,
-                mode,
-            )
-        yield stats
-    finally:
-        # DoRA 的 merge 缓存不是普通参数，必须在模型仍位于 eval device 时 unmerge。
-        for _name, peft_linear in reversed(merged_adapters):
-            if bool(getattr(peft_linear, "merged", False)):
-                peft_linear.unmerge()
-        for proxy, previous_flag in proxy_decode_flags:
-            proxy._train_decoder_with_adapter = bool(previous_flag)
-        model.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            stats = {
+                "plain_total": int(plain_stats.get("total", 0)),
+                "plain_warmed": int(plain_stats.get("warmed", 0)),
+                "proxy_total": int(proxy_stats.get("total", 0)),
+                "proxy_warmed": int(proxy_stats.get("warmed", 0)),
+                "merged_adapters": int(len(merged_adapters)),
+                "group_size": int(group_size),
+                "proxy_decode_skipped": int(bool(proxy_decode_skipped)),
+            }
+            if logger is not None:
+                logger.info(
+                    "Block eval predecode ready: plain_total=%d plain_warmed=%d proxy_total=%d proxy_warmed=%d merged_adapters=%d proxy_decode_skipped=%s group_size=%d eval_device=%s train_mode=%s active_block_targets=%s",
+                    int(stats["plain_total"]),
+                    int(stats["plain_warmed"]),
+                    int(stats["proxy_total"]),
+                    int(stats["proxy_warmed"]),
+                    int(stats["merged_adapters"]),
+                    str(bool(stats["proxy_decode_skipped"])).lower(),
+                    int(stats["group_size"]),
+                    device,
+                    mode,
+                    "all" if active_targets is None else str(len(active_targets)),
+                )
+            yield stats
+        finally:
+            # DoRA 的 merge 缓存不是普通参数，必须在模型仍位于 eval device 时 unmerge。
+            for _name, peft_linear in reversed(merged_adapters):
+                if bool(getattr(peft_linear, "merged", False)):
+                    peft_linear.unmerge()
+            for proxy, previous_flag in proxy_decode_flags:
+                proxy._train_decoder_with_adapter = bool(previous_flag)
+            model.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def relative_mse(student: torch.Tensor, teacher: torch.Tensor, *, eps: float = 1e-6) -> torch.Tensor:
@@ -395,20 +554,25 @@ def attention_map_kl_loss(
     query_chunk_size: int,
     eps: float = 1e-6,
     hif4_controller=None,
+    active_block_targets: Optional[Collection[Tuple[int, str]]] = None,
 ) -> torch.Tensor:
     if int(query_chunk_size) < 1:
         raise ValueError(f"query_chunk_size must be >= 1, got {query_chunk_size}.")
     previous_hif4_enabled = None if hif4_controller is None else bool(getattr(hif4_controller, "enabled", False))
-    set_model_temporary(model, False)
     try:
         if hif4_controller is not None:
             hif4_controller.enabled = False
-        with torch.no_grad():
+        with torch.no_grad(), block_student_weight_scope(model, set()):
             teacher_q, teacher_k, teacher_mask = _qk_states_for_attention(model, layer_idx, teacher_hidden)
-        set_model_temporary(model, True)
+        student_scope = (
+            block_student_weight_scope(model, active_block_targets)
+            if active_block_targets is not None
+            else nullcontext()
+        )
         if hif4_controller is not None:
             hif4_controller.enabled = True
-        student_q, student_k, student_mask = _qk_states_for_attention(model, layer_idx, student_hidden)
+        with student_scope:
+            student_q, student_k, student_mask = _qk_states_for_attention(model, layer_idx, student_hidden)
     finally:
         if hif4_controller is not None:
             hif4_controller.enabled = bool(previous_hif4_enabled)
@@ -660,6 +824,31 @@ def _resolve_block_base_layer(module_name: str, module: nn.Module) -> VAELinear:
     raise TypeError(f"{module_name}: expected VAELinear or PeftVAELinearProxy, got {type(module)}")
 
 
+def mark_untrained_block_targets_original_only(
+    model: nn.Module,
+    active_block_targets: Collection[Tuple[int, str]],
+) -> int:
+    active = _normalize_active_block_targets(active_block_targets)
+    if active is None:
+        raise ValueError("active_block_targets must be provided.")
+    marked = 0
+    for name, module in _iter_named_block_temporary_modules(model):
+        target = _block_target_from_module_name(name)
+        if target is None or target in active:
+            continue
+        base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+        original_weight = getattr(base_layer, "original_weight", None)
+        if original_weight is None:
+            raise RuntimeError(f"{name}: original_weight is required for untrained block target original-only mode.")
+        setattr(base_layer, "always_use_original", True)
+        setattr(base_layer, "protect_original_weight", True)
+        module.set_temporary(False)
+        if callable(getattr(base_layer, "clear_decoded_weight_cache", None)):
+            base_layer.clear_decoded_weight_cache()
+        marked += 1
+    return int(marked)
+
+
 def _enable_only_decoder_params(module: VAELinear) -> List[nn.Parameter]:
     trainable: List[nn.Parameter] = []
     packed_decoder = getattr(module, "_parallel_stage_decoder", None)
@@ -769,6 +958,7 @@ def train_block_lora_distill(
     categories = _normalize_target_categories(target_categories)
     if not categories:
         raise ValueError("block distill target categories cannot be empty.")
+    active_block_targets = {(int(layer_idx), str(category)) for category in categories}
     device = torch.device(config.device)
     layer = model.model.layers[int(layer_idx)].to(device)
     layer.eval()
@@ -827,21 +1017,21 @@ def train_block_lora_distill(
         student_in = student_hiddens_cpu[sample_idx].to(device=device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
-        set_model_temporary(model, False)
         needs_teacher_block = linear_weight > 0.0 or hidden_weight > 0.0
-        if linear_weight > 0.0:
-            with torch.no_grad(), capture_linear_io(module_by_name) as teacher_io:
-                teacher_out = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
-            if len(teacher_io) != len(module_names):
-                missing = sorted(set(module_names) - set(teacher_io.keys()))
-                raise RuntimeError(f"Layer {layer_idx}: missing teacher linear captures: {missing}")
-        elif needs_teacher_block:
-            teacher_io = {}
-            with torch.no_grad():
-                teacher_out = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
-        else:
-            teacher_io = {}
-            teacher_out = None
+        with block_student_weight_scope(model, set()):
+            if linear_weight > 0.0:
+                with torch.no_grad(), capture_linear_io(module_by_name) as teacher_io:
+                    teacher_out = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
+                if len(teacher_io) != len(module_names):
+                    missing = sorted(set(module_names) - set(teacher_io.keys()))
+                    raise RuntimeError(f"Layer {layer_idx}: missing teacher linear captures: {missing}")
+            elif needs_teacher_block:
+                teacher_io = {}
+                with torch.no_grad():
+                    teacher_out = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
+            else:
+                teacher_io = {}
+                teacher_out = None
 
         hif4_logger = logger if (logger is not None and step == 0 and bool(config.lora_hif4_act)) else None
         with applied_hif4_act(
@@ -851,43 +1041,44 @@ def train_block_lora_distill(
             log_prefix=f"[block {int(layer_idx)} {train_mode}] ",
         ) as hif4_ctx:
             hif4_controller = hif4_ctx.get("controller")
-            set_model_temporary(model, True)
-            if linear_weight > 0.0:
-                linear_losses = []
-                for name in module_names:
-                    local_in, local_teacher_out = teacher_io[name]
-                    student_local = module_by_name[name](local_in.to(device=device, non_blocking=True))
-                    linear_losses.append(
-                        relative_mse(
-                            student_local,
-                            local_teacher_out.to(device=device, non_blocking=True),
-                            eps=config.eps,
+            with block_student_weight_scope(model, active_block_targets):
+                if linear_weight > 0.0:
+                    linear_losses = []
+                    for name in module_names:
+                        local_in, local_teacher_out = teacher_io[name]
+                        student_local = module_by_name[name](local_in.to(device=device, non_blocking=True))
+                        linear_losses.append(
+                            relative_mse(
+                                student_local,
+                                local_teacher_out.to(device=device, non_blocking=True),
+                                eps=config.eps,
+                            )
                         )
-                    )
-                linear_loss = torch.stack(linear_losses).mean()
-            else:
-                linear_loss = student_in.new_zeros(())
+                    linear_loss = torch.stack(linear_losses).mean()
+                else:
+                    linear_loss = student_in.new_zeros(())
 
-            if hidden_weight > 0.0:
-                if teacher_out is None:
-                    raise RuntimeError("hidden loss requires teacher block output.")
-                student_out = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
-                hidden_loss = relative_mse(student_out, teacher_out, eps=config.eps)
-            else:
-                student_out = None
-                hidden_loss = student_in.new_zeros(())
-            if attn_weight > 0.0:
-                attn_loss = attention_map_kl_loss(
-                    model,
-                    int(layer_idx),
-                    student_in,
-                    teacher_in,
-                    query_chunk_size=int(config.attn_query_chunk_size),
-                    eps=config.eps,
-                    hif4_controller=hif4_controller,
-                )
-            else:
-                attn_loss = student_in.new_zeros(())
+                if hidden_weight > 0.0:
+                    if teacher_out is None:
+                        raise RuntimeError("hidden loss requires teacher block output.")
+                    student_out = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
+                    hidden_loss = relative_mse(student_out, teacher_out, eps=config.eps)
+                else:
+                    student_out = None
+                    hidden_loss = student_in.new_zeros(())
+                if attn_weight > 0.0:
+                    attn_loss = attention_map_kl_loss(
+                        model,
+                        int(layer_idx),
+                        student_in,
+                        teacher_in,
+                        query_chunk_size=int(config.attn_query_chunk_size),
+                        eps=config.eps,
+                        hif4_controller=hif4_controller,
+                        active_block_targets=active_block_targets,
+                    )
+                else:
+                    attn_loss = student_in.new_zeros(())
         loss = attn_weight * attn_loss + linear_weight * linear_loss + hidden_weight * hidden_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
@@ -929,12 +1120,12 @@ def train_block_lora_distill(
                 student_in = student_cpu.to(device=device, non_blocking=True)
                 if hif4_controller is not None:
                     hif4_controller.enabled = False
-                set_model_temporary(model, False)
-                teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
+                with block_student_weight_scope(model, set()):
+                    teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
                 if hif4_controller is not None:
                     hif4_controller.enabled = True
-                set_model_temporary(model, True)
-                student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
+                with block_student_weight_scope(model, active_block_targets):
+                    student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
                 next_teacher.append(teacher_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
                 next_student.append(student_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
     layer.to("cpu")

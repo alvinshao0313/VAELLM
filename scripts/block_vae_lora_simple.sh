@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-5}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 SEED="${SEED:-42}"
 export PYTHONHASHSEED="${SEED}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -16,6 +16,7 @@ fi
 # 可选参数：
 # --access_token "hf_xxx" 用于私有或 gated 模型。
 # --block_resume_from_checkpoint 只支持 inline/distill 路径；pretrain/pretrain_distill 模式不支持。
+# --vae_pretrained_checkpoint "/path/to/vae_pretrained_checkpoint" 预训练 checkpoint 路径，distill 模式必须指定。
 
 python tools/block_vae_lora_train.py \
   --model_path "Qwen/Qwen3-8B" \
@@ -24,8 +25,9 @@ python tools/block_vae_lora_train.py \
   --deterministic "${FULL_DETERMINISM:-false}" \
   --train_device "cuda" \
   --convert_device "cuda" \
-  --block_vae_pipeline_mode "pretrain" \
-  --vae_pretrained_checkpoint ".result/block_vae_cache" \
+  --unload_vae_original_weights_on_final_save \
+  --block_vae_pipeline_mode "distill" \
+  --vae_pretrained_checkpoint ".result/Qwen_Qwen3-8B_20260610_021016/block_vae_cache" \
   --block_vae_pretrain_devices "cuda" \
   --block_vae_pretrain_workers "1" \
   --block_vae_linear_group_size "36" \
@@ -43,17 +45,17 @@ python tools/block_vae_lora_train.py \
   --decoder_type "default=symmetric" \
   --recon_loss_type "default=mse" \
   --intra_parallel "default=1x1" \
-  --vae_steps "default=20000" \
-  --vae_batch_size "16384" \
+  --vae_steps "default=10000" \
+  --vae_batch_size "8192" \
   --vae_gpu_resident_data "true" \
   --vae_log_every 100 \
-  --vae_eval_every 0 \
+  --vae_eval_every 1000 \
   --quantizer_type "BSQ" \
   --gamma0 "1.0" \
   --gamma "1.0" \
   --zeta "1.0" \
   --inv_temperature "100.0" \
-  --lr "1e-2" \
+  --lr "3e-3" \
   --beta1 "0.9" \
   --beta2 "0.95" \
   --weight_decay "0.0" \
@@ -69,7 +71,7 @@ python tools/block_vae_lora_train.py \
   --use_checkpoint \
   --new_quant \
   --block_distill_dataset "openorca=0.24,fineweb_edu=0.18,race=0.24,sciq=0.03,alpaca=0.11,longalpaca=0.10,longalign=0.10" \
-  --block_distill_steps "5" \
+  --block_distill_steps "5000" \
   --block_distill_nsamples "5000" \
   --block_distill_seqlen "4096" \
   --block_distill_train_mode "lora" \
