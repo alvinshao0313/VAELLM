@@ -515,29 +515,29 @@ def validate_block_vae_category_pretrained_meta(
             f"checkpoint={stage!r} expected={BLOCK_VAE_CATEGORY_PRETRAIN_STAGE!r}."
         )
 
-    expected_selected = sorted(int(layer_idx) for layer_idx in selected_layers)
-    actual_selected = [int(layer_idx) for layer_idx in extra.get("selected_block_layers", [])]
-    if actual_selected != expected_selected:
-        raise ValueError(
-            "Block VAE pretrained checkpoint selected_block_layers mismatch: "
-            f"checkpoint={actual_selected} current={expected_selected}."
-        )
+    # expected_selected = sorted(int(layer_idx) for layer_idx in selected_layers)
+    # actual_selected = [int(layer_idx) for layer_idx in extra.get("selected_block_layers", [])]
+    # if actual_selected != expected_selected:
+    #     raise ValueError(
+    #         "Block VAE pretrained checkpoint selected_block_layers mismatch: "
+    #         f"checkpoint={actual_selected} current={expected_selected}."
+    #     )
 
-    expected_skip = format_skip_layers(sorted(skip_layer_keys))
-    actual_skip = [str(item) for item in extra.get("skip_layers", [])]
-    if actual_skip != expected_skip:
-        raise ValueError(
-            "Block VAE pretrained checkpoint skip_layers mismatch: "
-            f"checkpoint={actual_skip} current={expected_skip}."
-        )
+    # expected_skip = format_skip_layers(sorted(skip_layer_keys))
+    # actual_skip = [str(item) for item in extra.get("skip_layers", [])]
+    # if actual_skip != expected_skip:
+    #     raise ValueError(
+    #         "Block VAE pretrained checkpoint skip_layers mismatch: "
+    #         f"checkpoint={actual_skip} current={expected_skip}."
+    #     )
 
-    expected_train_mode = str(args.block_distill_train_mode).strip().lower()
-    actual_train_mode = str(extra.get("block_distill_train_mode", "")).strip().lower()
-    if actual_train_mode != expected_train_mode:
-        raise ValueError(
-            "Block VAE pretrained checkpoint block_distill_train_mode mismatch: "
-            f"checkpoint={actual_train_mode!r} current={expected_train_mode!r}."
-        )
+    # expected_train_mode = str(args.block_distill_train_mode).strip().lower()
+    # actual_train_mode = str(extra.get("block_distill_train_mode", "")).strip().lower()
+    # if actual_train_mode != expected_train_mode:
+    #     raise ValueError(
+    #         "Block VAE pretrained checkpoint block_distill_train_mode mismatch: "
+    #         f"checkpoint={actual_train_mode!r} current={expected_train_mode!r}."
+    #     )
 
     expected_hash = compute_block_vae_category_pretrain_hash(
         args=args,

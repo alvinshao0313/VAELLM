@@ -65,6 +65,8 @@ class BlockDistillConfig:
     seqlen: int
     rank: int
     lr: float
+    lr_scheduler: str
+    warmup_steps: int
     lora_variant: str
     lora_alpha: float
     lora_dropout: float
@@ -934,6 +936,20 @@ def _set_block_proxy_decoder_adapter_mode(model: nn.Module, module_names: Iterab
             module._train_decoder_with_adapter = bool(enabled)
 
 
+def _build_block_lora_lr_scheduler(optimizer: torch.optim.Optimizer, config: BlockDistillConfig):
+    scheduler_name = str(config.lr_scheduler).strip().lower()
+    if scheduler_name == "none":
+        return None
+    import transformers
+
+    return transformers.get_scheduler(
+        scheduler_name,
+        optimizer,
+        num_warmup_steps=int(config.warmup_steps),
+        num_training_steps=int(config.steps),
+    )
+
+
 def _finalize_block_decoder_trainables(model: nn.Module, module_names: Iterable[str]) -> int:
     finalized = 0
     for name in module_names:
@@ -1003,6 +1019,7 @@ def train_block_lora_distill(
         lora_bias=str(config.lora_bias),
     )
     optimizer = torch.optim.AdamW(trainable, lr=float(config.lr), weight_decay=0.0)
+    lr_scheduler = _build_block_lora_lr_scheduler(optimizer, config)
     module_by_name = {name: get_module_by_name(model, name) for name in module_names}
     num_samples = len(student_hiddens_cpu)
     if num_samples < 1:
@@ -1083,12 +1100,14 @@ def train_block_lora_distill(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         if use_lora and str(config.lora_variant).strip().lower() == "adalora":
             update_peft_vae_proxy_adalora(model, global_step=int(step + 1))
 
         if logger is not None and (step + 1 == 1 or (step + 1) % int(config.log_every) == 0 or step + 1 == int(config.steps)):
             logger.info(
-                "[block %d] distill step=%d/%d loss=%.6e attn_kl=%.6e linear=%.6e hidden=%.6e",
+                "[block %d] distill step=%d/%d loss=%.6e attn_kl=%.6e linear=%.6e hidden=%.6e lr=%.6e",
                 int(layer_idx),
                 int(step + 1),
                 int(config.steps),
@@ -1096,6 +1115,7 @@ def train_block_lora_distill(
                 float(attn_loss.detach().cpu()),
                 float(linear_loss.detach().cpu()),
                 float(hidden_loss.detach().cpu()),
+                float(optimizer.param_groups[0]["lr"]),
             )
 
         del teacher_in, student_in, teacher_out, student_out, loss, linear_loss, attn_loss, hidden_loss

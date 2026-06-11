@@ -112,6 +112,8 @@ class BlockVaeLoraArgs:
     block_distill_train_mode: str
     block_lora_rank: int
     block_lora_lr: float
+    block_lora_lr_scheduler: str
+    block_lora_warmup_steps: int
     block_lora_variant: str
     block_lora_alpha: float
     block_lora_dropout: float
@@ -463,6 +465,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block_lora_rank", type=int, default=32)
     parser.add_argument("--block_lora_lr", type=lambda raw: _parse_positive_float(raw, arg_name="--block_lora_lr"), default=1e-4)
     parser.add_argument(
+        "--block_lora_lr_scheduler",
+        type=lambda raw: _parse_choice(raw, arg_name="--block_lora_lr_scheduler", choices=_LR_SCHEDULER_CHOICES),
+        default="none",
+    )
+    parser.add_argument("--block_lora_warmup_steps", type=int, default=0)
+    parser.add_argument(
         "--block_lora_variant",
         type=lambda raw: _parse_choice(raw, arg_name="--block_lora_variant", choices=_BLOCK_LORA_VARIANT_CHOICES),
         default="plain",
@@ -601,6 +609,8 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         block_distill_train_mode=str(raw_args.block_distill_train_mode).lower(),
         block_lora_rank=int(raw_args.block_lora_rank),
         block_lora_lr=float(raw_args.block_lora_lr),
+        block_lora_lr_scheduler=str(raw_args.block_lora_lr_scheduler).lower(),
+        block_lora_warmup_steps=int(raw_args.block_lora_warmup_steps),
         block_lora_variant=str(raw_args.block_lora_variant).lower(),
         block_lora_alpha=float(raw_args.block_lora_rank if raw_args.block_lora_alpha is None else raw_args.block_lora_alpha),
         block_lora_dropout=float(raw_args.block_lora_dropout),
@@ -678,6 +688,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
         parser.error(f"--block_distill_train_mode must be one of: {','.join(_BLOCK_DISTILL_TRAIN_MODE_CHOICES)}.")
     if int(args.block_lora_rank) <= 0:
         parser.error("--block_lora_rank must be > 0.")
+    if str(args.block_lora_lr_scheduler) not in _LR_SCHEDULER_CHOICES:
+        parser.error(f"--block_lora_lr_scheduler must be one of: {','.join(_LR_SCHEDULER_CHOICES)}.")
+    if int(args.block_lora_warmup_steps) < 0:
+        parser.error("--block_lora_warmup_steps must be >= 0.")
     if str(args.block_lora_variant) not in _BLOCK_LORA_VARIANT_CHOICES:
         parser.error(f"--block_lora_variant must be one of: {','.join(_BLOCK_LORA_VARIANT_CHOICES)}.")
     if float(args.block_lora_alpha) <= 0.0:

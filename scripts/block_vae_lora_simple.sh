@@ -71,14 +71,16 @@ python tools/block_vae_lora_train.py \
   --use_checkpoint \
   --new_quant \
   --block_distill_dataset "openorca=0.24,fineweb_edu=0.18,race=0.24,sciq=0.03,alpaca=0.11,longalpaca=0.10,longalign=0.10" \
-  --block_distill_steps "5000" \
+  --block_distill_steps "10000" \
   --block_distill_nsamples "5000" \
   --block_distill_seqlen "4096" \
   --block_distill_train_mode "lora" \
   --block_lora_rank "32" \
-  --block_lora_lr "1e-4" \
-  --block_lora_variant "dora" \
   --block_lora_alpha "32" \
+  --block_lora_lr "1e-4" \
+  --block_lora_lr_scheduler "cosine" \
+  --block_lora_warmup_steps "0" \
+  --block_lora_variant "dora" \
   --block_lora_dropout "0.0" \
   --block_lora_bias "none" \
   --block_lora_hif4_act "false" \
@@ -89,14 +91,14 @@ python tools/block_vae_lora_train.py \
   --block_adalora_beta1 "0.85" \
   --block_adalora_beta2 "0.85" \
   --block_adalora_orth_reg_weight "0.5" \
-  --block_loss_alpha "0.3" \
+  --block_loss_alpha "0.5" \
   --block_loss_beta "0.2" \
   --block_attn_query_chunk_size "4096" \
   --block_distill_log_every "10" \
   --block_decode_group_size "8" \
   --skip_layers "" \
   --block_layers "all" \
-  --block_eval_after_each_layer "true" \
+  --block_eval_after_each_layer "false" \
   --block_eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --block_eval_ppl "false" \
   --block_eval_ppl_limit "-1" \
