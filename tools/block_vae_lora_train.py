@@ -24,6 +24,7 @@ from train_utils.block_distill import (
     mark_untrained_block_targets_original_only,
     prepare_block_eval_decoded_weights,
     train_block_lora_distill,
+    validate_block_distill_targets_available,
     validate_block_categories,
     validate_final_block_checkpoint,
     validate_qwen3_model,
@@ -47,7 +48,6 @@ from train_utils.block_vae_lora_checkpoint import (
 )
 from train_utils.block_vae_cache import (
     build_category_pretrain_tasks,
-    compute_block_vae_category_pretrain_hash,
     collect_block_linear_refs as _collect_block_linear_refs,
     load_block_vae_category_pretrained_model,
     planned_block_groups as _planned_block_groups,
@@ -301,6 +301,17 @@ def _active_targets_for_layers(
     return out
 
 
+def _source_block_vae_manifest_hash(meta: Optional[Dict[str, object]]) -> str:
+    extra_meta = meta.get("extra_meta", {}) if isinstance(meta, dict) else {}
+    if not isinstance(extra_meta, dict):
+        raise TypeError("checkpoint_meta.extra_meta must be a dict.")
+    return str(
+        extra_meta.get("block_vae_cache_manifest_hash")
+        or extra_meta.get("block_vae_pretrain_manifest_hash")
+        or ""
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args, hf_args, training_args = parse_block_vae_lora_args(argv)
     cat_args = _build_internal_cat_namespace(args)
@@ -440,42 +451,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 resolved_cfgs=resolved_cfgs,
             )
             logger.info(
-                "Validated block VAE category-pretrained checkpoint: manifest_hash=%s",
+                "Accepted block VAE category-pretrained checkpoint: source_manifest_hash=%s",
                 block_vae_pretrain_manifest_hash,
             )
-        else:
-            source_name = "Resume checkpoint"
-            source_meta = loaded_resume_meta
-            if loaded_block_init_meta is not None:
-                source_name = "Block init checkpoint"
-                source_meta = loaded_block_init_meta
-            extra_meta = source_meta.get("extra_meta", {}) if isinstance(source_meta, dict) else {}
-            actual_categories = extra_meta.get("block_vae_categories")
-            if actual_categories is None:
-                block_distill_meta = extra_meta.get("block_distill", {})
-                if isinstance(block_distill_meta, dict):
-                    actual_categories = block_distill_meta.get("block_vae_categories")
-            if actual_categories is not None:
-                actual_categories = [str(category) for category in actual_categories]
-                expected_categories = [str(category) for category in args.block_vae_categories]
-                if actual_categories != expected_categories:
-                    raise ValueError(
-                        f"{source_name} block_vae_categories mismatch: "
-                        f"checkpoint={actual_categories} current={expected_categories}."
-                    )
-            block_vae_pretrain_manifest_hash = compute_block_vae_category_pretrain_hash(
-                args=args,
+            validate_block_distill_targets_available(
+                model,
                 selected_layers=sorted(selected_layers),
+                target_categories=configured_categories,
                 skip_layer_keys=sorted(skip_layer_keys),
-                transpose_modules=transpose_modules,
-                resolved_cfgs=resolved_cfgs,
+                source_name="--vae_pretrained_checkpoint",
             )
-            checkpoint_hash = str(extra_meta.get("block_vae_cache_manifest_hash", ""))
-            if checkpoint_hash != block_vae_pretrain_manifest_hash:
-                raise ValueError(
-                    f"{source_name} block VAE pretrain manifest hash mismatch: "
-                    f"checkpoint={checkpoint_hash!r} current={block_vae_pretrain_manifest_hash!r}."
-                )
+        elif loaded_block_init_meta is not None:
+            block_vae_pretrain_manifest_hash = _source_block_vae_manifest_hash(loaded_block_init_meta)
+            logger.info(
+                "Accepted block init checkpoint: source_manifest_hash=%s",
+                block_vae_pretrain_manifest_hash,
+            )
+            validate_block_distill_targets_available(
+                model,
+                selected_layers=sorted(selected_layers),
+                target_categories=configured_categories,
+                skip_layer_keys=sorted(skip_layer_keys),
+                source_name="--block_init_checkpoint",
+            )
+        else:
+            block_vae_pretrain_manifest_hash = _source_block_vae_manifest_hash(loaded_resume_meta)
     resume_start_layer = 0
     completed_block_layers: List[int] = []
     if args.block_resume_from_checkpoint is not None:

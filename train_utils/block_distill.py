@@ -236,6 +236,41 @@ def validate_block_categories(model: nn.Module, layer_idx: int) -> Dict[str, str
     return out
 
 
+def _block_projection_module_name(layer_idx: int, category: str) -> str:
+    parent = "self_attn" if category in {"q_proj", "k_proj", "v_proj", "o_proj"} else "mlp"
+    return f"model.layers.{int(layer_idx)}.{parent}.{category}"
+
+
+def validate_block_distill_targets_available(
+    model: nn.Module,
+    *,
+    selected_layers: Sequence[int],
+    target_categories: Sequence[str],
+    skip_layer_keys: Sequence[Tuple[int, str]],
+    source_name: str = "checkpoint",
+) -> None:
+    categories = _normalize_target_categories(target_categories)
+    skip_set = set((int(layer_idx), str(category)) for layer_idx, category in skip_layer_keys)
+    for layer_idx in sorted(int(value) for value in selected_layers):
+        for category in categories:
+            if (int(layer_idx), str(category)) in skip_set:
+                continue
+            module_name = _block_projection_module_name(int(layer_idx), str(category))
+            try:
+                module = get_module_by_name(model, module_name)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"{source_name}: missing block distill target for layer {int(layer_idx)} "
+                    f"category {category!r} at {module_name}."
+                ) from exc
+            if not isinstance(module, (VAELinear, PeftVAELinearProxy)):
+                raise ValueError(
+                    f"{source_name}: block distill target for layer {int(layer_idx)} "
+                    f"category {category!r} at {module_name} must be VAELinear or "
+                    f"PeftVAELinearProxy, got {type(module).__name__}."
+                )
+
+
 def _iter_plain_named_vae_linears(model: nn.Module) -> Iterator[Tuple[str, VAELinear]]:
     skip_prefixes: List[str] = []
     for name, module in model.named_modules():

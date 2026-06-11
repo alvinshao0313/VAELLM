@@ -223,7 +223,11 @@ block_loss_alpha + block_loss_beta <= 1
 | `<run_output_dir>/block_checkpoints/block_XXXX/` | 逐层 resume checkpoint |
 | `<run_output_dir>/final_model/` | 最终模型，仅 `inline/distill/pretrain_distill` 会保存 |
 
-checkpoint meta 会记录 `block_vae_categories`、`block_vae_pretrain_manifest_hash`、`resume_from_checkpoint` 和 `block_init_checkpoint`。resume 时会校验类别列表、层选择、skip、训练模式和 manifest hash；`block_init_checkpoint` 会校验类别列表和 manifest hash，避免混用不匹配 checkpoint。
+checkpoint meta 会记录 `block_vae_categories`、`block_vae_pretrain_manifest_hash`、`resume_from_checkpoint` 和 `block_init_checkpoint`。
+
+`--vae_pretrained_checkpoint` 和 `--block_init_checkpoint` 是“重新开一轮 distill”的初始化来源，只强制校验 checkpoint stage。它们不会锁死后续的 `--block_layers`、`--skip_layers`、`--block_vae_categories` 或 `--block_distill_train_mode`，旧 checkpoint JSON 不需要迁移或手工修改。启动时会检查本轮实际要蒸馏的 active target；如果选到了没有被 VAE 压缩过的原始 `nn.Linear`，会直接报错并指出对应 layer/category。
+
+`--block_resume_from_checkpoint` 是同一轮训练中断恢复，仍然严格校验层选择、skip、训练模式、类别列表和 pipeline mode。不要把 `final_model` 当 resume checkpoint 使用。
 
 ## 7. simple.sh 环境变量
 
@@ -266,6 +270,8 @@ bash scripts/block_vae_lora_simple.sh \
 ```bash
   --vae_pretrained_checkpoint ".result/<pretrain_run>/block_vae_cache" \
 ```
+
+这个 checkpoint 不限制后续蒸馏的 layer/category/train mode；只要本轮选中的目标已经在该 checkpoint 里是 `VAELinear` 或 `PeftVAELinearProxy` 即可。
 
 从上一轮 block `final_model` 开始新一轮 decoder distill。这里不是 resume，会从第 0 层重新逐层蒸馏。
 使用时把 `scripts/block_vae_lora_simple.sh` 里的 `--vae_pretrained_checkpoint ...` 那一行替换成下面这一行。
