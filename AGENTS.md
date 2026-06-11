@@ -102,6 +102,35 @@ python train.py \
 
 不要把每个 CLI 参数都包装成 shell 变量。
 
+如果某个 CLI 参数是互斥可选项，不要用 shell 数组或中间变量拼接参数。
+
+不要写成：
+
+```bash
+INIT_ARGS=(--vae_pretrained_checkpoint "${VAE_CKPT}")
+
+if [[ -n "${BLOCK_INIT_CHECKPOINT:-}" ]]; then
+  INIT_ARGS=(--block_init_checkpoint "${BLOCK_INIT_CHECKPOINT}")
+fi
+
+python train.py \
+  "${INIT_ARGS[@]}"
+```
+
+应该把当前实验实际使用的参数直接写在 Python 命令里：
+
+```bash
+python train.py \
+  --vae_pretrained_checkpoint ".result/run/block_vae_cache"
+```
+
+如果需要改用另一个互斥参数，就在上方注释说明怎么替换，并让用户直接改下面的 CLI 行：
+
+```bash
+# 可选：把下面的 --vae_pretrained_checkpoint 替换成
+# --block_init_checkpoint ".result/run/final_model"
+```
+
 `.sh` 文件的目标是清楚记录一次实验配置，不是写成通用参数模板。
 
 ## 测试规则

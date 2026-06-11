@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 SEED="${SEED:-42}"
 export PYTHONHASHSEED="${SEED}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -16,7 +16,9 @@ fi
 # 可选参数：
 # --access_token "hf_xxx" 用于私有或 gated 模型。
 # --block_resume_from_checkpoint 只支持 inline/distill 路径；pretrain/pretrain_distill 模式不支持。
-# --vae_pretrained_checkpoint "/path/to/vae_pretrained_checkpoint" 预训练 checkpoint 路径，distill 模式必须指定。
+# --vae_pretrained_checkpoint "/path/to/block_vae_cache" 第一轮 distill 输入。
+# --block_init_checkpoint "/path/to/final_model" 从上一轮 block final_model 开始新一轮 distill。
+# --vae_pretrained_checkpoint、--block_init_checkpoint、--block_resume_from_checkpoint 三者只能选一个。
 
 python tools/block_vae_lora_train.py \
   --model_path "Qwen/Qwen3-8B" \

@@ -27,31 +27,40 @@ q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
 | 模式 | 行为 | 输出 |
 |---|---|---|
 | `inline` | 旧流程：每层先训练该层 VAE，再立刻蒸馏该层 | `final_model/` |
-| `pretrain` | 按 `--block_vae_categories` 顺序跨层同类别训练 VAE，并替换成全 VAE 模型 | 只保存 `--vae_pretrained_checkpoint` |
-| `distill` | 不训练 VAE，从已有全 VAE checkpoint 或 block resume checkpoint 开始逐层蒸馏 | `final_model/` |
-| `pretrain_distill` | 先执行完整 `pretrain`，保存全 VAE checkpoint，然后在内存中直接逐层蒸馏 | 全 VAE checkpoint 和 `final_model/` |
+| `pretrain` | 按 `--block_vae_categories` 顺序跨层同类别训练 VAE，并替换成全 VAE 模型 | `<run_output_dir>/block_vae_cache/` |
+| `distill` | 不训练 VAE，从已有全 VAE checkpoint、上一轮 block `final_model` 或 block resume checkpoint 开始逐层蒸馏 | `final_model/` |
+| `pretrain_distill` | 先执行完整 `pretrain`，保存全 VAE checkpoint，然后在内存中直接逐层蒸馏 | `<run_output_dir>/block_vae_cache/` 和 `final_model/` |
 
 `scripts/block_vae_lora_simple.sh` 默认使用：
 
 ```bash
---block_vae_pipeline_mode "pretrain"
+--block_vae_pipeline_mode "distill"
 ```
 
-## 2. 全 VAE Checkpoint
+## 2. 初始化 checkpoint
 
 | 参数 | Parser 默认值 | simple.sh 默认值 | 说明 |
 |---|---:|---:|---|
-| `--vae_pretrained_checkpoint` | 空 | `.result/block_vae_cache` | 全 VAE 替换后的 checkpoint；`pretrain/pretrain_distill` 保存到这里，`distill` 从这里加载 |
+| `--vae_pretrained_checkpoint` | 空 | `.result/Qwen_Qwen3-8B_20260610_021016/block_vae_cache` | `distill` 第一轮输入：全 VAELinear checkpoint，要求 stage 为 `block_vae_category_pretrained` |
+| `--block_init_checkpoint` | 空 | 空，按需手动替换 `--vae_pretrained_checkpoint` | `distill` 新一轮输入：上一轮 block `final_model`，要求 stage 为 `block_vae_lora_final` |
 | `--block_vae_pretrain_devices` | 空，实际回退到 `train_device` | `cuda` | VAE pretrain worker 使用的设备列表 |
 | `--block_vae_pretrain_workers` | 空，实际等于设备数 | `1` | VAE pretrain worker 数 |
 | `--block_vae_linear_group_size` | `32` | `36` | 每个同类别 VAE group 包含多少个 Linear |
 | `--block_vae_allow_tail_group` | `true` | `true` | 是否允许不足 group size 的尾组 |
 | `--block_vae_categories` | 7 类全量 | 7 类全量 | 要训练和蒸馏的 Linear 类别；输入顺序就是 pretrain 类别顺序 |
 
+`distill` 初始化入口三选一，不能混用：
+
+- `--vae_pretrained_checkpoint`：从全 VAE checkpoint 开始第一轮逐层蒸馏。
+- `--block_init_checkpoint`：从上一轮 block `final_model` 开始新一轮逐层蒸馏。不是 resume，会从第 0 层重新走一遍。
+- `--block_resume_from_checkpoint`：从 `<run_output_dir>/block_checkpoints/block_XXXX/` 继续中断的同一轮逐层蒸馏。
+
+`--block_init_checkpoint` 只接受 block final checkpoint，不能传逐层 checkpoint，也不能传 `block_vae_cache`。
+
 `pretrain/pretrain_distill` 不再保存 category group payload。VAE payload 只在内存中流转：每个 group 训练完立刻 apply，所有类别替换完成后才写一个全 VAELinear checkpoint：
 
 ```text
-.result/block_vae_cache/
+<run_output_dir>/block_vae_cache/
 ```
 
 `--block_vae_allow_tail_group false` 在 block 流程中要求每个类别的 active Linear 数能被 `--block_vae_linear_group_size` 整除；否则直接报错，避免生成部分层未 VAE 化的 checkpoint。
@@ -196,7 +205,7 @@ block_loss_alpha + block_loss_beta <= 1
 
 | 参数 | Parser 默认值 | simple.sh 默认值 | 说明 |
 |---|---:|---:|---|
-| `--block_eval_after_each_layer` | `false` | `true` | 每层蒸馏后是否评估 |
+| `--block_eval_after_each_layer` | `false` | `false` | 每层蒸馏后是否评估 |
 | `--block_eval_tasks` | 空 | `boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu` | lm-eval 任务列表 |
 | `--block_eval_ppl` | `false` | `false` | 是否评估 PPL |
 | `--block_eval_ppl_limit` | `-1` | `-1` | PPL 样本限制 |
@@ -210,11 +219,11 @@ block_loss_alpha + block_loss_beta <= 1
 |---|---|
 | `<run_output_dir>/block_vae_lora.log` | 训练日志 |
 | `<run_output_dir>/normalized_block_vae_lora_args.json` | 归一化参数快照 |
+| `<run_output_dir>/block_vae_cache/` | 全 VAE checkpoint，仅 `pretrain/pretrain_distill` 会保存 |
 | `<run_output_dir>/block_checkpoints/block_XXXX/` | 逐层 resume checkpoint |
 | `<run_output_dir>/final_model/` | 最终模型，仅 `inline/distill/pretrain_distill` 会保存 |
-| `--vae_pretrained_checkpoint` | 全 VAE checkpoint，仅 `pretrain/pretrain_distill` 会保存 |
 
-checkpoint meta 会记录 `block_vae_categories` 和 `block_vae_pretrain_manifest_hash`。resume 时会校验类别列表、层选择、skip、训练模式和 manifest hash，避免混用不匹配 checkpoint。
+checkpoint meta 会记录 `block_vae_categories`、`block_vae_pretrain_manifest_hash`、`resume_from_checkpoint` 和 `block_init_checkpoint`。resume 时会校验类别列表、层选择、skip、训练模式和 manifest hash；`block_init_checkpoint` 会校验类别列表和 manifest hash，避免混用不匹配 checkpoint。
 
 ## 7. simple.sh 环境变量
 
@@ -222,7 +231,7 @@ checkpoint meta 会记录 `block_vae_categories` 和 `block_vae_pretrain_manifes
 |---|---:|---|
 | `PYTHONPATH` | `.` | Python import 路径 |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | CUDA allocator 设置 |
-| `CUDA_VISIBLE_DEVICES` | `5` | 默认可见 GPU |
+| `CUDA_VISIBLE_DEVICES` | `6` | 默认可见 GPU |
 | `SEED` | `42` | 随机种子 |
 | `PYTHONHASHSEED` | `${SEED}` | Python hash seed |
 | `TOKENIZERS_PARALLELISM` | `false` | tokenizer 并行 |
@@ -231,7 +240,7 @@ checkpoint meta 会记录 `block_vae_categories` 和 `block_vae_pretrain_manifes
 
 ## 8. 不同模式样例
 
-默认推荐：先跨层同类别 VAE pretrain，再接逐层 distill。
+默认脚本：从脚本里写死的 `--vae_pretrained_checkpoint` 做逐层 `lora` distill。
 
 ```bash
 bash scripts/block_vae_lora_simple.sh
@@ -244,20 +253,44 @@ bash scripts/block_vae_lora_simple.sh \
   --block_vae_pipeline_mode "inline"
 ```
 
-只训练并保存全 VAE checkpoint，不做蒸馏。
+只训练并保存全 VAE checkpoint，不做蒸馏。输出路径是本次 run 目录下的 `block_vae_cache/`。
 
 ```bash
 bash scripts/block_vae_lora_simple.sh \
-  --block_vae_pipeline_mode "pretrain" \
-  --vae_pretrained_checkpoint ".result/block_vae_cache"
+  --block_vae_pipeline_mode "pretrain"
 ```
 
 复用已有全 VAE checkpoint 做逐层蒸馏。
+把 `scripts/block_vae_lora_simple.sh` 里的 `--vae_pretrained_checkpoint ...` 那一行改成：
 
 ```bash
-bash scripts/block_vae_lora_simple.sh \
-  --block_vae_pipeline_mode "distill" \
-  --vae_pretrained_checkpoint ".result/block_vae_cache"
+  --vae_pretrained_checkpoint ".result/<pretrain_run>/block_vae_cache" \
+```
+
+从上一轮 block `final_model` 开始新一轮 decoder distill。这里不是 resume，会从第 0 层重新逐层蒸馏。
+使用时把 `scripts/block_vae_lora_simple.sh` 里的 `--vae_pretrained_checkpoint ...` 那一行替换成下面这一行。
+
+```bash
+  --block_init_checkpoint ".result/<lora_run>/final_model" \
+```
+
+并把脚本里的训练模式改成：
+
+```bash
+  --block_distill_train_mode "decoder" \
+```
+
+从第二轮 block `final_model` 开始新一轮 both distill。已有 LoRA adapter 会被复用，不会叠第二套 adapter。
+同样把 `--vae_pretrained_checkpoint ...` 那一行替换成：
+
+```bash
+  --block_init_checkpoint ".result/<decoder_run>/final_model" \
+```
+
+并把脚本里的训练模式改成：
+
+```bash
+  --block_distill_train_mode "both" \
 ```
 
 自定义类别和顺序。

@@ -585,7 +585,12 @@ def _ensure_bias_param(
     return nn.Parameter(torch.zeros(out_features, dtype=torch.float32))
 
 
-def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dict[str, Any]]) -> None:
+def _rebuild_converted_modules(
+    model: nn.Module,
+    converted_modules: Sequence[Dict[str, Any]],
+    *,
+    preserve_original_weights_from_base: bool = False,
+) -> None:
     for spec in converted_modules:
         name = str(spec["name"])
         old_module = _get_module_by_name(model, name)
@@ -947,6 +952,9 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 qvalues=sparse_qvalues_payload,
             )
 
+        keep_original_weight = bool(spec.get("has_original_weight", False)) or bool(
+            preserve_original_weights_from_base
+        )
         new_module = VAELinear(
             in_features=int(spec["in_features"]),
             out_features=int(spec["out_features"]),
@@ -955,7 +963,7 @@ def _rebuild_converted_modules(model: nn.Module, converted_modules: Sequence[Dic
                 out_features=int(spec["out_features"]),
                 has_bias=bool(spec["has_bias"]),
             ),
-            original_weight=getattr(old_module, "weight", None) if bool(spec.get("has_original_weight", False)) else None,
+            original_weight=getattr(old_module, "weight", None) if keep_original_weight else None,
             vq_weight=vq_payload,
             vq_storage_specs=vq_storage_specs,
             decoder=decoder_payload,

@@ -748,6 +748,31 @@ def inject_block_peft_lora_adapters(
         raise ValueError(
             f"Layer {layer_idx}: expected {len(categories)} PEFT VAELinear proxies, got {len(proxy_refs)}."
         )
+    existing_adapter_names = [
+        name
+        for name, proxy in proxy_refs
+        if is_peft_proxy_adapter_linear(proxy.per_decoded_linear)
+    ]
+    if existing_adapter_names:
+        if len(existing_adapter_names) != len(proxy_refs):
+            raise ValueError(
+                f"Layer {layer_idx}: detected partially injected PEFT adapters: {existing_adapter_names}."
+            )
+        for name, proxy in proxy_refs:
+            peft_linear = proxy.per_decoded_linear
+            adapter_name = _default_adapter_name(peft_linear)
+            variant = str(config.lora_variant).strip().lower()
+            if variant == "adalora":
+                if not is_peft_adalora_linear(peft_linear):
+                    raise ValueError(f"{name}: existing adapter is not AdaLoRA but --block_lora_variant=adalora.")
+                if int(peft_linear.r[adapter_name]) != int(config.adalora_init_rank):
+                    raise ValueError(f"{name}: existing AdaLoRA init rank does not match --block_adalora_init_rank.")
+            else:
+                if not is_peft_lora_linear(peft_linear):
+                    raise ValueError(f"{name}: existing adapter is AdaLoRA but --block_lora_variant={variant}.")
+                if int(peft_linear.r[adapter_name]) != int(config.rank):
+                    raise ValueError(f"{name}: existing LoRA rank does not match --block_lora_rank.")
+        return [name for name, _proxy in proxy_refs]
     target_regex = _block_peft_target_regex(int(layer_idx), categories)
     variant = str(config.lora_variant).strip().lower()
     if str(config.lora_bias) == "lora_only":
@@ -892,6 +917,27 @@ def _collect_block_modules_for_decoder(
     return [name for name, _module in vae_refs]
 
 
+def _collect_or_wrap_block_lora_modules(
+    model: nn.Module,
+    layer_idx: int,
+    *,
+    target_categories: Optional[Sequence[str]] = None,
+) -> List[str]:
+    categories = _normalize_target_categories(target_categories)
+    proxy_refs = list(iter_named_block_peft_proxies(model, int(layer_idx), target_categories=categories))
+    if proxy_refs:
+        if len(proxy_refs) != len(categories):
+            raise ValueError(
+                f"Layer {layer_idx}: expected {len(categories)} PEFT VAELinear proxies, got {len(proxy_refs)}."
+            )
+        return [name for name, _proxy in proxy_refs]
+    return wrap_block_vae_linears_as_peft_proxies(
+        model,
+        int(layer_idx),
+        target_categories=categories,
+    )
+
+
 def freeze_except_block_distill_trainables(
     model: nn.Module,
     module_names: Iterable[str],
@@ -982,7 +1028,7 @@ def train_block_lora_distill(
     use_lora = train_mode in {"lora", "both"}
     use_decoder = train_mode in {"decoder", "both"}
     if use_lora:
-        module_names = wrap_block_vae_linears_as_peft_proxies(
+        module_names = _collect_or_wrap_block_lora_modules(
             model,
             int(layer_idx),
             target_categories=categories,
@@ -1181,6 +1227,7 @@ def validate_final_block_checkpoint(
     expected_count: int,
     lora_variant: str,
     train_mode: str = "lora",
+    allow_preserved_adapters: bool = False,
 ) -> None:
     mode = _normalize_block_distill_train_mode(train_mode)
     adapter_count = 0
@@ -1193,9 +1240,10 @@ def validate_final_block_checkpoint(
         peft_linear = module.per_decoded_linear
         has_adapter = is_peft_adalora_linear(peft_linear) or is_peft_lora_linear(peft_linear)
         if mode == "decoder":
-            if has_adapter:
+            if has_adapter and not bool(allow_preserved_adapters):
                 raise RuntimeError(f"{_name}: decoder-only block distill must not leave a PEFT adapter.")
-            continue
+            if not has_adapter:
+                continue
         adapter_count += 1
         variant = str(lora_variant).strip().lower()
         if variant == "adalora":
@@ -1211,6 +1259,10 @@ def validate_final_block_checkpoint(
             if int(peft_linear.r[adapter_name]) != int(expected_rank):
                 raise RuntimeError(f"{_name}: LoRA rank mismatch, expected {expected_rank}.")
     if mode == "decoder":
+        if bool(allow_preserved_adapters) and int(adapter_count) not in {0, int(expected_count)}:
+            raise RuntimeError(
+                f"Final preserved PEFT adapter count mismatch: got {adapter_count}, expected 0 or {expected_count}."
+            )
         return
     if int(adapter_count) != int(expected_count):
         raise RuntimeError(f"Final PEFT adapter count mismatch: got {adapter_count}, expected {expected_count}.")

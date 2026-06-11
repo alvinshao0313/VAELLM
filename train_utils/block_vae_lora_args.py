@@ -64,6 +64,7 @@ class BlockVaeLoraArgs:
     unload_vae_original_weights_on_final_save: bool
     block_vae_pipeline_mode: str
     vae_pretrained_checkpoint: Optional[str]
+    block_init_checkpoint: Optional[str]
     block_vae_pretrain_devices: str
     block_vae_pretrain_workers: Optional[int]
     block_vae_linear_group_size: int
@@ -388,6 +389,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="inline",
     )
     parser.add_argument("--vae_pretrained_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--block_init_checkpoint",
+        type=str,
+        default=None,
+        help="Initialize a new distill pass from a previous block final_model checkpoint.",
+    )
     parser.add_argument("--block_vae_pretrain_devices", type=str, default="")
     parser.add_argument(
         "--block_vae_pretrain_workers",
@@ -559,6 +566,9 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         vae_pretrained_checkpoint=None
         if raw_args.vae_pretrained_checkpoint is None or str(raw_args.vae_pretrained_checkpoint).strip() == ""
         else str(raw_args.vae_pretrained_checkpoint),
+        block_init_checkpoint=None
+        if raw_args.block_init_checkpoint is None or str(raw_args.block_init_checkpoint).strip() == ""
+        else str(raw_args.block_init_checkpoint),
         block_vae_pretrain_devices=str(raw_args.block_vae_pretrain_devices),
         block_vae_pretrain_workers=None
         if raw_args.block_vae_pretrain_workers is None
@@ -658,10 +668,24 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
     if str(args.block_vae_pipeline_mode) not in _BLOCK_VAE_PIPELINE_MODE_CHOICES:
         parser.error(f"--block_vae_pipeline_mode must be one of: {','.join(_BLOCK_VAE_PIPELINE_MODE_CHOICES)}.")
     if str(args.block_vae_pipeline_mode) == "distill":
-        if args.vae_pretrained_checkpoint is None:
-            parser.error("--vae_pretrained_checkpoint is required when --block_vae_pipeline_mode is distill.")
-    elif args.vae_pretrained_checkpoint is not None:
-        parser.error("--vae_pretrained_checkpoint is only supported when --block_vae_pipeline_mode is distill.")
+        if args.block_init_checkpoint is not None and args.vae_pretrained_checkpoint is not None:
+            parser.error("--block_init_checkpoint cannot be used together with --vae_pretrained_checkpoint.")
+        if args.block_init_checkpoint is not None and args.block_resume_from_checkpoint is not None:
+            parser.error("--block_init_checkpoint cannot be used together with --block_resume_from_checkpoint.")
+        if (
+            args.block_resume_from_checkpoint is None
+            and args.block_init_checkpoint is None
+            and args.vae_pretrained_checkpoint is None
+        ):
+            parser.error(
+                "--vae_pretrained_checkpoint or --block_init_checkpoint is required "
+                "when --block_vae_pipeline_mode is distill."
+            )
+    else:
+        if args.vae_pretrained_checkpoint is not None:
+            parser.error("--vae_pretrained_checkpoint is only supported when --block_vae_pipeline_mode is distill.")
+        if args.block_init_checkpoint is not None:
+            parser.error("--block_init_checkpoint is only supported when --block_vae_pipeline_mode is distill.")
     if args.block_vae_pretrain_workers is not None and int(args.block_vae_pretrain_workers) < 1:
         parser.error("--block_vae_pretrain_workers must be >= 1.")
     if int(args.block_vae_linear_group_size) < 1:

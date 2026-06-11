@@ -67,6 +67,15 @@ def _validate_resume_stage(extra: Dict[str, Any], checkpoint_dir: str) -> None:
         )
 
 
+def _validate_block_init_stage(extra: Dict[str, Any], checkpoint_dir: str) -> None:
+    stage = str(extra.get("stage", "")).strip()
+    if stage != BLOCK_FINAL_CHECKPOINT_STAGE:
+        raise ValueError(
+            f"Checkpoint is not a block final checkpoint: {checkpoint_dir}. "
+            f"Expected extra_meta.stage={BLOCK_FINAL_CHECKPOINT_STAGE!r}, got {stage!r}."
+        )
+
+
 def _int_tuple(value: object, *, field_name: str) -> Tuple[int, ...]:
     if not isinstance(value, list):
         raise TypeError(f"{field_name} must be a list, got {type(value)}.")
@@ -182,6 +191,29 @@ def load_block_resume_model(
 ):
     checkpoint_dir, meta = _read_checkpoint_meta(path)
     _validate_resume_stage(_extra_meta(meta), checkpoint_dir)
+    model, load_meta, load_result = load_e2e_model_checkpoint(
+        checkpoint_dir,
+        access_token=access_token,
+        map_location="cpu",
+        strict=True,
+        materialize_proxy_decoded_linears=True,
+        proxy_group_size=int(proxy_group_size),
+        proxy_compute_device=proxy_compute_device,
+        proxy_logger=logger,
+    )
+    return model, checkpoint_dir, load_meta, load_result
+
+
+def load_block_init_checkpoint_model(
+    path: str,
+    *,
+    access_token: Optional[str],
+    proxy_group_size: int,
+    proxy_compute_device: object,
+    logger=None,
+):
+    checkpoint_dir, meta = _read_checkpoint_meta(path)
+    _validate_block_init_stage(_extra_meta(meta), checkpoint_dir)
     model, load_meta, load_result = load_e2e_model_checkpoint(
         checkpoint_dir,
         access_token=access_token,

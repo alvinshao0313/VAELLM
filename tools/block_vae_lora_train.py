@@ -39,6 +39,7 @@ from train_utils.block_vae_lora_args import (
     validate_skip_layers_with_block_layers,
 )
 from train_utils.block_vae_lora_checkpoint import (
+    load_block_init_checkpoint_model,
     load_block_resume_model,
     load_block_resume_state,
     prune_block_layer_checkpoints,
@@ -330,9 +331,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
 
     loaded_pretrain_meta = None
+    loaded_block_init_meta = None
     loaded_resume_meta = None
     if args.block_resume_from_checkpoint is None:
-        if pipeline_mode == "distill":
+        if pipeline_mode == "distill" and args.block_init_checkpoint is not None:
+            model, init_checkpoint_dir, init_load_meta, init_load_result = load_block_init_checkpoint_model(
+                str(args.block_init_checkpoint),
+                access_token=hf_args.access_token,
+                proxy_group_size=int(args.block_decode_group_size),
+                proxy_compute_device=str(args.convert_device),
+                logger=logger,
+            )
+            loaded_block_init_meta = init_load_meta
+            logger.info("Initialized new block distill pass from final checkpoint: %s", init_checkpoint_dir)
+            logger.info(
+                "Block init checkpoint loaded. missing_keys=%d unexpected_keys=%d converted_module_count=%s adapter_module_count=%s",
+                len(getattr(init_load_result, "missing_keys", [])),
+                len(getattr(init_load_result, "unexpected_keys", [])),
+                str(init_load_meta.get("converted_module_count")),
+                str(init_load_meta.get("adapter_module_count")),
+            )
+        elif pipeline_mode == "distill":
             model, loaded_pretrain_meta, pretrain_load_result = load_block_vae_category_pretrained_model(
                 str(args.vae_pretrained_checkpoint),
                 access_token=hf_args.access_token,
@@ -425,7 +444,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 block_vae_pretrain_manifest_hash,
             )
         else:
-            extra_meta = loaded_resume_meta.get("extra_meta", {}) if isinstance(loaded_resume_meta, dict) else {}
+            source_name = "Resume checkpoint"
+            source_meta = loaded_resume_meta
+            if loaded_block_init_meta is not None:
+                source_name = "Block init checkpoint"
+                source_meta = loaded_block_init_meta
+            extra_meta = source_meta.get("extra_meta", {}) if isinstance(source_meta, dict) else {}
+            actual_categories = extra_meta.get("block_vae_categories")
+            if actual_categories is None:
+                block_distill_meta = extra_meta.get("block_distill", {})
+                if isinstance(block_distill_meta, dict):
+                    actual_categories = block_distill_meta.get("block_vae_categories")
+            if actual_categories is not None:
+                actual_categories = [str(category) for category in actual_categories]
+                expected_categories = [str(category) for category in args.block_vae_categories]
+                if actual_categories != expected_categories:
+                    raise ValueError(
+                        f"{source_name} block_vae_categories mismatch: "
+                        f"checkpoint={actual_categories} current={expected_categories}."
+                    )
             block_vae_pretrain_manifest_hash = compute_block_vae_category_pretrain_hash(
                 args=args,
                 selected_layers=sorted(selected_layers),
@@ -436,7 +473,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             checkpoint_hash = str(extra_meta.get("block_vae_cache_manifest_hash", ""))
             if checkpoint_hash != block_vae_pretrain_manifest_hash:
                 raise ValueError(
-                    "Resume checkpoint block VAE pretrain manifest hash mismatch: "
+                    f"{source_name} block VAE pretrain manifest hash mismatch: "
                     f"checkpoint={checkpoint_hash!r} current={block_vae_pretrain_manifest_hash!r}."
                 )
     resume_start_layer = 0
@@ -704,6 +741,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "Final save: marked untrained block targets original-only: %d",
             int(final_original_only_count),
         )
+    allow_preserved_adapters = args.block_init_checkpoint is not None
+    if loaded_resume_meta is not None:
+        adapter_modules = loaded_resume_meta.get("adapter_modules", [])
+        allow_preserved_adapters = allow_preserved_adapters or bool(adapter_modules)
     validate_final_block_checkpoint(
         model,
         expected_rank=int(args.block_lora_rank),
@@ -711,6 +752,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         expected_count=expected_count,
         lora_variant=str(args.block_lora_variant),
         train_mode=str(args.block_distill_train_mode),
+        allow_preserved_adapters=allow_preserved_adapters,
     )
     fused_post_norm_head = fuse_post_norm_head_linear(model)
     if fused_post_norm_head:
@@ -733,6 +775,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "target_module_count": expected_count,
             "completed_block_layers": sorted(int(idx) for idx in completed_block_layers),
             "resume_from_checkpoint": args.block_resume_from_checkpoint,
+            "block_init_checkpoint": args.block_init_checkpoint,
             "block_vae_pipeline_mode": pipeline_mode,
             "block_vae_categories": [str(category) for category in args.block_vae_categories],
             "block_vae_pretrain_manifest_hash": block_vae_pretrain_manifest_hash,

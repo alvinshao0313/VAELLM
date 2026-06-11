@@ -426,6 +426,18 @@ def _materialize_missing_proxy_dense_base_from_model(
                 state_dict[key] = current_state[key]
 
 
+def _materialize_missing_original_weights_from_model(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+) -> None:
+    current_state = model.state_dict()
+    for key, value in current_state.items():
+        if not str(key).endswith(".original_weight"):
+            continue
+        if key not in state_dict:
+            state_dict[key] = value
+
+
 def load_e2e_checkpoint_into_model(
     model: nn.Module,
     model_dir: str,
@@ -436,6 +448,7 @@ def load_e2e_checkpoint_into_model(
     proxy_group_size: int = 8,
     proxy_compute_device: Optional[object] = None,
     proxy_logger=None,
+    preserve_original_weights_from_base: bool = False,
 ):
     meta_path = os.path.join(model_dir, META_FILENAME)
     if not os.path.exists(meta_path):
@@ -448,7 +461,11 @@ def load_e2e_checkpoint_into_model(
 
     converted_modules = meta.get("converted_modules", [])
     if converted_modules:
-        _rebuild_converted_modules(model, converted_modules)
+        _rebuild_converted_modules(
+            model,
+            converted_modules,
+            preserve_original_weights_from_base=bool(preserve_original_weights_from_base),
+        )
 
     adapter_modules = meta.get("adapter_modules", [])
     extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
@@ -471,6 +488,8 @@ def load_e2e_checkpoint_into_model(
     adalora_runtime_state = pop_peft_proxy_adalora_runtime_state_dict(state_dict)
     _materialize_missing_bias_params_from_state_dict(model, state_dict)
     _materialize_missing_proxy_dense_base_from_model(model, state_dict)
+    if bool(preserve_original_weights_from_base):
+        _materialize_missing_original_weights_from_model(model, state_dict)
 
     load_result = model.load_state_dict(state_dict, strict=strict)
     if materialize_proxy_decoded_linears:
@@ -496,6 +515,7 @@ def load_e2e_model_checkpoint(
     proxy_group_size: int = 8,
     proxy_compute_device: Optional[object] = None,
     proxy_logger=None,
+    preserve_original_weights_from_base: bool = False,
 ):
     meta_path = os.path.join(model_dir, META_FILENAME)
     if not os.path.exists(meta_path):
@@ -519,4 +539,5 @@ def load_e2e_model_checkpoint(
         proxy_group_size=int(proxy_group_size),
         proxy_compute_device=proxy_compute_device,
         proxy_logger=proxy_logger,
+        preserve_original_weights_from_base=bool(preserve_original_weights_from_base),
     )
