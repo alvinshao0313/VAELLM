@@ -241,6 +241,10 @@ def _advance_block_hidden_states(
     device: str,
     student_hif4_act: bool,
     active_block_targets: Sequence[Tuple[int, str]],
+    batch_size: int = 1,
+    train_mode: str = "lora",
+    decode_group_size: int = 8,
+    logger=None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     return advance_block_hidden_states_in_place(
         model=model,
@@ -250,6 +254,10 @@ def _advance_block_hidden_states(
         device=str(device),
         student_hif4_act=bool(student_hif4_act),
         active_block_targets=active_block_targets,
+        batch_size=int(batch_size),
+        train_mode=str(train_mode),
+        decode_group_size=int(decode_group_size),
+        logger=logger,
     )
 
 
@@ -571,6 +579,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         device=str(args.train_device),
         train_mode=str(args.block_distill_train_mode),
         decode_group_size=int(args.block_decode_group_size),
+        hidden_advance_batch_size=int(args.block_hidden_advance_batch_size),
     )
 
     for layer_idx in range(num_layers):
@@ -584,6 +593,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
                 active_block_targets=sorted(completed_block_targets),
+                batch_size=int(args.block_hidden_advance_batch_size),
+                train_mode=str(args.block_distill_train_mode),
+                decode_group_size=int(args.block_decode_group_size),
+                logger=logger,
             )
             continue
         if int(layer_idx) not in selected_layers:
@@ -596,6 +609,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
                 active_block_targets=sorted(completed_block_targets),
+                batch_size=int(args.block_hidden_advance_batch_size),
+                train_mode=str(args.block_distill_train_mode),
+                decode_group_size=int(args.block_decode_group_size),
+                logger=logger,
             )
             continue
         validate_block_categories(model, layer_idx)
@@ -638,6 +655,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
                 active_block_targets=sorted(completed_block_targets),
+                batch_size=int(args.block_hidden_advance_batch_size),
+                train_mode=str(args.block_distill_train_mode),
+                decode_group_size=int(args.block_decode_group_size),
+                logger=logger,
             )
             continue
         if pipeline_mode == "inline":

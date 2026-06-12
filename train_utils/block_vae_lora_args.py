@@ -132,6 +132,7 @@ class BlockVaeLoraArgs:
     block_attn_query_chunk_size: int
     block_distill_log_every: int
     block_decode_group_size: int
+    block_hidden_advance_batch_size: int
     transpose_modules: str
     skip_layers: str
     block_layers: str
@@ -507,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block_attn_query_chunk_size", type=int, default=128)
     parser.add_argument("--block_distill_log_every", type=int, default=10)
     parser.add_argument("--block_decode_group_size", type=int, default=8)
+    parser.add_argument("--block_hidden_advance_batch_size", type=int, default=1)
     parser.add_argument(
         "--transpose_modules",
         type=str,
@@ -638,6 +640,7 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         block_attn_query_chunk_size=int(raw_args.block_attn_query_chunk_size),
         block_distill_log_every=int(raw_args.block_distill_log_every),
         block_decode_group_size=int(raw_args.block_decode_group_size),
+        block_hidden_advance_batch_size=int(raw_args.block_hidden_advance_batch_size),
         transpose_modules=str(raw_args.transpose_modules),
         skip_layers=str(raw_args.skip_layers),
         block_layers=str(raw_args.block_layers),
@@ -746,6 +749,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
         parser.error("--block_distill_log_every must be > 0.")
     if int(args.block_decode_group_size) <= 0:
         parser.error("--block_decode_group_size must be > 0.")
+    if int(args.block_hidden_advance_batch_size) <= 0:
+        parser.error("--block_hidden_advance_batch_size must be > 0.")
     try:
         parse_transpose_modules(str(args.transpose_modules))
     except ValueError as exc:

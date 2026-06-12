@@ -4,6 +4,8 @@ set -euo pipefail
 export PYTHONPATH="${PYTHONPATH:-.}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
 SEED="${SEED:-42}"
 export PYTHONHASHSEED="${SEED}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -30,6 +32,7 @@ python tools/block_vae_lora_train.py \
   --unload_vae_original_weights_on_final_save \
   --block_vae_pipeline_mode "distill" \
   --vae_pretrained_checkpoint ".result/Qwen_Qwen3-8B_vae_pretrained_20260610_021016/block_vae_cache" \
+  --block_resume_from_checkpoint .result/Qwen_Qwen3-8B_20260611_074709/block_checkpoints/block_0016 \
   --block_vae_pretrain_devices "cuda" \
   --block_vae_pretrain_workers "1" \
   --block_vae_linear_group_size "36" \
@@ -98,6 +101,7 @@ python tools/block_vae_lora_train.py \
   --block_attn_query_chunk_size "4096" \
   --block_distill_log_every "10" \
   --block_decode_group_size "8" \
+  --block_hidden_advance_batch_size "64" \
   --skip_layers "" \
   --block_layers "all" \
   --block_eval_after_each_layer "false" \

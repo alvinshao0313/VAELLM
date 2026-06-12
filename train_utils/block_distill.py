@@ -86,6 +86,7 @@ class BlockDistillConfig:
     device: str
     train_mode: str = "lora"
     decode_group_size: int = 8
+    hidden_advance_batch_size: int = 1
     eps: float = 1e-6
 
 
@@ -189,6 +190,113 @@ def _iter_named_block_temporary_modules(model: nn.Module) -> Iterator[Tuple[str,
             continue
         if callable(getattr(module, "set_temporary", None)):
             yield str(name), module
+
+
+def _collect_layer_temporary_modules(
+    model: nn.Module,
+    layer_idx: int,
+    target_categories: Optional[Sequence[str]] = None,
+) -> Tuple[Tuple[str, nn.Module], ...]:
+    modules: List[Tuple[str, nn.Module]] = []
+    for category in _normalize_target_categories(target_categories):
+        module_name = _block_projection_module_name(int(layer_idx), str(category))
+        module = get_module_by_name(model, module_name)
+        if callable(getattr(module, "set_temporary", None)):
+            modules.append((str(category), module))
+    return tuple(modules)
+
+
+def _active_categories_for_layer(
+    layer_idx: int,
+    active_block_targets: Optional[Collection[Tuple[int, str]]],
+) -> Optional[Set[str]]:
+    active = _normalize_active_block_targets(active_block_targets)
+    if active is None:
+        return None
+    return {str(category) for active_layer_idx, category in active if int(active_layer_idx) == int(layer_idx)}
+
+
+@contextmanager
+def block_layer_student_weight_scope(
+    layer_modules: Sequence[Tuple[str, nn.Module]],
+    active_categories: Collection[str],
+) -> Iterator[None]:
+    active = {str(category) for category in active_categories}
+    previous: List[Tuple[nn.Module, Optional[bool]]] = []
+    try:
+        for category, module in layer_modules:
+            previous.append((module, getattr(module, "temporary", None)))
+            module.set_temporary(str(category) in active)
+        yield
+    finally:
+        for module, old_temporary in reversed(previous):
+            if old_temporary is not None:
+                module.set_temporary(bool(old_temporary))
+
+
+def _resolve_decoder_inference_base_layer(module: nn.Module) -> Optional[VAELinear]:
+    if isinstance(module, PeftVAELinearProxy):
+        base_layer = module.base_layer
+    else:
+        base_layer = module
+    if isinstance(base_layer, VAELinear):
+        return base_layer
+    return None
+
+
+@torch.no_grad()
+def _prime_block_decoder_inference_weights(
+    *,
+    model: nn.Module,
+    layer_idx: int,
+    active_block_targets: Collection[Tuple[int, str]],
+    group_size: int,
+    device: str,
+    layer_temporary_modules: Optional[Sequence[Tuple[str, nn.Module]]] = None,
+    logger=None,
+) -> int:
+    active_layer_categories = _active_categories_for_layer(int(layer_idx), active_block_targets)
+    if active_layer_categories is None:
+        raise ValueError("active_block_targets must be provided for decoder hidden-state predecode.")
+    if not active_layer_categories:
+        return 0
+    modules = (
+        tuple(layer_temporary_modules)
+        if layer_temporary_modules is not None
+        else _collect_layer_temporary_modules(model, int(layer_idx))
+    )
+    targets: List[NamedVAELinearTarget] = []
+    for category, module in modules:
+        if str(category) not in active_layer_categories:
+            continue
+        base_layer = _resolve_decoder_inference_base_layer(module)
+        if base_layer is None:
+            continue
+        targets.append(
+            NamedVAELinearTarget(
+                name=_block_projection_module_name(int(layer_idx), str(category)),
+                base_layer=base_layer,
+            )
+        )
+    if not targets:
+        return 0
+    stats = prime_named_vae_linear_cache(
+        targets,
+        clear_existing=True,
+        group_size=int(group_size),
+        compute_device=str(device),
+        logger=logger,
+    )
+    if logger is not None:
+        logger.info(
+            "[block %d] primed decoder hidden-advance weights: total=%d warmed=%d group_size=%d device=%s",
+            int(layer_idx),
+            int(stats.get("total", len(targets))),
+            int(stats.get("warmed", len(targets))),
+            int(group_size),
+            str(device),
+        )
+    return int(stats.get("total", len(targets)))
 
 
 @contextmanager
@@ -592,6 +700,9 @@ def attention_map_kl_loss(
     eps: float = 1e-6,
     hif4_controller=None,
     active_block_targets: Optional[Collection[Tuple[int, str]]] = None,
+    layer_temporary_modules: Optional[Sequence[Tuple[str, nn.Module]]] = None,
+    active_layer_categories: Optional[Collection[str]] = None,
+    student_scope_already_active: bool = False,
 ) -> torch.Tensor:
     if int(query_chunk_size) < 1:
         raise ValueError(f"query_chunk_size must be >= 1, got {query_chunk_size}.")
@@ -599,13 +710,21 @@ def attention_map_kl_loss(
     try:
         if hif4_controller is not None:
             hif4_controller.enabled = False
-        with torch.no_grad(), block_student_weight_scope(model, set()):
-            teacher_q, teacher_k, teacher_mask = _qk_states_for_attention(model, layer_idx, teacher_hidden)
-        student_scope = (
-            block_student_weight_scope(model, active_block_targets)
-            if active_block_targets is not None
-            else nullcontext()
+        teacher_scope = (
+            block_layer_student_weight_scope(layer_temporary_modules, set())
+            if layer_temporary_modules is not None
+            else block_student_weight_scope(model, set())
         )
+        with torch.no_grad(), teacher_scope:
+            teacher_q, teacher_k, teacher_mask = _qk_states_for_attention(model, layer_idx, teacher_hidden)
+        if bool(student_scope_already_active):
+            student_scope = nullcontext()
+        elif layer_temporary_modules is not None and active_layer_categories is not None:
+            student_scope = block_layer_student_weight_scope(layer_temporary_modules, active_layer_categories)
+        elif active_block_targets is not None:
+            student_scope = block_student_weight_scope(model, active_block_targets)
+        else:
+            student_scope = nullcontext()
         if hif4_controller is not None:
             hif4_controller.enabled = True
         with student_scope:
@@ -1052,6 +1171,10 @@ def advance_block_hidden_states_in_place(
     device: str,
     student_hif4_act: bool,
     active_block_targets: Collection[Tuple[int, str]],
+    batch_size: int = 1,
+    train_mode: str = "lora",
+    decode_group_size: int = 8,
+    logger=None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if not isinstance(teacher_hiddens_cpu, list) or not isinstance(student_hiddens_cpu, list):
         raise TypeError("teacher_hiddens_cpu and student_hiddens_cpu must be mutable lists.")
@@ -1060,28 +1183,53 @@ def advance_block_hidden_states_in_place(
             "teacher_hiddens_cpu and student_hiddens_cpu must have the same length: "
             f"{len(teacher_hiddens_cpu)} != {len(student_hiddens_cpu)}."
         )
+    batch = int(batch_size)
+    if batch <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}.")
 
     run_device = torch.device(device)
     layer = model.model.layers[int(layer_idx)].to(run_device)
     layer.eval()
+    layer_temporary_modules = _collect_layer_temporary_modules(model, int(layer_idx))
+    active_layer_categories = _active_categories_for_layer(int(layer_idx), active_block_targets)
+    if active_layer_categories is None:
+        raise ValueError("active_block_targets must be provided for hidden-state advancement.")
+    mode = _normalize_block_distill_train_mode(str(train_mode))
+    if mode in {"decoder", "both"}:
+        _prime_block_decoder_inference_weights(
+            model=model,
+            layer_idx=int(layer_idx),
+            active_block_targets=active_block_targets,
+            group_size=int(decode_group_size),
+            device=str(run_device),
+            layer_temporary_modules=layer_temporary_modules,
+            logger=logger,
+        )
     with applied_hif4_act(model, enabled=bool(student_hif4_act), require_targets=False) as hif4_ctx:
         hif4_controller = hif4_ctx.get("controller")
-        for sample_idx in range(len(teacher_hiddens_cpu)):
-            teacher_cpu = teacher_hiddens_cpu[sample_idx]
-            student_cpu = student_hiddens_cpu[sample_idx]
-            teacher_in = teacher_cpu.to(device=run_device, non_blocking=True)
-            student_in = student_cpu.to(device=run_device, non_blocking=True)
+        for start_idx in range(0, len(teacher_hiddens_cpu), batch):
+            stop_idx = min(start_idx + batch, len(teacher_hiddens_cpu))
+            teacher_batch_cpu = teacher_hiddens_cpu[start_idx:stop_idx]
+            student_batch_cpu = student_hiddens_cpu[start_idx:stop_idx]
+            teacher_batch_sizes = [int(item.shape[0]) for item in teacher_batch_cpu]
+            student_batch_sizes = [int(item.shape[0]) for item in student_batch_cpu]
+            teacher_in = torch.cat(teacher_batch_cpu, dim=0).to(device=run_device, non_blocking=True)
+            student_in = torch.cat(student_batch_cpu, dim=0).to(device=run_device, non_blocking=True)
             if hif4_controller is not None:
                 hif4_controller.enabled = False
-            with block_student_weight_scope(model, set()):
+            with block_layer_student_weight_scope(layer_temporary_modules, set()):
                 teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
             if hif4_controller is not None:
                 hif4_controller.enabled = True
-            with block_student_weight_scope(model, active_block_targets):
+            with block_layer_student_weight_scope(layer_temporary_modules, active_layer_categories):
                 student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
-            teacher_hiddens_cpu[sample_idx] = teacher_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
-            student_hiddens_cpu[sample_idx] = student_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
-            del teacher_cpu, student_cpu, teacher_in, student_in, teacher_next, student_next
+            teacher_next_cpu = teacher_next.detach().to(device="cpu", dtype=torch.bfloat16)
+            student_next_cpu = student_next.detach().to(device="cpu", dtype=torch.bfloat16)
+            for offset, tensor in enumerate(torch.split(teacher_next_cpu, teacher_batch_sizes, dim=0)):
+                teacher_hiddens_cpu[start_idx + offset] = tensor.contiguous()
+            for offset, tensor in enumerate(torch.split(student_next_cpu, student_batch_sizes, dim=0)):
+                student_hiddens_cpu[start_idx + offset] = tensor.contiguous()
+            del teacher_in, student_in, teacher_next, student_next, teacher_next_cpu, student_next_cpu
     layer.to("cpu")
     if run_device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1154,6 +1302,10 @@ def train_block_lora_distill(
     attn_weight = float(config.alpha)
     linear_weight = float(config.beta)
     hidden_weight = 1.0 - attn_weight - linear_weight
+    layer_temporary_modules = _collect_layer_temporary_modules(model, int(layer_idx))
+    active_layer_categories = _active_categories_for_layer(int(layer_idx), active_block_targets)
+    if active_layer_categories is None:
+        raise ValueError("active_block_targets must be provided for block distill training.")
 
     for step in range(int(config.steps)):
         sample_idx = int(step) % int(num_samples)
@@ -1162,7 +1314,7 @@ def train_block_lora_distill(
         optimizer.zero_grad(set_to_none=True)
 
         needs_teacher_block = linear_weight > 0.0 or hidden_weight > 0.0
-        with block_student_weight_scope(model, set()):
+        with block_layer_student_weight_scope(layer_temporary_modules, set()):
             if linear_weight > 0.0:
                 with torch.no_grad(), capture_linear_io(module_by_name) as teacher_io:
                     teacher_out = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
@@ -1185,7 +1337,7 @@ def train_block_lora_distill(
             log_prefix=f"[block {int(layer_idx)} {train_mode}] ",
         ) as hif4_ctx:
             hif4_controller = hif4_ctx.get("controller")
-            with block_student_weight_scope(model, active_block_targets):
+            with block_layer_student_weight_scope(layer_temporary_modules, active_layer_categories):
                 if linear_weight > 0.0:
                     linear_losses = []
                     for name in module_names:
@@ -1220,6 +1372,9 @@ def train_block_lora_distill(
                         eps=config.eps,
                         hif4_controller=hif4_controller,
                         active_block_targets=active_block_targets,
+                        layer_temporary_modules=layer_temporary_modules,
+                        active_layer_categories=active_layer_categories,
+                        student_scope_already_active=True,
                     )
                 else:
                     attn_loss = student_in.new_zeros(())
@@ -1264,6 +1419,10 @@ def train_block_lora_distill(
         device=str(device),
         student_hif4_act=bool(config.lora_hif4_act),
         active_block_targets=active_block_targets,
+        batch_size=int(config.hidden_advance_batch_size),
+        train_mode=str(config.train_mode),
+        decode_group_size=int(config.decode_group_size),
+        logger=logger,
     )
 
 

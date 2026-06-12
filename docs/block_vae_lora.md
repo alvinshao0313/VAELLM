@@ -43,17 +43,20 @@ q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
 |---|---:|---:|---|
 | `--vae_pretrained_checkpoint` | 空 | `.result/Qwen_Qwen3-8B_20260610_021016/block_vae_cache` | `distill` 第一轮输入：全 VAELinear checkpoint，要求 stage 为 `block_vae_category_pretrained` |
 | `--block_init_checkpoint` | 空 | 空，按需手动替换 `--vae_pretrained_checkpoint` | `distill` 新一轮输入：上一轮 block `final_model`，要求 stage 为 `block_vae_lora_final` |
+| `--block_resume_from_checkpoint` | 空 | `.result/Qwen_Qwen3-8B_20260611_074519/block_checkpoints/block_0020` | 同一轮逐层蒸馏中断恢复，要求 stage 为 `block_vae_lora_layer` |
 | `--block_vae_pretrain_devices` | 空，实际回退到 `train_device` | `cuda` | VAE pretrain worker 使用的设备列表 |
 | `--block_vae_pretrain_workers` | 空，实际等于设备数 | `1` | VAE pretrain worker 数 |
 | `--block_vae_linear_group_size` | `32` | `36` | 每个同类别 VAE group 包含多少个 Linear |
 | `--block_vae_allow_tail_group` | `true` | `true` | 是否允许不足 group size 的尾组 |
 | `--block_vae_categories` | 7 类全量 | 7 类全量 | 要训练和蒸馏的 Linear 类别；输入顺序就是 pretrain 类别顺序 |
 
-`distill` 初始化入口三选一，不能混用：
+`distill` 初始化入口建议只保留一个，避免实验配置含义混乱：
 
 - `--vae_pretrained_checkpoint`：从全 VAE checkpoint 开始第一轮逐层蒸馏。
 - `--block_init_checkpoint`：从上一轮 block `final_model` 开始新一轮逐层蒸馏。不是 resume，会从第 0 层重新走一遍。
 - `--block_resume_from_checkpoint`：从 `<run_output_dir>/block_checkpoints/block_XXXX/` 继续中断的同一轮逐层蒸馏。
+
+当前 `scripts/block_vae_lora_simple.sh` 写了 `--block_resume_from_checkpoint`，用于继续现有 run；这种情况下实际模型初始化来自 resume checkpoint。新开一轮 distill 时，应删除这行，只保留 `--vae_pretrained_checkpoint` 或改用 `--block_init_checkpoint`。
 
 `--block_init_checkpoint` 只接受 block final checkpoint，不能传逐层 checkpoint，也不能传 `block_vae_cache`。
 
@@ -166,7 +169,7 @@ cat:<当前类别> > default
 | 参数 | Parser 默认值 | simple.sh 默认值 | 说明 |
 |---|---:|---:|---|
 | `--block_distill_train_mode` | `lora` | `lora` | 蒸馏训练模式：`lora/decoder/both` |
-| `--block_distill_steps` | `100` | `5` | 每个 selected block 的蒸馏步数 |
+| `--block_distill_steps` | `100` | `5000` | 每个 selected block 的蒸馏步数 |
 | `--block_distill_dataset` | `fineweb_edu=0.35,race=0.30,sciq=0.20,openorca=0.15` | `openorca=0.24,fineweb_edu=0.18,race=0.24,sciq=0.03,alpaca=0.11,longalpaca=0.10,longalign=0.10` | 蒸馏校准数据 |
 | `--block_distill_nsamples` | `100` | `5000` | 校准样本数 |
 | `--block_distill_seqlen` | `4096` | `4096` | 校准序列长度 |
@@ -176,10 +179,11 @@ cat:<当前类别> > default
 | `--block_lora_alpha` | rank | `32` | LoRA alpha |
 | `--block_lora_dropout` | `0.0` | `0.0` | LoRA dropout |
 | `--block_lora_bias` | `none` | `none` | LoRA bias 模式 |
-| `--block_loss_alpha` | `0.1` | `0.3` | attention KL 权重 |
+| `--block_loss_alpha` | `0.1` | `0.5` | attention KL 权重 |
 | `--block_loss_beta` | `0.2` | `0.2` | linear relative MSE 权重 |
 | `--block_attn_query_chunk_size` | `128` | `4096` | attention KL query chunk |
 | `--block_decode_group_size` | `8` | `8` | PEFT proxy decode group size |
+| `--block_hidden_advance_batch_size` | `1` | `8` | 推进 teacher/student hidden states 时的小 batch 大小；用于 resume prefix、skipped layer 和每层蒸馏结束后的 hidden 更新，不改变蒸馏训练 step 的 sample 粒度 |
 
 loss 公式：
 
@@ -211,7 +215,7 @@ block_loss_alpha + block_loss_beta <= 1
 | `--block_eval_ppl_limit` | `-1` | `-1` | PPL 样本限制 |
 | `--block_eval_device` | `None` | `cuda` | 评估设备 |
 | `--block_keep_last_checkpoints` | `3` | `1` | 保留最近多少个逐层 checkpoint |
-| `--block_resume_from_checkpoint` | `None` | 空 | 从逐层 checkpoint 继续 |
+| `--block_resume_from_checkpoint` | `None` | `.result/Qwen_Qwen3-8B_20260611_074519/block_checkpoints/block_0020` | 从逐层 checkpoint 继续 |
 
 输出：
 
@@ -235,7 +239,7 @@ checkpoint meta 会记录 `block_vae_categories`、`block_vae_pretrain_manifest_
 |---|---:|---|
 | `PYTHONPATH` | `.` | Python import 路径 |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | CUDA allocator 设置 |
-| `CUDA_VISIBLE_DEVICES` | `6` | 默认可见 GPU |
+| `CUDA_VISIBLE_DEVICES` | `7` | 默认可见 GPU |
 | `SEED` | `42` | 随机种子 |
 | `PYTHONHASHSEED` | `${SEED}` | Python hash seed |
 | `TOKENIZERS_PARALLELISM` | `false` | tokenizer 并行 |
