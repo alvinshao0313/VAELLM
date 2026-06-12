@@ -19,7 +19,7 @@ from e2e_common.post_norm_head import fuse_post_norm_head_linear
 from litebsq.vae_linear import clear_model_vae_linear_cache
 from train_utils.block_distill import (
     BlockDistillConfig,
-    block_student_weight_scope,
+    advance_block_hidden_states_in_place,
     build_initial_hidden_states,
     mark_untrained_block_targets_original_only,
     prepare_block_eval_decoded_weights,
@@ -28,7 +28,6 @@ from train_utils.block_distill import (
     validate_block_categories,
     validate_final_block_checkpoint,
     validate_qwen3_model,
-    run_qwen3_block,
 )
 from train_utils.block_vae_lora_args import (
     BlockVaeLoraArgs,
@@ -59,7 +58,6 @@ from train_utils.cat_train_args import parse_skip_layers
 from train_utils.cat_train_runtime import (
     load_model_for_cat_train,
 )
-from train_utils.hif4_act import applied_hif4_act
 from train_utils.lora_data import build_calibration_input_ids
 from train_utils.model_checkpoint_io import _build_run_output_dir
 from train_utils.utils import (
@@ -238,36 +236,21 @@ def _advance_block_hidden_states(
     *,
     model: nn.Module,
     layer_idx: int,
-    teacher_hiddens_cpu: Sequence[torch.Tensor],
-    student_hiddens_cpu: Sequence[torch.Tensor],
+    teacher_hiddens_cpu: List[torch.Tensor],
+    student_hiddens_cpu: List[torch.Tensor],
     device: str,
     student_hif4_act: bool,
     active_block_targets: Sequence[Tuple[int, str]],
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    run_device = torch.device(device)
-    layer = model.model.layers[int(layer_idx)].to(run_device)
-    layer.eval()
-    next_teacher: List[torch.Tensor] = []
-    next_student: List[torch.Tensor] = []
-    with applied_hif4_act(model, enabled=bool(student_hif4_act), require_targets=False) as hif4_ctx:
-        hif4_controller = hif4_ctx.get("controller")
-        for teacher_cpu, student_cpu in zip(teacher_hiddens_cpu, student_hiddens_cpu):
-            teacher_in = teacher_cpu.to(device=run_device, non_blocking=True)
-            student_in = student_cpu.to(device=run_device, non_blocking=True)
-            if hif4_controller is not None:
-                hif4_controller.enabled = False
-            with block_student_weight_scope(model, set()):
-                teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
-            if hif4_controller is not None:
-                hif4_controller.enabled = True
-            with block_student_weight_scope(model, active_block_targets):
-                student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
-            next_teacher.append(teacher_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
-            next_student.append(student_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
-    layer.to("cpu")
-    if run_device.type == "cuda":
-        torch.cuda.empty_cache()
-    return next_teacher, next_student
+    return advance_block_hidden_states_in_place(
+        model=model,
+        layer_idx=int(layer_idx),
+        teacher_hiddens_cpu=teacher_hiddens_cpu,
+        student_hiddens_cpu=student_hiddens_cpu,
+        device=str(device),
+        student_hif4_act=bool(student_hif4_act),
+        active_block_targets=active_block_targets,
+    )
 
 
 def _active_categories_for_layer(

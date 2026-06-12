@@ -1042,12 +1042,58 @@ def _finalize_block_decoder_trainables(model: nn.Module, module_names: Iterable[
     return int(finalized)
 
 
+@torch.no_grad()
+def advance_block_hidden_states_in_place(
+    *,
+    model: nn.Module,
+    layer_idx: int,
+    teacher_hiddens_cpu: List[torch.Tensor],
+    student_hiddens_cpu: List[torch.Tensor],
+    device: str,
+    student_hif4_act: bool,
+    active_block_targets: Collection[Tuple[int, str]],
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    if not isinstance(teacher_hiddens_cpu, list) or not isinstance(student_hiddens_cpu, list):
+        raise TypeError("teacher_hiddens_cpu and student_hiddens_cpu must be mutable lists.")
+    if len(teacher_hiddens_cpu) != len(student_hiddens_cpu):
+        raise ValueError(
+            "teacher_hiddens_cpu and student_hiddens_cpu must have the same length: "
+            f"{len(teacher_hiddens_cpu)} != {len(student_hiddens_cpu)}."
+        )
+
+    run_device = torch.device(device)
+    layer = model.model.layers[int(layer_idx)].to(run_device)
+    layer.eval()
+    with applied_hif4_act(model, enabled=bool(student_hif4_act), require_targets=False) as hif4_ctx:
+        hif4_controller = hif4_ctx.get("controller")
+        for sample_idx in range(len(teacher_hiddens_cpu)):
+            teacher_cpu = teacher_hiddens_cpu[sample_idx]
+            student_cpu = student_hiddens_cpu[sample_idx]
+            teacher_in = teacher_cpu.to(device=run_device, non_blocking=True)
+            student_in = student_cpu.to(device=run_device, non_blocking=True)
+            if hif4_controller is not None:
+                hif4_controller.enabled = False
+            with block_student_weight_scope(model, set()):
+                teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
+            if hif4_controller is not None:
+                hif4_controller.enabled = True
+            with block_student_weight_scope(model, active_block_targets):
+                student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
+            teacher_hiddens_cpu[sample_idx] = teacher_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+            student_hiddens_cpu[sample_idx] = student_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+            del teacher_cpu, student_cpu, teacher_in, student_in, teacher_next, student_next
+    layer.to("cpu")
+    if run_device.type == "cuda":
+        torch.cuda.empty_cache()
+    return teacher_hiddens_cpu, student_hiddens_cpu
+
+
 def train_block_lora_distill(
     *,
     model: nn.Module,
     layer_idx: int,
-    teacher_hiddens_cpu: Sequence[torch.Tensor],
-    student_hiddens_cpu: Sequence[torch.Tensor],
+    teacher_hiddens_cpu: List[torch.Tensor],
+    student_hiddens_cpu: List[torch.Tensor],
     config: BlockDistillConfig,
     target_categories: Optional[Sequence[str]] = None,
     logger=None,
@@ -1210,29 +1256,15 @@ def train_block_lora_distill(
     elif use_decoder:
         _finalize_block_decoder_trainables(model, module_names)
 
-    next_teacher: List[torch.Tensor] = []
-    next_student: List[torch.Tensor] = []
-    layer.eval()
-    with torch.no_grad():
-        with applied_hif4_act(model, enabled=bool(config.lora_hif4_act), require_targets=False) as hif4_ctx:
-            hif4_controller = hif4_ctx.get("controller")
-            for teacher_cpu, student_cpu in zip(teacher_hiddens_cpu, student_hiddens_cpu):
-                teacher_in = teacher_cpu.to(device=device, non_blocking=True)
-                student_in = student_cpu.to(device=device, non_blocking=True)
-                if hif4_controller is not None:
-                    hif4_controller.enabled = False
-                with block_student_weight_scope(model, set()):
-                    teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
-                if hif4_controller is not None:
-                    hif4_controller.enabled = True
-                with block_student_weight_scope(model, active_block_targets):
-                    student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
-                next_teacher.append(teacher_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
-                next_student.append(student_next.detach().to(device="cpu", dtype=torch.bfloat16).contiguous())
-    layer.to("cpu")
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return next_teacher, next_student
+    return advance_block_hidden_states_in_place(
+        model=model,
+        layer_idx=int(layer_idx),
+        teacher_hiddens_cpu=teacher_hiddens_cpu,
+        student_hiddens_cpu=student_hiddens_cpu,
+        device=str(device),
+        student_hif4_act=bool(config.lora_hif4_act),
+        active_block_targets=active_block_targets,
+    )
 
 
 @torch.no_grad()

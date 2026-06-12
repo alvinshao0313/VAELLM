@@ -29,7 +29,7 @@ python tools/block_vae_lora_train.py \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
   --block_vae_pipeline_mode "distill" \
-  --vae_pretrained_checkpoint ".result/Qwen_Qwen3-8B_20260610_021016/block_vae_cache" \
+  --vae_pretrained_checkpoint ".result/Qwen_Qwen3-8B_vae_pretrained_20260610_021016/block_vae_cache" \
   --block_vae_pretrain_devices "cuda" \
   --block_vae_pretrain_workers "1" \
   --block_vae_linear_group_size "36" \
