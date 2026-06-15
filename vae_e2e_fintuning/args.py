@@ -17,6 +17,7 @@ _DEFAULT_RUN_ROOT = ".result/vae_e2e_fintuning"
 _SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"}
 _VALID_VAE_TRAIN_MODES = {"decoder", "low_rank", "both"}
 _VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
+_VALID_HIDDEN_LAYER_WEIGHTING = {"uniform", "linear_depth"}
 
 
 @dataclass
@@ -29,6 +30,8 @@ class VAEDecoderE2EArguments:
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
     post_attn: bool = False
+    hidden_loss_weight: float = 0.0
+    hidden_layer_weighting: str = "uniform"
     decoder_layers: str = "all"
     target_modules: str = "all"
     vae_train_mode: str = "decoder"
@@ -91,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--distill_alpha", type=float, default=0.5)
     parser.add_argument("--post_attn", type=lambda v: _parse_bool_like(v, arg_name="--post_attn"), default=False)
+    parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
+    parser.add_argument("--hidden_layer_weighting", type=str, default="uniform")
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
     parser.add_argument("--vae_train_mode", type=str, default="decoder")
@@ -222,6 +227,12 @@ def validate_args(
         parser.error("--distill_temperature must be > 0.")
     if not (0.0 <= float(args.distill_alpha) <= 1.0):
         parser.error("--distill_alpha must satisfy 0 <= alpha <= 1.")
+    if float(args.hidden_loss_weight) < 0.0:
+        parser.error("--hidden_loss_weight must be >= 0.")
+    hidden_layer_weighting = str(args.hidden_layer_weighting or "").strip().lower()
+    if hidden_layer_weighting not in _VALID_HIDDEN_LAYER_WEIGHTING:
+        parser.error("--hidden_layer_weighting must be one of: uniform | linear_depth.")
+    args.hidden_layer_weighting = hidden_layer_weighting
     train_mode = str(args.vae_train_mode or "").strip().lower()
     if train_mode not in _VALID_VAE_TRAIN_MODES:
         parser.error("--vae_train_mode must be one of: decoder | low_rank | both.")

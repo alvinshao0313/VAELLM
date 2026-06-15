@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -9,6 +10,11 @@ from transformers.trainer_utils import IntervalStrategy
 from e2e_common.data import _record_to_text, build_datasets
 from raw_e2e_fintuning.args import parse_args
 from train_utils.lora_data import build_calibration_input_ids, prepare_lora_datasets
+from vae_e2e_fintuning.args import parse_args as parse_vae_e2e_args
+from vae_e2e_fintuning.trainer import (
+    build_vae_hidden_layer_weights,
+    compute_vae_hidden_alignment_loss,
+)
 
 
 class DummyTokenizer:
@@ -165,6 +171,135 @@ class DatasetMixArgsTest(unittest.TestCase):
         )
         self.assertEqual(e2e_args.dataset_mix_sources, ["longalpaca", "longalign"])
         self.assertEqual(e2e_args.dataset_mix_spec, "longalpaca=0.666666666667,longalign=0.333333333333")
+
+
+class VAEE2EHiddenLossArgsTest(unittest.TestCase):
+    def _parse_with_checkpoint(self, extra_args):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(f"{tmpdir}/checkpoint_meta.json", "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            args, _hf_args, _training_args = parse_vae_e2e_args(
+                [
+                    "--student_checkpoint_dir",
+                    tmpdir,
+                    "--dataset_mix",
+                    "openorca=1.0",
+                    "--max_steps",
+                    "1",
+                    *extra_args,
+                ]
+            )
+        return args
+
+    def test_hidden_loss_defaults_to_disabled_uniform(self):
+        args = self._parse_with_checkpoint([])
+
+        self.assertEqual(args.hidden_loss_weight, 0.0)
+        self.assertEqual(args.hidden_layer_weighting, "uniform")
+
+    def test_hidden_loss_accepts_linear_depth(self):
+        args = self._parse_with_checkpoint(
+            [
+                "--hidden_loss_weight",
+                "0.003",
+                "--hidden_layer_weighting",
+                "linear_depth",
+            ]
+        )
+
+        self.assertEqual(args.hidden_loss_weight, 0.003)
+        self.assertEqual(args.hidden_layer_weighting, "linear_depth")
+
+    def test_hidden_loss_rejects_negative_weight(self):
+        with self.assertRaises(SystemExit):
+            self._parse_with_checkpoint(["--hidden_loss_weight", "-0.1"])
+
+    def test_hidden_loss_rejects_unknown_weighting(self):
+        with self.assertRaises(SystemExit):
+            self._parse_with_checkpoint(["--hidden_layer_weighting", "quadratic"])
+
+
+class VAEE2EHiddenLossTest(unittest.TestCase):
+    def test_uniform_hidden_loss_skips_embedding_state(self):
+        teacher = (
+            torch.zeros(1, 2, 1),
+            torch.ones(1, 2, 1),
+            torch.full((1, 2, 1), 2.0),
+        )
+        student = (
+            torch.full((1, 2, 1), 100.0),
+            torch.full((1, 2, 1), 2.0),
+            torch.full((1, 2, 1), 4.0),
+        )
+
+        loss = compute_vae_hidden_alignment_loss(
+            teacher_hidden_states=teacher,
+            student_hidden_states=student,
+            attention_mask=torch.ones(1, 2),
+            layer_weighting="uniform",
+            loss_device=torch.device("cpu"),
+        )
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(1.0)))
+
+    def test_hidden_loss_attention_mask_excludes_padding_tokens(self):
+        teacher = (
+            torch.zeros(1, 2, 1),
+            torch.tensor([[[1.0], [10.0]]]),
+        )
+        student = (
+            torch.zeros(1, 2, 1),
+            torch.tensor([[[2.0], [100.0]]]),
+        )
+
+        loss = compute_vae_hidden_alignment_loss(
+            teacher_hidden_states=teacher,
+            student_hidden_states=student,
+            attention_mask=torch.tensor([[1, 0]]),
+            layer_weighting="uniform",
+            loss_device=torch.device("cpu"),
+        )
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(1.0)))
+
+    def test_linear_depth_weights_increase_and_average_to_one(self):
+        weights = build_vae_hidden_layer_weights(
+            num_layers=4,
+            layer_weighting="linear_depth",
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertTrue(torch.all(weights[1:] > weights[:-1]))
+        self.assertTrue(torch.allclose(weights.mean(), torch.tensor(1.0)))
+
+    def test_linear_depth_hidden_loss_uses_normalized_layer_weights(self):
+        teacher = (
+            torch.zeros(1, 1, 1),
+            torch.ones(1, 1, 1),
+            torch.ones(1, 1, 1),
+        )
+        student = (
+            torch.zeros(1, 1, 1),
+            torch.ones(1, 1, 1),
+            torch.full((1, 1, 1), 2.0),
+        )
+
+        loss = compute_vae_hidden_alignment_loss(
+            teacher_hidden_states=teacher,
+            student_hidden_states=student,
+            attention_mask=None,
+            layer_weighting="linear_depth",
+            loss_device=torch.device("cpu"),
+        )
+
+        expected_weights = build_vae_hidden_layer_weights(
+            num_layers=2,
+            layer_weighting="linear_depth",
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        self.assertTrue(torch.allclose(loss, expected_weights[1] / 2.0))
 
 
 class DatasetMixBuilderTest(unittest.TestCase):

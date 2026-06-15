@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-5}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 SEED="${SEED:-42}"
@@ -72,7 +72,6 @@ python tools/block_vae_lora_train.py \
   --entropy_loss_weight "1e-2" \
   --diversity_gamma "1.0" \
   --normalize_weight \
-  --use_checkpoint \
   --new_quant \
   --block_distill_dataset "openorca=0.24,fineweb_edu=0.18,race=0.24,sciq=0.03,alpaca=0.11,longalpaca=0.10,longalign=0.10" \
   --block_distill_steps "5000" \
@@ -95,15 +94,15 @@ python tools/block_vae_lora_train.py \
   --block_adalora_beta1 "0.85" \
   --block_adalora_beta2 "0.85" \
   --block_adalora_orth_reg_weight "0.5" \
-  --block_loss_alpha "0.5" \
-  --block_loss_beta "0.2" \
+  --block_loss_alpha "0." \
+  --block_loss_beta "0.05" \
   --block_attn_query_chunk_size "4096" \
   --block_distill_log_every "10" \
   --block_decode_group_size "8" \
   --block_hidden_advance_batch_size "64" \
   --skip_layers "" \
-  --block_layers "all" \
-  --block_eval_after_each_layer "false" \
+  --block_layers "6" \
+  --block_eval_after_each_layer "true" \
   --block_eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --block_eval_ppl "false" \
   --block_eval_ppl_limit "-1" \

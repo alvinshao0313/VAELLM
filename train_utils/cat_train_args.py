@@ -93,6 +93,8 @@ class NormalizedCatArgs:
     lora_temperature: OverrideTable[float]
     lora_loss_alpha: OverrideTable[float]
     lora_loss_type: OverrideTable[str]
+    lora_hidden_loss_weight: OverrideTable[float]
+    lora_hidden_layer_weighting: str
     lora_use_dora: OverrideTable[bool]
     tune_final_norm: bool
     use_post_norm_head_linear: bool
@@ -174,6 +176,8 @@ class ResolvedLoraRuntimeConfig:
     temperature: float
     loss_alpha: float
     loss_type: str
+    hidden_loss_weight: float
+    hidden_layer_weighting: str
     use_dora: bool
 
 
@@ -184,6 +188,7 @@ _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "co
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "residual_sparse", "per_vae_low_rank", "post_vae_low_rank")
+_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
 _OUTLIER_RESIDUAL_SCORE_CHOICES = (
     "abs",
     "input_act_weighted_abs",
@@ -521,6 +526,17 @@ _LORA_LOSS_TYPE_SPEC = _make_override_spec(
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=sft,after:q_proj=dual_kl_top_1000",
 )
+_LORA_HIDDEN_LOSS_WEIGHT_SPEC = _make_override_spec(
+    arg_name="--lora_hidden_loss_weight",
+    parse_value=lambda raw: parse_float_text(
+        raw,
+        arg_name="--lora_hidden_loss_weight",
+        min_value=0.0,
+        inclusive_min=True,
+    ),
+    allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=0.0,after:q_proj=0.01",
+)
 _LORA_USE_DORA_SPEC = _make_override_spec(
     arg_name="--lora_use_dora",
     parse_value=lambda raw: parse_bool_text(raw, arg_name="--lora_use_dora"),
@@ -647,6 +663,11 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         lora_temperature=_parse_cat_override(raw_args.lora_temperature, spec=_LORA_TEMPERATURE_SPEC),
         lora_loss_alpha=_parse_cat_override(raw_args.lora_loss_alpha, spec=_LORA_LOSS_ALPHA_SPEC),
         lora_loss_type=_parse_cat_override(raw_args.lora_loss_type, spec=_LORA_LOSS_TYPE_SPEC),
+        lora_hidden_loss_weight=_parse_cat_override(raw_args.lora_hidden_loss_weight, spec=_LORA_HIDDEN_LOSS_WEIGHT_SPEC),
+        lora_hidden_layer_weighting=make_choice_parser(
+            arg_name="--lora_hidden_layer_weighting",
+            choices=_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES,
+        )(raw_args.lora_hidden_layer_weighting),
         lora_use_dora=_parse_cat_override(raw_args.lora_use_dora, spec=_LORA_USE_DORA_SPEC),
         tune_final_norm=bool(raw_args.tune_final_norm),
         use_post_norm_head_linear=bool(raw_args.use_post_norm_head_linear),
@@ -961,6 +982,8 @@ def resolve_lora_runtime_config(cat_args: NormalizedCatArgs, after_category: Opt
         temperature=float(resolve_after_category_value(cat_args.lora_temperature, after_category)),
         loss_alpha=float(resolve_after_category_value(cat_args.lora_loss_alpha, after_category)),
         loss_type=str(resolve_after_category_value(cat_args.lora_loss_type, after_category)),
+        hidden_loss_weight=float(resolve_after_category_value(cat_args.lora_hidden_loss_weight, after_category)),
+        hidden_layer_weighting=str(cat_args.lora_hidden_layer_weighting),
         use_dora=bool(resolve_after_category_value(cat_args.lora_use_dora, after_category)),
     )
 
@@ -1110,6 +1133,13 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_temperature", type=str, default="default=1.0", help=f"after_category 覆盖参数。示例：{_LORA_TEMPERATURE_SPEC.example}")
     parser.add_argument("--lora_loss_alpha", type=str, default="default=0.5", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_ALPHA_SPEC.example}")
     parser.add_argument("--lora_loss_type", type=str, default="default=sft", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_TYPE_SPEC.example}")
+    parser.add_argument("--lora_hidden_loss_weight", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_LORA_HIDDEN_LOSS_WEIGHT_SPEC.example}")
+    parser.add_argument(
+        "--lora_hidden_layer_weighting",
+        type=str,
+        default="uniform",
+        help="LoRA hidden-state 对齐损失的层权重模式：uniform 或 linear_depth。",
+    )
     parser.add_argument("--lora_use_dora", type=str, default="default=true", help=f"after_category 覆盖参数。示例：{_LORA_USE_DORA_SPEC.example}")
     parser.add_argument(
         "--lora_tune_final_norm",

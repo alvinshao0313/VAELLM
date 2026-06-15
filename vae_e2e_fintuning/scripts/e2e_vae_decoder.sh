@@ -12,8 +12,8 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
-MAX_STEPS="${MAX_STEPS:-100}"
-STUDENT_CKPT="${STUDENT_CKPT:-.result/final_model}"
+MAX_STEPS="${MAX_STEPS:-5000}"
+STUDENT_CKPT="${STUDENT_CKPT:-.result/cat_train_final_model}"
 EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
@@ -53,8 +53,10 @@ python -m vae_e2e_fintuning.main \
   --dataset_num_proc 64 \
   --loss_type kd_top_1000 \
   --distill_temperature 1.0 \
-  --distill_alpha 0.6 \
+  --distill_alpha 0.5 \
   --post_attn false \
+  --hidden_loss_weight 0.0 \
+  --hidden_layer_weighting linear_depth \
   --model_max_length 8192 \
   --decoder_layers 0-35 \
   --target_modules all \

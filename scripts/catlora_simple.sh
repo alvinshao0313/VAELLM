@@ -3,9 +3,8 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=7
-SEED="${SEED:-42}"
-export PYTHONHASHSEED="${SEED}"
+export CUDA_VISIBLE_DEVICES=5
+export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
 export CAT_LORA_DATASET_NUM_PROC="${CAT_LORA_DATASET_NUM_PROC:-16}"
@@ -40,8 +39,8 @@ export CAT_LORA_DATASET_NUM_PROC="${CAT_LORA_DATASET_NUM_PROC:-16}"
 
 python tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
-  --output_dir ".result" \
-  --seed "${SEED}" \
+  --output_dir "./.result/catlora" \
+  --seed "31" \
   --deterministic "true" \
   --train_device "cuda" \
   --convert \
@@ -54,16 +53,16 @@ python tools/cat_train.py \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
-  --steps_per_category "default=10" \
+  --steps_per_category "default=1000" \
   --joint_decoder_steps "default=0" \
-  --joint_decoder_lr "default=5e-3" \
+  --joint_decoder_lr "default=0.005" \
   --joint_decoder_group_size "default=36" \
   --joint_decoder_batch_size "default=524288" \
-  --batch_size "2048" \
+  --batch_size "8192" \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
-  --eval_ppl "false" \
+  --eval_ppl "true" \
   --eval_tasks "" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
@@ -71,18 +70,17 @@ python tools/cat_train.py \
   --sort_prep_workers "0" \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
-  --outlier_protect_mode "per_vae_low_rank" \
-  --outlier_low_rank "default=16" \
-  --outlier_residual_top_p "default=0.0" \
+  --outlier_protect_mode "residual_sparse" \
+  --outlier_residual_top_p "default=0.01" \
   --outlier_residual_score "input_act_weighted_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
-  --wa_mse_calib_dataset "wiki=1.0" \
+  --wa_mse_calib_dataset "wiki=1" \
   --wa_mse_calib_nsamples "512" \
   --wa_mse_calib_seqlen "4096" \
-  --wa_mse_calib_seed "${SEED}" \
+  --wa_mse_calib_seed "31" \
   --wa_mse_calib_device "" \
   --wa_mse_calib_log_every "0" \
   --codebook_bits "default=32" \
@@ -99,8 +97,8 @@ python tools/cat_train.py \
   --gamma0 "1.0" \
   --gamma "1.0" \
   --zeta "1.0" \
-  --inv_temperature "200.0" \
-  --lr "1e-2" \
+  --inv_temperature "100.0" \
+  --lr "3e-3" \
   --beta1 "0.9" \
   --beta2 "0.95" \
   --weight_decay "0.0" \
@@ -108,20 +106,20 @@ python tools/cat_train.py \
   --lr_scheduler "linear" \
   --lr_warmup_steps "0" \
   --l1_weight "1.0" \
-  --lfq_weight "5.0" \
-  --commitment_loss_weight "0.1" \
-  --entropy_loss_weight "1e-4" \
+  --lfq_weight "2.5" \
+  --commitment_loss_weight "0.25" \
+  --entropy_loss_weight "0.01" \
   --diversity_gamma "1.0" \
   --normalize_weight \
   --use_checkpoint \
   --new_quant \
   --lora_after_category \
-  --lora_dataset "wiki=1.0" \
-  --lora_rank "default=24" \
-  --lora_alpha "default=48.0" \
-  --lora_dropout "default=0.0" \
-  --lora_steps "default=5" \
-  --lora_batch_size "default=1" \
+  --lora_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
+  --lora_rank "default=12" \
+  --lora_alpha "default=24.0" \
+  --lora_dropout "default=0.03" \
+  --lora_steps "default=5000" \
+  --lora_batch_size "default=2" \
   --lora_nsamples "default=20000" \
   --lora_lr "default=1e-4" \
   --lora_weight_decay "default=0.001" \
@@ -130,6 +128,8 @@ python tools/cat_train.py \
   --lora_temperature "default=1.0" \
   --lora_loss_alpha "default=0.5" \
   --lora_loss_type "default=kd_top_1000" \
+  --lora_hidden_loss_weight "default=0.01" \
+  --lora_hidden_layer_weighting "linear_depth" \
   --lora_use_dora "default=true" \
   --lora_tune_final_norm "true" \
   --lora_use_post_norm_head_linear "true" \
@@ -139,8 +139,8 @@ python tools/cat_train.py \
   --lora_gradient_checkpointing "true" \
   --lora_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --lora_optim "adamw_torch" \
-  --lora_max_grad_norm "0.333" \
-  --lora_warmup_ratio "0.3" \
+  --lora_max_grad_norm "1.3" \
+  --lora_warmup_ratio "0.1" \
   --lora_group_by_length "true" \
   --lora_lr_scheduler_type "cosine" \
   --lora_model_max_length "8192" \

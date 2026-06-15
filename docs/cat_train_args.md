@@ -90,6 +90,7 @@
 - `lora_temperature`
 - `lora_loss_alpha`
 - `lora_loss_type`
+- `lora_hidden_loss_weight`
 - `lora_use_dora`
 
 写法：
@@ -188,6 +189,8 @@
 | `--lora_temperature` | `default=1.0` | LoRA 蒸馏温度 | after-category override |
 | `--lora_loss_alpha` | `default=0.5` | LoRA 蒸馏混合权重 | after-category override |
 | `--lora_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
+| `--lora_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
+| `--lora_hidden_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权，`linear_depth` 让后层权重线性增大并归一到平均权重为 1 |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override |
 | `--lora_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
 | `--eval_hif4_act` | `false` | 是否在 cat_train 内部类别后评估阶段启用 HiFloat4 激活伪量化 | 同时作用于 PPL 和 lm_eval；不影响训练 |
@@ -643,6 +646,8 @@ python tools/cat_train.py \
   --lora_dataset wiki=1.0 \
   --lora_rank default=8,after:q_proj=16 \
   --lora_steps default=50,after:q_proj=200 \
+  --lora_hidden_loss_weight default=0.01 \
+  --lora_hidden_layer_weighting linear_depth \
   --eval_ppl true \
   --eval_tasks boolq,rte,piqa \
   --lora_hif4_act false \

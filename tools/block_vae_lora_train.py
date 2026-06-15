@@ -21,6 +21,8 @@ from train_utils.block_distill import (
     BlockDistillConfig,
     advance_block_hidden_states_in_place,
     build_initial_hidden_states,
+    collect_active_block_adapter_targets,
+    collect_active_block_targets,
     mark_untrained_block_targets_original_only,
     prepare_block_eval_decoded_weights,
     train_block_lora_distill,
@@ -292,6 +294,10 @@ def _active_targets_for_layers(
     return out
 
 
+def _sorted_block_targets(targets: Sequence[Tuple[int, str]]) -> List[Tuple[int, str]]:
+    return sorted((int(layer_idx), str(category)) for layer_idx, category in targets)
+
+
 def _source_block_vae_manifest_hash(meta: Optional[Dict[str, object]]) -> str:
     extra_meta = meta.get("extra_meta", {}) if isinstance(meta, dict) else {}
     if not isinstance(extra_meta, dict):
@@ -496,6 +502,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             skip_layer_keys=sorted(skip_layer_keys),
         )
     )
+    preserved_block_targets = set()
+    preserved_block_adapter_targets = set()
+    if args.block_init_checkpoint is not None:
+        preserved_block_targets = collect_active_block_targets(model)
+        preserved_block_adapter_targets = collect_active_block_adapter_targets(model)
+        logger.info(
+            "Block init preserved active targets: total=%d adapter_targets=%d",
+            int(len(preserved_block_targets)),
+            int(len(preserved_block_adapter_targets)),
+        )
+    completed_block_adapter_targets = set()
+    lora_train_mode = str(args.block_distill_train_mode).strip().lower() in {"lora", "both"}
     if pipeline_mode in {"pretrain", "pretrain_distill"}:
         category_tasks, block_vae_pretrain_manifest_hash = build_category_pretrain_tasks(
             model=model,
@@ -592,7 +610,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 student_hiddens_cpu=student_hiddens,
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
-                active_block_targets=sorted(completed_block_targets),
+                active_block_targets=_sorted_block_targets(preserved_block_targets | completed_block_targets),
                 batch_size=int(args.block_hidden_advance_batch_size),
                 train_mode=str(args.block_distill_train_mode),
                 decode_group_size=int(args.block_decode_group_size),
@@ -608,7 +626,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 student_hiddens_cpu=student_hiddens,
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
-                active_block_targets=sorted(completed_block_targets),
+                active_block_targets=_sorted_block_targets(preserved_block_targets | completed_block_targets),
                 batch_size=int(args.block_hidden_advance_batch_size),
                 train_mode=str(args.block_distill_train_mode),
                 decode_group_size=int(args.block_decode_group_size),
@@ -654,7 +672,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 student_hiddens_cpu=student_hiddens,
                 device=str(args.train_device),
                 student_hif4_act=bool(args.block_lora_hif4_act),
-                active_block_targets=sorted(completed_block_targets),
+                active_block_targets=_sorted_block_targets(preserved_block_targets | completed_block_targets),
                 batch_size=int(args.block_hidden_advance_batch_size),
                 train_mode=str(args.block_distill_train_mode),
                 decode_group_size=int(args.block_decode_group_size),
@@ -687,6 +705,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             completed_block_layers.sort()
         for category in active_categories:
             completed_block_targets.add((int(layer_idx), str(category)))
+            if bool(lora_train_mode):
+                completed_block_adapter_targets.add((int(layer_idx), str(category)))
         if int(args.block_keep_last_checkpoints) > 0:
             logger.info("[block %d] start saving layer checkpoint.", int(layer_idx))
             save_paths = save_block_layer_checkpoint(
@@ -718,7 +738,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 eval_device=eval_device,
                 group_size=int(args.block_decode_group_size),
                 train_mode=str(args.block_distill_train_mode),
-                active_block_targets=sorted(completed_block_targets),
+                active_block_targets=_sorted_block_targets(preserved_block_targets | completed_block_targets),
                 logger=logger,
             ):
                 eval_after_category(
@@ -738,7 +758,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     final_original_only_count = mark_untrained_block_targets_original_only(
         model,
-        sorted(completed_block_targets),
+        _sorted_block_targets(preserved_block_targets | completed_block_targets),
     )
     if final_original_only_count:
         logger.info(
@@ -757,6 +777,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         lora_variant=str(args.block_lora_variant),
         train_mode=str(args.block_distill_train_mode),
         allow_preserved_adapters=allow_preserved_adapters,
+        expected_adapter_targets=_sorted_block_targets(
+            preserved_block_adapter_targets | completed_block_adapter_targets
+        ),
     )
     fused_post_norm_head = fuse_post_norm_head_linear(model)
     if fused_post_norm_head:

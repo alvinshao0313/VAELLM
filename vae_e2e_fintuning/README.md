@@ -12,6 +12,26 @@
 
 三种模式都使用同一套数据、loss、评估和保存流程；差别只在训练哪些参数。
 
+## Hidden-state 对齐
+
+可选参数：
+
+```bash
+--hidden_loss_weight 0.0
+--hidden_layer_weighting uniform  # uniform | linear_depth
+```
+
+`hidden_loss_weight=0` 表示关闭。开启后会在现有 SFT/KD loss 之外，对齐 teacher 和 student 的所有 transformer block 输出 hidden states，即 `hidden_states[1:]`，跳过 embedding hidden state。
+
+`linear_depth` 会让越靠后的层权重越大，并把平均权重归一到 1。当前 `e2e_vae_decoder.sh` 使用较保守的：
+
+```bash
+--hidden_loss_weight 0.003
+--hidden_layer_weighting linear_depth
+```
+
+这个损失会额外保存 teacher/student hidden states，长序列训练时显存压力会增加。
+
 ## 1. `decoder`
 
 只训练 VAELinear 的 decoder。

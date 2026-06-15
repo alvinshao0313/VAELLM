@@ -29,6 +29,88 @@ except ImportError:
     SFTTrainer = None
 
 
+_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+
+
+def build_lora_hidden_layer_weights(
+    *,
+    num_layers: int,
+    layer_weighting: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    num_layers = int(num_layers)
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be > 0, got {num_layers}.")
+    mode = str(layer_weighting).strip().lower()
+    if mode == "uniform":
+        return torch.ones(num_layers, device=device, dtype=dtype)
+    if mode == "linear_depth":
+        denom = max(num_layers - 1, 1)
+        raw = 1.0 + torch.arange(num_layers, device=device, dtype=dtype) / float(denom)
+        return raw / raw.mean()
+    raise ValueError(
+        f"Unsupported lora hidden layer weighting: {layer_weighting}. "
+        f"Supported: {', '.join(_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
+    )
+
+
+def _masked_mean_square(value: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    value = value.float()
+    square = value.pow(2)
+    if attention_mask is None:
+        return square.mean()
+    mask = attention_mask.to(device=value.device, dtype=value.dtype)
+    while mask.ndim < value.ndim:
+        mask = mask.unsqueeze(-1)
+    mask = mask.expand_as(value)
+    count = mask.sum().clamp_min(1.0)
+    return (square * mask).sum() / count
+
+
+def compute_lora_hidden_alignment_loss(
+    *,
+    teacher_hidden_states: Sequence[torch.Tensor],
+    student_hidden_states: Sequence[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    layer_weighting: str,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if teacher_hidden_states is None or student_hidden_states is None:
+        raise ValueError("Hidden states are required when LoRA hidden alignment loss is enabled.")
+    if len(teacher_hidden_states) != len(student_hidden_states):
+        raise ValueError(
+            "Teacher/student hidden state counts differ: "
+            f"{len(teacher_hidden_states)} vs {len(student_hidden_states)}."
+        )
+    if len(teacher_hidden_states) <= 1:
+        raise ValueError("Hidden states must include embedding output plus at least one transformer block output.")
+
+    layer_losses: List[torch.Tensor] = []
+    for layer_idx, (teacher_hidden, student_hidden) in enumerate(
+        zip(teacher_hidden_states[1:], student_hidden_states[1:])
+    ):
+        if tuple(teacher_hidden.shape) != tuple(student_hidden.shape):
+            raise ValueError(
+                f"Teacher/student hidden shape mismatch at block layer {layer_idx}: "
+                f"{tuple(teacher_hidden.shape)} vs {tuple(student_hidden.shape)}."
+            )
+        teacher_hidden = teacher_hidden.detach()
+        diff = student_hidden.float() - teacher_hidden.float()
+        numerator = _masked_mean_square(diff, attention_mask)
+        denominator = _masked_mean_square(teacher_hidden, attention_mask)
+        layer_losses.append(numerator / (denominator + float(eps)))
+
+    stacked = torch.stack(layer_losses)
+    weights = build_lora_hidden_layer_weights(
+        num_layers=len(layer_losses),
+        layer_weighting=layer_weighting,
+        device=stacked.device,
+        dtype=stacked.dtype,
+    )
+    return (stacked * weights).mean()
+
+
 
 def ensure_lora_training_stack_available() -> None:
     if LoraConfig is None or TaskType is None or get_peft_model is None:
@@ -86,6 +168,8 @@ else:
             loss_type: str = "r_kl_top_1000",
             temperature: float = 1.0,
             loss_alpha: float = 0.5,
+            hidden_loss_weight: float = 0.0,
+            hidden_layer_weighting: str = "uniform",
             lora_hif4_act_controller: Optional[Hif4ActController] = None,
             teacher_param_snapshots: Optional[Sequence[Tuple[nn.Parameter, torch.Tensor]]] = None,
             **kwargs,
@@ -94,12 +178,22 @@ else:
             self.loss_type = str(loss_type).strip().lower()
             self.temperature = float(temperature)
             self.loss_alpha = float(loss_alpha)
+            self.hidden_loss_weight = float(hidden_loss_weight)
+            if self.hidden_loss_weight < 0.0:
+                raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
+            self.hidden_layer_weighting = str(hidden_layer_weighting).strip().lower()
+            if self.hidden_layer_weighting not in _LORA_HIDDEN_LAYER_WEIGHTING_CHOICES:
+                raise ValueError(
+                    f"Unsupported hidden_layer_weighting: {hidden_layer_weighting}. "
+                    f"Supported: {', '.join(_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
+                )
             self.lora_hif4_act_controller = lora_hif4_act_controller
             self.teacher_param_snapshots = list(teacher_param_snapshots or [])
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
             args = self.args
             loss_type = self.loss_type
+            hidden_loss_enabled = float(self.hidden_loss_weight) > 0.0
             teacher_inputs = dict(inputs)
             teacher_inputs.pop("labels", None)
             student_inputs = dict(inputs)
@@ -181,11 +275,33 @@ else:
                     else nullcontext()
                 )
                 with adapter_context, teacher_param_context():
-                    outputs = model(**teacher_inputs, output_hidden_states=False)
+                    outputs = model(**teacher_inputs, output_hidden_states=hidden_loss_enabled)
                 return outputs
+
+            def student_forward(model_inputs):
+                if hidden_loss_enabled:
+                    return model(**model_inputs, output_hidden_states=True)
+                return model(**model_inputs)
+
+            def add_hidden_alignment_loss(loss, teacher_outputs, student_outputs):
+                if not hidden_loss_enabled:
+                    return loss
+                hidden_loss = compute_lora_hidden_alignment_loss(
+                    teacher_hidden_states=teacher_outputs.hidden_states,
+                    student_hidden_states=student_outputs.hidden_states,
+                    attention_mask=full_inputs.get("attention_mask"),
+                    layer_weighting=self.hidden_layer_weighting,
+                )
+                return loss + float(self.hidden_loss_weight) * hidden_loss
 
             try:
                 if loss_type in {"origin", "sft"}:
+                    if hidden_loss_enabled:
+                        teacher_outputs = get_ori_outputs()
+                        prepare_student_path()
+                        outputs = student_forward(full_inputs)
+                        loss = add_hidden_alignment_loss(outputs["loss"], teacher_outputs, outputs)
+                        return (loss, outputs) if return_outputs else loss
                     try:
                         return super().compute_loss(
                             model,
@@ -203,21 +319,24 @@ else:
                 prepare_student_path()
 
                 if loss_type == "rkl":
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     loss = F.kl_div(
                         F.log_softmax(ori_logits.flatten(0, -2), dim=-1),
                         F.softmax(logits, dim=-1).flatten(0, -2),
                         reduction="batchmean",
                     )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "dual_rkl":
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
@@ -229,25 +348,29 @@ else:
                         teacher_logits=ori_logits,
                         mask=token_mask,
                     )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "kl":
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     loss = F.kl_div(
                         F.log_softmax(logits.flatten(0, -2), dim=-1),
                         F.softmax(ori_logits, dim=-1).flatten(0, -2),
                         reduction="batchmean",
                     )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("r_kl_top"):
                     k = parse_k("r_kl_top", default_k=1000)
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     k = min(k, int(logits.shape[-1]))
                     top_logits, indices = logits.topk(k, dim=-1, sorted=False)
@@ -257,13 +380,15 @@ else:
                         F.softmax(top_logits.flatten(0, -2), dim=-1),
                         reduction="batchmean",
                     )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("dual_r_kl_top"):
                     k = parse_k("dual_r_kl_top", default_k=1000)
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
@@ -277,13 +402,15 @@ else:
                         k=k,
                         post_attn=use_post_attn(),
                     )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("kl_top"):
                     k = parse_k("kl_top", default_k=1000)
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     k = min(k, int(ori_logits.shape[-1]))
                     top_ori_logits, indices = ori_logits.topk(k, dim=-1, sorted=False)
@@ -298,13 +425,15 @@ else:
                             F.softmax(top_ori_logits, dim=-1).flatten(0, -2),
                             reduction="batchmean",
                         )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("kd_top"):
                     k = parse_k("kd_top", default_k=1000)
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**full_inputs)
+                    outputs = student_forward(full_inputs)
                     logits = outputs.logits
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
@@ -322,20 +451,24 @@ else:
                             reduction="batchmean",
                         )
                     loss = ori_loss * (1 - alpha) + distill_loss * (alpha * T * T)
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "mse":
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     loss = F.mse_loss(logits, ori_logits)
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "kd":
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**full_inputs)
+                    outputs = student_forward(full_inputs)
                     logits = outputs.logits
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
@@ -347,12 +480,14 @@ else:
                         reduction="batchmean",
                     )
                     loss = ori_loss * (1 - alpha) + distill_loss * (alpha * T * T)
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "dual_kl":
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
@@ -364,13 +499,15 @@ else:
                         teacher_logits=ori_logits,
                         mask=token_mask,
                     )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("dual_kl_top"):
                     k = parse_k("dual_kl_top", default_k=1000)
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**student_inputs)
+                    outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
@@ -384,13 +521,15 @@ else:
                         k=k,
                         post_attn=use_post_attn(),
                     )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("dual_kd_top"):
                     k = parse_k("dual_kd_top", default_k=1000)
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**full_inputs)
+                    outputs = student_forward(full_inputs)
                     logits = outputs.logits
                     ori_loss = outputs["loss"]
                     token_mask = build_distill_token_mask(
@@ -407,12 +546,14 @@ else:
                     )
                     alpha = self.loss_alpha
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "dual_kd":
-                    ori_logits = get_ori_outputs().logits
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = teacher_outputs.logits
                     prepare_student_path()
-                    outputs = model(**full_inputs)
+                    outputs = student_forward(full_inputs)
                     logits = outputs.logits
                     ori_loss = outputs["loss"]
                     token_mask = build_distill_token_mask(
@@ -427,6 +568,7 @@ else:
                     )
                     alpha = self.loss_alpha
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 raise ValueError(

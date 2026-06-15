@@ -192,6 +192,34 @@ def _iter_named_block_temporary_modules(model: nn.Module) -> Iterator[Tuple[str,
             yield str(name), module
 
 
+def collect_active_block_targets(model: nn.Module) -> Set[Tuple[int, str]]:
+    active: Set[Tuple[int, str]] = set()
+    for name, module in _iter_named_block_temporary_modules(model):
+        target = _block_target_from_module_name(name)
+        if target is None:
+            continue
+        base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+        if bool(getattr(base_layer, "always_use_original", False)):
+            continue
+        active.add(target)
+    return active
+
+
+def collect_active_block_adapter_targets(model: nn.Module) -> Set[Tuple[int, str]]:
+    active: Set[Tuple[int, str]] = set()
+    for name, module in iter_named_peft_vae_proxies(model):
+        target = _block_target_from_module_name(name)
+        if target is None:
+            continue
+        base_layer = module.base_layer
+        if bool(getattr(base_layer, "always_use_original", False)):
+            continue
+        peft_linear = module.per_decoded_linear
+        if is_peft_adalora_linear(peft_linear) or is_peft_lora_linear(peft_linear):
+            active.add(target)
+    return active
+
+
 def _collect_layer_temporary_modules(
     model: nn.Module,
     layer_idx: int,
@@ -1454,14 +1482,17 @@ def validate_final_block_checkpoint(
     lora_variant: str,
     train_mode: str = "lora",
     allow_preserved_adapters: bool = False,
+    expected_adapter_targets: Optional[Collection[Tuple[int, str]]] = None,
 ) -> None:
     mode = _normalize_block_distill_train_mode(train_mode)
+    expected_targets = _normalize_active_block_targets(expected_adapter_targets)
+    seen_adapter_targets: Set[Tuple[int, str]] = set()
     adapter_count = 0
     for _name, module in model.named_modules():
         if not isinstance(module, PeftVAELinearProxy):
             continue
-        category = _name.rsplit(".", 1)[-1]
-        if category not in QWEN3_BLOCK_CATEGORIES:
+        target = _block_target_from_module_name(_name)
+        if target is None:
             continue
         peft_linear = module.per_decoded_linear
         has_adapter = is_peft_adalora_linear(peft_linear) or is_peft_lora_linear(peft_linear)
@@ -1470,7 +1501,10 @@ def validate_final_block_checkpoint(
                 raise RuntimeError(f"{_name}: decoder-only block distill must not leave a PEFT adapter.")
             if not has_adapter:
                 continue
+        elif not has_adapter:
+            continue
         adapter_count += 1
+        seen_adapter_targets.add(target)
         variant = str(lora_variant).strip().lower()
         if variant == "adalora":
             if not is_peft_adalora_linear(peft_linear):
@@ -1484,6 +1518,11 @@ def validate_final_block_checkpoint(
             adapter_name = _default_adapter_name(peft_linear)
             if int(peft_linear.r[adapter_name]) != int(expected_rank):
                 raise RuntimeError(f"{_name}: LoRA rank mismatch, expected {expected_rank}.")
+    if expected_targets is not None:
+        missing_targets = sorted(expected_targets - seen_adapter_targets)
+        if missing_targets:
+            raise RuntimeError(f"Final checkpoint missing expected PEFT adapter targets: {missing_targets}")
+        return
     if mode == "decoder":
         if bool(allow_preserved_adapters) and int(adapter_count) not in {0, int(expected_count)}:
             raise RuntimeError(

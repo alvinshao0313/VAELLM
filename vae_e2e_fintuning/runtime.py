@@ -323,7 +323,7 @@ def _peft_base_model(model: nn.Module) -> nn.Module:
 
 
 def _load_teacher(*, args, hf_args, base_model_path: str, log):
-    if not needs_teacher(args.loss_type):
+    if not needs_teacher(args.loss_type) and float(getattr(args, "hidden_loss_weight", 0.0)) <= 0.0:
         return None, "disabled"
     teacher_path = str(args.teacher_model_path or base_model_path)
     log.info("Loading teacher model from %s", teacher_path)
@@ -720,6 +720,11 @@ def run(args, hf_args, training_args):
         log=log,
     )
     log.info("Teacher source: %s", teacher_source)
+    log.info(
+        "Hidden alignment config: weight=%.6f layer_weighting=%s",
+        float(getattr(args, "hidden_loss_weight", 0.0)),
+        str(getattr(args, "hidden_layer_weighting", "uniform")),
+    )
 
     training_args.output_dir = os.path.join(run_output_dir, "trainer_state")
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -740,6 +745,8 @@ def run(args, hf_args, training_args):
         distill_temperature=args.distill_temperature,
         distill_alpha=args.distill_alpha,
         post_attn=bool(args.post_attn),
+        hidden_loss_weight=float(args.hidden_loss_weight),
+        hidden_layer_weighting=str(args.hidden_layer_weighting),
         saved_tensor_offload=saved_tensor_offload,
         streaming_offload_manager=streaming_manager,
     )

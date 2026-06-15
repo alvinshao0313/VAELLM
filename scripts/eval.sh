@@ -3,9 +3,9 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/vae_e2e_fintuning/final_model_20260603_084628/final_model}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/final_model}"
 ADAPTER_DIR="${ADAPTER_DIR:-}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 

@@ -48,6 +48,8 @@ class _ResolvedLoraStageConfig:
     temperature: float
     loss_alpha: float
     loss_type: str
+    hidden_loss_weight: float
+    hidden_layer_weighting: str
     dataset: str
     use_dora: bool
     use_lora_hif4_act: bool
@@ -108,6 +110,8 @@ def _resolve_lora_stage_config(
         temperature=float(runtime_cfg.temperature),
         loss_alpha=float(runtime_cfg.loss_alpha),
         loss_type=str(runtime_cfg.loss_type),
+        hidden_loss_weight=float(runtime_cfg.hidden_loss_weight),
+        hidden_layer_weighting=str(runtime_cfg.hidden_layer_weighting),
         dataset=str(getattr(cat_args, "lora_dataset", "")).strip().lower(),
         use_dora=bool(runtime_cfg.use_dora),
         use_lora_hif4_act=bool(getattr(training_args, "lora_hif4_act", False)),
@@ -232,9 +236,11 @@ def _log_lora_stage_start(
             int(cfg.seed),
         )
         logger.info(
-            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f",
+            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f hidden_loss_weight=%.6f hidden_layer_weighting=%s",
             float(cfg.loss_alpha),
             float(cfg.temperature),
+            float(cfg.hidden_loss_weight),
+            str(cfg.hidden_layer_weighting),
         )
         return
 
@@ -330,12 +336,16 @@ def _build_lora_trainer(
         trainer_kwargs["peft_config"] = lora_config
 
     resolved_lora_loss = str(cfg.loss_type).strip().lower()
-    if resolved_lora_loss not in {"", "none", "sft"}:
+    hidden_loss_enabled = float(cfg.hidden_loss_weight) > 0.0
+    if resolved_lora_loss not in {"", "none", "sft"} or hidden_loss_enabled:
+        trainer_loss_type = "sft" if resolved_lora_loss in {"", "none"} else resolved_lora_loss
         return CustomSFTTrainer(
             **trainer_kwargs,
-            loss_type=resolved_lora_loss,
+            loss_type=trainer_loss_type,
             temperature=float(cfg.temperature),
             loss_alpha=float(cfg.loss_alpha),
+            hidden_loss_weight=float(cfg.hidden_loss_weight),
+            hidden_layer_weighting=str(cfg.hidden_layer_weighting),
             lora_hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
         )
@@ -425,7 +435,7 @@ def lora_finetune_remaining_categories(
                 return model
 
         resolved_lora_loss = str(cfg.loss_type).strip().lower()
-        use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"}
+        use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"} or float(cfg.hidden_loss_weight) > 0.0
         _log_lora_stage_start(
             logger=logger,
             cfg=cfg,

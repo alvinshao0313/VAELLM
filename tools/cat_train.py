@@ -1697,6 +1697,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         (cat_args.lora_temperature, "--lora_temperature"),
         (cat_args.lora_loss_alpha, "--lora_loss_alpha"),
         (cat_args.lora_loss_type, "--lora_loss_type"),
+        (cat_args.lora_hidden_loss_weight, "--lora_hidden_loss_weight"),
         (cat_args.lora_use_dora, "--lora_use_dora"),
     )
     for table, arg_name in lora_tables:
