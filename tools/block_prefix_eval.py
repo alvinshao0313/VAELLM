@@ -167,6 +167,42 @@ def build_prefix_active_targets(
     return [(layer_idx, str(category)) for layer_idx in range(prefix) for category in categories]
 
 
+def _block_module_name(layer_idx: int, category: str) -> str:
+    parent = "self_attn" if str(category) in {"q_proj", "k_proj", "v_proj", "o_proj"} else "mlp"
+    return f"model.layers.{int(layer_idx)}.{parent}.{category}"
+
+
+def build_prefix_mode_summary(
+    *,
+    prefix_layers: int,
+    num_layers: int,
+    categories: Sequence[str],
+) -> Dict[str, Any]:
+    prefix = int(prefix_layers)
+    total = int(num_layers)
+    if prefix < 0 or prefix > total:
+        raise ValueError(f"prefix_layers must be in [0, {total}], got {prefix_layers}.")
+
+    distilled = [
+        _block_module_name(layer_idx, str(category))
+        for layer_idx in range(prefix)
+        for category in categories
+    ]
+    original = [
+        _block_module_name(layer_idx, str(category))
+        for layer_idx in range(prefix, total)
+        for category in categories
+    ]
+    return {
+        "distilled_target_count": int(len(distilled)),
+        "original_target_count": int(len(original)),
+        "distilled_layers": list(range(prefix)),
+        "original_layers": list(range(prefix, total)),
+        "distilled_examples": distilled[:8],
+        "original_examples": original[:8],
+    }
+
+
 def summarize_task_metrics(
     *,
     task_names: Sequence[str],
@@ -205,6 +241,7 @@ def summarize_task_metrics(
         "valid_task_count": int(len(valid_metrics)),
         "missing_task_count": int(len(rows) - len(valid_metrics)),
         "mean_metric": mean_metric,
+        "average_accuracy": mean_metric,
     }
 
 
@@ -216,14 +253,17 @@ def build_prefix_result_row(
     prep_stats: Dict[str, Any],
     task_names: Sequence[str],
     lm_result: Dict[str, Any],
+    mode_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     task_summary = summarize_task_metrics(task_names=task_names, lm_result=lm_result)
     return {
         "prefix_layers": int(prefix_layers),
         "num_layers": int(num_layers),
         "active_target_count": int(active_target_count),
+        "mode_summary": mode_summary,
         "prep_stats": dict(prep_stats),
         "mean_metric": task_summary["mean_metric"],
+        "average_accuracy": task_summary["average_accuracy"],
         "valid_task_count": task_summary["valid_task_count"],
         "missing_task_count": task_summary["missing_task_count"],
         "task_rows": task_summary["rows"],
@@ -281,12 +321,19 @@ def _validate_original_weights_available(
 def _log_prefix_result(logger: logging.Logger, row: Dict[str, Any]) -> None:
     mean_metric = row.get("mean_metric")
     mean_text = "N/A" if mean_metric is None else f"{float(mean_metric):.4f} ({float(mean_metric) * 100.0:.2f}%)"
+    average_accuracy = row.get("average_accuracy")
+    average_text = (
+        "N/A"
+        if average_accuracy is None
+        else f"{float(average_accuracy):.4f} ({float(average_accuracy) * 100.0:.2f}%)"
+    )
     logger.info(
-        "[prefix n=%d/%d] active_targets=%d mean=%s valid_tasks=%d missing_tasks=%d",
+        "[prefix n=%d/%d] active_targets=%d mean=%s average_accuracy=%s valid_tasks=%d missing_tasks=%d",
         int(row["prefix_layers"]),
         int(row["num_layers"]),
         int(row["active_target_count"]),
         mean_text,
+        average_text,
         int(row["valid_task_count"]),
         int(row["missing_task_count"]),
     )
@@ -300,6 +347,31 @@ def _log_prefix_result(logger: logging.Logger, row: Dict[str, Any]) -> None:
             str(task_row["metric_key"]),
             metric_text,
         )
+
+
+def _log_prefix_mode_summary(
+    logger: logging.Logger,
+    *,
+    prefix_layers: int,
+    num_layers: int,
+    mode_summary: Dict[str, Any],
+) -> None:
+    logger.info(
+        "[prefix n=%d/%d] mode_summary distilled_targets=%d original_targets=%d distilled_layers=%s original_layers=%s",
+        int(prefix_layers),
+        int(num_layers),
+        int(mode_summary["distilled_target_count"]),
+        int(mode_summary["original_target_count"]),
+        ",".join(str(item) for item in mode_summary["distilled_layers"]),
+        ",".join(str(item) for item in mode_summary["original_layers"]),
+    )
+    logger.info(
+        "[prefix n=%d/%d] distilled_examples=%s original_examples=%s",
+        int(prefix_layers),
+        int(num_layers),
+        ",".join(str(item) for item in mode_summary["distilled_examples"]),
+        ",".join(str(item) for item in mode_summary["original_examples"]),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -403,11 +475,22 @@ def main(argv: Optional[List[str]] = None) -> None:
             num_layers=num_layers,
             categories=categories,
         )
+        mode_summary = build_prefix_mode_summary(
+            prefix_layers=prefix_layers,
+            num_layers=num_layers,
+            categories=categories,
+        )
         logger.info(
             "[prefix n=%d/%d] starting lm_eval with active_targets=%d",
             int(prefix_layers),
             int(num_layers),
             len(active_targets),
+        )
+        _log_prefix_mode_summary(
+            logger,
+            prefix_layers=prefix_layers,
+            num_layers=num_layers,
+            mode_summary=mode_summary,
         )
         with prepare_block_eval_decoded_weights(
             model=model,
@@ -441,6 +524,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             prep_stats=prep_stats,
             task_names=task_names,
             lm_result=lm_result,
+            mode_summary=mode_summary,
         )
         if int(row["valid_task_count"]) <= 0:
             raise ValueError(f"prefix_layers={prefix_layers} produced no valid lm-eval metrics.")

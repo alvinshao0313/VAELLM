@@ -204,6 +204,40 @@ def load_block_resume_model(
     return model, checkpoint_dir, load_meta, load_result
 
 
+def _get_module_by_name(model: nn.Module, module_name: str) -> nn.Module:
+    current = model
+    for token in str(module_name).split("."):
+        if not hasattr(current, token):
+            raise ValueError(f"Failed to resolve module {module_name!r}: missing {token!r}.")
+        current = getattr(current, token)
+    if not isinstance(current, nn.Module):
+        raise TypeError(f"Resolved object at {module_name!r} is not an nn.Module: {type(current)}")
+    return current
+
+
+def _validate_block_init_original_weights_available(model: nn.Module, meta: Dict[str, Any]) -> None:
+    converted_modules = meta.get("converted_modules", [])
+    if not isinstance(converted_modules, list):
+        raise TypeError(f"checkpoint_meta.converted_modules must be a list, got {type(converted_modules)}.")
+    missing: List[str] = []
+    for spec in converted_modules:
+        if not isinstance(spec, dict):
+            raise TypeError(f"checkpoint_meta.converted_modules entries must be dicts, got {type(spec)}.")
+        module_name = str(spec.get("name", "")).strip()
+        if not module_name:
+            raise ValueError("checkpoint_meta.converted_modules entry is missing name.")
+        module = _get_module_by_name(model, module_name)
+        base_layer = getattr(module, "base_layer", module)
+        if getattr(base_layer, "original_weight", None) is None:
+            missing.append(module_name)
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise RuntimeError(
+            "--block_init_checkpoint requires original_weight after load for the block distill teacher path. "
+            f"Missing {len(missing)} converted modules: {preview}"
+        )
+
+
 def load_block_init_checkpoint_model(
     path: str,
     *,
@@ -223,7 +257,9 @@ def load_block_init_checkpoint_model(
         proxy_group_size=int(proxy_group_size),
         proxy_compute_device=proxy_compute_device,
         proxy_logger=logger,
+        preserve_original_weights_from_base=True,
     )
+    _validate_block_init_original_weights_available(model, load_meta)
     return model, checkpoint_dir, load_meta, load_result
 
 
