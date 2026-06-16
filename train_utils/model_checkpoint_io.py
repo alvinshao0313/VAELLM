@@ -1147,6 +1147,7 @@ def load_checkpoint_into_model(
     *,
     map_location: str = "cpu",
     strict: bool = True,
+    preserve_original_weights_from_base: bool = False,
 ):
     meta_path = os.path.join(model_dir, META_FILENAME)
     if not os.path.exists(meta_path):
@@ -1159,7 +1160,11 @@ def load_checkpoint_into_model(
 
     converted_modules = meta.get("converted_modules", [])
     if converted_modules:
-        _rebuild_converted_modules(model, converted_modules)
+        _rebuild_converted_modules(
+            model,
+            converted_modules,
+            preserve_original_weights_from_base=bool(preserve_original_weights_from_base),
+        )
 
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)
@@ -1167,6 +1172,11 @@ def load_checkpoint_into_model(
     model_state_keys = tuple(model.state_dict().keys())
     state_dict, _remap_count = _remap_legacy_parallel_linear_state_dict_keys(state_dict, model_state_keys)
     _materialize_missing_bias_params_from_state_dict(model, state_dict)
+    if bool(preserve_original_weights_from_base):
+        current_state = model.state_dict()
+        for key, value in current_state.items():
+            if key.endswith(".original_weight") and key not in state_dict:
+                state_dict[key] = value
 
     load_result = model.load_state_dict(state_dict, strict=strict)
     model.eval()
@@ -1180,6 +1190,7 @@ def load_model_checkpoint(
     base_model_path: Optional[str] = None,
     map_location: str = "cpu",
     strict: bool = True,
+    preserve_original_weights_from_base: bool = False,
 ):
     meta_path = os.path.join(model_dir, META_FILENAME)
     if not os.path.exists(meta_path):
@@ -1199,4 +1210,5 @@ def load_model_checkpoint(
         model_dir=model_dir,
         map_location=map_location,
         strict=strict,
+        preserve_original_weights_from_base=bool(preserve_original_weights_from_base),
     )

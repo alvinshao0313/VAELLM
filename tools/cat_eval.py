@@ -337,9 +337,25 @@ def _build_compact_eval_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
             "task_metrics": lm_eval.get("task_metrics"),
             "task_metric_keys": lm_eval.get("task_metric_keys"),
             "summary_rows": lm_eval.get("summary_rows"),
+            "mmlu_debug": lm_eval.get("mmlu_debug"),
         }
 
     return compact
+
+
+def _build_lm_eval_args(args: argparse.Namespace, *, tokenizer_name: str, eval_run_ts: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        tasks=str(args.tasks),
+        num_fewshot=int(args.num_fewshot),
+        batch_size=str(args.lm_batch_size),
+        lm_limit=args.lm_limit,
+        model_path=tokenizer_name,
+        eval_log_dir=None,
+        eval_run_ts=None,
+        mmlu_debug_samples=int(args.mmlu_debug_samples),
+        mmlu_debug_log_dir=str(args.eval_log_dir),
+        mmlu_debug_run_ts=str(eval_run_ts),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -397,6 +413,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_fewshot", type=int, default=0, help="Few-shot count for lm_eval.")
     parser.add_argument("--lm_batch_size", type=str, default="auto", help="Batch size for lm_eval.")
     parser.add_argument("--lm_limit", type=int, default=None, help="Optional lm_eval sample limit.")
+    parser.add_argument(
+        "--mmlu_debug_samples",
+        type=int,
+        default=0,
+        help="Print and save the first N MMLU multiple-choice sample comparisons; 0 disables it.",
+    )
 
     parser.add_argument("--topk", type=int, default=100, help="K used in topk-MSE for each linear.")
     parser.add_argument(
@@ -423,6 +445,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         raise ValueError("No evaluation selected. Please enable at least one of: --eval_ppl, --eval_lm_eval, --eval_linear_mse")
     if int(args.prewarm_group_size) < 1:
         raise ValueError("--prewarm_group_size must be >= 1.")
+    if int(args.mmlu_debug_samples) < 0:
+        raise ValueError("--mmlu_debug_samples must be >= 0.")
     if args.eval_lm_eval and (args.tasks is None or not str(args.tasks).strip()):
         raise ValueError("--tasks is required when --eval_lm_eval is enabled.")
 
@@ -638,15 +662,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             trust_remote_code=True,
             token=args.access_token,
         )
-        lm_args = argparse.Namespace(
-            tasks=str(args.tasks),
-            num_fewshot=int(args.num_fewshot),
-            batch_size=str(args.lm_batch_size),
-            lm_limit=args.lm_limit,
-            model_path=tokenizer_name,
-            eval_log_dir=None,
-            eval_run_ts=None,
-        )
+        lm_args = _build_lm_eval_args(args, tokenizer_name=tokenizer_name, eval_run_ts=_eval_run_ts)
         with applied_hif4_act(
             model,
             enabled=bool(args.eval_hif4_act),

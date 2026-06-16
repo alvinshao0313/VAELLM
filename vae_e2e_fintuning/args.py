@@ -7,14 +7,15 @@ from typing import List, Optional, Sequence, Tuple
 
 from transformers import HfArgumentParser
 
-from dense_e2e_fintuning.args import parse_decoder_layers, parse_target_modules
-from e2e_common.data import normalize_dataset_mix_spec
+from e2e_common.data import MCQA_DATASET_MIX_ALIASES, normalize_dataset_mix_spec
+from e2e_common.e2e_args import parse_decoder_layers, parse_target_modules
 from train_utils.model_checkpoint_io import resolve_checkpoint_dir
 from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_like, _parse_lora_loss_type
 
 
 _DEFAULT_RUN_ROOT = ".result/vae_e2e_fintuning"
 _SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"}
+_MCQA_LOSS_TYPES = {"choice_kd", "choice_kd_ce"}
 _VALID_VAE_TRAIN_MODES = {"decoder", "low_rank", "both"}
 _VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
 _VALID_HIDDEN_LAYER_WEIGHTING = {"uniform", "linear_depth"}
@@ -207,8 +208,8 @@ def validate_args(
         parser.error(str(exc))
 
     dataset_task = str(args.dataset_task or "lm").strip().lower()
-    if dataset_task not in {"lm", "sft"}:
-        parser.error("--dataset_task must be one of: lm | sft.")
+    if dataset_task not in {"lm", "sft", "mcqa"}:
+        parser.error("--dataset_task must be one of: lm | sft | mcqa.")
     args.dataset_task = dataset_task
 
     _validate_dataset_inputs(parser, args)
@@ -223,6 +224,21 @@ def validate_args(
                 + ". Unsupported: "
                 + ",".join(unsupported)
             )
+    if args.dataset_task == "mcqa":
+        if not args.dataset_mix_spec:
+            parser.error("--dataset_task mcqa requires --dataset_mix.")
+        unsupported = sorted(set(args.dataset_mix_sources or []) - MCQA_DATASET_MIX_ALIASES)
+        if unsupported:
+            parser.error(
+                "--dataset_task mcqa supports only these dataset_mix aliases: "
+                + ",".join(sorted(MCQA_DATASET_MIX_ALIASES))
+                + ". Unsupported: "
+                + ",".join(unsupported)
+            )
+        if str(args.loss_type).strip().lower() not in _MCQA_LOSS_TYPES:
+            parser.error("--dataset_task mcqa requires --loss_type choice_kd or choice_kd_ce.")
+        if float(args.hidden_loss_weight) > 0.0:
+            parser.error("--dataset_task mcqa does not support --hidden_loss_weight > 0.")
     if float(args.distill_temperature) <= 0.0:
         parser.error("--distill_temperature must be > 0.")
     if not (0.0 <= float(args.distill_alpha) <= 1.0):

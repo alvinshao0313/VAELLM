@@ -44,6 +44,8 @@ def _parse_lora_loss_type(value: str) -> str:
         "dual_r_kl_top",
         "kl_top",
         "dual_kl_top",
+        "choice_kd",
+        "choice_kd_ce",
     }
     if raw in static_choices:
         return raw
@@ -62,7 +64,7 @@ def _parse_lora_loss_type(value: str) -> str:
     raise argparse.ArgumentTypeError(
         "Invalid --lora_loss_type. Supported: sft, origin, rkl, dual_rkl, kl, mse, kd, kd_top[_K], "
         "dual_kd_top[_K], dual_kl, dual_kd, r_kl_top[_K], dual_r_kl_top[_K], kl_top[_K], "
-        "dual_kl_top[_K] (K must be a positive integer)."
+        "dual_kl_top[_K], choice_kd, choice_kd_ce (K must be a positive integer)."
     )
 
 

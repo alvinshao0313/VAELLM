@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Trainer
 
-from dense_e2e_fintuning.trainer import _get_output_logits, compute_dense_loss_from_logits
+from e2e_common.dense_loss import compute_dense_loss_from_logits, get_output_logits
 from train_utils.distill_losses import build_distill_token_mask
 
 _HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
@@ -103,6 +103,66 @@ def _causal_lm_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torc
     )
 
 
+def compute_choice_scores_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    if logits.ndim != 4:
+        raise ValueError(f"choice logits must have shape [B, C, L, V], got {tuple(logits.shape)}.")
+    if labels.ndim != 3:
+        raise ValueError(f"choice labels must have shape [B, C, L], got {tuple(labels.shape)}.")
+    if tuple(logits.shape[:3]) != tuple(labels.shape):
+        raise ValueError(
+            f"choice logits/labels shape mismatch: {tuple(logits.shape[:3])} vs {tuple(labels.shape)}."
+        )
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].to(device=shift_logits.device).contiguous()
+    valid_mask = shift_labels.ne(-100)
+    safe_labels = shift_labels.masked_fill(~valid_mask, 0)
+    log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    return (token_log_probs * valid_mask.to(dtype=token_log_probs.dtype)).sum(dim=-1)
+
+
+def compute_choice_kd_loss_from_scores(
+    *,
+    student_scores: torch.Tensor,
+    teacher_scores: Optional[torch.Tensor],
+    answer_index: torch.Tensor,
+    loss_type: str,
+    temperature: float,
+    alpha: float,
+) -> torch.Tensor:
+    norm = str(loss_type or "").strip().lower()
+    if norm not in {"choice_kd", "choice_kd_ce"}:
+        raise ValueError(f"Unsupported choice KD loss_type={loss_type!r}.")
+    if teacher_scores is None:
+        raise ValueError(f"loss_type={norm} requires teacher_scores.")
+    if student_scores.ndim != 2 or teacher_scores.ndim != 2:
+        raise ValueError("student_scores and teacher_scores must have shape [B, C].")
+    if tuple(student_scores.shape) != tuple(teacher_scores.shape):
+        raise ValueError(
+            f"student/teacher choice score shape mismatch: {tuple(student_scores.shape)} vs {tuple(teacher_scores.shape)}."
+        )
+
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be > 0, got {temperature}.")
+    alpha = float(alpha)
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"alpha must satisfy 0 <= alpha <= 1, got {alpha}.")
+
+    teacher_scores = teacher_scores.detach().to(device=student_scores.device)
+    answer_index = answer_index.to(device=student_scores.device, dtype=torch.long)
+    kd_loss = F.kl_div(
+        F.log_softmax(student_scores.float() / temperature, dim=-1),
+        F.softmax(teacher_scores.float() / temperature, dim=-1),
+        reduction="batchmean",
+    ) * (temperature * temperature)
+    if norm == "choice_kd":
+        return kd_loss
+    ce_loss = F.cross_entropy(student_scores.float(), answer_index)
+    return ce_loss * (1.0 - alpha) + kd_loss * alpha
+
+
 class VAEDecoderE2ETrainer(Trainer):
     def __init__(
         self,
@@ -166,7 +226,55 @@ class VAEDecoderE2ETrainer(Trainer):
         )
         return loss + float(self.hidden_loss_weight) * hidden_loss
 
+    def _compute_choice_kd_loss(self, model, inputs, return_outputs: bool):
+        if float(self.hidden_loss_weight) > 0.0:
+            raise ValueError("dataset_task=mcqa does not support hidden_loss_weight > 0.")
+        if self.teacher_model is None:
+            raise ValueError(f"loss_type={self.loss_type} requires teacher_model for MCQA choice KD.")
+
+        choice_input_ids = inputs["choice_input_ids"]
+        choice_attention_mask = inputs.get("choice_attention_mask")
+        choice_labels = inputs["choice_labels"]
+        answer_index = inputs["answer_index"]
+        if choice_input_ids.ndim != 3:
+            raise ValueError(f"choice_input_ids must have shape [B, C, L], got {tuple(choice_input_ids.shape)}.")
+        batch_size, choice_count, seq_len = choice_input_ids.shape
+        flat_student_inputs = {
+            "input_ids": choice_input_ids.reshape(batch_size * choice_count, seq_len),
+        }
+        if choice_attention_mask is not None:
+            flat_student_inputs["attention_mask"] = choice_attention_mask.reshape(batch_size * choice_count, seq_len)
+
+        offload_context = (
+            self.saved_tensor_offload.context()
+            if self.saved_tensor_offload is not None
+            else nullcontext()
+        )
+        with offload_context:
+            outputs = model(**flat_student_inputs, output_hidden_states=False)
+        student_logits = get_output_logits(outputs).reshape(batch_size, choice_count, seq_len, -1)
+
+        flat_teacher_inputs = dict(flat_student_inputs)
+        teacher_outputs = self._compute_teacher_outputs(flat_teacher_inputs, output_hidden_states=False)
+        teacher_logits = get_output_logits(teacher_outputs).to(device=student_logits.device)
+        teacher_logits = teacher_logits.reshape(batch_size, choice_count, seq_len, -1)
+
+        student_scores = compute_choice_scores_from_logits(student_logits, choice_labels)
+        teacher_scores = compute_choice_scores_from_logits(teacher_logits, choice_labels.to(device=teacher_logits.device))
+        loss = compute_choice_kd_loss_from_scores(
+            student_scores=student_scores,
+            teacher_scores=teacher_scores,
+            answer_index=answer_index,
+            loss_type=self.loss_type,
+            temperature=self.distill_temperature,
+            alpha=self.distill_alpha,
+        )
+        return (loss, outputs) if return_outputs else loss
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        if "choice_input_ids" in inputs:
+            return self._compute_choice_kd_loss(model, inputs, return_outputs=bool(return_outputs))
+
         labels = inputs.get("labels")
         student_inputs = dict(inputs)
         student_inputs.pop("labels", None)
@@ -178,7 +286,7 @@ class VAEDecoderE2ETrainer(Trainer):
         )
         with offload_context:
             outputs = model(**student_inputs, output_hidden_states=hidden_loss_enabled)
-        logits = _get_output_logits(outputs)
+        logits = get_output_logits(outputs)
 
         ce_loss = None
         if labels is not None:
@@ -198,7 +306,7 @@ class VAEDecoderE2ETrainer(Trainer):
         teacher_inputs = dict(inputs)
         teacher_inputs.pop("labels", None)
         teacher_outputs = self._compute_teacher_outputs(teacher_inputs, output_hidden_states=hidden_loss_enabled)
-        teacher_logits = _get_output_logits(teacher_outputs).to(device=logits.device)
+        teacher_logits = get_output_logits(teacher_outputs).to(device=logits.device)
         token_mask = build_distill_token_mask(
             labels=labels,
             attention_mask=inputs.get("attention_mask"),

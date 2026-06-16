@@ -3,9 +3,9 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/final_model}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/cat_train_final_model}"
 ADAPTER_DIR="${ADAPTER_DIR:-}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 
@@ -27,7 +27,7 @@ if [[ -n "${ADAPTER_DIR}" ]]; then
     --adapter_dir "${ADAPTER_DIR}" \
     --eval_ppl \
     --eval_lm_eval \
-    --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
+    --tasks "mmlu" \
     --eval_device "${EVAL_DEVICE}" \
     --lm_batch_size "auto" \
     --num_fewshot "0" \
@@ -35,6 +35,7 @@ if [[ -n "${ADAPTER_DIR}" ]]; then
     --ppl_seqlen "2048" \
     --ppl_limit "-1" \
     --eval_hif4_act "false" \
+    --mmlu_debug_samples "20" \
     --eval_log_dir "./eval_log" \
     "$@"
 else
@@ -42,7 +43,7 @@ else
     --checkpoint_dir "${CHECKPOINT_DIR}" \
     --eval_ppl \
     --eval_lm_eval \
-    --tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
+    --tasks "mmlu" \
     --eval_device "${EVAL_DEVICE}" \
     --lm_batch_size "auto" \
     --num_fewshot "0" \
@@ -50,6 +51,7 @@ else
     --ppl_seqlen "2048" \
     --ppl_limit "-1" \
     --eval_hif4_act "false" \
+    --mmlu_debug_samples "200" \
     --eval_log_dir "./eval_log" \
     "$@"
 fi

@@ -3,11 +3,13 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=6
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
 export CAT_LORA_DATASET_NUM_PROC="${CAT_LORA_DATASET_NUM_PROC:-16}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
 
 # 可按需补充的可选参数：
 # --access_token "hf_xxx"
@@ -34,8 +36,8 @@ export CAT_LORA_DATASET_NUM_PROC="${CAT_LORA_DATASET_NUM_PROC:-16}"
 # --wa_mse_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
 # CAT_LORA_DATASET_NUM_PROC=16          # LoRA/校准数据 format 预处理并行进程数 位置在 lora_data.py
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
-# --eval_tasks "boolq,rte,piqa"       # 可选：类别后下游任务评估；空串表示不跑
-# --lora_after_category \ boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa
+# --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
+# --distill_after_category "none|remaining_lora|compressed_lora|decoder|both"
 
 python tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
@@ -53,7 +55,7 @@ python tools/cat_train.py \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
-  --steps_per_category "default=1000" \
+  --steps_per_category "default=10000" \
   --joint_decoder_steps "default=0" \
   --joint_decoder_lr "default=0.005" \
   --joint_decoder_group_size "default=36" \
@@ -62,15 +64,15 @@ python tools/cat_train.py \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
-  --eval_ppl "true" \
-  --eval_tasks "" \
+  --eval_ppl "false" \
+  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
   --intra_part_sort_mode "default=none" \
   --sort_prep_workers "0" \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
-  --outlier_protect_mode "residual_sparse" \
+  --outlier_protect_mode "none" \
   --outlier_residual_top_p "default=0.01" \
   --outlier_residual_score "input_act_weighted_abs" \
   --outlier_residual_min_abs "0.0" \
@@ -113,13 +115,13 @@ python tools/cat_train.py \
   --normalize_weight \
   --use_checkpoint \
   --new_quant \
-  --lora_after_category \
+  --distill_after_category "compressed_lora" \
   --lora_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
-  --lora_rank "default=12" \
-  --lora_alpha "default=24.0" \
+  --lora_rank "default=128" \
+  --lora_alpha "default=128.0" \
   --lora_dropout "default=0.03" \
   --lora_steps "default=5000" \
-  --lora_batch_size "default=2" \
+  --lora_batch_size "default=1" \
   --lora_nsamples "default=20000" \
   --lora_lr "default=1e-4" \
   --lora_weight_decay "default=0.001" \
@@ -130,9 +132,9 @@ python tools/cat_train.py \
   --lora_loss_type "default=kd_top_1000" \
   --lora_hidden_loss_weight "default=0.01" \
   --lora_hidden_layer_weighting "linear_depth" \
-  --lora_use_dora "default=true" \
-  --lora_tune_final_norm "true" \
-  --lora_use_post_norm_head_linear "true" \
+  --lora_use_dora "default=false" \
+  --lora_tune_final_norm "false" \
+  --lora_use_post_norm_head_linear "false" \
   --lora_hif4_act "false" \
   --eval_hif4_act "false" \
   --lora_gradient_accumulation_steps "1" \
@@ -142,7 +144,7 @@ python tools/cat_train.py \
   --lora_max_grad_norm "1.3" \
   --lora_warmup_ratio "0.1" \
   --lora_group_by_length "true" \
-  --lora_lr_scheduler_type "cosine" \
+  --lora_lr_scheduler_type "constant" \
   --lora_model_max_length "8192" \
   --fp16 "false" \
   --bf16 "true" \

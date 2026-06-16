@@ -175,8 +175,8 @@
 | `--eval_ppl` | `true` | 是否在类别后评估阶段运行 PPL | 现在和 `convert` 解耦；`false` 时不跑 PPL |
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
-| `--lora_after_category` | `False` | 每训练完一个类别后，对剩余类别做一次 LoRA 微调并融合 | 开启后才会进入 LoRA 阶段 |
-| `--lora_dataset` | `""` | LoRA 补偿训练混合数据集 | 开启 `--lora_after_category` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
+| `--distill_after_category` | `none` | 每训练完一个类别后的蒸馏模式 | `none` / `remaining_lora` / `compressed_lora` / `decoder` / `both`；非 `none` 要求开启 `--convert` |
+| `--lora_dataset` | `""` | 每类后蒸馏训练混合数据集 | `--distill_after_category != none` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
 | `--lora_rank` | `default=8` | LoRA rank | after-category override |
 | `--lora_alpha` | `default=16.0` | LoRA alpha | after-category override |
 | `--lora_dropout` | `default=0.0` | LoRA dropout | after-category override |
@@ -191,7 +191,9 @@
 | `--lora_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
 | `--lora_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
 | `--lora_hidden_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权，`linear_depth` 让后层权重线性增大并归一到平均权重为 1 |
-| `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override |
+| `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 `remaining_lora` 支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
+| `--lora_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 `--distill_after_category=remaining_lora` 支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
+| `--lora_use_post_norm_head_linear` | `false` | 每类后 LoRA 蒸馏是否训练 post-norm head linear | 仅 `--distill_after_category=remaining_lora` 支持；最终保存前会融合回 `lm_head` |
 | `--lora_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
 | `--eval_hif4_act` | `false` | 是否在 cat_train 内部类别后评估阶段启用 HiFloat4 激活伪量化 | 同时作用于 PPL 和 lm_eval；不影响训练 |
 | `--seed` | `0` | 全流程随机种子 | LoRA 每轮会叠加轮次偏移 |
@@ -264,7 +266,7 @@
 | `--beta2` | `0.95` | Adam/AdamW 的 `beta2` |
 | `--weight_decay` | `1e-2` | 权重衰减 |
 | `--optimizer` | `adamw` | `adam/adamw/sgd/rmsprop` |
-| `--lr_scheduler` | `none` | `none/linear/cosine` |
+| `--lr_scheduler` | `constant` | `constant/linear/cosine`；`constant` 表示固定学习率 |
 | `--lr_warmup_steps` | `0` | warmup 步数 |
 
 ### 4.3 数据 / 损失 / 量化相关
@@ -395,15 +397,33 @@
 - 不开 `--convert` 时：
   - 不会把模块替换成 `VAELinear`
   - 仍然可以按 `--eval_ppl/--eval_tasks` 跑类别后评估
-- `--lora_after_category` 和 `--save_model` 仍然要求 `--convert` 开启，因为它们依赖“压缩结果已经写回模型”。
+- `--distill_after_category != none` 和 `--save_model` 仍然要求 `--convert` 开启，因为它们依赖“压缩结果已经写回模型”。
 
-### 6.11 `normalize_weight`
+### 6.11 每类后蒸馏模式
+
+`--distill_after_category` 控制每个类别压缩完成后的补偿训练：
+
+| 模式 | 训练目标 | 保存语义 | 主要限制 |
+|---|---|---|---|
+| `none` | 不做每类后蒸馏 | 只保存 VAE 压缩结果 | 无 |
+| `remaining_lora` | 尚未压缩的剩余 dense `nn.Linear`，可选最终 norm / post-norm head | LoRA 训练后融合回 dense Linear；post-norm head 在最终保存前融合回 `lm_head` | 保留旧行为，支持 DoRA |
+| `compressed_lora` | 当前刚压缩类别的 `VAELinear` proxy LoRA | 先预解码 dense base，再训练 LoRA delta；训练后导出为 `VAELinear.low_rank_a/b` 并恢复普通 `VAELinear` | v1 不支持 DoRA；不训练 final norm / post-norm head |
+| `decoder` | 当前刚压缩类别的 `VAELinear` decoder 参数 | 训练后关闭 trainable decode、拆回普通 decoder 并清 cache | 不训练 final norm / post-norm head |
+| `both` | 当前刚压缩类别的 decoder + proxy LoRA | decoder 收尾同 `decoder`；LoRA delta 导出为 `low_rank_a/b`；最终不保留 proxy | v1 不支持 DoRA；不训练 final norm / post-norm head |
+
+注意：
+
+- `compressed_lora` / `both` 如果 `--lora_use_dora` 解析为 `true` 会直接报错；v1 不做 DoRA 到低秩补丁的近似 SVD。
+- `compressed_lora` / `decoder` / `both` 如果开启 `--lora_tune_final_norm` 或 `--lora_use_post_norm_head_linear` 会直接报错，避免每类后移动最终 logits 路径。
+- 最终普通 cat checkpoint 不保留 `PeftVAELinearProxy`；保存前若仍有 proxy 残留会直接报错。
+
+### 6.12 `normalize_weight`
 
 - 训练时会对当前 stage 的 residual 计算 `(mean, std)` 并标准化训练
 - 转换时会把该 stage 的 `(mean, std)` 融合进 decoder
 - 多阶 residual 会分别计算和融合各自的标准化统计量
 
-### 6.12 `wa_mse` 与 activation 依赖
+### 6.13 `wa_mse` 与 activation 依赖
 
 - `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
 - `outlier_protect_mode=channel` 且 `outlier_protect_count > 0` 时，也复用同一条动态 activation 路径
@@ -637,12 +657,32 @@ python tools/cat_train.py \
 - 低秩模式和 `channel`、`residual_sparse` 是互斥模式。
 - 最终推理权重等价于 `W_final = W_vae + low_rank_a @ low_rank_b`，若同时存在 sparse residual，则 sparse residual 在 low-rank 后再加。
 
-### 9.7 LoRA after-category 覆盖
+### 9.7 每类后蒸馏覆盖
 
 ```bash
 python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
-  --lora_after_category \
+  --convert \
+  --distill_after_category compressed_lora \
+  --lora_dataset wiki=1.0 \
+  --lora_rank default=8,after:q_proj=16 \
+  --lora_steps default=50,after:q_proj=200 \
+  --lora_hidden_loss_weight default=0.01 \
+  --lora_hidden_layer_weighting linear_depth \
+  --eval_ppl true \
+  --eval_tasks boolq,rte,piqa \
+  --lora_hif4_act false \
+  --eval_hif4_act false \
+  --lora_use_dora default=false
+```
+
+如果需要保留旧的“补偿剩余 dense Linear”行为：
+
+```bash
+python tools/cat_train.py \
+  --model_path meta-llama/Llama-2-7b-hf \
+  --convert \
+  --distill_after_category remaining_lora \
   --lora_dataset wiki=1.0 \
   --lora_rank default=8,after:q_proj=16 \
   --lora_steps default=50,after:q_proj=200 \

@@ -578,10 +578,19 @@ class VAELinear(nn.Module):
         self.trainable_decode = False
         self.parallel_stage_decode = False
         self._parallel_stage_layout: List[Tuple[int, int]] = []
+        self._parallel_stage_layout_is_stage_major = False
+        self._parallel_stage_restore_identity = False
+        self._parallel_stage_grouped_vq_runtime_key: Optional[Tuple[str, torch.dtype]] = None
+        self._parallel_stage_model_indices_runtime_key: Optional[str] = None
+        self._parallel_stage_restore_index_cache: Dict[Tuple[Any, ...], torch.Tensor] = {}
         self.register_buffer("_cached_weight", None, persistent=False)
         self.register_buffer("_cached_sparse_residual_row_indices", None, persistent=False)
         self.register_buffer("_cached_sparse_residual_col_indices", None, persistent=False)
         self.register_buffer("_cached_sparse_residual_values", None, persistent=False)
+        self.register_buffer("_parallel_stage_grouped_vq_weight", None, persistent=False)
+        self.register_buffer("_parallel_stage_grouped_vq_runtime", None, persistent=False)
+        self.register_buffer("_parallel_stage_model_indices", None, persistent=False)
+        self.register_buffer("_parallel_stage_model_indices_runtime", None, persistent=False)
 
         use_stage_payload = stage_vq_weights is not None or stage_decoders is not None
         if use_stage_payload:
@@ -973,6 +982,153 @@ class VAELinear(nn.Module):
                 layout.append((int(stage_idx), int(part_idx)))
         return decoders, layout
 
+    def _clear_parallel_stage_decode_runtime_cache(self) -> None:
+        self._parallel_stage_grouped_vq_runtime_key = None
+        self._parallel_stage_model_indices_runtime_key = None
+        self._parallel_stage_restore_index_cache = {}
+        self._parallel_stage_grouped_vq_runtime = None
+        self._parallel_stage_model_indices_runtime = None
+
+    def _clear_parallel_stage_decode_plan(self) -> None:
+        self._clear_parallel_stage_decode_runtime_cache()
+        self._parallel_stage_layout_is_stage_major = False
+        self._parallel_stage_restore_identity = False
+        self._parallel_stage_grouped_vq_weight = None
+        self._parallel_stage_model_indices = None
+
+    def _build_parallel_stage_grouped_vq_weight(self, layout: Sequence[Tuple[int, int]]) -> torch.Tensor:
+        if not layout:
+            raise RuntimeError("parallel stage layout cannot be empty.")
+        vq_tensors: List[torch.Tensor] = []
+        first_shape = None
+        for stage_idx, part_idx in layout:
+            vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
+            if bool(vq_weight.requires_grad):
+                raise RuntimeError("parallel_stage_decode runtime VQ packing requires frozen vq_weight tensors.")
+            if vq_weight.ndim != 3 or int(vq_weight.shape[1]) != 1:
+                raise ValueError(
+                    f"parallel_stage_decode expects vq shape [N_blocks, 1, latent_dim], got {tuple(vq_weight.shape)} "
+                    f"for stage={int(stage_idx)} part={int(part_idx)}."
+                )
+            shape = tuple(int(v) for v in vq_weight.shape)
+            if first_shape is None:
+                first_shape = shape
+            elif shape != first_shape:
+                raise ValueError(
+                    f"parallel_stage_decode requires identical vq shapes, got {shape} vs {first_shape}."
+                )
+            vq_tensors.append(vq_weight.detach())
+        grouped_vq = torch.cat(vq_tensors, dim=1).contiguous()
+        if int(grouped_vq.shape[1]) != len(layout):
+            raise RuntimeError(
+                f"parallel grouped VQ model axis {int(grouped_vq.shape[1])} != layout length {len(layout)}."
+            )
+        return grouped_vq
+
+    def _parallel_stage_restore_is_identity(self) -> bool:
+        for stage_idx in range(int(self.residual_stages)):
+            if self.get_stage_restore_row_indices(stage_idx) is not None:
+                return False
+            if self.get_stage_restore_col_indices(stage_idx) is not None:
+                return False
+            if self.get_stage_part_restore_col_indices(stage_idx) is not None:
+                return False
+        return True
+
+    def _build_parallel_stage_decode_plan(self) -> None:
+        layout = list(getattr(self, "_parallel_stage_layout", []))
+        expected = int(self.residual_stages) * int(self.parallel_parts)
+        if len(layout) != expected:
+            raise RuntimeError(f"parallel stage layout length {len(layout)} != expected {expected}.")
+
+        stage_major = [
+            (int(stage_idx), int(part_idx))
+            for stage_idx in range(int(self.residual_stages))
+            for part_idx in range(int(self.parallel_parts))
+        ]
+        model_indices = torch.empty(
+            (int(self.residual_stages), int(self.parallel_parts)),
+            dtype=torch.long,
+            device="cpu",
+        )
+        seen = set()
+        for model_idx, (stage_idx, part_idx) in enumerate(layout):
+            key = (int(stage_idx), int(part_idx))
+            if key in seen:
+                raise RuntimeError(f"parallel stage layout contains duplicate entry: {key}.")
+            if int(stage_idx) < 0 or int(stage_idx) >= int(self.residual_stages):
+                raise RuntimeError(f"parallel stage layout stage index out of range: {key}.")
+            if int(part_idx) < 0 or int(part_idx) >= int(self.parallel_parts):
+                raise RuntimeError(f"parallel stage layout part index out of range: {key}.")
+            seen.add(key)
+            model_indices[int(stage_idx), int(part_idx)] = int(model_idx)
+        if len(seen) != expected:
+            raise RuntimeError(f"parallel stage layout covers {len(seen)} entries, expected {expected}.")
+
+        grouped_vq = self._build_parallel_stage_grouped_vq_weight(layout)
+        self._parallel_stage_grouped_vq_weight = grouped_vq
+        self._parallel_stage_model_indices = model_indices
+        self._parallel_stage_layout_is_stage_major = list(layout) == stage_major
+        self._parallel_stage_restore_identity = self._parallel_stage_restore_is_identity()
+        self._clear_parallel_stage_decode_runtime_cache()
+
+    def _get_parallel_stage_grouped_vq(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        grouped_vq = getattr(self, "_parallel_stage_grouped_vq_weight", None)
+        if grouped_vq is None:
+            raise RuntimeError("parallel_stage_decode packed VQ buffer is missing.")
+        target_device = torch.device(device)
+        cache_key = (str(target_device), dtype)
+        cached = getattr(self, "_parallel_stage_grouped_vq_runtime", None)
+        if (
+            isinstance(cached, torch.Tensor)
+            and self._parallel_stage_grouped_vq_runtime_key == cache_key
+            and cached.device == target_device
+            and cached.dtype == dtype
+        ):
+            return cached
+        out = grouped_vq.to(device=target_device, dtype=dtype, non_blocking=True)
+        self._parallel_stage_grouped_vq_runtime = out
+        self._parallel_stage_grouped_vq_runtime_key = cache_key
+        return out
+
+    def _get_parallel_stage_model_indices(self, device: torch.device) -> torch.Tensor:
+        indices = getattr(self, "_parallel_stage_model_indices", None)
+        if indices is None:
+            raise RuntimeError("parallel_stage_decode model index plan is missing.")
+        target_device = torch.device(device)
+        cache_key = str(target_device)
+        cached = getattr(self, "_parallel_stage_model_indices_runtime", None)
+        if (
+            isinstance(cached, torch.Tensor)
+            and self._parallel_stage_model_indices_runtime_key == cache_key
+            and cached.device == target_device
+        ):
+            return cached
+        out = indices.to(device=target_device, non_blocking=True)
+        self._parallel_stage_model_indices_runtime = out
+        self._parallel_stage_model_indices_runtime_key = cache_key
+        return out
+
+    def _restore_index_to_device(
+        self,
+        restore_idx: Optional[torch.Tensor],
+        *,
+        cache_key: Tuple[Any, ...],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if restore_idx is None:
+            return None
+        target_device = torch.device(device)
+        if restore_idx.device == target_device:
+            return restore_idx
+        full_key = tuple(cache_key) + (str(target_device),)
+        cached = self._parallel_stage_restore_index_cache.get(full_key)
+        if isinstance(cached, torch.Tensor) and cached.device == target_device:
+            return cached
+        moved = restore_idx.to(device=target_device, non_blocking=True)
+        self._parallel_stage_restore_index_cache[full_key] = moved
+        return moved
+
     def enable_trainable_decode(self, *, parallel_stage_decode: bool = False) -> None:
         self.trainable_decode = True
         self.cache_decoded_weight = False
@@ -993,6 +1149,8 @@ class VAELinear(nn.Module):
             packed_decoder.requires_grad_(bool(trainable))
             packed_decoder.train(self.training)
             self.parallel_stage_decode = True
+            if getattr(self, "_parallel_stage_grouped_vq_weight", None) is None:
+                self._build_parallel_stage_decode_plan()
             return True
         decoders, layout = self._iter_stage_part_decoders_for_pack()
         if len(decoders) <= 1:
@@ -1014,6 +1172,7 @@ class VAELinear(nn.Module):
         self._parallel_stage_layout = list(layout)
         self._parallel_stage_decoder = packed_decoder
         self.parallel_stage_decode = True
+        self._build_parallel_stage_decode_plan()
 
         if self._multi_parts:
             del self.decoders
@@ -1059,6 +1218,7 @@ class VAELinear(nn.Module):
                     setattr(self, f"decoder_s{stage_idx}", parts[0])
 
         del self._parallel_stage_decoder
+        self._clear_parallel_stage_decode_plan()
         self._parallel_stage_layout = []
         self.parallel_stage_decode = False
         return True
@@ -1105,8 +1265,11 @@ class VAELinear(nn.Module):
             raise ValueError(
                 f"restore_row_indices size {int(restore_idx.numel())} != decoded split rows {int(w_split.shape[0])}"
             )
-        if restore_idx.device != w_split.device:
-            restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
+        restore_idx = self._restore_index_to_device(
+            restore_idx,
+            cache_key=("restore_row", int(stage_idx)),
+            device=w_split.device,
+        )
         return w_split.index_select(0, restore_idx)
 
     def _restore_split_col_order(self, w_split: torch.Tensor, *, stage_idx: int) -> torch.Tensor:
@@ -1117,8 +1280,11 @@ class VAELinear(nn.Module):
             raise ValueError(
                 f"restore_col_indices size {int(restore_idx.numel())} != decoded split cols {int(w_split.shape[1])}"
             )
-        if restore_idx.device != w_split.device:
-            restore_idx = restore_idx.to(device=w_split.device, non_blocking=True)
+        restore_idx = self._restore_index_to_device(
+            restore_idx,
+            cache_key=("restore_col", int(stage_idx)),
+            device=w_split.device,
+        )
         return w_split.index_select(1, restore_idx)
 
     def _restore_part_col_order(self, part_matrix: torch.Tensor, part_idx: int, *, stage_idx: int) -> torch.Tensor:
@@ -1138,8 +1304,11 @@ class VAELinear(nn.Module):
             raise ValueError(
                 f"part_restore_col_indices[{part_idx}] size {int(restore_idx.numel())} != part cols {int(part_matrix.shape[1])}"
             )
-        if restore_idx.device != part_matrix.device:
-            restore_idx = restore_idx.to(device=part_matrix.device, non_blocking=True)
+        restore_idx = self._restore_index_to_device(
+            restore_idx,
+            cache_key=("part_restore_col", int(stage_idx), int(part_idx)),
+            device=part_matrix.device,
+        )
         return part_matrix.index_select(1, restore_idx)
 
     def _decode_part_flat(self, stage_idx: int, part_idx: int, dtype: torch.dtype) -> torch.Tensor:
@@ -1211,6 +1380,40 @@ class VAELinear(nn.Module):
         stacked_parts = torch.stack(decoded_parts, dim=0)
         return self._restore_split_weight_from_part_flats(stacked_parts, dtype=dtype, stage_idx=stage_idx)
 
+    def _restore_stage_part_flats_fast(self, stage_part_flats: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        expected_shape = (int(self.residual_stages), int(self.parallel_parts))
+        if stage_part_flats.ndim != 3 or tuple(int(v) for v in stage_part_flats.shape[:2]) != expected_shape:
+            raise ValueError(
+                f"stage_part_flats must have leading shape {expected_shape}, got {tuple(stage_part_flats.shape)}."
+            )
+
+        split_rows = self.compressed_in_features if self.transpose else self.compressed_out_features
+        split_cols = self.compressed_out_features if self.transpose else self.compressed_in_features
+        if (
+            bool(getattr(self, "_parallel_stage_restore_identity", False))
+            and int(self.parallel_parts) == 1
+        ):
+            stage_splits = stage_part_flats[:, 0, :].contiguous().view(
+                int(self.residual_stages),
+                int(split_rows),
+                int(split_cols),
+            )
+            return stage_splits.sum(dim=0).contiguous().to(dtype=dtype)
+
+        restored_stages = [
+            self._restore_split_weight_from_part_flats(
+                stage_part_flats[stage_idx],
+                dtype=dtype,
+                stage_idx=stage_idx,
+            )
+            for stage_idx in range(int(self.residual_stages))
+        ]
+        if not restored_stages:
+            raise RuntimeError("parallel stage decode produced no reconstruction.")
+        if len(restored_stages) == 1:
+            return restored_stages[0].contiguous()
+        return torch.stack(restored_stages, dim=0).sum(dim=0).contiguous()
+
     def _decode_split_weight_parallel_stages(self, dtype: torch.dtype) -> torch.Tensor:
         packed_decoder = getattr(self, "_parallel_stage_decoder", None)
         if packed_decoder is None:
@@ -1223,25 +1426,7 @@ class VAELinear(nn.Module):
         param = next(packed_decoder.parameters(), None)
         decode_device = param.device if param is not None else torch.device("cpu")
         decode_dtype = param.dtype if param is not None else dtype
-        vq_tensors: List[torch.Tensor] = []
-        first_shape = None
-        for stage_idx, part_idx in layout:
-            vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
-            if vq_weight.ndim != 3 or int(vq_weight.shape[1]) != 1:
-                raise ValueError(
-                    f"parallel_stage_decode expects vq shape [N_blocks, 1, latent_dim], got {tuple(vq_weight.shape)} "
-                    f"for stage={stage_idx} part={part_idx}."
-                )
-            shape = tuple(int(v) for v in vq_weight.shape)
-            if first_shape is None:
-                first_shape = shape
-            elif shape != first_shape:
-                raise ValueError(
-                    f"parallel_stage_decode requires identical vq shapes, got {shape} vs {first_shape}."
-                )
-            vq_tensors.append(vq_weight)
-
-        grouped_vq = torch.cat(vq_tensors, dim=1).to(device=decode_device, dtype=decode_dtype, non_blocking=True)
+        grouped_vq = self._get_parallel_stage_grouped_vq(dtype=decode_dtype, device=decode_device)
         stage_out = packed_decoder(grouped_vq)
         if tuple(int(v) for v in stage_out.shape[:2]) != (int(grouped_vq.shape[0]), expected_models):
             raise RuntimeError(
@@ -1249,32 +1434,16 @@ class VAELinear(nn.Module):
                 f"expected leading={(int(grouped_vq.shape[0]), expected_models)}."
             )
         model_flats = stage_out.permute(1, 0, 2).contiguous().view(expected_models, -1)
-
-        split_weight = None
-        for stage_idx in range(int(self.residual_stages)):
-            part_indices = [
-                model_idx
-                for model_idx, (layout_stage_idx, _part_idx) in enumerate(layout)
-                if int(layout_stage_idx) == int(stage_idx)
-            ]
-            if len(part_indices) != int(self.parallel_parts):
-                raise RuntimeError(
-                    f"parallel stage layout has {len(part_indices)} parts for stage={stage_idx}, "
-                    f"expected {int(self.parallel_parts)}."
-                )
-            stage_part_flats = model_flats.index_select(
-                0,
-                torch.tensor(part_indices, dtype=torch.long, device=model_flats.device),
+        if bool(getattr(self, "_parallel_stage_layout_is_stage_major", False)):
+            stage_part_flats = model_flats.view(int(self.residual_stages), int(self.parallel_parts), -1)
+        else:
+            indices = self._get_parallel_stage_model_indices(model_flats.device).reshape(-1)
+            stage_part_flats = model_flats.index_select(0, indices).view(
+                int(self.residual_stages),
+                int(self.parallel_parts),
+                -1,
             )
-            stage_split = self._restore_split_weight_from_part_flats(
-                stage_part_flats,
-                dtype=dtype,
-                stage_idx=stage_idx,
-            )
-            split_weight = stage_split if split_weight is None else (split_weight + stage_split)
-        if split_weight is None:
-            raise RuntimeError("parallel stage decode produced no reconstruction.")
-        return split_weight.contiguous()
+        return self._restore_stage_part_flats_fast(stage_part_flats, dtype=dtype)
 
     def _decode_split_weight(self, dtype: torch.dtype) -> torch.Tensor:
         if bool(getattr(self, "parallel_stage_decode", False)):
@@ -1546,6 +1715,7 @@ class VAELinear(nn.Module):
     def clear_decoded_weight_cache(self) -> None:
         self._cached_weight = None
         self.clear_sparse_residual_cache()
+        self._clear_parallel_stage_decode_runtime_cache()
 
     @torch.no_grad()
     def prime_sparse_residual_cache(

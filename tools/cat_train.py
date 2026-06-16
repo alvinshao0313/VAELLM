@@ -20,6 +20,7 @@ from train_utils.cat_train_args import (
     resolve_category_runtime_configs,
     resolve_skip_layer_matches,
 )
+from train_utils.cat_after_category_distill import run_after_category_distill
 from train_utils.cat_train_runtime import (
     init_sort_prep_worker as _init_sort_prep_worker,
     load_model_for_cat_train as _load_model_for_cat_train,
@@ -947,8 +948,8 @@ def train_group_vae_payload(
         # 2) 训练当前 residual stage 对应的 VAE。
         optimizer = create_optimizer(vae.parameters(), stage_vae_args, stage_vae_args.lr)
         lr_scheduler = None
-        lr_scheduler_name = str(getattr(stage_vae_args, "lr_scheduler", "none"))
-        if lr_scheduler_name != "none":
+        lr_scheduler_name = str(getattr(stage_vae_args, "lr_scheduler", "constant")).strip().lower()
+        if lr_scheduler_name != "constant":
             import transformers
 
             lr_scheduler = transformers.get_scheduler(
@@ -1586,10 +1587,11 @@ def _train_group_vae_and_replace(
 def main(argv: Optional[Sequence[str]] = None) -> None:
     global log
     cat_args, hf_args, training_args, vae_args = process_cat_train_args(argv)
-    if bool(getattr(training_args, "lora_hif4_act", False)) and not bool(cat_args.lora_after_category):
-        raise ValueError("--lora_hif4_act 仅在 LoRA 阶段生效，因此必须同时开启 --lora_after_category。")
-    if bool(cat_args.lora_after_category) and not bool(cat_args.convert):
-        raise ValueError("--lora_after_category requires --convert，因为 LoRA 补偿必须作用在已替换的压缩模型上。")
+    distill_after_category = str(getattr(cat_args, "distill_after_category", "none")).strip().lower()
+    if bool(getattr(training_args, "lora_hif4_act", False)) and distill_after_category == "none":
+        raise ValueError("--lora_hif4_act 仅在每类后蒸馏阶段生效，因此必须设置 --distill_after_category。")
+    if distill_after_category != "none" and not bool(cat_args.convert):
+        raise ValueError("--distill_after_category requires --convert，因为每类后蒸馏必须作用在已替换的压缩模型上。")
     configure_deterministic_mode(bool(getattr(cat_args, "deterministic", False)))
     set_seed(cat_args.seed)
 
@@ -2020,7 +2022,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     deterministic=bool(cat_args.deterministic),
                     shuffle_seed=int(cat_args.seed) + int(cat_idx) * 100000 + int(start),
                 )
-            if run_category_eval and not bool(cat_args.lora_after_category):
+            if run_category_eval and distill_after_category == "none":
                 log.info("类别训练后评估...")
                 _eval_after_category(
                     model=model,
@@ -2035,10 +2037,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     tokenizer=eval_tokenizer,
                 )
 
-            if cat_args.lora_after_category:
-                from train_utils.lora_utils import lora_finetune_remaining_categories
+            if distill_after_category != "none":
                 if run_category_eval:
-                    log.info("LoRA 微调前评估...")
+                    log.info("每类后蒸馏前评估...")
                     _eval_after_category(
                         model=model,
                         vae_args=vae_args,
@@ -2051,28 +2052,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         eval_tasks=eval_tasks_text,
                         tokenizer=eval_tokenizer,
                     )
-                current_remaining_linears = _collect_current_trainable_linears(
-                    model,
-                    transpose_modules=transpose_modules,
-                    only_decoder_projections=only_decoder_projections,
-                    projection_suffixes=projection_suffixes,
-                )
-                remaining_categories = list(dict.fromkeys(r.category for r in current_remaining_linears))
-                model = lora_finetune_remaining_categories(
+                distill_result = run_after_category_distill(
                     model=model,
-                    remaining_categories=remaining_categories,
-                    target_names=[r.name for r in current_remaining_linears],
+                    category=cat,
                     cat_args=cat_args,
                     vae_args=vae_args,
                     training_args=training_args,
                     logger=log,
                     lora_round_idx=lora_round_idx,
-                    after_category=cat,
+                    transpose_modules=transpose_modules,
+                    only_decoder_projections=only_decoder_projections,
+                    projection_suffixes=projection_suffixes,
                 )
-                lora_round_idx += 1
+                model = distill_result.model
+                lora_round_idx = int(distill_result.next_lora_round_idx)
 
-            if run_category_eval and bool(cat_args.lora_after_category):
-                log.info("LoRA 微调后评估...")
+            if run_category_eval and distill_after_category != "none":
+                log.info("每类后蒸馏后评估...")
                 _eval_after_category(
                     model=model,
                     vae_args=vae_args,
@@ -2105,6 +2101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 raise ValueError("--save_model requires --convert")
             from transformers import AutoTokenizer
             from e2e_common.post_norm_head import fuse_post_norm_head_linear
+            from e2e_common.peft_proxy import iter_named_peft_vae_proxies
             from litebsq.vae_linear import clear_model_vae_linear_cache
 
             model_out = os.path.join(run_output_dir, "final_model")
@@ -2112,6 +2109,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             fused_post_norm_head = fuse_post_norm_head_linear(model)
             if fused_post_norm_head:
                 log.info("Final save: fused post_norm_linear into lm_head.weight.")
+            leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
+            if leftover_proxies:
+                raise RuntimeError(
+                    "Final save found unexported PeftVAELinearProxy modules: "
+                    + ", ".join(leftover_proxies)
+                )
             cleared = clear_model_vae_linear_cache(model)
             log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
             save_paths = save_model_checkpoint(

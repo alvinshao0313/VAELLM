@@ -9,15 +9,20 @@ import torch
 from torch import nn
 from transformers import AutoTokenizer, default_data_collator
 
-from dense_e2e_fintuning.args import needs_teacher
-from dense_e2e_fintuning.checkpoint_bridge import (
+from e2e_common.compressed_checkpoint import (
     get_decode_device_diagnostics,
     load_compressed_student_checkpoint,
     resolve_base_model_path,
 )
-from dense_e2e_fintuning.runtime import _build_datasets_with_main_process_first, _eval_final_ppl
 from e2e_common.data import build_tokenizer
+from e2e_common.e2e_args import needs_teacher
+from e2e_common.low_rank_lora import (
+    extract_low_rank_payloads_from_lora,
+    iter_lora_target_modules,
+    write_low_rank_payloads_to_compressed_model,
+)
 from e2e_common.post_norm_head import ensure_post_norm_head_linear
+from e2e_common.runtime_utils import build_datasets_with_main_process_first, eval_final_ppl
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import NamedVAELinearDecodeTarget, decode_named_vae_linear_weights
@@ -181,26 +186,12 @@ def _materialize_selected_vae_linears_without_low_rank(
     return int(converted)
 
 
-def _strip_peft_module_prefix(name: str) -> str:
-    text = str(name)
-    for prefix in ("base_model.model.", "model."):
-        if text.startswith(prefix):
-            return text[len(prefix):]
-    return text
-
-
-def _iter_lora_target_modules(model: nn.Module):
-    for name, module in model.named_modules():
-        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
-            yield _strip_peft_module_prefix(str(name)), module
-
-
 def _initialize_lora_from_low_rank(
     peft_model: nn.Module,
     low_rank_payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
 ) -> int:
     initialized = 0
-    for base_name, module in _iter_lora_target_modules(peft_model):
+    for base_name, module in iter_lora_target_modules(peft_model):
         if base_name not in low_rank_payloads:
             continue
         low_rank_a, low_rank_b = low_rank_payloads[base_name]
@@ -269,50 +260,6 @@ def _build_low_rank_peft_model(
         train_mode="low_rank",
     )
     return peft_model, selection
-
-
-def _extract_low_rank_payloads_from_lora(
-    peft_model: nn.Module,
-    target_modules: Sequence[str],
-) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
-    target_set = {str(name) for name in target_modules}
-    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-    for base_name, module in _iter_lora_target_modules(peft_model):
-        if base_name not in target_set:
-            continue
-        lora_a = module.lora_A["default"].weight.detach()
-        lora_b = module.lora_B["default"].weight.detach()
-        scaling = float(module.scaling["default"])
-        low_rank_b = lora_a.to(device="cpu").contiguous()
-        low_rank_a = (lora_b.to(device="cpu", dtype=torch.float32) * scaling).to(dtype=lora_b.dtype).contiguous()
-        payloads[base_name] = (low_rank_a, low_rank_b)
-    if len(payloads) != len(target_set):
-        missing = sorted(target_set - set(payloads.keys()))
-        raise RuntimeError(f"Missing trained LoRA payloads for low-rank export: {missing}")
-    return payloads
-
-
-def _write_low_rank_payloads_to_compressed_model(
-    model: nn.Module,
-    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
-) -> int:
-    modules = dict(_iter_named_vae_linears(model))
-    written = 0
-    for name, (low_rank_a, low_rank_b) in payloads.items():
-        module = modules.get(str(name))
-        if module is None:
-            raise RuntimeError(f"Cannot export low-rank payload; VAELinear not found: {name}")
-        if getattr(module, "low_rank_a", None) is None or getattr(module, "low_rank_b", None) is None:
-            raise RuntimeError(f"Cannot export low-rank payload; checkpoint module has no low_rank_a/b: {name}")
-        if tuple(module.low_rank_a.shape) != tuple(low_rank_a.shape):
-            raise RuntimeError(f"{name}: low_rank_a shape mismatch: {tuple(module.low_rank_a.shape)} != {tuple(low_rank_a.shape)}.")
-        if tuple(module.low_rank_b.shape) != tuple(low_rank_b.shape):
-            raise RuntimeError(f"{name}: low_rank_b shape mismatch: {tuple(module.low_rank_b.shape)} != {tuple(low_rank_b.shape)}.")
-        module.low_rank_a.data.copy_(low_rank_a.to(device=module.low_rank_a.device, dtype=module.low_rank_a.dtype))
-        module.low_rank_b.data.copy_(low_rank_b.to(device=module.low_rank_b.device, dtype=module.low_rank_b.dtype))
-        module.clear_decoded_weight_cache()
-        written += 1
-    return int(written)
 
 
 def _peft_base_model(model: nn.Module) -> nn.Module:
@@ -513,11 +460,13 @@ def _build_run_meta(
     offload_mode: str,
     global_step: int,
 ) -> Dict[str, Any]:
-    return {
+    stage = str(getattr(args, "e2e_stage", "vae_e2e_fintuning"))
+    args_key = str(getattr(args, "e2e_args_key", "vae_e2e_args"))
+    meta = {
         "format": "vae_decoder_e2e_run_meta",
         "version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "stage": "vae_e2e_fintuning",
+        "stage": stage,
         "teacher_source": str(teacher_source),
         "student_checkpoint_dir": str(resolved_student_checkpoint_dir),
         "base_model_path": str(base_model_path),
@@ -525,21 +474,26 @@ def _build_run_meta(
         "layer_device_map": dict(layer_device_map),
         "offload_mode": str(offload_mode),
         "global_step": int(global_step),
-        "vae_e2e_args": _namespace_to_dict(args),
         "hf_args": _namespace_to_dict(hf_args),
         "training_args": _namespace_to_dict(training_args),
         "dataset": _jsonable(data_info),
         "trainables": _jsonable(trainable_info),
     }
+    if hasattr(args, "finetune_mode"):
+        meta["finetune_mode"] = str(getattr(args, "finetune_mode"))
+        meta["internal_vae_train_mode"] = str(getattr(args, "vae_train_mode"))
+    meta[args_key] = _namespace_to_dict(args)
+    return meta
 
 
 def run(args, hf_args, training_args):
+    stage = str(getattr(args, "e2e_stage", "vae_e2e_fintuning"))
     run_output_dir = _build_distributed_run_output_dir(
         args.run_root_dir,
         os.path.basename(args.student_checkpoint_dir),
     )
-    os.environ["LOG_FILE"] = os.path.join(run_output_dir, "vae_e2e_fintuning.log")
-    log = get_logger("vae_e2e_fintuning")
+    os.environ["LOG_FILE"] = os.path.join(run_output_dir, f"{stage}.log")
+    log = get_logger(stage)
     resume_from_checkpoint = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
 
     log.info("Run output directory: %s", run_output_dir)
@@ -696,7 +650,7 @@ def run(args, hf_args, training_args):
     if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    train_dataset, eval_dataset, data_info = _build_datasets_with_main_process_first(
+    train_dataset, eval_dataset, data_info = build_datasets_with_main_process_first(
         args,
         training_args,
         tokenizer,
@@ -772,7 +726,7 @@ def run(args, hf_args, training_args):
         unwrapped_streaming = unwrap_streaming_offload_layers(unwrap_target)
         log.info("Unwrapped %d streaming offload layers before final save.", unwrapped_streaming)
     if train_mode == "low_rank":
-        low_rank_payloads_for_export = _extract_low_rank_payloads_from_lora(
+        low_rank_payloads_for_export = extract_low_rank_payloads_from_lora(
             final_model,
             selection.target_modules,
         )
@@ -781,7 +735,7 @@ def run(args, hf_args, training_args):
             access_token=hf_args.access_token,
             logger=log,
         )
-        written = _write_low_rank_payloads_to_compressed_model(export_model, low_rank_payloads_for_export)
+        written = write_low_rank_payloads_to_compressed_model(export_model, low_rank_payloads_for_export)
         log.info("Exported trained LoRA payloads back to compressed low-rank branches: written=%d", written)
         final_model = export_model
         if hasattr(final_model, "config"):
@@ -813,7 +767,8 @@ def run(args, hf_args, training_args):
             tokenizer=tok,
             save_config=True,
             extra_meta={
-                "stage": "vae_e2e_fintuning",
+                "stage": stage,
+                "finetune_mode": None if not hasattr(args, "finetune_mode") else str(getattr(args, "finetune_mode")),
                 "vae_train_mode": str(train_mode),
                 "tune_final_norm": bool(args.tune_final_norm),
                 "use_post_norm_head_linear": bool(args.use_post_norm_head_linear),
@@ -844,7 +799,7 @@ def run(args, hf_args, training_args):
             args=args,
             log=log,
         )
-        ppl_eval = _eval_final_ppl(
+        ppl_eval = eval_final_ppl(
             model=final_model,
             args=args,
             model_path=str(base_model_path),

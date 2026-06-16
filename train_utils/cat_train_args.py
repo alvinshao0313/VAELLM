@@ -79,7 +79,7 @@ class NormalizedCatArgs:
     eval_tasks: str
     ppl_limit: int
     eval_hif4_act: bool
-    lora_after_category: bool
+    distill_after_category: str
     lora_dataset: str
     lora_rank: OverrideTable[int]
     lora_alpha: OverrideTable[float]
@@ -189,6 +189,8 @@ _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "residual_sparse", "per_vae_low_rank", "post_vae_low_rank")
 _LORA_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+_DISTILL_AFTER_CATEGORY_CHOICES = ("none", "remaining_lora", "compressed_lora", "decoder", "both")
+_DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES = {"compressed_lora", "both"}
 _OUTLIER_RESIDUAL_SCORE_CHOICES = (
     "abs",
     "input_act_weighted_abs",
@@ -245,12 +247,23 @@ def _parse_lora_dataset_mix_text(raw: str, *, arg_name: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _normalize_lora_dataset_arg(raw: str, *, lora_after_category: bool) -> str:
+def _normalize_distill_after_category(raw: str) -> str:
+    mode = str(raw or "none").strip().lower()
+    if mode not in _DISTILL_AFTER_CATEGORY_CHOICES:
+        raise ValueError(
+            "--distill_after_category must be one of: "
+            f"{', '.join(_DISTILL_AFTER_CATEGORY_CHOICES)}."
+        )
+    return mode
+
+
+def _normalize_lora_dataset_arg(raw: str, *, distill_after_category: str) -> str:
     value = str(raw or "").strip()
-    if not bool(lora_after_category):
+    mode = _normalize_distill_after_category(distill_after_category)
+    if mode == "none":
         return value
     if not value:
-        raise ValueError("--lora_dataset must be set when --lora_after_category is enabled.")
+        raise ValueError("--lora_dataset must be set when --distill_after_category is enabled.")
     if "=" not in value:
         raise ValueError(
             "--lora_dataset only accepts ratio-style dataset specs, for example "
@@ -578,7 +591,7 @@ def _build_cat_train_vae_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw", "sgd", "rmsprop"])
-    parser.add_argument("--lr_scheduler", type=str, default="none", choices=["none", "linear", "cosine"], help="Learning rate scheduler")
+    parser.add_argument("--lr_scheduler", type=str, default="constant", choices=["constant", "linear", "cosine"], help="Learning rate scheduler")
     parser.add_argument("--lr_warmup_steps", type=int, default=0, help="Warmup steps for scheduler")
     parser.add_argument("--model_path", type=str, default="meta-llama/Llama-2-7b-hf", help="Path or HuggingFace ID of the LLM")
     parser.add_argument("--normalize_weight", action="store_true", help="Normalize weight (z-score) before training")
@@ -646,10 +659,10 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         eval_tasks=str(raw_args.eval_tasks),
         ppl_limit=int(raw_args.ppl_limit),
         eval_hif4_act=bool(raw_args.eval_hif4_act),
-        lora_after_category=bool(raw_args.lora_after_category),
+        distill_after_category=_normalize_distill_after_category(raw_args.distill_after_category),
         lora_dataset=_normalize_lora_dataset_arg(
             raw_args.lora_dataset,
-            lora_after_category=bool(raw_args.lora_after_category),
+            distill_after_category=str(raw_args.distill_after_category),
         ),
         lora_rank=_parse_cat_override(raw_args.lora_rank, spec=_LORA_RANK_SPEC),
         lora_alpha=_parse_cat_override(raw_args.lora_alpha, spec=_LORA_ALPHA_SPEC),
@@ -725,18 +738,23 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
         )
 
 
-def _validate_lora_extra_trainable_args(cat_args: NormalizedCatArgs) -> None:
-    if bool(cat_args.lora_after_category):
-        return
+def _validate_distill_after_category_args(cat_args: NormalizedCatArgs) -> None:
+    mode = _normalize_distill_after_category(cat_args.distill_after_category)
     enabled = []
     if bool(cat_args.tune_final_norm):
         enabled.append("--lora_tune_final_norm")
     if bool(cat_args.use_post_norm_head_linear):
         enabled.append("--lora_use_post_norm_head_linear")
-    if enabled:
+    if enabled and mode != "remaining_lora":
         raise ValueError(
-            f"{', '.join(enabled)} 仅在 LoRA 补偿阶段生效，因此必须同时开启 --lora_after_category。"
+            f"{', '.join(enabled)} is only supported with --distill_after_category=remaining_lora."
         )
+    if mode in _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES:
+        for _selector, use_dora in _iter_override_entries(cat_args.lora_use_dora):
+            if bool(use_dora):
+                raise ValueError(
+                    f"--distill_after_category={mode} does not support --lora_use_dora=true."
+                )
 
 
 def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
@@ -1110,13 +1128,22 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         default=False,
         help="是否在 cat_train 内部的 PPL 评估阶段启用 HiFloat4 激活伪量化。",
     )
-    parser.add_argument("--lora_after_category", action="store_true", help="每个类别 VAE 训练后，对剩余类别做一次 LoRA 微调并融合。")
+    parser.add_argument(
+        "--distill_after_category",
+        type=str,
+        choices=list(_DISTILL_AFTER_CATEGORY_CHOICES),
+        default="none",
+        help=(
+            "每个类别 VAE 训练后的蒸馏模式：none 不蒸馏；remaining_lora 保留旧的剩余 dense Linear LoRA；"
+            "compressed_lora 只给刚压缩类别挂 proxy LoRA；decoder 只微调刚压缩类别 decoder；both 同时训练两者。"
+        ),
+    )
     parser.add_argument(
         "--lora_dataset",
         type=str,
         default="",
         help=(
-            "LoRA 补偿训练数据集比例串。开启 --lora_after_category 时必填；"
+            "每类后蒸馏训练数据集比例串。开启 --distill_after_category 非 none 时必填；"
             "格式: alias=weight,alias=weight，例如 wiki=1.0、openorca=1.0 或 "
             "openorca=0.5,fineweb_edu=0.5。支持 dense_e2e 的 dataset_mix alias。"
         ),
@@ -1187,10 +1214,15 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
 
         argv = sys.argv[1:]
     script_parser = build_cat_train_parser()
+    if any(str(arg) == "--lora_after_category" or str(arg).startswith("--lora_after_category=") for arg in argv):
+        script_parser.error(
+            "--lora_after_category has been removed; use --distill_after_category "
+            "remaining_lora|compressed_lora|decoder|both."
+        )
     raw_script_args, remaining = script_parser.parse_known_args(list(argv))
     cat_args = _normalize_cat_train_script_args(raw_script_args)
     _validate_outlier_protect_mode_args(cat_args)
-    _validate_lora_extra_trainable_args(cat_args)
+    _validate_distill_after_category_args(cat_args)
 
     vae_parser = _build_cat_train_vae_parser()
     raw_vae_args, unknown_args = vae_parser.parse_known_args(remaining)

@@ -355,8 +355,8 @@ def finetune_stage_decoders(
         raise RuntimeError(f"[{group_tag}] joint decoder fine-tune has no trainable parameters.")
     optimizer = create_optimizer(params, shared_stage_args, float(joint_lr))
     lr_scheduler = None
-    lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "none"))
-    if lr_scheduler_name != "none":
+    lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "constant")).strip().lower()
+    if lr_scheduler_name != "constant":
         import transformers
 
         lr_scheduler = transformers.get_scheduler(

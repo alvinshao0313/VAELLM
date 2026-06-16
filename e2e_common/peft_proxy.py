@@ -1,7 +1,7 @@
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from peft import AdaLoraConfig, LoraConfig
@@ -185,6 +185,80 @@ def iter_named_peft_vae_proxies(model: nn.Module) -> Iterator[Tuple[str, PeftVAE
 
 def _sorted_named_peft_vae_proxies(model: nn.Module) -> List[Tuple[str, PeftVAELinearProxy]]:
     return sorted(iter_named_peft_vae_proxies(model), key=lambda item: str(item[0]))
+
+
+def _select_peft_proxy_refs(
+    model: nn.Module,
+    module_names: Optional[Sequence[str]],
+) -> List[Tuple[str, PeftVAELinearProxy]]:
+    proxy_refs = _sorted_named_peft_vae_proxies(model)
+    if module_names is None:
+        return proxy_refs
+    requested = [str(name) for name in module_names]
+    by_name = {name: proxy for name, proxy in proxy_refs}
+    missing = [name for name in requested if name not in by_name]
+    if missing:
+        raise ValueError(f"Missing PeftVAELinearProxy modules: {missing}")
+    return [(name, by_name[name]) for name in requested]
+
+
+def _adapter_uses_dora(peft_linear: PeftLoraLinear, adapter_name: str) -> bool:
+    use_dora = getattr(peft_linear, "use_dora", None)
+    if isinstance(use_dora, dict):
+        return bool(use_dora.get(adapter_name, False))
+    return bool(use_dora)
+
+
+@torch.no_grad()
+def export_peft_proxy_lora_to_low_rank(
+    model: nn.Module,
+    *,
+    module_names: Optional[Sequence[str]] = None,
+) -> int:
+    proxy_refs = _select_peft_proxy_refs(model, module_names)
+    exported = 0
+    for module_name, proxy in proxy_refs:
+        peft_linear = proxy.per_decoded_linear
+        if is_peft_adalora_linear(peft_linear):
+            raise ValueError(f"{module_name}: AdaLoRA export to VAELinear low_rank_a/b is not supported.")
+        if not is_peft_lora_linear(peft_linear):
+            raise TypeError(f"{module_name}: expected PEFT LoRA Linear, got {type(peft_linear)}.")
+        adapter_name = _get_default_adapter_name(peft_linear)
+        if _adapter_uses_dora(peft_linear, adapter_name):
+            raise ValueError(f"{module_name}: DoRA export to VAELinear low_rank_a/b is not supported.")
+
+        base_layer = proxy.base_layer
+        existing_a = getattr(base_layer, "low_rank_a", None)
+        existing_b = getattr(base_layer, "low_rank_b", None)
+        if existing_a is not None or existing_b is not None:
+            raise ValueError(f"{module_name}: VAELinear already has low_rank_a/b; refusing to overwrite.")
+
+        weight_a = peft_linear.lora_A[adapter_name].weight.detach()
+        weight_b = peft_linear.lora_B[adapter_name].weight.detach()
+        scaling = float(peft_linear.scaling[adapter_name])
+        low_rank_a = (weight_b * scaling).detach().clone().contiguous()
+        low_rank_b = weight_a.detach().clone().contiguous()
+        if int(low_rank_a.shape[0]) != int(base_layer.out_features):
+            raise ValueError(
+                f"{module_name}: exported low_rank_a rows {int(low_rank_a.shape[0])} "
+                f"!= out_features {int(base_layer.out_features)}."
+            )
+        if int(low_rank_b.shape[1]) != int(base_layer.in_features):
+            raise ValueError(
+                f"{module_name}: exported low_rank_b cols {int(low_rank_b.shape[1])} "
+                f"!= in_features {int(base_layer.in_features)}."
+            )
+        if int(low_rank_a.shape[1]) != int(low_rank_b.shape[0]):
+            raise ValueError(
+                f"{module_name}: exported low-rank inner dim mismatch "
+                f"{int(low_rank_a.shape[1])} != {int(low_rank_b.shape[0])}."
+            )
+        base_layer.low_rank_a = nn.Parameter(low_rank_a, requires_grad=False)
+        base_layer.low_rank_b = nn.Parameter(low_rank_b, requires_grad=False)
+        base_layer.clear_decoded_weight_cache()
+        set_module_by_name(model, module_name, base_layer)
+        exported += 1
+    return int(exported)
 
 
 def _resolve_proxy_base_linear(module_name: str, proxy: PeftVAELinearProxy) -> nn.Linear:

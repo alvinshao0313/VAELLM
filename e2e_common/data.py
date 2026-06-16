@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets, interleave_datasets, load_dataset
 from transformers import AutoTokenizer
 from transformers.trainer_utils import IntervalStrategy
@@ -110,7 +111,97 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         text_field="support",
         text_format="sciq_qa",
     ),
+    "mmlu": DatasetMixSourcePreset(
+        alias="mmlu",
+        path="hails/mmlu_no_train",
+        config=None,
+        train_split="dev+validation",
+        eval_split=None,
+        text_field="question",
+        text_format="mmlu_mcqa",
+    ),
+    "arc": DatasetMixSourcePreset(
+        alias="arc",
+        path="allenai/ai2_arc",
+        config="ARC-Challenge",
+        train_split="train",
+        eval_split="validation",
+        text_field="question",
+        text_format="arc_mcqa",
+    ),
+    "openbookqa": DatasetMixSourcePreset(
+        alias="openbookqa",
+        path="allenai/openbookqa",
+        config="main",
+        train_split="train",
+        eval_split="validation",
+        text_field="question_stem",
+        text_format="openbookqa_mcqa",
+    ),
 }
+
+
+MCQA_DATASET_MIX_ALIASES = {"mmlu", "race", "sciq", "arc", "openbookqa"}
+_MCQA_CONTINUATIONS = [" A", " B", " C", " D"]
+_MMLU_NO_TRAIN_SUBJECTS = (
+    "abstract_algebra",
+    "anatomy",
+    "astronomy",
+    "business_ethics",
+    "clinical_knowledge",
+    "college_biology",
+    "college_chemistry",
+    "college_computer_science",
+    "college_mathematics",
+    "college_medicine",
+    "college_physics",
+    "computer_security",
+    "conceptual_physics",
+    "econometrics",
+    "electrical_engineering",
+    "elementary_mathematics",
+    "formal_logic",
+    "global_facts",
+    "high_school_biology",
+    "high_school_chemistry",
+    "high_school_computer_science",
+    "high_school_european_history",
+    "high_school_geography",
+    "high_school_government_and_politics",
+    "high_school_macroeconomics",
+    "high_school_mathematics",
+    "high_school_microeconomics",
+    "high_school_physics",
+    "high_school_psychology",
+    "high_school_statistics",
+    "high_school_us_history",
+    "high_school_world_history",
+    "human_aging",
+    "human_sexuality",
+    "international_law",
+    "jurisprudence",
+    "logical_fallacies",
+    "machine_learning",
+    "management",
+    "marketing",
+    "medical_genetics",
+    "miscellaneous",
+    "moral_disputes",
+    "moral_scenarios",
+    "nutrition",
+    "philosophy",
+    "prehistory",
+    "professional_accounting",
+    "professional_law",
+    "professional_medicine",
+    "professional_psychology",
+    "public_relations",
+    "security_studies",
+    "sociology",
+    "us_foreign_policy",
+    "virology",
+    "world_religions",
+)
 
 
 def build_tokenizer(model_path: str, access_token: Optional[str] = None):
@@ -284,6 +375,193 @@ def _resolve_choice_index(answer: object, num_options: int) -> Optional[int]:
         if 0 <= idx < num_options:
             return idx
     return None
+
+
+def _normalize_four_options(raw_options: object) -> Optional[List[str]]:
+    options = _normalize_choice_options(raw_options)
+    if len(options) != 4:
+        return None
+    return options
+
+
+def _normalize_labeled_choice_dict(raw_choices: object) -> Optional[Tuple[List[str], List[str]]]:
+    if not isinstance(raw_choices, dict):
+        return None
+    texts = raw_choices.get("text")
+    labels = raw_choices.get("label")
+    if not isinstance(texts, (list, tuple)) or not isinstance(labels, (list, tuple)):
+        return None
+    pairs = []
+    for label, text in zip(labels, texts):
+        norm_label = _stringify_text(label).upper()
+        norm_text = _stringify_text(text)
+        if not norm_label or not norm_text:
+            continue
+        pairs.append((norm_label, norm_text))
+    if len(pairs) != 4:
+        return None
+    pairs.sort(key=lambda item: item[0])
+    expected = ["A", "B", "C", "D"]
+    sorted_labels = [label for label, _text in pairs]
+    if sorted_labels != expected:
+        return None
+    return [text for _label, text in pairs], sorted_labels
+
+
+def _stable_sciq_answer_index(question: str) -> int:
+    return int(sum(ord(char) for char in str(question)) % 4)
+
+
+def _build_mcqa_prompt(
+    *,
+    question: str,
+    options: Sequence[str],
+    subject: Optional[str] = None,
+    passage: Optional[str] = None,
+    support: Optional[str] = None,
+) -> str:
+    parts: List[str] = []
+    if subject:
+        parts.append(f"Subject: {subject}")
+    if passage:
+        parts.append(f"Passage: {passage}")
+    if support:
+        parts.append(f"Support: {support}")
+    parts.append(f"Question: {question}")
+    for idx, option in enumerate(options):
+        parts.append(f"{chr(ord('A') + idx)}. {option}")
+    parts.append("Answer:")
+    return "\n".join(parts)
+
+
+def record_to_mcqa_example(
+    record: Dict[str, object],
+    *,
+    text_format: str,
+) -> Optional[Dict[str, object]]:
+    normalized_text_format = str(text_format).strip().lower()
+    if normalized_text_format == "mmlu_mcqa":
+        question = _stringify_text(record.get("question"))
+        options = _normalize_four_options(record.get("choices"))
+        answer_idx = _resolve_choice_index(record.get("answer"), 4)
+        subject = _stringify_text(record.get("subject")).replace("_", " ")
+        if not question or options is None or answer_idx is None:
+            return None
+        prompt = _build_mcqa_prompt(question=question, options=options, subject=subject or None)
+        return {"prompt": prompt, "continuations": list(_MCQA_CONTINUATIONS), "answer_index": int(answer_idx)}
+
+    if normalized_text_format == "race_mcqa":
+        article = _stringify_text(record.get("article"))
+        question = _stringify_text(record.get("question"))
+        options = _normalize_four_options(record.get("options"))
+        answer_idx = _resolve_choice_index(record.get("answer"), 4)
+        if not article or not question or options is None or answer_idx is None:
+            return None
+        prompt = _build_mcqa_prompt(question=question, options=options, passage=article)
+        return {"prompt": prompt, "continuations": list(_MCQA_CONTINUATIONS), "answer_index": int(answer_idx)}
+
+    if normalized_text_format == "sciq_qa":
+        support = _stringify_text(record.get("support"))
+        question = _stringify_text(record.get("question"))
+        correct_answer = _stringify_text(record.get("correct_answer"))
+        distractors = [
+            _stringify_text(record.get("distractor1")),
+            _stringify_text(record.get("distractor2")),
+            _stringify_text(record.get("distractor3")),
+        ]
+        if not question or not correct_answer or any(not item for item in distractors):
+            return None
+        answer_idx = _stable_sciq_answer_index(question)
+        options = list(distractors)
+        options.insert(answer_idx, correct_answer)
+        prompt = _build_mcqa_prompt(question=question, options=options, support=support or None)
+        return {"prompt": prompt, "continuations": list(_MCQA_CONTINUATIONS), "answer_index": int(answer_idx)}
+
+    if normalized_text_format in {"arc_mcqa", "openbookqa_mcqa"}:
+        question_key = "question_stem" if normalized_text_format == "openbookqa_mcqa" else "question"
+        question = _stringify_text(record.get(question_key))
+        normalized_choices = _normalize_labeled_choice_dict(record.get("choices"))
+        if normalized_choices is None:
+            return None
+        options, labels = normalized_choices
+        answer_text = _stringify_text(record.get("answerKey")).upper()
+        if not question or answer_text not in labels:
+            return None
+        answer_idx = labels.index(answer_text)
+        prompt = _build_mcqa_prompt(question=question, options=options)
+        return {"prompt": prompt, "continuations": list(_MCQA_CONTINUATIONS), "answer_index": int(answer_idx)}
+
+    raise ValueError(
+        f"MCQA dataset_task does not support text_format={text_format!r}. "
+        "Supported formats: mmlu_mcqa, race_mcqa, sciq_qa, arc_mcqa, openbookqa_mcqa."
+    )
+
+
+def encode_mcqa_example(
+    example: Dict[str, object],
+    tokenizer,
+    *,
+    block_size: int,
+) -> Dict[str, torch.Tensor]:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if eos_token_id is None:
+        raise ValueError("MCQA dataset_task requires tokenizer.eos_token_id.")
+    if pad_token_id is None:
+        raise ValueError("MCQA dataset_task requires tokenizer.pad_token_id.")
+
+    prompt = _stringify_text(example.get("prompt"))
+    continuations = list(example.get("continuations") or [])
+    answer_index = int(example.get("answer_index"))
+    if not prompt or len(continuations) != 4 or not (0 <= answer_index < len(continuations)):
+        raise ValueError("Invalid MCQA example.")
+
+    prompt_ids = [
+        int(token_id)
+        for token_id in tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        ).get("input_ids", [])
+    ]
+    if not prompt_ids:
+        raise ValueError("MCQA prompt tokenization produced no tokens.")
+
+    out_input_ids: List[List[int]] = []
+    out_attention_mask: List[List[int]] = []
+    out_labels: List[List[int]] = []
+    for continuation in continuations:
+        continuation_ids = [
+            int(token_id)
+            for token_id in tokenizer(
+                str(continuation),
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            ).get("input_ids", [])
+        ]
+        if not continuation_ids:
+            raise ValueError("MCQA continuation tokenization produced no tokens.")
+        input_ids = list(prompt_ids) + continuation_ids + [int(eos_token_id)]
+        labels = [-100] * len(prompt_ids) + list(continuation_ids) + [-100]
+        attention_mask = [1] * len(input_ids)
+        if len(input_ids) > int(block_size):
+            raise ValueError(
+                f"MCQA sample length {len(input_ids)} exceeds --model_max_length={int(block_size)}. "
+                "Increase --model_max_length or remove this over-length sample."
+            )
+        pad_len = int(block_size) - len(input_ids)
+        out_input_ids.append(input_ids + [int(pad_token_id)] * pad_len)
+        out_attention_mask.append(attention_mask + [0] * pad_len)
+        out_labels.append(labels + [-100] * pad_len)
+
+    return {
+        "choice_input_ids": torch.tensor(out_input_ids, dtype=torch.long),
+        "choice_attention_mask": torch.tensor(out_attention_mask, dtype=torch.long),
+        "choice_labels": torch.tensor(out_labels, dtype=torch.long),
+        "answer_index": torch.tensor(answer_index, dtype=torch.long),
+    }
 
 
 def _format_race_record(record: Dict[str, object]) -> Optional[str]:
@@ -574,7 +852,19 @@ def _group_texts(examples: Dict[str, Sequence[Sequence[int]]], *, block_size: in
 
 
 def _set_torch_columns(dataset: Dataset) -> Dataset:
-    columns = [name for name in ("input_ids", "attention_mask", "labels") if name in dataset.column_names]
+    columns = [
+        name
+        for name in (
+            "input_ids",
+            "attention_mask",
+            "labels",
+            "choice_input_ids",
+            "choice_attention_mask",
+            "choice_labels",
+            "answer_index",
+        )
+        if name in dataset.column_names
+    ]
     dataset.set_format(type="torch", columns=columns)
     return dataset
 
@@ -728,6 +1018,72 @@ def _tokenize_and_pack_sft(
         num_proc=None if int(num_proc) == 1 else int(num_proc),
     )
     return _set_torch_columns(packed)
+
+
+def _records_to_mcqa_batch(
+    examples: Dict[str, Sequence[object]],
+    *,
+    text_format: str,
+    tokenizer,
+    block_size: int,
+) -> Dict[str, List[object]]:
+    if not examples:
+        return {
+            "choice_input_ids": [],
+            "choice_attention_mask": [],
+            "choice_labels": [],
+            "answer_index": [],
+        }
+
+    keys = list(examples.keys())
+    batch_size = len(examples[keys[0]])
+    out_input_ids: List[List[List[int]]] = []
+    out_attention_mask: List[List[List[int]]] = []
+    out_labels: List[List[List[int]]] = []
+    out_answer_index: List[int] = []
+
+    for idx in range(batch_size):
+        record = {key: examples[key][idx] for key in keys}
+        example = record_to_mcqa_example(record, text_format=text_format)
+        if example is None:
+            continue
+        try:
+            encoded = encode_mcqa_example(example, tokenizer, block_size=int(block_size))
+        except ValueError:
+            continue
+        out_input_ids.append(encoded["choice_input_ids"].tolist())
+        out_attention_mask.append(encoded["choice_attention_mask"].tolist())
+        out_labels.append(encoded["choice_labels"].tolist())
+        out_answer_index.append(int(encoded["answer_index"].item()))
+
+    return {
+        "choice_input_ids": out_input_ids,
+        "choice_attention_mask": out_attention_mask,
+        "choice_labels": out_labels,
+        "answer_index": out_answer_index,
+    }
+
+
+def _tokenize_mcqa(
+    dataset: Dataset,
+    tokenizer,
+    *,
+    block_size: int,
+    text_format: str,
+    num_proc: int = 1,
+) -> Dataset:
+    tokenized = dataset.map(
+        lambda batch: _records_to_mcqa_batch(
+            batch,
+            text_format=str(text_format),
+            tokenizer=tokenizer,
+            block_size=int(block_size),
+        ),
+        batched=True,
+        remove_columns=list(dataset.column_names),
+        num_proc=None if int(num_proc) == 1 else int(num_proc),
+    )
+    return _set_torch_columns(tokenized)
 
 
 def _resolve_dataset_num_proc(args) -> int:
@@ -960,7 +1316,89 @@ def _sample_and_pack_sft_source(
     }
 
 
+def _sample_and_pack_mcqa_source(
+    raw_dataset: Dataset,
+    *,
+    target_rows: int,
+    tokenizer,
+    block_size: int,
+    text_format: str,
+    num_proc: int,
+    seed: int,
+) -> Tuple[Dataset, Dict[str, object]]:
+    if int(target_rows) < 1:
+        raise ValueError(f"target_rows must be >= 1, got {target_rows}")
+
+    raw_rows = int(len(raw_dataset))
+    chunk_size = max(4096, int(num_proc) * 256)
+    shuffled_raw = raw_dataset.shuffle(seed=int(seed))
+    packed_chunks: List[Dataset] = []
+    processed_raw_rows = 0
+    collected_packed_rows = 0
+
+    for start in range(0, raw_rows, chunk_size):
+        stop = min(start + chunk_size, raw_rows)
+        chunk = shuffled_raw.select(range(start, stop))
+        processed_raw_rows += int(len(chunk))
+
+        packed_chunk = _tokenize_mcqa(
+            chunk,
+            tokenizer,
+            block_size=int(block_size),
+            text_format=str(text_format),
+            num_proc=int(num_proc),
+        )
+        if len(packed_chunk) > 0:
+            packed_chunks.append(packed_chunk)
+            collected_packed_rows += int(len(packed_chunk))
+
+        if collected_packed_rows >= int(target_rows):
+            break
+
+    if collected_packed_rows < 1:
+        raise ValueError(
+            "Packed MCQA training dataset for mix source is empty. "
+            "Check the source schema and --model_max_length."
+        )
+
+    collected = packed_chunks[0] if len(packed_chunks) == 1 else concatenate_datasets(packed_chunks)
+    collected = _set_torch_columns(collected.shuffle(seed=int(seed)))
+    resized, repeat_factor = _resize_packed_dataset(
+        collected,
+        target_rows=int(target_rows),
+        seed=int(seed),
+        shuffle=False,
+    )
+    return resized, {
+        "raw_rows": int(raw_rows),
+        "text_rows": int(processed_raw_rows),
+        "packed_rows": int(collected_packed_rows),
+        "target_rows": int(target_rows),
+        "repeat_factor": float(repeat_factor),
+        "processed_raw_rows": int(processed_raw_rows),
+        "limited_preprocessing": bool(processed_raw_rows < raw_rows),
+        "sampling_policy": "shuffled_raw_streaming_mcqa_pack",
+        "collected_packed_rows": int(collected_packed_rows),
+    }
+
+
 def _load_preset_raw_datasets(preset: DatasetMixSourcePreset) -> Tuple[Dataset, Optional[Dataset]]:
+    if str(preset.alias) == "mmlu":
+        train_parts: List[Dataset] = []
+        for subject in _MMLU_NO_TRAIN_SUBJECTS:
+            dataset = load_dataset(str(preset.path), name=str(subject))
+            if not isinstance(dataset, DatasetDict):
+                raise RuntimeError(f"Expected DatasetDict from MMLU subject {subject}, got {type(dataset)}")
+            missing = [split for split in ("dev", "validation") if split not in dataset]
+            if missing:
+                raise ValueError(f"Missing MMLU splits for subject {subject}: {missing}")
+            subject_train = concatenate_datasets([dataset["dev"], dataset["validation"]])
+            if "subject" not in subject_train.column_names:
+                subject_train = subject_train.add_column("subject", [str(subject)] * len(subject_train))
+            train_parts.append(subject_train)
+        if not train_parts:
+            raise ValueError("MMLU subject list is empty.")
+        return concatenate_datasets(train_parts), None
     return _load_hf_dataset_splits(
         path=preset.path,
         config=preset.config,
@@ -1001,6 +1439,16 @@ def _build_mixed_datasets(args, training_args, tokenizer):
                 num_proc=dataset_num_proc,
                 seed=int(source_seed),
             )
+        elif dataset_task == "mcqa":
+            resized_train, train_stats = _sample_and_pack_mcqa_source(
+                train_raw,
+                target_rows=int(target_rows),
+                tokenizer=tokenizer,
+                block_size=int(block_size),
+                text_format=str(preset.text_format),
+                num_proc=dataset_num_proc,
+                seed=int(source_seed),
+            )
         elif dataset_task == "lm":
             resized_train, train_stats = _sample_and_pack_source(
                 train_raw,
@@ -1013,7 +1461,7 @@ def _build_mixed_datasets(args, training_args, tokenizer):
                 seed=int(source_seed),
             )
         else:
-            raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm' or 'sft'.")
+            raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm', 'sft', or 'mcqa'.")
         train_datasets.append(resized_train)
 
         eval_text = None
@@ -1028,6 +1476,17 @@ def _build_mixed_datasets(args, training_args, tokenizer):
         eval_packed_rows = 0
         if dataset_task == "sft" and prepare_eval and eval_raw is not None:
             eval_packed = _tokenize_and_pack_sft(
+                eval_raw,
+                tokenizer,
+                block_size=block_size,
+                text_format=str(preset.text_format),
+                num_proc=dataset_num_proc,
+            )
+            eval_packed_rows = len(eval_packed)
+            if eval_packed_rows > 0:
+                eval_datasets.append(eval_packed)
+        elif dataset_task == "mcqa" and prepare_eval and eval_raw is not None:
+            eval_packed = _tokenize_mcqa(
                 eval_raw,
                 tokenizer,
                 block_size=block_size,
@@ -1082,10 +1541,10 @@ def build_datasets(args, training_args, tokenizer):
         return _build_mixed_datasets(args, training_args, tokenizer)
 
     dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
-    if dataset_task == "sft":
-        raise ValueError("--dataset_task sft currently supports --dataset_mix only.")
+    if dataset_task in {"sft", "mcqa"}:
+        raise ValueError(f"--dataset_task {dataset_task} currently supports --dataset_mix only.")
     if dataset_task != "lm":
-        raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm' or 'sft'.")
+        raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm', 'sft', or 'mcqa'.")
 
     block_size = int(training_args.model_max_length)
     dataset_num_proc = _resolve_dataset_num_proc(args)

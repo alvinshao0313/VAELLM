@@ -441,6 +441,176 @@ def _pick_task_metric(task_result):
     return "n/a", None
 
 
+_CHOICE_LABELS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _extract_response_score(response: Any) -> float:
+    if isinstance(response, (int, float)):
+        return float(response)
+    if isinstance(response, (list, tuple)) and response:
+        first = response[0]
+        if isinstance(first, (int, float)):
+            return float(first)
+        if len(response) == 1:
+            return _extract_response_score(first)
+    raise ValueError(f"Unsupported MMLU response score format: {response!r}")
+
+
+def _coerce_choice_index(value: Any, *, choices: List[str], score_count: int) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value < score_count else None
+    if isinstance(value, float) and value.is_integer():
+        idx = int(value)
+        return idx if 0 <= idx < score_count else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            idx = int(text)
+            return idx if 0 <= idx < score_count else None
+        upper = text.upper()
+        labels = _CHOICE_LABELS[:score_count]
+        if upper in labels:
+            return labels.index(upper)
+        if text in choices:
+            return choices.index(text)
+    if isinstance(value, (list, tuple)) and value:
+        return _coerce_choice_index(value[0], choices=choices, score_count=score_count)
+    return None
+
+
+def _one_line_text(value: Any, *, max_chars: int = 220) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def _compact_mmlu_sample(task_name: str, sample: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(sample, dict):
+        raise TypeError(f"MMLU sample must be a dict, got {type(sample).__name__}")
+
+    doc = sample.get("doc", {})
+    if not isinstance(doc, dict):
+        doc = {}
+    choices_raw = doc.get("choices", [])
+    choices = [str(item) for item in choices_raw] if isinstance(choices_raw, list) else []
+
+    responses = sample.get("filtered_resps")
+    if not isinstance(responses, list) or not responses:
+        responses = sample.get("resps")
+    if not isinstance(responses, list) or not responses:
+        raise ValueError(f"{task_name}: MMLU sample has no filtered_resps/resps.")
+
+    scores = [_extract_response_score(response) for response in responses]
+    if len(scores) > len(_CHOICE_LABELS):
+        raise ValueError(f"{task_name}: too many MMLU choices to label: {len(scores)}")
+
+    labels = _CHOICE_LABELS[: len(scores)]
+    prediction_idx = max(range(len(scores)), key=lambda idx: scores[idx])
+    target_idx = _coerce_choice_index(
+        sample.get("target", doc.get("answer")),
+        choices=choices,
+        score_count=len(scores),
+    )
+    prediction = labels[prediction_idx]
+    target = labels[target_idx] if target_idx is not None else None
+    correct = bool(prediction_idx == target_idx) if target_idx is not None else None
+
+    return {
+        "task": str(task_name),
+        "doc_id": sample.get("doc_id"),
+        "question": doc.get("question"),
+        "choices": {labels[idx]: choices[idx] if idx < len(choices) else None for idx in range(len(scores))},
+        "prediction": prediction,
+        "prediction_index": int(prediction_idx),
+        "target": target,
+        "target_index": None if target_idx is None else int(target_idx),
+        "correct": correct,
+        "choice_scores": {labels[idx]: float(scores[idx]) for idx in range(len(scores))},
+        "metrics": {
+            key: value
+            for key, value in sample.items()
+            if key not in {"doc", "arguments", "resps", "filtered_resps"}
+            and isinstance(value, (bool, int, float))
+        },
+    }
+
+
+def _iter_mmlu_debug_samples(samples: Any):
+    if not isinstance(samples, dict):
+        return
+    for task_name in sorted(samples.keys()):
+        task_text = str(task_name)
+        if task_text != "mmlu" and not task_text.startswith("mmlu_"):
+            continue
+        task_samples = samples.get(task_name)
+        if not isinstance(task_samples, list):
+            continue
+        for sample in task_samples:
+            yield task_text, sample
+
+
+def write_mmlu_debug_samples(
+    lm_result: Dict[str, Any],
+    *,
+    limit: int,
+    output_dir: str,
+    run_ts: Optional[str] = None,
+    log=logger,
+) -> Optional[Dict[str, Any]]:
+    sample_limit = int(limit)
+    if sample_limit <= 0:
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts = str(run_ts or time.strftime("%Y%m%d_%H%M%S", time.localtime()))
+    json_path = os.path.join(output_dir, f"mmlu_debug_samples_{ts}.json")
+
+    compact_samples: List[Dict[str, Any]] = []
+    for task_name, sample in _iter_mmlu_debug_samples(lm_result.get("samples", {})):
+        compact = _compact_mmlu_sample(task_name, sample)
+        compact["raw_sample"] = sample
+        compact_samples.append(compact)
+        if len(compact_samples) >= sample_limit:
+            break
+
+    payload = {
+        "run_ts": ts,
+        "limit": sample_limit,
+        "sample_count": len(compact_samples),
+        "samples": compact_samples,
+    }
+    _json_dump(json_path, payload)
+
+    for idx, sample in enumerate(compact_samples, start=1):
+        scores = " ".join(
+            f"{label}={score:.4f}" for label, score in sample.get("choice_scores", {}).items()
+        )
+        choices = " | ".join(
+            f"{label}. {_one_line_text(text, max_chars=120)}"
+            for label, text in sample.get("choices", {}).items()
+        )
+        log.info(
+            "[mmlu_debug] sample %d/%d task=%s doc_id=%s pred=%s target=%s correct=%s scores=%s question=%s choices=%s",
+            idx,
+            sample_limit,
+            sample.get("task"),
+            str(sample.get("doc_id")),
+            sample.get("prediction"),
+            sample.get("target"),
+            str(sample.get("correct")),
+            scores,
+            _one_line_text(sample.get("question"), max_chars=220),
+            choices,
+        )
+    log.info("[mmlu_debug] Saved samples: %s", json_path)
+    return {"path": json_path, "sample_count": len(compact_samples), "limit": sample_limit}
+
+
 def run_lm_eval(model, tokenizer, args):
     if "lm_eval" not in globals() or "evaluator" not in globals():
         raise ImportError("lm_eval not installed. Please install it via `pip install lm_eval`.")
@@ -531,6 +701,16 @@ def run_lm_eval(model, tokenizer, args):
         "n_shot": results.get("n-shot", {}),
         "n_samples": results.get("n-samples", {}),
     }
+
+    mmlu_debug = write_mmlu_debug_samples(
+        {**artifact_payload, "samples": results.get("samples", {})},
+        limit=int(getattr(args, "mmlu_debug_samples", 0) or 0),
+        output_dir=str(getattr(args, "mmlu_debug_log_dir", None) or getattr(args, "eval_log_dir", None) or "./eval_log"),
+        run_ts=getattr(args, "mmlu_debug_run_ts", None) or getattr(args, "eval_run_ts", None),
+        log=logger,
+    )
+    if mmlu_debug is not None:
+        artifact_payload["mmlu_debug"] = mmlu_debug
 
     eval_log_dir = getattr(args, "eval_log_dir", None)
     eval_run_ts = getattr(args, "eval_run_ts", None)
