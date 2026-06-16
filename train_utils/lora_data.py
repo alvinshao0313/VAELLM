@@ -13,24 +13,24 @@ except ImportError:
     load_dataset = None
 
 
-def ensure_lora_dataset_stack_available() -> None:
+def ensure_distill_dataset_stack_available() -> None:
     if load_dataset is None or DatasetDict is None or concatenate_datasets is None:
         raise ImportError("未安装 datasets。请先安装：pip install datasets")
 
 
-def _resolve_lora_dataset_num_proc() -> int:
-    raw_num_proc = os.environ.get("CAT_LORA_DATASET_NUM_PROC", "16")
+def _resolve_distill_dataset_num_proc() -> int:
+    raw_num_proc = os.environ.get("CAT_DISTILL_DATASET_NUM_PROC", "16")
     num_proc = int(raw_num_proc)
     if num_proc < 1:
-        raise ValueError(f"CAT_LORA_DATASET_NUM_PROC must be >= 1, got {raw_num_proc}.")
+        raise ValueError(f"CAT_DISTILL_DATASET_NUM_PROC must be >= 1, got {raw_num_proc}.")
     return num_proc
 
 
 def _split_lora_mix_targets(total_rows: int, weights: List[float]) -> List[int]:
     if int(total_rows) < 1:
-        raise ValueError(f"--lora_nsamples must be >= 1, got {total_rows}.")
+        raise ValueError(f"--distill_nsamples must be >= 1, got {total_rows}.")
     if not weights:
-        raise ValueError("--lora_dataset cannot be empty.")
+        raise ValueError("--distill_dataset cannot be empty.")
     targets: List[int] = []
     allocated = 0
     for idx, weight in enumerate(weights):
@@ -41,7 +41,7 @@ def _split_lora_mix_targets(total_rows: int, weights: List[float]) -> List[int]:
             allocated += int(rows)
         if rows < 1:
             raise ValueError(
-                "--lora_nsamples is too small for the requested --lora_dataset mix; "
+                "--distill_nsamples is too small for the requested --distill_dataset mix; "
                 f"source index {idx} got target_rows={rows}."
             )
         targets.append(int(rows))
@@ -88,7 +88,7 @@ def _prepare_lora_mix_source(
     train_raw, _eval_raw = _load_preset_raw_datasets(preset)
     raw_rows = int(len(train_raw))
     chunk_size = 4096
-    num_proc = _resolve_lora_dataset_num_proc()
+    num_proc = _resolve_distill_dataset_num_proc()
     shuffled_raw = train_raw.shuffle(seed=int(seed))
     text_chunks = []
     processed_raw_rows = 0
@@ -175,7 +175,7 @@ def _iter_calibration_texts_for_source(
     train_raw, _eval_raw = _load_preset_raw_datasets(preset)
     raw_rows = int(len(train_raw))
     chunk_size = 4096
-    num_proc = _resolve_lora_dataset_num_proc()
+    num_proc = _resolve_distill_dataset_num_proc()
     shuffled_raw = train_raw.shuffle(seed=int(seed))
     yielded_text = False
 
@@ -246,7 +246,7 @@ def build_calibration_input_ids(
     seqlen: int,
     seed: int,
 ) -> List[torch.Tensor]:
-    ensure_lora_dataset_stack_available()
+    ensure_distill_dataset_stack_available()
     target_blocks = int(nsamples)
     block_size = int(seqlen)
     dataset_mix_spec = str(dataset_name or "").strip()
@@ -290,16 +290,16 @@ def build_calibration_input_ids(
     return blocks
 
 
-def prepare_lora_datasets(
+def prepare_distill_datasets(
     dataset_name: str,
     *,
     nsamples: int,
     seed: int,
 ):
-    ensure_lora_dataset_stack_available()
+    ensure_distill_dataset_stack_available()
     if "=" not in str(dataset_name):
         raise ValueError(
-            "--lora_dataset only accepts ratio-style dataset specs, for example "
+            "--distill_dataset only accepts ratio-style dataset specs, for example "
             "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
         )
     dataset_mix_spec, source_stats, train_ds = _prepare_lora_mixed_dataset(

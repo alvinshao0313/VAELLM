@@ -6,10 +6,10 @@ import unittest
 import torch
 
 from tools.cat_eval import _compute_checkpoint_fingerprint, _validate_adapter_checkpoint_match
-from train_utils.cat_train_args import process_cat_train_args, resolve_lora_runtime_config
+from train_utils.cat_train_args import process_cat_train_args, resolve_distill_runtime_config
 from train_utils.lora_training import (
-    build_lora_hidden_layer_weights,
-    compute_lora_hidden_alignment_loss,
+    build_distill_hidden_layer_weights,
+    compute_distill_hidden_alignment_loss,
 )
 
 
@@ -62,42 +62,42 @@ class CatEvalAdapterMatchTest(unittest.TestCase):
                 )
 
 
-class CatLoraHiddenArgsTest(unittest.TestCase):
-    def test_lora_hidden_loss_defaults_to_disabled_uniform(self):
+class CatDistillHiddenArgsTest(unittest.TestCase):
+    def test_distill_hidden_loss_defaults_to_disabled_uniform(self):
         cat_args, _hf_args, _training_args, _vae_args = process_cat_train_args([])
-        cfg = resolve_lora_runtime_config(cat_args, after_category=None)
+        cfg = resolve_distill_runtime_config(cat_args, after_category=None)
 
         self.assertEqual(cfg.hidden_loss_weight, 0.0)
         self.assertEqual(cfg.hidden_layer_weighting, "uniform")
 
-    def test_lora_hidden_loss_resolves_after_category_overrides(self):
+    def test_distill_hidden_loss_resolves_after_category_overrides(self):
         cat_args, _hf_args, _training_args, _vae_args = process_cat_train_args(
             [
-                "--lora_hidden_loss_weight",
+                "--distill_hidden_loss_weight",
                 "default=0.01,after:q_proj=0.02",
-                "--lora_hidden_layer_weighting",
+                "--distill_hidden_layer_weighting",
                 "linear_depth",
             ]
         )
 
-        default_cfg = resolve_lora_runtime_config(cat_args, after_category=None)
-        q_proj_cfg = resolve_lora_runtime_config(cat_args, after_category="q_proj")
+        default_cfg = resolve_distill_runtime_config(cat_args, after_category=None)
+        q_proj_cfg = resolve_distill_runtime_config(cat_args, after_category="q_proj")
 
         self.assertEqual(default_cfg.hidden_loss_weight, 0.01)
         self.assertEqual(q_proj_cfg.hidden_loss_weight, 0.02)
         self.assertEqual(default_cfg.hidden_layer_weighting, "linear_depth")
         self.assertEqual(q_proj_cfg.hidden_layer_weighting, "linear_depth")
 
-    def test_lora_hidden_loss_rejects_negative_weight(self):
+    def test_distill_hidden_loss_rejects_negative_weight(self):
         with self.assertRaises(argparse.ArgumentTypeError):
-            process_cat_train_args(["--lora_hidden_loss_weight", "default=-0.01"])
+            process_cat_train_args(["--distill_hidden_loss_weight", "default=-0.01"])
 
-    def test_lora_hidden_loss_rejects_unknown_weighting(self):
+    def test_distill_hidden_loss_rejects_unknown_weighting(self):
         with self.assertRaises(argparse.ArgumentTypeError):
-            process_cat_train_args(["--lora_hidden_layer_weighting", "quadratic"])
+            process_cat_train_args(["--distill_hidden_layer_weighting", "quadratic"])
 
 
-class CatLoraHiddenLossTest(unittest.TestCase):
+class CatDistillHiddenLossTest(unittest.TestCase):
     def test_uniform_hidden_loss_skips_embedding_state(self):
         teacher = (
             torch.zeros(1, 2, 1),
@@ -110,7 +110,7 @@ class CatLoraHiddenLossTest(unittest.TestCase):
             torch.full((1, 2, 1), 4.0),
         )
 
-        loss = compute_lora_hidden_alignment_loss(
+        loss = compute_distill_hidden_alignment_loss(
             teacher_hidden_states=teacher,
             student_hidden_states=student,
             attention_mask=torch.ones(1, 2),
@@ -129,7 +129,7 @@ class CatLoraHiddenLossTest(unittest.TestCase):
             torch.tensor([[[2.0], [100.0]]]),
         )
 
-        loss = compute_lora_hidden_alignment_loss(
+        loss = compute_distill_hidden_alignment_loss(
             teacher_hidden_states=teacher,
             student_hidden_states=student,
             attention_mask=torch.tensor([[1, 0]]),
@@ -139,7 +139,7 @@ class CatLoraHiddenLossTest(unittest.TestCase):
         self.assertTrue(torch.allclose(loss, torch.tensor(1.0)))
 
     def test_linear_depth_weights_increase_and_average_to_one(self):
-        weights = build_lora_hidden_layer_weights(
+        weights = build_distill_hidden_layer_weights(
             num_layers=4,
             layer_weighting="linear_depth",
             device=torch.device("cpu"),
@@ -161,14 +161,14 @@ class CatLoraHiddenLossTest(unittest.TestCase):
             torch.full((1, 1, 1), 2.0),
         )
 
-        loss = compute_lora_hidden_alignment_loss(
+        loss = compute_distill_hidden_alignment_loss(
             teacher_hidden_states=teacher,
             student_hidden_states=student,
             attention_mask=None,
             layer_weighting="linear_depth",
         )
 
-        expected_weights = build_lora_hidden_layer_weights(
+        expected_weights = build_distill_hidden_layer_weights(
             num_layers=2,
             layer_weighting="linear_depth",
             device=torch.device("cpu"),

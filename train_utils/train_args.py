@@ -68,6 +68,13 @@ def _parse_lora_loss_type(value: str) -> str:
     )
 
 
+def _parse_distill_loss_type(value: str) -> str:
+    try:
+        return _parse_lora_loss_type(value)
+    except argparse.ArgumentTypeError as exc:
+        raise argparse.ArgumentTypeError(str(exc).replace("--lora_loss_type", "--distill_loss_type")) from exc
+
+
 def _parse_bool_like(value, *, arg_name: str) -> bool:
     if isinstance(value, bool):
         return bool(value)

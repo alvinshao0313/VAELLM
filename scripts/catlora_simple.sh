@@ -7,7 +7,7 @@ export CUDA_VISIBLE_DEVICES=6
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
-export CAT_LORA_DATASET_NUM_PROC="${CAT_LORA_DATASET_NUM_PROC:-16}"
+export CAT_DISTILL_DATASET_NUM_PROC="${CAT_DISTILL_DATASET_NUM_PROC:-16}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
@@ -18,10 +18,14 @@ export HF_DATASETS_OFFLINE=1
 # --rot_llm
 # --unload_vae_original_weights_on_final_save
 # --allow_tail_group "true"
-# --intra_part_sort_mode "default=none" / "default=spectral_cosine" / "default=act_spectral_cosine"
-#   现在只支持单值模式，不再支持 row:...|col:...；排序只会发生在每个 part 内的列轴
-# --sort_prep_workers "0"
-#   排序预处理并行 worker 数：0=auto，1=串行，>1=显式 CPU 多进程；只影响 spectral_cosine / act_spectral_cosine
+# 排序代码，已关闭；不要在实际 CLI 中传入以下旧参数：
+#   --intra_part_sort_mode "default=none"
+#   --sort_prep_workers "0"
+# joint decoder 联合优化代码，已关闭；不要在实际 CLI 中传入以下旧参数：
+#   --joint_decoder_steps "default=0"
+#   --joint_decoder_lr "default=0.005"
+#   --joint_decoder_group_size "default=36"
+#   --joint_decoder_batch_size "default=524288"
 # --outlier_residual_top_p "default=0.01,cat:down_proj=0.02"
 # --outlier_residual_score "abs" / "input_act_weighted_abs" / "original_weight_abs" / "input_act_weighted_original_weight_abs"
 # --outlier_residual_min_abs "1e-6"
@@ -34,7 +38,7 @@ export HF_DATASETS_OFFLINE=1
 # --outlier_low_rank "default=16"
 #   低秩模式需同时设置 --outlier_residual_top_p "default=0"
 # --wa_mse_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
-# CAT_LORA_DATASET_NUM_PROC=16          # LoRA/校准数据 format 预处理并行进程数 位置在 lora_data.py
+# CAT_DISTILL_DATASET_NUM_PROC=16          # 蒸馏/校准数据 format 预处理并行进程数，位置在 lora_data.py
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
 # --distill_after_category "none|remaining_lora|compressed_lora|decoder|both"
@@ -56,10 +60,6 @@ python tools/cat_train.py \
   --skip_layers "" \
   --linear_group_size "36" \
   --steps_per_category "default=10000" \
-  --joint_decoder_steps "default=0" \
-  --joint_decoder_lr "default=0.005" \
-  --joint_decoder_group_size "default=36" \
-  --joint_decoder_batch_size "default=524288" \
   --batch_size "8192" \
   --log_every "100" \
   --eval_every "0" \
@@ -68,8 +68,6 @@ python tools/cat_train.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
-  --intra_part_sort_mode "default=none" \
-  --sort_prep_workers "0" \
   --outlier_protect_count "default=0" \
   --outlier_protect_axis "input" \
   --outlier_protect_mode "none" \
@@ -116,36 +114,36 @@ python tools/cat_train.py \
   --use_checkpoint \
   --new_quant \
   --distill_after_category "compressed_lora" \
-  --lora_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
+  --distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
   --lora_rank "default=128" \
   --lora_alpha "default=128.0" \
   --lora_dropout "default=0.03" \
-  --lora_steps "default=5000" \
-  --lora_batch_size "default=1" \
-  --lora_nsamples "default=20000" \
-  --lora_lr "default=1e-4" \
-  --lora_weight_decay "default=0.001" \
-  --lora_log_every "default=2" \
-  --lora_post_attn "false" \
-  --lora_temperature "default=1.0" \
-  --lora_loss_alpha "default=0.5" \
-  --lora_loss_type "default=kd_top_1000" \
-  --lora_hidden_loss_weight "default=0.01" \
-  --lora_hidden_layer_weighting "linear_depth" \
+  --distill_steps "default=5000" \
+  --distill_batch_size "default=1" \
+  --distill_nsamples "default=20000" \
+  --distill_lr "default=1e-4" \
+  --distill_weight_decay "default=0.001" \
+  --distill_log_every "default=2" \
+  --distill_post_attn "false" \
+  --distill_temperature "default=1.0" \
+  --distill_loss_alpha "default=0.5" \
+  --distill_loss_type "default=kd_top_1000" \
+  --distill_hidden_loss_weight "default=0.01" \
+  --distill_hidden_layer_weighting "linear_depth" \
   --lora_use_dora "default=false" \
-  --lora_tune_final_norm "false" \
-  --lora_use_post_norm_head_linear "false" \
-  --lora_hif4_act "false" \
+  --distill_tune_final_norm "false" \
+  --distill_use_post_norm_head_linear "false" \
+  --distill_hif4_act "false" \
   --eval_hif4_act "false" \
-  --lora_gradient_accumulation_steps "1" \
-  --lora_gradient_checkpointing "true" \
-  --lora_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
-  --lora_optim "adamw_torch" \
-  --lora_max_grad_norm "1.3" \
-  --lora_warmup_ratio "0.1" \
-  --lora_group_by_length "true" \
-  --lora_lr_scheduler_type "constant" \
-  --lora_model_max_length "8192" \
+  --distill_gradient_accumulation_steps "1" \
+  --distill_gradient_checkpointing "true" \
+  --distill_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
+  --distill_optim "adamw_torch" \
+  --distill_max_grad_norm "1.3" \
+  --distill_warmup_ratio "0.1" \
+  --distill_group_by_length "true" \
+  --distill_lr_scheduler_type "constant" \
+  --distill_model_max_length "8192" \
   --fp16 "false" \
   --bf16 "true" \
   "$@"

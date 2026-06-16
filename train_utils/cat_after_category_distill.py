@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -19,7 +19,7 @@ from train_utils.hif4_act import (
     register_hif4_act_hooks,
     remove_hif4_act_hooks,
 )
-from train_utils.lora_data import prepare_lora_datasets
+from train_utils.lora_data import prepare_distill_datasets
 from train_utils.lora_utils import (
     _build_lora_trainer,
     _build_sft_args,
@@ -27,7 +27,7 @@ from train_utils.lora_utils import (
     _ensure_lora_tokenizer_ready,
     _freeze_model_for_lora,
     _log_lora_stage_start,
-    _resolve_lora_stage_config,
+    _resolve_distill_stage_config,
     _restore_model_use_cache,
     lora_finetune_remaining_categories,
 )
@@ -73,7 +73,7 @@ def _logger_warning(logger, message: str, *args) -> None:
         info(message, *args)
 
 
-def _log_lora_dataset(logger, dataset_mix_spec, source_stats, nsamples: int) -> None:
+def _log_distill_dataset(logger, dataset_mix_spec, source_stats, nsamples: int) -> None:
     logger.info(
         "After-category distill: 训练混合数据集=%s nsamples=%d eval_dataset=none",
         str(dataset_mix_spec),
@@ -196,8 +196,8 @@ def _train_without_merging_peft_adapters(
 ) -> nn.Module:
     hif4_act_handles: List[torch.utils.hooks.RemovableHandle] = []
     if hif4_act_controller is not None:
-        if hasattr(trainer, "lora_hif4_act_controller"):
-            trainer.lora_hif4_act_controller = hif4_act_controller
+        if hasattr(trainer, "distill_hif4_act_controller"):
+            trainer.distill_hif4_act_controller = hif4_act_controller
         hif4_act_handles = register_hif4_act_hooks(trainer.model, hif4_act_controller)
         if not hif4_act_handles:
             raise RuntimeError("启用 HiFloat4 激活量化失败：未找到可注册 hook 的逻辑线性层。")
@@ -243,7 +243,7 @@ def _run_compressed_category_distill(
         )
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
-    cfg = _resolve_lora_stage_config(
+    cfg = _resolve_distill_stage_config(
         cat_args=cat_args,
         training_args=training_args,
         after_category=category,
@@ -261,12 +261,12 @@ def _run_compressed_category_distill(
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
     _ensure_lora_stack_available()
-    dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_lora_datasets(
+    dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
         cfg.dataset,
         nsamples=cfg.nsamples,
         seed=cfg.seed,
     )
-    _log_lora_dataset(logger, dataset_mix_spec, source_stats, cfg.nsamples)
+    _log_distill_dataset(logger, dataset_mix_spec, source_stats, cfg.nsamples)
     if len(train_ds) == 0:
         _logger_warning(logger, "After-category distill: 数据集为空，跳过。")
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
@@ -317,7 +317,7 @@ def _run_compressed_category_distill(
         )
         _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
         sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
-        hif4_act_controller = build_hif4_act_controller(cfg.use_lora_hif4_act)
+        hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
         trainer = _build_lora_trainer(
             model=model,
             train_ds=train_ds,

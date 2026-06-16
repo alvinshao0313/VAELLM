@@ -20,6 +20,34 @@ from rotation.model_utils import get_model
 
 STATE_DICT_FILENAME = "pytorch_model.bin"
 META_FILENAME = "checkpoint_meta.json"
+_DISABLED_SORT_RESTORE_FIELDS = (
+    "restore_row_indices",
+    "restore_col_indices",
+    "part_restore_col_indices",
+    "stage_restore_row_indices",
+    "stage_restore_col_indices",
+    "stage_part_restore_col_indices",
+)
+
+
+def _has_disabled_sort_restore_payload(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_has_disabled_sort_restore_payload(item) for item in value)
+    return bool(value)
+
+
+def _reject_disabled_sort_restore_metadata(module_name: str, spec: Dict[str, Any]) -> None:
+    # 排序代码，已关闭：旧排序 checkpoint restore metadata 不再支持恢复。
+    for field_name in _DISABLED_SORT_RESTORE_FIELDS:
+        if _has_disabled_sort_restore_payload(spec.get(field_name)):
+            raise ValueError(
+                f"[{module_name}] {field_name} 是排序 checkpoint restore 字段；排序代码已关闭，"
+                "无法加载旧排序 checkpoint。"
+            )
 
 
 def _safe_path_token(value: str) -> str:
@@ -593,6 +621,7 @@ def _rebuild_converted_modules(
 ) -> None:
     for spec in converted_modules:
         name = str(spec["name"])
+        _reject_disabled_sort_restore_metadata(name, spec)
         old_module = _get_module_by_name(model, name)
         weight = getattr(old_module, "weight", None)
         device = weight.device if weight is not None else torch.device("cpu")
@@ -705,112 +734,119 @@ def _rebuild_converted_modules(
             else:
                 vq_payload = vq_placeholders
                 decoder_payload = decoders
+        # 排序代码，已关闭。旧排序 checkpoint restore placeholder 构造保留如下：
+        # restore_payload = None
+        # restore_spec = spec.get("restore_row_indices")
+        # if isinstance(restore_spec, dict):
+        #     shape = tuple(int(v) for v in restore_spec.get("shape", []))
+        #     if len(shape) != 1:
+        #         raise ValueError(f"[{name}] restore_row_indices shape must be 1D, got {shape}")
+        #     restore_dtype = _name_to_dtype(str(restore_spec.get("dtype", "int64")))
+        #     restore_payload = torch.zeros(shape, dtype=restore_dtype, device=device)
+        # restore_col_payload = None
+        # restore_col_spec = spec.get("restore_col_indices")
+        # if isinstance(restore_col_spec, dict):
+        #     shape = tuple(int(v) for v in restore_col_spec.get("shape", []))
+        #     if len(shape) != 1:
+        #         raise ValueError(f"[{name}] restore_col_indices shape must be 1D, got {shape}")
+        #     restore_dtype = _name_to_dtype(str(restore_col_spec.get("dtype", "int64")))
+        #     restore_col_payload = torch.zeros(shape, dtype=restore_dtype, device=device)
+        # part_restore_col_payload = None
+        # part_restore_col_spec = spec.get("part_restore_col_indices")
+        # if isinstance(part_restore_col_spec, dict):
+        #     shape = tuple(int(v) for v in part_restore_col_spec.get("shape", []))
+        #     if len(shape) != 2:
+        #         raise ValueError(f"[{name}] part_restore_col_indices shape must be 2D, got {shape}")
+        #     part_restore_dtype = _name_to_dtype(str(part_restore_col_spec.get("dtype", "int64")))
+        #     part_restore_col_payload = _build_part_restore_placeholder(
+        #         shape,
+        #         dtype=part_restore_dtype,
+        #         device=device,
+        #     )
+        # stage_restore_row_payload = None
+        # stage_restore_row_specs = _normalize_stage_spec_list(
+        #     spec.get("stage_restore_row_indices"),
+        #     residual_stages=residual_stages,
+        #     module_name=name,
+        #     field_name="stage_restore_row_indices",
+        # )
+        # if stage_restore_row_specs is not None:
+        #     stage_restore_row_payload = []
+        #     for stage_idx, stage_spec in enumerate(stage_restore_row_specs):
+        #         if stage_spec is None:
+        #             stage_restore_row_payload.append(None)
+        #             continue
+        #         shape = tuple(int(v) for v in stage_spec.get("shape", []))
+        #         if len(shape) != 1:
+        #             raise ValueError(
+        #                 f"[{name}] stage_restore_row_indices[{stage_idx}] shape must be 1D, got {shape}"
+        #             )
+        #         stage_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
+        #         stage_restore_row_payload.append(
+        #             _build_unique_index_placeholder(
+        #                 shape,
+        #                 dtype=stage_restore_dtype,
+        #                 device=device,
+        #             )
+        #         )
+        # stage_restore_col_payload = None
+        # stage_restore_col_specs = _normalize_stage_spec_list(
+        #     spec.get("stage_restore_col_indices"),
+        #     residual_stages=residual_stages,
+        #     module_name=name,
+        #     field_name="stage_restore_col_indices",
+        # )
+        # if stage_restore_col_specs is not None:
+        #     stage_restore_col_payload = []
+        #     for stage_idx, stage_spec in enumerate(stage_restore_col_specs):
+        #         if stage_spec is None:
+        #             stage_restore_col_payload.append(None)
+        #             continue
+        #         shape = tuple(int(v) for v in stage_spec.get("shape", []))
+        #         if len(shape) != 1:
+        #             raise ValueError(
+        #                 f"[{name}] stage_restore_col_indices[{stage_idx}] shape must be 1D, got {shape}"
+        #             )
+        #         stage_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
+        #         stage_restore_col_payload.append(
+        #             _build_unique_index_placeholder(
+        #                 shape,
+        #                 dtype=stage_restore_dtype,
+        #                 device=device,
+        #             )
+        #         )
+        # stage_part_restore_col_payload = None
+        # stage_part_restore_col_specs = _normalize_stage_spec_list(
+        #     spec.get("stage_part_restore_col_indices"),
+        #     residual_stages=residual_stages,
+        #     module_name=name,
+        #     field_name="stage_part_restore_col_indices",
+        # )
+        # if stage_part_restore_col_specs is not None:
+        #     stage_part_restore_col_payload = []
+        #     for stage_idx, stage_spec in enumerate(stage_part_restore_col_specs):
+        #         if stage_spec is None:
+        #             stage_part_restore_col_payload.append(None)
+        #             continue
+        #         shape = tuple(int(v) for v in stage_spec.get("shape", []))
+        #         if len(shape) != 2:
+        #             raise ValueError(
+        #                 f"[{name}] stage_part_restore_col_indices[{stage_idx}] shape must be 2D, got {shape}"
+        #             )
+        #         stage_part_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
+        #         stage_part_restore_col_payload.append(
+        #             _build_part_restore_placeholder(
+        #                 shape,
+        #                 dtype=stage_part_restore_dtype,
+        #                 device=device,
+        #             )
+        #         )
         restore_payload = None
-        restore_spec = spec.get("restore_row_indices")
-        if isinstance(restore_spec, dict):
-            shape = tuple(int(v) for v in restore_spec.get("shape", []))
-            if len(shape) != 1:
-                raise ValueError(f"[{name}] restore_row_indices shape must be 1D, got {shape}")
-            restore_dtype = _name_to_dtype(str(restore_spec.get("dtype", "int64")))
-            restore_payload = torch.zeros(shape, dtype=restore_dtype, device=device)
         restore_col_payload = None
-        restore_col_spec = spec.get("restore_col_indices")
-        if isinstance(restore_col_spec, dict):
-            shape = tuple(int(v) for v in restore_col_spec.get("shape", []))
-            if len(shape) != 1:
-                raise ValueError(f"[{name}] restore_col_indices shape must be 1D, got {shape}")
-            restore_dtype = _name_to_dtype(str(restore_col_spec.get("dtype", "int64")))
-            restore_col_payload = torch.zeros(shape, dtype=restore_dtype, device=device)
         part_restore_col_payload = None
-        part_restore_col_spec = spec.get("part_restore_col_indices")
-        if isinstance(part_restore_col_spec, dict):
-            shape = tuple(int(v) for v in part_restore_col_spec.get("shape", []))
-            if len(shape) != 2:
-                raise ValueError(f"[{name}] part_restore_col_indices shape must be 2D, got {shape}")
-            part_restore_dtype = _name_to_dtype(str(part_restore_col_spec.get("dtype", "int64")))
-            part_restore_col_payload = _build_part_restore_placeholder(
-                shape,
-                dtype=part_restore_dtype,
-                device=device,
-            )
         stage_restore_row_payload = None
-        stage_restore_row_specs = _normalize_stage_spec_list(
-            spec.get("stage_restore_row_indices"),
-            residual_stages=residual_stages,
-            module_name=name,
-            field_name="stage_restore_row_indices",
-        )
-        if stage_restore_row_specs is not None:
-            stage_restore_row_payload = []
-            for stage_idx, stage_spec in enumerate(stage_restore_row_specs):
-                if stage_spec is None:
-                    stage_restore_row_payload.append(None)
-                    continue
-                shape = tuple(int(v) for v in stage_spec.get("shape", []))
-                if len(shape) != 1:
-                    raise ValueError(
-                        f"[{name}] stage_restore_row_indices[{stage_idx}] shape must be 1D, got {shape}"
-                    )
-                stage_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
-                stage_restore_row_payload.append(
-                    _build_unique_index_placeholder(
-                        shape,
-                        dtype=stage_restore_dtype,
-                        device=device,
-                    )
-                )
         stage_restore_col_payload = None
-        stage_restore_col_specs = _normalize_stage_spec_list(
-            spec.get("stage_restore_col_indices"),
-            residual_stages=residual_stages,
-            module_name=name,
-            field_name="stage_restore_col_indices",
-        )
-        if stage_restore_col_specs is not None:
-            stage_restore_col_payload = []
-            for stage_idx, stage_spec in enumerate(stage_restore_col_specs):
-                if stage_spec is None:
-                    stage_restore_col_payload.append(None)
-                    continue
-                shape = tuple(int(v) for v in stage_spec.get("shape", []))
-                if len(shape) != 1:
-                    raise ValueError(
-                        f"[{name}] stage_restore_col_indices[{stage_idx}] shape must be 1D, got {shape}"
-                    )
-                stage_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
-                stage_restore_col_payload.append(
-                    _build_unique_index_placeholder(
-                        shape,
-                        dtype=stage_restore_dtype,
-                        device=device,
-                    )
-                )
         stage_part_restore_col_payload = None
-        stage_part_restore_col_specs = _normalize_stage_spec_list(
-            spec.get("stage_part_restore_col_indices"),
-            residual_stages=residual_stages,
-            module_name=name,
-            field_name="stage_part_restore_col_indices",
-        )
-        if stage_part_restore_col_specs is not None:
-            stage_part_restore_col_payload = []
-            for stage_idx, stage_spec in enumerate(stage_part_restore_col_specs):
-                if stage_spec is None:
-                    stage_part_restore_col_payload.append(None)
-                    continue
-                shape = tuple(int(v) for v in stage_spec.get("shape", []))
-                if len(shape) != 2:
-                    raise ValueError(
-                        f"[{name}] stage_part_restore_col_indices[{stage_idx}] shape must be 2D, got {shape}"
-                    )
-                stage_part_restore_dtype = _name_to_dtype(str(stage_spec.get("dtype", "int64")))
-                stage_part_restore_col_payload.append(
-                    _build_part_restore_placeholder(
-                        shape,
-                        dtype=stage_part_restore_dtype,
-                        device=device,
-                    )
-                )
         protected_idx_payload = None
         protected_idx_spec = spec.get("protected_input_indices")
         if isinstance(protected_idx_spec, dict):

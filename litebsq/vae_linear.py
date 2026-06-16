@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from litebsq.autoencoder import Decoder, pack_decoders
+from litebsq.autoencoder import pack_decoders
 from litebsq.bitpack import (
     build_bitpack_u8_spec,
     pack_bool_tensor_to_uint8,
@@ -148,52 +148,61 @@ class VAELinear(nn.Module):
             raise ValueError(
                 f"split_cols={split_cols} not divisible by parallel_cols={self.parallel_cols}"
             )
-        if restore_row_indices is None:
-            self.register_buffer("restore_row_indices", None, persistent=True)
-        else:
-            restore_idx = restore_row_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
-            if restore_idx.ndim != 1:
-                raise ValueError(
-                    f"restore_row_indices must be 1D, got shape={tuple(restore_idx.shape)}"
-                )
-            if int(restore_idx.numel()) != int(split_rows):
-                raise ValueError(
-                    f"restore_row_indices size {int(restore_idx.numel())} != split_rows {int(split_rows)}"
-                )
-            self.register_buffer("restore_row_indices", restore_idx, persistent=True)
-        if restore_col_indices is None:
-            self.register_buffer("restore_col_indices", None, persistent=True)
-        else:
-            restore_col_idx = restore_col_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
-            if restore_col_idx.ndim != 1:
-                raise ValueError(
-                    f"restore_col_indices must be 1D, got shape={tuple(restore_col_idx.shape)}"
-                )
-            if int(restore_col_idx.numel()) != int(split_cols):
-                raise ValueError(
-                    f"restore_col_indices size {int(restore_col_idx.numel())} != split_cols {int(split_cols)}"
-                )
-            self.register_buffer("restore_col_indices", restore_col_idx, persistent=True)
+        if restore_row_indices is not None or restore_col_indices is not None:
+            raise ValueError("排序代码已关闭；VAELinear 不再接受 restore_row_indices / restore_col_indices。")
+        # 排序代码，已关闭。旧全局 restore 注册逻辑保留如下：
+        # if restore_row_indices is None:
+        #     self.register_buffer("restore_row_indices", None, persistent=True)
+        # else:
+        #     restore_idx = restore_row_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+        #     if restore_idx.ndim != 1:
+        #         raise ValueError(
+        #             f"restore_row_indices must be 1D, got shape={tuple(restore_idx.shape)}"
+        #         )
+        #     if int(restore_idx.numel()) != int(split_rows):
+        #         raise ValueError(
+        #             f"restore_row_indices size {int(restore_idx.numel())} != split_rows {int(split_rows)}"
+        #         )
+        #     self.register_buffer("restore_row_indices", restore_idx, persistent=True)
+        # if restore_col_indices is None:
+        #     self.register_buffer("restore_col_indices", None, persistent=True)
+        # else:
+        #     restore_col_idx = restore_col_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+        #     if restore_col_idx.ndim != 1:
+        #         raise ValueError(
+        #             f"restore_col_indices must be 1D, got shape={tuple(restore_col_idx.shape)}"
+        #         )
+        #     if int(restore_col_idx.numel()) != int(split_cols):
+        #         raise ValueError(
+        #             f"restore_col_indices size {int(restore_col_idx.numel())} != split_cols {int(split_cols)}"
+        #         )
+        #     self.register_buffer("restore_col_indices", restore_col_idx, persistent=True)
+        self.register_buffer("restore_row_indices", None, persistent=True)
+        self.register_buffer("restore_col_indices", None, persistent=True)
         cols_per_part = split_cols // self.parallel_cols
-        if part_restore_col_indices is None:
-            self.register_buffer("part_restore_col_indices", None, persistent=True)
-        else:
-            part_restore_idx = part_restore_col_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
-            expected_shape = (int(self.parallel_parts), int(cols_per_part))
-            if tuple(part_restore_idx.shape) != expected_shape:
-                raise ValueError(
-                    f"part_restore_col_indices shape {tuple(part_restore_idx.shape)} != {expected_shape}"
-                )
-            for part_idx in range(int(part_restore_idx.shape[0])):
-                local_restore = part_restore_idx[part_idx]
-                if int(torch.unique(local_restore, sorted=False).numel()) != int(local_restore.numel()):
-                    raise ValueError(f"part_restore_col_indices[{part_idx}] contains duplicates.")
-                if int(local_restore.min().item()) < 0 or int(local_restore.max().item()) >= int(cols_per_part):
-                    raise ValueError(
-                        f"part_restore_col_indices[{part_idx}] must be within [0, {int(cols_per_part)}), got "
-                        f"[{int(local_restore.min().item())}, {int(local_restore.max().item())}]"
-                    )
-            self.register_buffer("part_restore_col_indices", part_restore_idx, persistent=True)
+        if part_restore_col_indices is not None:
+            raise ValueError("排序代码已关闭；VAELinear 不再接受 part_restore_col_indices。")
+        # 排序代码，已关闭。旧 part restore 注册逻辑保留如下：
+        # if part_restore_col_indices is None:
+        #     self.register_buffer("part_restore_col_indices", None, persistent=True)
+        # else:
+        #     part_restore_idx = part_restore_col_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+        #     expected_shape = (int(self.parallel_parts), int(cols_per_part))
+        #     if tuple(part_restore_idx.shape) != expected_shape:
+        #         raise ValueError(
+        #             f"part_restore_col_indices shape {tuple(part_restore_idx.shape)} != {expected_shape}"
+        #         )
+        #     for part_idx in range(int(part_restore_idx.shape[0])):
+        #         local_restore = part_restore_idx[part_idx]
+        #         if int(torch.unique(local_restore, sorted=False).numel()) != int(local_restore.numel()):
+        #             raise ValueError(f"part_restore_col_indices[{part_idx}] contains duplicates.")
+        #         if int(local_restore.min().item()) < 0 or int(local_restore.max().item()) >= int(cols_per_part):
+        #             raise ValueError(
+        #                 f"part_restore_col_indices[{part_idx}] must be within [0, {int(cols_per_part)}), got "
+        #                 f"[{int(local_restore.min().item())}, {int(local_restore.max().item())}]"
+        #             )
+        #     self.register_buffer("part_restore_col_indices", part_restore_idx, persistent=True)
+        self.register_buffer("part_restore_col_indices", None, persistent=True)
 
         if protected_input_indices is None:
             self.register_buffer("protected_input_indices", None, persistent=True)
@@ -679,92 +688,106 @@ class VAELinear(nn.Module):
         # Keep legacy scalar field for compatibility.
         self.codebook_dim = int(self.stage_codebook_dims[0])
 
-        normalized_stage_restore_rows = self._normalize_optional_stage_tensor_payload(
-            stage_restore_row_indices,
-            residual_stages=self.residual_stages,
-            payload_name="stage_restore_row_indices",
-        )
-        normalized_stage_restore_cols = self._normalize_optional_stage_tensor_payload(
-            stage_restore_col_indices,
-            residual_stages=self.residual_stages,
-            payload_name="stage_restore_col_indices",
-        )
-        normalized_stage_part_restore_cols = self._normalize_optional_stage_tensor_payload(
-            stage_part_restore_col_indices,
-            residual_stages=self.residual_stages,
-            payload_name="stage_part_restore_col_indices",
-        )
-
-        legacy_restore_row = getattr(self, "restore_row_indices", None)
-        legacy_restore_col = getattr(self, "restore_col_indices", None)
-        legacy_part_restore_col = getattr(self, "part_restore_col_indices", None)
-
-        stage_restore_rows: List[Optional[torch.Tensor]] = []
-        for stage_idx in range(self.residual_stages):
-            item = legacy_restore_row if normalized_stage_restore_rows is None else normalized_stage_restore_rows[stage_idx]
-            if item is None:
-                stage_restore_rows.append(None)
-                continue
-            restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
-            if restore_idx.ndim != 1:
-                raise ValueError(
-                    f"stage_restore_row_indices[{stage_idx}] must be 1D, got shape={tuple(restore_idx.shape)}"
-                )
-            if int(restore_idx.numel()) != int(split_rows):
-                raise ValueError(
-                    f"stage_restore_row_indices[{stage_idx}] size {int(restore_idx.numel())} != split_rows {int(split_rows)}"
-                )
-            stage_restore_rows.append(restore_idx)
-
-        stage_restore_cols: List[Optional[torch.Tensor]] = []
-        for stage_idx in range(self.residual_stages):
-            item = legacy_restore_col if normalized_stage_restore_cols is None else normalized_stage_restore_cols[stage_idx]
-            if item is None:
-                stage_restore_cols.append(None)
-                continue
-            restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
-            if restore_idx.ndim != 1:
-                raise ValueError(
-                    f"stage_restore_col_indices[{stage_idx}] must be 1D, got shape={tuple(restore_idx.shape)}"
-                )
-            if int(restore_idx.numel()) != int(split_cols):
-                raise ValueError(
-                    f"stage_restore_col_indices[{stage_idx}] size {int(restore_idx.numel())} != split_cols {int(split_cols)}"
-                )
-            stage_restore_cols.append(restore_idx)
-
-        stage_part_restore_cols: List[Optional[torch.Tensor]] = []
-        expected_part_restore_shape = (int(self.parallel_parts), int(cols_per_part))
-        for stage_idx in range(self.residual_stages):
-            item = legacy_part_restore_col if normalized_stage_part_restore_cols is None else normalized_stage_part_restore_cols[stage_idx]
-            if item is None:
-                stage_part_restore_cols.append(None)
-                continue
-            part_restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
-            if tuple(part_restore_idx.shape) != expected_part_restore_shape:
-                raise ValueError(
-                    f"stage_part_restore_col_indices[{stage_idx}] shape {tuple(part_restore_idx.shape)} != {expected_part_restore_shape}"
-                )
-            for part_idx in range(int(part_restore_idx.shape[0])):
-                local_restore = part_restore_idx[part_idx]
-                if int(torch.unique(local_restore, sorted=False).numel()) != int(local_restore.numel()):
-                    raise ValueError(
-                        f"stage_part_restore_col_indices[{stage_idx}][{part_idx}] contains duplicates."
-                    )
-                if int(local_restore.min().item()) < 0 or int(local_restore.max().item()) >= int(cols_per_part):
-                    raise ValueError(
-                        f"stage_part_restore_col_indices[{stage_idx}][{part_idx}] must be within [0, {int(cols_per_part)}), got "
-                        f"[{int(local_restore.min().item())}, {int(local_restore.max().item())}]"
-                    )
-            stage_part_restore_cols.append(part_restore_idx)
-
-        self.restore_row_indices = stage_restore_rows[0]
-        self.restore_col_indices = stage_restore_cols[0]
-        self.part_restore_col_indices = stage_part_restore_cols[0]
+        if (
+            stage_restore_row_indices is not None
+            or stage_restore_col_indices is not None
+            or stage_part_restore_col_indices is not None
+        ):
+            raise ValueError("排序代码已关闭；VAELinear 不再接受 stage restore indices。")
+        # 排序代码，已关闭。旧多 stage restore 校验和注册逻辑保留如下：
+        # normalized_stage_restore_rows = self._normalize_optional_stage_tensor_payload(
+        #     stage_restore_row_indices,
+        #     residual_stages=self.residual_stages,
+        #     payload_name="stage_restore_row_indices",
+        # )
+        # normalized_stage_restore_cols = self._normalize_optional_stage_tensor_payload(
+        #     stage_restore_col_indices,
+        #     residual_stages=self.residual_stages,
+        #     payload_name="stage_restore_col_indices",
+        # )
+        # normalized_stage_part_restore_cols = self._normalize_optional_stage_tensor_payload(
+        #     stage_part_restore_col_indices,
+        #     residual_stages=self.residual_stages,
+        #     payload_name="stage_part_restore_col_indices",
+        # )
+        #
+        # legacy_restore_row = getattr(self, "restore_row_indices", None)
+        # legacy_restore_col = getattr(self, "restore_col_indices", None)
+        # legacy_part_restore_col = getattr(self, "part_restore_col_indices", None)
+        #
+        # stage_restore_rows: List[Optional[torch.Tensor]] = []
+        # for stage_idx in range(self.residual_stages):
+        #     item = legacy_restore_row if normalized_stage_restore_rows is None else normalized_stage_restore_rows[stage_idx]
+        #     if item is None:
+        #         stage_restore_rows.append(None)
+        #         continue
+        #     restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
+        #     if restore_idx.ndim != 1:
+        #         raise ValueError(
+        #             f"stage_restore_row_indices[{stage_idx}] must be 1D, got shape={tuple(restore_idx.shape)}"
+        #         )
+        #     if int(restore_idx.numel()) != int(split_rows):
+        #         raise ValueError(
+        #             f"stage_restore_row_indices[{stage_idx}] size {int(restore_idx.numel())} != split_rows {int(split_rows)}"
+        #         )
+        #     stage_restore_rows.append(restore_idx)
+        #
+        # stage_restore_cols: List[Optional[torch.Tensor]] = []
+        # for stage_idx in range(self.residual_stages):
+        #     item = legacy_restore_col if normalized_stage_restore_cols is None else normalized_stage_restore_cols[stage_idx]
+        #     if item is None:
+        #         stage_restore_cols.append(None)
+        #         continue
+        #     restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
+        #     if restore_idx.ndim != 1:
+        #         raise ValueError(
+        #             f"stage_restore_col_indices[{stage_idx}] must be 1D, got shape={tuple(restore_idx.shape)}"
+        #         )
+        #     if int(restore_idx.numel()) != int(split_cols):
+        #         raise ValueError(
+        #             f"stage_restore_col_indices[{stage_idx}] size {int(restore_idx.numel())} != split_cols {int(split_cols)}"
+        #         )
+        #     stage_restore_cols.append(restore_idx)
+        #
+        # stage_part_restore_cols: List[Optional[torch.Tensor]] = []
+        # expected_part_restore_shape = (int(self.parallel_parts), int(cols_per_part))
+        # for stage_idx in range(self.residual_stages):
+        #     item = legacy_part_restore_col if normalized_stage_part_restore_cols is None else normalized_stage_part_restore_cols[stage_idx]
+        #     if item is None:
+        #         stage_part_restore_cols.append(None)
+        #         continue
+        #     part_restore_idx = item.detach().to(device="cpu", dtype=torch.long).contiguous()
+        #     if tuple(part_restore_idx.shape) != expected_part_restore_shape:
+        #         raise ValueError(
+        #             f"stage_part_restore_col_indices[{stage_idx}] shape {tuple(part_restore_idx.shape)} != {expected_part_restore_shape}"
+        #         )
+        #     for part_idx in range(int(part_restore_idx.shape[0])):
+        #         local_restore = part_restore_idx[part_idx]
+        #         if int(torch.unique(local_restore, sorted=False).numel()) != int(local_restore.numel()):
+        #             raise ValueError(
+        #                 f"stage_part_restore_col_indices[{stage_idx}][{part_idx}] contains duplicates."
+        #             )
+        #         if int(local_restore.min().item()) < 0 or int(local_restore.max().item()) >= int(cols_per_part):
+        #             raise ValueError(
+        #                 f"stage_part_restore_col_indices[{stage_idx}][{part_idx}] must be within [0, {int(cols_per_part)}), got "
+        #                 f"[{int(local_restore.min().item())}, {int(local_restore.max().item())}]"
+        #             )
+        #     stage_part_restore_cols.append(part_restore_idx)
+        #
+        # self.restore_row_indices = stage_restore_rows[0]
+        # self.restore_col_indices = stage_restore_cols[0]
+        # self.part_restore_col_indices = stage_part_restore_cols[0]
+        # for stage_idx in range(1, self.residual_stages):
+        #     self.register_buffer(f"restore_row_indices_s{stage_idx}", stage_restore_rows[stage_idx], persistent=True)
+        #     self.register_buffer(f"restore_col_indices_s{stage_idx}", stage_restore_cols[stage_idx], persistent=True)
+        #     self.register_buffer(f"part_restore_col_indices_s{stage_idx}", stage_part_restore_cols[stage_idx], persistent=True)
+        self.restore_row_indices = None
+        self.restore_col_indices = None
+        self.part_restore_col_indices = None
         for stage_idx in range(1, self.residual_stages):
-            self.register_buffer(f"restore_row_indices_s{stage_idx}", stage_restore_rows[stage_idx], persistent=True)
-            self.register_buffer(f"restore_col_indices_s{stage_idx}", stage_restore_cols[stage_idx], persistent=True)
-            self.register_buffer(f"part_restore_col_indices_s{stage_idx}", stage_part_restore_cols[stage_idx], persistent=True)
+            self.register_buffer(f"restore_row_indices_s{stage_idx}", None, persistent=True)
+            self.register_buffer(f"restore_col_indices_s{stage_idx}", None, persistent=True)
+            self.register_buffer(f"part_restore_col_indices_s{stage_idx}", None, persistent=True)
 
         self._stage_vq_storage_specs: List[List[Dict[str, Any]]] = []
         for stage_idx, stage_parts in enumerate(stage_vq_payload):
@@ -1026,13 +1049,14 @@ class VAELinear(nn.Module):
         return grouped_vq
 
     def _parallel_stage_restore_is_identity(self) -> bool:
-        for stage_idx in range(int(self.residual_stages)):
-            if self.get_stage_restore_row_indices(stage_idx) is not None:
-                return False
-            if self.get_stage_restore_col_indices(stage_idx) is not None:
-                return False
-            if self.get_stage_part_restore_col_indices(stage_idx) is not None:
-                return False
+        # 排序代码，已关闭。原 restore identity 检查保留如下：
+        # for stage_idx in range(int(self.residual_stages)):
+        #     if self.get_stage_restore_row_indices(stage_idx) is not None:
+        #         return False
+        #     if self.get_stage_restore_col_indices(stage_idx) is not None:
+        #         return False
+        #     if self.get_stage_part_restore_col_indices(stage_idx) is not None:
+        #         return False
         return True
 
     def _build_parallel_stage_decode_plan(self) -> None:
@@ -1258,58 +1282,64 @@ class VAELinear(nn.Module):
         return w_blocks.permute(1, 0, 2).contiguous().view(-1)
 
     def _restore_split_row_order(self, w_split: torch.Tensor, *, stage_idx: int) -> torch.Tensor:
-        restore_idx = self.get_stage_restore_row_indices(stage_idx)
-        if restore_idx is None:
-            return w_split
-        if int(restore_idx.numel()) != int(w_split.shape[0]):
-            raise ValueError(
-                f"restore_row_indices size {int(restore_idx.numel())} != decoded split rows {int(w_split.shape[0])}"
-            )
-        restore_idx = self._restore_index_to_device(
-            restore_idx,
-            cache_key=("restore_row", int(stage_idx)),
-            device=w_split.device,
-        )
-        return w_split.index_select(0, restore_idx)
+        # 排序代码，已关闭。原 row restore 解码分支保留如下：
+        # restore_idx = self.get_stage_restore_row_indices(stage_idx)
+        # if restore_idx is None:
+        #     return w_split
+        # if int(restore_idx.numel()) != int(w_split.shape[0]):
+        #     raise ValueError(
+        #         f"restore_row_indices size {int(restore_idx.numel())} != decoded split rows {int(w_split.shape[0])}"
+        #     )
+        # restore_idx = self._restore_index_to_device(
+        #     restore_idx,
+        #     cache_key=("restore_row", int(stage_idx)),
+        #     device=w_split.device,
+        # )
+        # return w_split.index_select(0, restore_idx)
+        return w_split
 
     def _restore_split_col_order(self, w_split: torch.Tensor, *, stage_idx: int) -> torch.Tensor:
-        restore_idx = self.get_stage_restore_col_indices(stage_idx)
-        if restore_idx is None:
-            return w_split
-        if int(restore_idx.numel()) != int(w_split.shape[1]):
-            raise ValueError(
-                f"restore_col_indices size {int(restore_idx.numel())} != decoded split cols {int(w_split.shape[1])}"
-            )
-        restore_idx = self._restore_index_to_device(
-            restore_idx,
-            cache_key=("restore_col", int(stage_idx)),
-            device=w_split.device,
-        )
-        return w_split.index_select(1, restore_idx)
+        # 排序代码，已关闭。原 col restore 解码分支保留如下：
+        # restore_idx = self.get_stage_restore_col_indices(stage_idx)
+        # if restore_idx is None:
+        #     return w_split
+        # if int(restore_idx.numel()) != int(w_split.shape[1]):
+        #     raise ValueError(
+        #         f"restore_col_indices size {int(restore_idx.numel())} != decoded split cols {int(w_split.shape[1])}"
+        #     )
+        # restore_idx = self._restore_index_to_device(
+        #     restore_idx,
+        #     cache_key=("restore_col", int(stage_idx)),
+        #     device=w_split.device,
+        # )
+        # return w_split.index_select(1, restore_idx)
+        return w_split
 
     def _restore_part_col_order(self, part_matrix: torch.Tensor, part_idx: int, *, stage_idx: int) -> torch.Tensor:
-        restore_all = self.get_stage_part_restore_col_indices(stage_idx)
-        if restore_all is None:
-            return part_matrix
-        if restore_all.ndim != 2:
-            raise ValueError(
-                f"part_restore_col_indices must be 2D, got shape={tuple(restore_all.shape)}"
-            )
-        if part_idx < 0 or part_idx >= int(restore_all.shape[0]):
-            raise IndexError(
-                f"part_idx out of range for part_restore_col_indices: {part_idx} vs {int(restore_all.shape[0])}"
-            )
-        restore_idx = restore_all[part_idx]
-        if int(restore_idx.numel()) != int(part_matrix.shape[1]):
-            raise ValueError(
-                f"part_restore_col_indices[{part_idx}] size {int(restore_idx.numel())} != part cols {int(part_matrix.shape[1])}"
-            )
-        restore_idx = self._restore_index_to_device(
-            restore_idx,
-            cache_key=("part_restore_col", int(stage_idx), int(part_idx)),
-            device=part_matrix.device,
-        )
-        return part_matrix.index_select(1, restore_idx)
+        # 排序代码，已关闭。原 part col restore 解码分支保留如下：
+        # restore_all = self.get_stage_part_restore_col_indices(stage_idx)
+        # if restore_all is None:
+        #     return part_matrix
+        # if restore_all.ndim != 2:
+        #     raise ValueError(
+        #         f"part_restore_col_indices must be 2D, got shape={tuple(restore_all.shape)}"
+        #     )
+        # if part_idx < 0 or part_idx >= int(restore_all.shape[0]):
+        #     raise IndexError(
+        #         f"part_idx out of range for part_restore_col_indices: {part_idx} vs {int(restore_all.shape[0])}"
+        #     )
+        # restore_idx = restore_all[part_idx]
+        # if int(restore_idx.numel()) != int(part_matrix.shape[1]):
+        #     raise ValueError(
+        #         f"part_restore_col_indices[{part_idx}] size {int(restore_idx.numel())} != part cols {int(part_matrix.shape[1])}"
+        #     )
+        # restore_idx = self._restore_index_to_device(
+        #     restore_idx,
+        #     cache_key=("part_restore_col", int(stage_idx), int(part_idx)),
+        #     device=part_matrix.device,
+        # )
+        # return part_matrix.index_select(1, restore_idx)
+        return part_matrix
 
     def _decode_part_flat(self, stage_idx: int, part_idx: int, dtype: torch.dtype) -> torch.Tensor:
         decoder = self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)

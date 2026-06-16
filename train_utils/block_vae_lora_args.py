@@ -1,6 +1,6 @@
 import argparse
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from train_utils.cat_arg_overrides import (
@@ -817,10 +817,6 @@ def resolve_block_runtime_configs(
             category=str(category),
             residual_stages=int(resolve_category_value(args.residual_stages, category)),
             steps=int(resolve_category_value(args.vae_steps, category)),
-            joint_decoder_steps=0,
-            joint_decoder_lr=0.0,
-            joint_decoder_group_size=1,
-            joint_decoder_batch_size=None,
             intra_parallel=tuple(resolve_category_value(args.intra_parallel, category)),
             intra_part_sort_mode="none",
             codebook_bits=int(resolve_category_value(args.codebook_bits, category)),

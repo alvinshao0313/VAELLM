@@ -9,7 +9,7 @@ from transformers.trainer_utils import IntervalStrategy
 
 from e2e_common.data import _record_to_text, build_datasets
 from raw_e2e_fintuning.args import parse_args
-from train_utils.lora_data import build_calibration_input_ids, prepare_lora_datasets
+from train_utils.lora_data import build_calibration_input_ids, prepare_distill_datasets
 from vae_e2e_fintuning.args import parse_args as parse_vae_e2e_args
 from vae_e2e_fintuning.trainer import (
     build_vae_hidden_layer_weights,
@@ -892,14 +892,14 @@ class DatasetMixBuilderTest(unittest.TestCase):
         self.assertIn(2, multi_requested)
 
 
-class LoraDataTest(unittest.TestCase):
+class DistillDataTest(unittest.TestCase):
     def setUp(self):
         self.tokenizer = DummyTokenizer()
-        self.num_proc_patch = mock.patch.dict("os.environ", {"CAT_LORA_DATASET_NUM_PROC": "1"})
+        self.num_proc_patch = mock.patch.dict("os.environ", {"CAT_DISTILL_DATASET_NUM_PROC": "1"})
         self.num_proc_patch.start()
         self.addCleanup(self.num_proc_patch.stop)
 
-    def test_prepare_lora_datasets_limits_source_preprocessing(self):
+    def test_prepare_distill_datasets_limits_source_preprocessing(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
             if path == "Open-Orca/OpenOrca":
                 return DatasetDict({"train": _make_openorca_dataset(5000)})
@@ -908,7 +908,7 @@ class LoraDataTest(unittest.TestCase):
             raise AssertionError(f"unexpected dataset path: {path}")
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_lora_datasets(
+            dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
                 "openorca=0.5,alpaca=0.5",
                 nsamples=2,
                 seed=7,
@@ -926,7 +926,7 @@ class LoraDataTest(unittest.TestCase):
             self.assertTrue(source_info["limited_preprocessing"])
             self.assertEqual(source_info["sampling_policy"], "shuffled_raw_streaming_text")
 
-    def test_prepare_lora_datasets_is_deterministic_for_same_seed(self):
+    def test_prepare_distill_datasets_is_deterministic_for_same_seed(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
             if path == "Open-Orca/OpenOrca":
                 return DatasetDict({"train": _make_openorca_dataset(128, variable_lengths=True)})
@@ -935,13 +935,13 @@ class LoraDataTest(unittest.TestCase):
             raise AssertionError(f"unexpected dataset path: {path}")
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            _spec_a, stats_a, train_a, _eval_a, _split_a = prepare_lora_datasets(
+            _spec_a, stats_a, train_a, _eval_a, _split_a = prepare_distill_datasets(
                 "openorca=0.5,alpaca=0.5",
                 nsamples=10,
                 seed=17,
             )
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            _spec_b, stats_b, train_b, _eval_b, _split_b = prepare_lora_datasets(
+            _spec_b, stats_b, train_b, _eval_b, _split_b = prepare_distill_datasets(
                 "openorca=0.5,alpaca=0.5",
                 nsamples=10,
                 seed=17,
@@ -950,7 +950,7 @@ class LoraDataTest(unittest.TestCase):
         self.assertEqual([row["text"] for row in train_a], [row["text"] for row in train_b])
         self.assertEqual(stats_a, stats_b)
 
-    def test_prepare_lora_datasets_changes_with_different_seed(self):
+    def test_prepare_distill_datasets_changes_with_different_seed(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
             if path == "Open-Orca/OpenOrca":
                 return DatasetDict({"train": _make_openorca_dataset(128, variable_lengths=True)})
@@ -959,13 +959,13 @@ class LoraDataTest(unittest.TestCase):
             raise AssertionError(f"unexpected dataset path: {path}")
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            _spec_a, _stats_a, train_a, _eval_a, _split_a = prepare_lora_datasets(
+            _spec_a, _stats_a, train_a, _eval_a, _split_a = prepare_distill_datasets(
                 "openorca=0.5,alpaca=0.5",
                 nsamples=10,
                 seed=17,
             )
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            _spec_b, _stats_b, train_b, _eval_b, _split_b = prepare_lora_datasets(
+            _spec_b, _stats_b, train_b, _eval_b, _split_b = prepare_distill_datasets(
                 "openorca=0.5,alpaca=0.5",
                 nsamples=10,
                 seed=23,
@@ -973,7 +973,7 @@ class LoraDataTest(unittest.TestCase):
 
         self.assertNotEqual([row["text"] for row in train_a], [row["text"] for row in train_b])
 
-    def test_prepare_lora_datasets_rejects_short_source(self):
+    def test_prepare_distill_datasets_rejects_short_source(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
             if path == "Open-Orca/OpenOrca":
                 return DatasetDict({"train": _make_openorca_dataset(1)})
@@ -983,7 +983,7 @@ class LoraDataTest(unittest.TestCase):
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
             with self.assertRaises(ValueError):
-                prepare_lora_datasets(
+                prepare_distill_datasets(
                     "openorca=0.5,alpaca=0.5",
                     nsamples=4,
                     seed=7,

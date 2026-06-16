@@ -1,7 +1,7 @@
 import argparse
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Generic, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Callable, Dict, Generic, Optional, Sequence, Tuple, TypeVar
 
 
 T = TypeVar("T")
@@ -284,16 +284,25 @@ def parse_intra_part_sort_mode_text(
     *,
     arg_name: str,
 ) -> str:
-    parse_choice = make_choice_parser(
-        arg_name=arg_name,
-        choices=("none", "spectral_cosine", "act_spectral_cosine"),
-    )
+    # 排序代码，已关闭。原排序 parser 保留如下：
+    # parse_choice = make_choice_parser(
+    #     arg_name=arg_name,
+    #     choices=("none", "spectral_cosine", "act_spectral_cosine"),
+    # )
+    # value = str(raw).strip().lower()
+    # if not value:
+    #     raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
+    # if "," in value or "|" in value or ":" in value:
+    #     raise argparse.ArgumentTypeError(
+    #         f"Invalid {arg_name} value '{raw}'. "
+    #         "Only single-mode syntax is supported: none / spectral_cosine / act_spectral_cosine."
+    #     )
+    # return parse_choice(value)
     value = str(raw).strip().lower()
     if not value:
         raise argparse.ArgumentTypeError(f"{arg_name} cannot be empty.")
-    if "," in value or "|" in value or ":" in value:
+    if value != "none":
         raise argparse.ArgumentTypeError(
-            f"Invalid {arg_name} value '{raw}'. "
-            "Only single-mode syntax is supported: none / spectral_cosine / act_spectral_cosine."
+            f"Invalid {arg_name} value '{raw}'. 排序代码已关闭；只允许 none."
         )
-    return parse_choice(value)
+    return value

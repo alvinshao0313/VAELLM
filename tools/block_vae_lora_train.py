@@ -13,7 +13,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-import tools.cat_train as cat_train_impl
+from train_utils import cat_train_pipeline as cat_train_impl
 from e2e_common.checkpoint_io import save_e2e_model_checkpoint
 from e2e_common.post_norm_head import fuse_post_norm_head_linear
 from litebsq.vae_linear import clear_model_vae_linear_cache
@@ -226,8 +226,6 @@ def _train_block_vae_groups(
             outlier_residual_index_bits=8,
             outlier_residual_value_bits=8,
             outlier_residual_block_shape=(256, 256),
-            sort_executor=None,
-            sort_prep_workers_resolved=1,
             deterministic=bool(cat_args.deterministic),
             shuffle_seed=int(cat_args.seed) + int(layer_idx) * 100000 + int(group_idx) * 1000,
         )

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-import tools.cat_train as cat_train_impl
+from train_utils import cat_train_pipeline as cat_train_impl
 from e2e_common.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
 from train_utils.block_distill import validate_qwen3_model
 from train_utils.block_vae_lora_args import BlockVaeLoraArgs, format_skip_layers
@@ -52,10 +52,6 @@ def _module_shape_key(ref: LinearRef, runtime_cfg) -> Tuple[object, ...]:
         int(row_parts) * int(col_parts),
         int(runtime_cfg.residual_stages),
         int(runtime_cfg.steps),
-        int(runtime_cfg.joint_decoder_steps),
-        float(runtime_cfg.joint_decoder_lr),
-        int(runtime_cfg.joint_decoder_group_size),
-        None if runtime_cfg.joint_decoder_batch_size is None else int(runtime_cfg.joint_decoder_batch_size),
         tuple(runtime_cfg.intra_parallel),
         str(runtime_cfg.intra_part_sort_mode),
         int(runtime_cfg.codebook_bits),
@@ -187,12 +183,6 @@ def _runtime_cfg_manifest(runtime_cfg) -> Dict[str, Any]:
         else int(runtime_cfg.decoder_num_res_blocks),
         "norm_type": str(runtime_cfg.norm_type),
         "decoder_type": str(runtime_cfg.decoder_type),
-        "joint_decoder_steps": int(runtime_cfg.joint_decoder_steps),
-        "joint_decoder_lr": float(runtime_cfg.joint_decoder_lr),
-        "joint_decoder_group_size": int(runtime_cfg.joint_decoder_group_size),
-        "joint_decoder_batch_size": None
-        if runtime_cfg.joint_decoder_batch_size is None
-        else int(runtime_cfg.joint_decoder_batch_size),
     }
 
 
@@ -328,8 +318,6 @@ def _train_category_tasks_on_loaded_model(
             outlier_residual_index_bits=8,
             outlier_residual_value_bits=8,
             outlier_residual_block_shape=(256, 256),
-            sort_executor=None,
-            sort_prep_workers_resolved=1,
             deterministic=bool(local_cat_args.deterministic),
             shuffle_seed=int(task["shuffle_seed"]),
         )

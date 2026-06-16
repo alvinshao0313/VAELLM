@@ -4,7 +4,6 @@ import os
 from dataclasses import asdict, is_dataclass
 from typing import Dict
 
-import torch
 from torch import nn
 
 from train_utils.cat_train_args import ResolvedCategoryRuntimeConfig
@@ -16,25 +15,29 @@ from train_utils.model_checkpoint_io import (
 from train_utils.utils import get_logger
 
 
-def init_sort_prep_worker() -> None:
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    try:
-        torch.set_num_threads(1)
-    except Exception:
-        pass
-
-
-def resolve_sort_prep_workers(requested_workers: int, *, linear_group_size: int) -> int:
-    requested = int(requested_workers)
-    if requested < 0:
-        raise ValueError(f"sort_prep_workers must be >= 0, got {requested}.")
-    max_tasks = max(1, int(linear_group_size))
-    if requested == 0:
-        cpu_count = os.cpu_count() or 1
-        return max(1, min(int(cpu_count), max_tasks))
-    return max(1, min(requested, max_tasks))
+# def init_sort_prep_worker() -> None:
+#     # 排序代码，已关闭：旧排序预处理 worker 初始化保留如下，不再执行。
+#     # os.environ["OMP_NUM_THREADS"] = "1"
+#     # os.environ["MKL_NUM_THREADS"] = "1"
+#     # os.environ["OPENBLAS_NUM_THREADS"] = "1"
+#     # try:
+#     #     torch.set_num_threads(1)
+#     # except Exception:
+#     #     pass
+#     return None
+#
+#
+# def resolve_sort_prep_workers(requested_workers: int, *, linear_group_size: int) -> int:
+#     # 排序代码，已关闭：旧排序 worker 解析保留如下，实际固定为串行 none 路径。
+#     # requested = int(requested_workers)
+#     # if requested < 0:
+#     #     raise ValueError(f"sort_prep_workers must be >= 0, got {requested}.")
+#     # max_tasks = max(1, int(linear_group_size))
+#     # if requested == 0:
+#     #     cpu_count = os.cpu_count() or 1
+#     #     return max(1, min(int(cpu_count), max_tasks))
+#     # return max(1, min(requested, max_tasks))
+#     return 1
 
 
 def _to_jsonable(value):

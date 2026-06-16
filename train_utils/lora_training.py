@@ -29,10 +29,10 @@ except ImportError:
     SFTTrainer = None
 
 
-_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
 
 
-def build_lora_hidden_layer_weights(
+def build_distill_hidden_layer_weights(
     *,
     num_layers: int,
     layer_weighting: str,
@@ -50,8 +50,8 @@ def build_lora_hidden_layer_weights(
         raw = 1.0 + torch.arange(num_layers, device=device, dtype=dtype) / float(denom)
         return raw / raw.mean()
     raise ValueError(
-        f"Unsupported lora hidden layer weighting: {layer_weighting}. "
-        f"Supported: {', '.join(_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
+        f"Unsupported distill hidden layer weighting: {layer_weighting}. "
+        f"Supported: {', '.join(_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
     )
 
 
@@ -68,7 +68,7 @@ def _masked_mean_square(value: torch.Tensor, attention_mask: Optional[torch.Tens
     return (square * mask).sum() / count
 
 
-def compute_lora_hidden_alignment_loss(
+def compute_distill_hidden_alignment_loss(
     *,
     teacher_hidden_states: Sequence[torch.Tensor],
     student_hidden_states: Sequence[torch.Tensor],
@@ -102,7 +102,7 @@ def compute_lora_hidden_alignment_loss(
         layer_losses.append(numerator / (denominator + float(eps)))
 
     stacked = torch.stack(layer_losses)
-    weights = build_lora_hidden_layer_weights(
+    weights = build_distill_hidden_layer_weights(
         num_layers=len(layer_losses),
         layer_weighting=layer_weighting,
         device=stacked.device,
@@ -170,7 +170,7 @@ else:
             loss_alpha: float = 0.5,
             hidden_loss_weight: float = 0.0,
             hidden_layer_weighting: str = "uniform",
-            lora_hif4_act_controller: Optional[Hif4ActController] = None,
+            distill_hif4_act_controller: Optional[Hif4ActController] = None,
             teacher_param_snapshots: Optional[Sequence[Tuple[nn.Parameter, torch.Tensor]]] = None,
             **kwargs,
         ):
@@ -182,12 +182,12 @@ else:
             if self.hidden_loss_weight < 0.0:
                 raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
             self.hidden_layer_weighting = str(hidden_layer_weighting).strip().lower()
-            if self.hidden_layer_weighting not in _LORA_HIDDEN_LAYER_WEIGHTING_CHOICES:
+            if self.hidden_layer_weighting not in _DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES:
                 raise ValueError(
                     f"Unsupported hidden_layer_weighting: {hidden_layer_weighting}. "
-                    f"Supported: {', '.join(_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
+                    f"Supported: {', '.join(_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
                 )
-            self.lora_hif4_act_controller = lora_hif4_act_controller
+            self.distill_hif4_act_controller = distill_hif4_act_controller
             self.teacher_param_snapshots = list(teacher_param_snapshots or [])
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
@@ -216,7 +216,7 @@ else:
                 if callable(getattr(module, "set_temporary", None))
             ]
             previous_temporary = [getattr(module, "temporary", None) for module in temporary_modules]
-            hif4_act_controller = self.lora_hif4_act_controller
+            hif4_act_controller = self.distill_hif4_act_controller
             previous_hif4_enabled = bool(getattr(hif4_act_controller, "enabled", False))
             peft_model_for_teacher = unwrapped_model if isinstance(unwrapped_model, PeftModel) else model
 
@@ -247,7 +247,7 @@ else:
                 return max(1, int(suffix))
 
             def use_post_attn() -> bool:
-                return bool(getattr(args, "lora_post_attn", False))
+                return bool(getattr(args, "distill_post_attn", False))
 
             @contextmanager
             def teacher_param_context():
@@ -286,7 +286,7 @@ else:
             def add_hidden_alignment_loss(loss, teacher_outputs, student_outputs):
                 if not hidden_loss_enabled:
                     return loss
-                hidden_loss = compute_lora_hidden_alignment_loss(
+                hidden_loss = compute_distill_hidden_alignment_loss(
                     teacher_hidden_states=teacher_outputs.hidden_states,
                     student_hidden_states=student_outputs.hidden_states,
                     attention_mask=full_inputs.get("attention_mask"),

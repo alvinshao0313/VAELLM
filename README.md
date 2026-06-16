@@ -23,7 +23,7 @@ export PYTHONPATH=.
   - 入口：`tools/cat_train.py`
   - 用途：按类别训练权重 VAE、把 `nn.Linear` 替换成 `VAELinear`、保存压缩模型
   - residual / low-rank 离群保护逻辑在 `train_utils/cat_train_residual_protection.py`
-  - 多阶 residual 的 joint decoder 联合微调逻辑在 `train_utils/cat_joint_decoder.py`
+  - joint decoder 联合微调代码已关闭，旧实现仅以注释形式保留在 `train_utils/cat_joint_decoder.py`
 - `scripts/eval.sh`
   - 入口：`tools/cat_eval.py`
   - 用途：对保存好的 checkpoint 做 PPL 和 lm-eval
@@ -112,7 +112,7 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - `channel`：压缩前保护 top-N channel
   - `residual_sparse`：训练后保存稀疏残差补丁
   - `per_vae_low_rank`：VAE 训练前先扣除原始权重的 rank-k SVD 主成分，让 VAE 训练残差
-  - `post_vae_low_rank`：VAE / joint decoder 训练完成后，对最终重建残差做 rank-k SVD 补丁
+  - `post_vae_low_rank`：VAE 训练完成后，对最终重建残差做 rank-k SVD 补丁
 - 推理时 `VAELinear` 的权重重建顺序固定为：
   - `VAE reconstruction -> low_rank patch -> sparse_residual patch`
 - `raw_e2e_fintuning` 是原始模型独立训练链路，输入输出保持 HF/PEFT 格式。
@@ -135,9 +135,9 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - 这个转换脚本是独立工具，不参与运行时 import，删掉它不影响新格式 checkpoint 的训练、保存、加载和评估
 - `train_utils` 当前按扁平模块组织：
   - `cat_train_args.py`：`tools/cat_train.py` 参数解析和类别 override
-  - `cat_data_prep.py` / `cat_train_data.py`：权重切分、排序、block 数据构造和恢复
+  - `cat_data_prep.py` / `cat_train_data.py`：权重切分、block 数据构造和恢复；排序代码已关闭
   - `cat_train_residual_protection.py`：sparse residual 与 low-rank outlier protection
-  - `cat_joint_decoder.py`：多阶 residual 的 joint decoder 训练
+  - `cat_joint_decoder.py`：joint decoder 旧实现，已整体注释关闭
   - `model_checkpoint_io.py`：压缩模型 checkpoint 保存和加载
   - `lora_*`：after-category LoRA 数据、训练和融合
   - `eval_utils.py` / `cat_train_eval.py`：PPL、lm_eval、MSE 评估

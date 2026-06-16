@@ -1,7 +1,7 @@
 import argparse
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import transformers
 
@@ -32,7 +32,7 @@ from train_utils.cat_arg_overrides import (
 from train_utils.train_args import (
     HFArguments,
     _parse_bool_like,
-    _parse_lora_loss_type,
+    _parse_distill_loss_type,
 )
 from train_utils.utils import split_csv
 
@@ -44,10 +44,11 @@ class NormalizedCatArgs:
     projection_suffixes: str
     include_all_linears: bool
     steps_per_category: OverrideTable[int]
-    joint_decoder_steps: OverrideTable[Optional[int]]
-    joint_decoder_lr: OverrideTable[Optional[float]]
-    joint_decoder_group_size: OverrideTable[Optional[int]]
-    joint_decoder_batch_size: OverrideTable[Optional[int]]
+    # 联合优化代码，已关闭。旧字段保留如下：
+    # joint_decoder_steps: OverrideTable[Optional[int]]
+    # joint_decoder_lr: OverrideTable[Optional[float]]
+    # joint_decoder_group_size: OverrideTable[Optional[int]]
+    # joint_decoder_batch_size: OverrideTable[Optional[int]]
     skip_layers: str
     linear_group_size: int
     intra_parallel: OverrideTable[Tuple[int, int]]
@@ -57,7 +58,8 @@ class NormalizedCatArgs:
     log_every: int
     eval_every: int
     eval_blocks: int
-    sort_prep_workers: int
+    # 排序代码，已关闭。旧字段保留如下：
+    # sort_prep_workers: int
     outlier_protect_count: OverrideTable[int]
     outlier_protect_mode: str
     outlier_low_rank: OverrideTable[int]
@@ -80,24 +82,24 @@ class NormalizedCatArgs:
     ppl_limit: int
     eval_hif4_act: bool
     distill_after_category: str
-    lora_dataset: str
+    distill_dataset: str
     lora_rank: OverrideTable[int]
     lora_alpha: OverrideTable[float]
     lora_dropout: OverrideTable[float]
-    lora_steps: OverrideTable[int]
-    lora_batch_size: OverrideTable[int]
-    lora_nsamples: OverrideTable[int]
-    lora_lr: OverrideTable[float]
-    lora_weight_decay: OverrideTable[float]
-    lora_log_every: OverrideTable[int]
-    lora_temperature: OverrideTable[float]
-    lora_loss_alpha: OverrideTable[float]
-    lora_loss_type: OverrideTable[str]
-    lora_hidden_loss_weight: OverrideTable[float]
-    lora_hidden_layer_weighting: str
+    distill_steps: OverrideTable[int]
+    distill_batch_size: OverrideTable[int]
+    distill_nsamples: OverrideTable[int]
+    distill_lr: OverrideTable[float]
+    distill_weight_decay: OverrideTable[float]
+    distill_log_every: OverrideTable[int]
+    distill_temperature: OverrideTable[float]
+    distill_loss_alpha: OverrideTable[float]
+    distill_loss_type: OverrideTable[str]
+    distill_hidden_loss_weight: OverrideTable[float]
+    distill_hidden_layer_weighting: str
     lora_use_dora: OverrideTable[bool]
-    tune_final_norm: bool
-    use_post_norm_head_linear: bool
+    distill_tune_final_norm: bool
+    distill_use_post_norm_head_linear: bool
     seed: int
     deterministic: bool
     train_device: str
@@ -113,25 +115,25 @@ class NormalizedCatArgs:
 
 @dataclass
 class CatTrainHFTrainingArguments:
-    lora_model_max_length: int = field(
+    distill_model_max_length: int = field(
         default=2048,
-        metadata={"help": "Maximum sequence length used by the LoRA trainer."},
+        metadata={"help": "Maximum sequence length used by the after-category distill trainer."},
     )
-    lora_gradient_accumulation_steps: int = field(default=1)
-    lora_optim: str = field(default="paged_adamw_8bit")
-    lora_max_grad_norm: float = field(default=0.3)
-    lora_warmup_ratio: float = field(default=0.3)
-    lora_group_by_length: bool = field(default=True)
-    lora_lr_scheduler_type: str = field(default="linear")
-    lora_gradient_checkpointing: bool = field(default=False)
-    lora_gradient_checkpointing_kwargs: Optional[str] = field(default=None)
-    lora_post_attn: bool = field(
+    distill_gradient_accumulation_steps: int = field(default=1)
+    distill_optim: str = field(default="paged_adamw_8bit")
+    distill_max_grad_norm: float = field(default=0.3)
+    distill_warmup_ratio: float = field(default=0.3)
+    distill_group_by_length: bool = field(default=True)
+    distill_lr_scheduler_type: str = field(default="linear")
+    distill_gradient_checkpointing: bool = field(default=False)
+    distill_gradient_checkpointing_kwargs: Optional[str] = field(default=None)
+    distill_post_attn: bool = field(
         default=False,
-        metadata={"help": "For *_top LoRA distillation losses, compute KL on gathered full-vocab probabilities instead of renormalizing within the top-k subset."},
+        metadata={"help": "For *_top distillation losses, compute KL on gathered full-vocab probabilities instead of renormalizing within the top-k subset."},
     )
-    lora_hif4_act: bool = field(
+    distill_hif4_act: bool = field(
         default=False,
-        metadata={"help": "Enable HiFloat4 activation pseudo-quantization for student linear inputs during the LoRA stage."},
+        metadata={"help": "Enable HiFloat4 activation pseudo-quantization for student linear inputs during the after-category distill stage."},
     )
     fp16: bool = field(default=False)
     bf16: bool = field(default=False)
@@ -142,10 +144,11 @@ class ResolvedCategoryRuntimeConfig:
     category: str
     residual_stages: int
     steps: int
-    joint_decoder_steps: int
-    joint_decoder_lr: float
-    joint_decoder_group_size: int
-    joint_decoder_batch_size: Optional[int]
+    # 联合优化代码，已关闭。旧字段保留如下：
+    # joint_decoder_steps: int
+    # joint_decoder_lr: float
+    # joint_decoder_group_size: int
+    # joint_decoder_batch_size: Optional[int]
     intra_parallel: Tuple[int, int]
     intra_part_sort_mode: str
     codebook_bits: int
@@ -163,7 +166,7 @@ class ResolvedCategoryRuntimeConfig:
 
 
 @dataclass(frozen=True)
-class ResolvedLoraRuntimeConfig:
+class ResolvedDistillRuntimeConfig:
     rank: int
     alpha: float
     dropout: float
@@ -188,7 +191,7 @@ _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "co
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "residual_sparse", "per_vae_low_rank", "post_vae_low_rank")
-_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
 _DISTILL_AFTER_CATEGORY_CHOICES = ("none", "remaining_lora", "compressed_lora", "decoder", "both")
 _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES = {"compressed_lora", "both"}
 _OUTLIER_RESIDUAL_SCORE_CHOICES = (
@@ -226,7 +229,7 @@ def resolve_skip_layer_matches(
     return requested, matched, missing
 
 
-def _parse_lora_loss_alpha_text(raw: str, *, arg_name: str) -> float:
+def _parse_distill_loss_alpha_text(raw: str, *, arg_name: str) -> float:
     value = parse_float_text(raw, arg_name=arg_name, min_value=0.0, inclusive_min=True)
     if value > 1.0:
         raise argparse.ArgumentTypeError(f"{arg_name} must be <= 1.0, got {value}.")
@@ -237,7 +240,7 @@ def _parse_nonnegative_float_text(raw: str, *, arg_name: str) -> float:
     return float(parse_float_text(raw, arg_name=arg_name, min_value=0.0, inclusive_min=True))
 
 
-def _parse_lora_dataset_mix_text(raw: str, *, arg_name: str) -> str:
+def _parse_distill_dataset_mix_text(raw: str, *, arg_name: str) -> str:
     try:
         from e2e_common.data import normalize_dataset_mix_spec
 
@@ -257,19 +260,19 @@ def _normalize_distill_after_category(raw: str) -> str:
     return mode
 
 
-def _normalize_lora_dataset_arg(raw: str, *, distill_after_category: str) -> str:
+def _normalize_distill_dataset_arg(raw: str, *, distill_after_category: str) -> str:
     value = str(raw or "").strip()
     mode = _normalize_distill_after_category(distill_after_category)
     if mode == "none":
         return value
     if not value:
-        raise ValueError("--lora_dataset must be set when --distill_after_category is enabled.")
+        raise ValueError("--distill_dataset must be set when --distill_after_category is enabled.")
     if "=" not in value:
         raise ValueError(
-            "--lora_dataset only accepts ratio-style dataset specs, for example "
+            "--distill_dataset only accepts ratio-style dataset specs, for example "
             "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
         )
-    return _parse_lora_dataset_mix_text(value, arg_name="--lora_dataset")
+    return _parse_distill_dataset_mix_text(value, arg_name="--distill_dataset")
 
 
 def _parse_wa_mse_calib_dataset_text(raw: str, *, arg_name: str) -> str:
@@ -281,7 +284,7 @@ def _parse_wa_mse_calib_dataset_text(raw: str, *, arg_name: str) -> str:
             f"{arg_name} only accepts ratio-style dataset specs, for example "
             "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
         )
-    return _parse_lora_dataset_mix_text(value, arg_name=arg_name)
+    return _parse_distill_dataset_mix_text(value, arg_name=arg_name)
 
 
 def _make_override_spec(
@@ -353,44 +356,46 @@ _STEPS_PER_CATEGORY_SPEC = _make_positive_int_override_spec(
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
     example="default=2000,cat:down_proj=1000",
 )
-_JOINT_DECODER_STEPS_SPEC = _make_optional_int_override_spec(
-    arg_name="--joint_decoder_steps",
-    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=none,cat:down_proj=500",
-    min_value=0,
-)
-_JOINT_DECODER_LR_SPEC = _make_override_spec(
-    arg_name="--joint_decoder_lr",
-    parse_value=lambda raw: (
-        None if str(raw).strip().lower() == "none"
-        else parse_float_text(raw, arg_name="--joint_decoder_lr", min_value=0.0, inclusive_min=False)
-    ),
-    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=none,cat:down_proj=5e-5",
-)
-_JOINT_DECODER_GROUP_SIZE_SPEC = _make_optional_int_override_spec(
-    arg_name="--joint_decoder_group_size",
-    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=none,cat:down_proj=2",
-    min_value=1,
-)
-_JOINT_DECODER_BATCH_SIZE_SPEC = _make_optional_int_override_spec(
-    arg_name="--joint_decoder_batch_size",
-    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=none,cat:down_proj=1024",
-    min_value=1,
-)
+# 联合优化代码，已关闭。旧 joint decoder override spec 保留如下：
+# _JOINT_DECODER_STEPS_SPEC = _make_optional_int_override_spec(
+#     arg_name="--joint_decoder_steps",
+#     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+#     example="default=none,cat:down_proj=500",
+#     min_value=0,
+# )
+# _JOINT_DECODER_LR_SPEC = _make_override_spec(
+#     arg_name="--joint_decoder_lr",
+#     parse_value=lambda raw: (
+#         None if str(raw).strip().lower() == "none"
+#         else parse_float_text(raw, arg_name="--joint_decoder_lr", min_value=0.0, inclusive_min=False)
+#     ),
+#     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+#     example="default=none,cat:down_proj=5e-5",
+# )
+# _JOINT_DECODER_GROUP_SIZE_SPEC = _make_optional_int_override_spec(
+#     arg_name="--joint_decoder_group_size",
+#     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+#     example="default=none,cat:down_proj=2",
+#     min_value=1,
+# )
+# _JOINT_DECODER_BATCH_SIZE_SPEC = _make_optional_int_override_spec(
+#     arg_name="--joint_decoder_batch_size",
+#     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+#     example="default=none,cat:down_proj=1024",
+#     min_value=1,
+# )
 _INTRA_PARALLEL_SPEC = _make_override_spec(
     arg_name="--intra_parallel",
     parse_value=lambda raw: parse_intra_parallel_text(raw, arg_name="--intra_parallel"),
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
     example="default=1x1,cat:q_proj=4x1",
 )
+# 排序代码，已关闭：保留 spec 仅用于内部固定 default=none 的结构化配置。
 _INTRA_PART_SORT_MODE_SPEC = _make_override_spec(
     arg_name="--intra_part_sort_mode",
     parse_value=lambda raw: parse_intra_part_sort_mode_text(raw, arg_name="--intra_part_sort_mode"),
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=none,cat:q_proj=spectral_cosine",
+    example="default=none",
 )
 _OUTLIER_PROTECT_COUNT_SPEC = _make_positive_int_override_spec(
     arg_name="--outlier_protect_count",
@@ -488,62 +493,62 @@ _LORA_DROPOUT_SPEC = _make_override_spec(
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=0.0,after:q_proj=0.1",
 )
-_LORA_STEPS_SPEC = _make_positive_int_override_spec(
-    arg_name="--lora_steps",
+_DISTILL_STEPS_SPEC = _make_positive_int_override_spec(
+    arg_name="--distill_steps",
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=50,after:q_proj=200",
     min_value=0,
 )
-_LORA_BATCH_SIZE_SPEC = _make_positive_int_override_spec(
-    arg_name="--lora_batch_size",
+_DISTILL_BATCH_SIZE_SPEC = _make_positive_int_override_spec(
+    arg_name="--distill_batch_size",
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=2,after:q_proj=4",
 )
-_LORA_NSAMPLES_SPEC = _make_positive_int_override_spec(
-    arg_name="--lora_nsamples",
+_DISTILL_NSAMPLES_SPEC = _make_positive_int_override_spec(
+    arg_name="--distill_nsamples",
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=128,after:q_proj=256",
 )
-_LORA_LR_SPEC = _make_override_spec(
-    arg_name="--lora_lr",
-    parse_value=lambda raw: parse_float_text(raw, arg_name="--lora_lr"),
+_DISTILL_LR_SPEC = _make_override_spec(
+    arg_name="--distill_lr",
+    parse_value=lambda raw: parse_float_text(raw, arg_name="--distill_lr"),
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=1e-4,after:q_proj=5e-5",
 )
-_LORA_WEIGHT_DECAY_SPEC = _make_override_spec(
-    arg_name="--lora_weight_decay",
-    parse_value=lambda raw: parse_float_text(raw, arg_name="--lora_weight_decay"),
+_DISTILL_WEIGHT_DECAY_SPEC = _make_override_spec(
+    arg_name="--distill_weight_decay",
+    parse_value=lambda raw: parse_float_text(raw, arg_name="--distill_weight_decay"),
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=0.0,after:q_proj=0.01",
 )
-_LORA_LOG_EVERY_SPEC = _make_positive_int_override_spec(
-    arg_name="--lora_log_every",
+_DISTILL_LOG_EVERY_SPEC = _make_positive_int_override_spec(
+    arg_name="--distill_log_every",
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=1,after:q_proj=10",
 )
-_LORA_TEMPERATURE_SPEC = _make_override_spec(
-    arg_name="--lora_temperature",
-    parse_value=lambda raw: parse_float_text(raw, arg_name="--lora_temperature", min_value=0.0, inclusive_min=False),
+_DISTILL_TEMPERATURE_SPEC = _make_override_spec(
+    arg_name="--distill_temperature",
+    parse_value=lambda raw: parse_float_text(raw, arg_name="--distill_temperature", min_value=0.0, inclusive_min=False),
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=1.0,after:q_proj=2.0",
 )
-_LORA_LOSS_ALPHA_SPEC = _make_override_spec(
-    arg_name="--lora_loss_alpha",
-    parse_value=lambda raw: _parse_lora_loss_alpha_text(raw, arg_name="--lora_loss_alpha"),
+_DISTILL_LOSS_ALPHA_SPEC = _make_override_spec(
+    arg_name="--distill_loss_alpha",
+    parse_value=lambda raw: _parse_distill_loss_alpha_text(raw, arg_name="--distill_loss_alpha"),
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=0.5,after:q_proj=0.3",
 )
-_LORA_LOSS_TYPE_SPEC = _make_override_spec(
-    arg_name="--lora_loss_type",
-    parse_value=lambda raw: _parse_lora_loss_type(str(raw)),
+_DISTILL_LOSS_TYPE_SPEC = _make_override_spec(
+    arg_name="--distill_loss_type",
+    parse_value=lambda raw: _parse_distill_loss_type(str(raw)),
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=sft,after:q_proj=dual_kl_top_1000",
 )
-_LORA_HIDDEN_LOSS_WEIGHT_SPEC = _make_override_spec(
-    arg_name="--lora_hidden_loss_weight",
+_DISTILL_HIDDEN_LOSS_WEIGHT_SPEC = _make_override_spec(
+    arg_name="--distill_hidden_loss_weight",
     parse_value=lambda raw: parse_float_text(
         raw,
-        arg_name="--lora_hidden_loss_weight",
+        arg_name="--distill_hidden_loss_weight",
         min_value=0.0,
         inclusive_min=True,
     ),
@@ -621,20 +626,22 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         projection_suffixes=str(raw_args.projection_suffixes),
         include_all_linears=bool(raw_args.include_all_linears),
         steps_per_category=_parse_cat_override(raw_args.steps_per_category, spec=_STEPS_PER_CATEGORY_SPEC),
-        joint_decoder_steps=_parse_cat_override(raw_args.joint_decoder_steps, spec=_JOINT_DECODER_STEPS_SPEC),
-        joint_decoder_lr=_parse_cat_override(raw_args.joint_decoder_lr, spec=_JOINT_DECODER_LR_SPEC),
-        joint_decoder_group_size=_parse_cat_override(raw_args.joint_decoder_group_size, spec=_JOINT_DECODER_GROUP_SIZE_SPEC),
-        joint_decoder_batch_size=_parse_cat_override(raw_args.joint_decoder_batch_size, spec=_JOINT_DECODER_BATCH_SIZE_SPEC),
+        # 联合优化代码，已关闭。原 joint CLI 解析保留如下：
+        # joint_decoder_steps=_parse_cat_override(raw_args.joint_decoder_steps, spec=_JOINT_DECODER_STEPS_SPEC),
+        # joint_decoder_lr=_parse_cat_override(raw_args.joint_decoder_lr, spec=_JOINT_DECODER_LR_SPEC),
+        # joint_decoder_group_size=_parse_cat_override(raw_args.joint_decoder_group_size, spec=_JOINT_DECODER_GROUP_SIZE_SPEC),
+        # joint_decoder_batch_size=_parse_cat_override(raw_args.joint_decoder_batch_size, spec=_JOINT_DECODER_BATCH_SIZE_SPEC),
         skip_layers=str(raw_args.skip_layers),
         linear_group_size=int(raw_args.linear_group_size),
         intra_parallel=_parse_cat_override(raw_args.intra_parallel, spec=_INTRA_PARALLEL_SPEC),
-        intra_part_sort_mode=_parse_cat_override(raw_args.intra_part_sort_mode, spec=_INTRA_PART_SORT_MODE_SPEC),
+        intra_part_sort_mode=_parse_cat_override("default=none", spec=_INTRA_PART_SORT_MODE_SPEC),
         batch_size=int(raw_args.batch_size),
         gpu_resident_data=bool(raw_args.gpu_resident_data),
         log_every=int(raw_args.log_every),
         eval_every=int(raw_args.eval_every),
         eval_blocks=int(raw_args.eval_blocks),
-        sort_prep_workers=int(raw_args.sort_prep_workers),
+        # 排序代码，已关闭。旧字段赋值保留如下：
+        # sort_prep_workers=1,
         outlier_protect_count=_parse_cat_override(raw_args.outlier_protect_count, spec=_OUTLIER_PROTECT_COUNT_SPEC),
         outlier_protect_mode=str(raw_args.outlier_protect_mode).strip().lower(),
         outlier_low_rank=_parse_cat_override(raw_args.outlier_low_rank, spec=_OUTLIER_LOW_RANK_SPEC),
@@ -660,30 +667,30 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         ppl_limit=int(raw_args.ppl_limit),
         eval_hif4_act=bool(raw_args.eval_hif4_act),
         distill_after_category=_normalize_distill_after_category(raw_args.distill_after_category),
-        lora_dataset=_normalize_lora_dataset_arg(
-            raw_args.lora_dataset,
+        distill_dataset=_normalize_distill_dataset_arg(
+            raw_args.distill_dataset,
             distill_after_category=str(raw_args.distill_after_category),
         ),
         lora_rank=_parse_cat_override(raw_args.lora_rank, spec=_LORA_RANK_SPEC),
         lora_alpha=_parse_cat_override(raw_args.lora_alpha, spec=_LORA_ALPHA_SPEC),
         lora_dropout=_parse_cat_override(raw_args.lora_dropout, spec=_LORA_DROPOUT_SPEC),
-        lora_steps=_parse_cat_override(raw_args.lora_steps, spec=_LORA_STEPS_SPEC),
-        lora_batch_size=_parse_cat_override(raw_args.lora_batch_size, spec=_LORA_BATCH_SIZE_SPEC),
-        lora_nsamples=_parse_cat_override(raw_args.lora_nsamples, spec=_LORA_NSAMPLES_SPEC),
-        lora_lr=_parse_cat_override(raw_args.lora_lr, spec=_LORA_LR_SPEC),
-        lora_weight_decay=_parse_cat_override(raw_args.lora_weight_decay, spec=_LORA_WEIGHT_DECAY_SPEC),
-        lora_log_every=_parse_cat_override(raw_args.lora_log_every, spec=_LORA_LOG_EVERY_SPEC),
-        lora_temperature=_parse_cat_override(raw_args.lora_temperature, spec=_LORA_TEMPERATURE_SPEC),
-        lora_loss_alpha=_parse_cat_override(raw_args.lora_loss_alpha, spec=_LORA_LOSS_ALPHA_SPEC),
-        lora_loss_type=_parse_cat_override(raw_args.lora_loss_type, spec=_LORA_LOSS_TYPE_SPEC),
-        lora_hidden_loss_weight=_parse_cat_override(raw_args.lora_hidden_loss_weight, spec=_LORA_HIDDEN_LOSS_WEIGHT_SPEC),
-        lora_hidden_layer_weighting=make_choice_parser(
-            arg_name="--lora_hidden_layer_weighting",
-            choices=_LORA_HIDDEN_LAYER_WEIGHTING_CHOICES,
-        )(raw_args.lora_hidden_layer_weighting),
+        distill_steps=_parse_cat_override(raw_args.distill_steps, spec=_DISTILL_STEPS_SPEC),
+        distill_batch_size=_parse_cat_override(raw_args.distill_batch_size, spec=_DISTILL_BATCH_SIZE_SPEC),
+        distill_nsamples=_parse_cat_override(raw_args.distill_nsamples, spec=_DISTILL_NSAMPLES_SPEC),
+        distill_lr=_parse_cat_override(raw_args.distill_lr, spec=_DISTILL_LR_SPEC),
+        distill_weight_decay=_parse_cat_override(raw_args.distill_weight_decay, spec=_DISTILL_WEIGHT_DECAY_SPEC),
+        distill_log_every=_parse_cat_override(raw_args.distill_log_every, spec=_DISTILL_LOG_EVERY_SPEC),
+        distill_temperature=_parse_cat_override(raw_args.distill_temperature, spec=_DISTILL_TEMPERATURE_SPEC),
+        distill_loss_alpha=_parse_cat_override(raw_args.distill_loss_alpha, spec=_DISTILL_LOSS_ALPHA_SPEC),
+        distill_loss_type=_parse_cat_override(raw_args.distill_loss_type, spec=_DISTILL_LOSS_TYPE_SPEC),
+        distill_hidden_loss_weight=_parse_cat_override(raw_args.distill_hidden_loss_weight, spec=_DISTILL_HIDDEN_LOSS_WEIGHT_SPEC),
+        distill_hidden_layer_weighting=make_choice_parser(
+            arg_name="--distill_hidden_layer_weighting",
+            choices=_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES,
+        )(raw_args.distill_hidden_layer_weighting),
         lora_use_dora=_parse_cat_override(raw_args.lora_use_dora, spec=_LORA_USE_DORA_SPEC),
-        tune_final_norm=bool(raw_args.tune_final_norm),
-        use_post_norm_head_linear=bool(raw_args.use_post_norm_head_linear),
+        distill_tune_final_norm=bool(raw_args.distill_tune_final_norm),
+        distill_use_post_norm_head_linear=bool(raw_args.distill_use_post_norm_head_linear),
         seed=int(raw_args.seed),
         deterministic=bool(raw_args.deterministic),
         train_device=str(raw_args.train_device),
@@ -718,10 +725,6 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
             lambda value: str(value).strip().lower() == "wa_mse",
         )
         or _override_table_contains(
-            cat_args.intra_part_sort_mode,
-            lambda value: str(value).strip().lower() == "act_spectral_cosine",
-        )
-        or _override_table_contains(
             cat_args.outlier_protect_count,
             lambda value: int(value) > 0,
         )
@@ -741,10 +744,10 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
 def _validate_distill_after_category_args(cat_args: NormalizedCatArgs) -> None:
     mode = _normalize_distill_after_category(cat_args.distill_after_category)
     enabled = []
-    if bool(cat_args.tune_final_norm):
-        enabled.append("--lora_tune_final_norm")
-    if bool(cat_args.use_post_norm_head_linear):
-        enabled.append("--lora_use_post_norm_head_linear")
+    if bool(cat_args.distill_tune_final_norm):
+        enabled.append("--distill_tune_final_norm")
+    if bool(cat_args.distill_use_post_norm_head_linear):
+        enabled.append("--distill_use_post_norm_head_linear")
     if enabled and mode != "remaining_lora":
         raise ValueError(
             f"{', '.join(enabled)} is only supported with --distill_after_category=remaining_lora."
@@ -766,8 +769,6 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
     top_p_table = cat_args.outlier_residual_top_p
     protect_table = cat_args.outlier_protect_count
     low_rank_table = cat_args.outlier_low_rank
-    if int(cat_args.sort_prep_workers) < 0:
-        raise ValueError(f"--sort_prep_workers must be >= 0, got {int(cat_args.sort_prep_workers)}.")
     if mode not in _OUTLIER_PROTECT_MODE_CHOICES:
         raise ValueError(
             f"Unsupported --outlier_protect_mode={cat_args.outlier_protect_mode!r}. "
@@ -894,10 +895,11 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
     resolved_outlier_mode = str(cat_args.outlier_protect_mode).strip().lower()
     tables = (
         (cat_args.steps_per_category, "--steps_per_category"),
-        (cat_args.joint_decoder_steps, "--joint_decoder_steps"),
-        (cat_args.joint_decoder_lr, "--joint_decoder_lr"),
-        (cat_args.joint_decoder_group_size, "--joint_decoder_group_size"),
-        (cat_args.joint_decoder_batch_size, "--joint_decoder_batch_size"),
+        # 联合优化代码，已关闭。旧 joint decoder category table 校验保留如下：
+        # (cat_args.joint_decoder_steps, "--joint_decoder_steps"),
+        # (cat_args.joint_decoder_lr, "--joint_decoder_lr"),
+        # (cat_args.joint_decoder_group_size, "--joint_decoder_group_size"),
+        # (cat_args.joint_decoder_batch_size, "--joint_decoder_batch_size"),
         (cat_args.intra_parallel, "--intra_parallel"),
         (cat_args.intra_part_sort_mode, "--intra_part_sort_mode"),
         (cat_args.outlier_protect_count, "--outlier_protect_count"),
@@ -920,20 +922,21 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
     resolved: Dict[str, ResolvedCategoryRuntimeConfig] = {}
     for category in active_categories:
         steps_per_category = resolve_category_value(cat_args.steps_per_category, category)
-        joint_decoder_steps = resolve_category_value(cat_args.joint_decoder_steps, category)
-        joint_decoder_lr = resolve_category_value(cat_args.joint_decoder_lr, category)
-        joint_decoder_group_size = resolve_category_value(cat_args.joint_decoder_group_size, category)
-        joint_decoder_batch_size = resolve_category_value(cat_args.joint_decoder_batch_size, category)
-        resolved_joint_decoder_steps = int(steps_per_category) if joint_decoder_steps is None else int(joint_decoder_steps)
-        resolved_joint_decoder_lr = float(vae_args.lr) if joint_decoder_lr is None else float(joint_decoder_lr)
-        resolved_joint_decoder_group_size = (
-            int(cat_args.linear_group_size)
-            if joint_decoder_group_size is None
-            else int(joint_decoder_group_size)
-        )
-        resolved_joint_decoder_batch_size = (
-            None if joint_decoder_batch_size is None else int(joint_decoder_batch_size)
-        )
+        # 联合优化代码，已关闭。旧 joint decoder runtime 解析保留如下：
+        # joint_decoder_steps = resolve_category_value(cat_args.joint_decoder_steps, category)
+        # joint_decoder_lr = resolve_category_value(cat_args.joint_decoder_lr, category)
+        # joint_decoder_group_size = resolve_category_value(cat_args.joint_decoder_group_size, category)
+        # joint_decoder_batch_size = resolve_category_value(cat_args.joint_decoder_batch_size, category)
+        # resolved_joint_decoder_steps = int(steps_per_category) if joint_decoder_steps is None else int(joint_decoder_steps)
+        # resolved_joint_decoder_lr = float(vae_args.lr) if joint_decoder_lr is None else float(joint_decoder_lr)
+        # resolved_joint_decoder_group_size = (
+        #     int(cat_args.linear_group_size)
+        #     if joint_decoder_group_size is None
+        #     else int(joint_decoder_group_size)
+        # )
+        # resolved_joint_decoder_batch_size = (
+        #     None if joint_decoder_batch_size is None else int(joint_decoder_batch_size)
+        # )
         resolved_outlier_residual_top_p = float(resolve_category_value(cat_args.outlier_residual_top_p, category))
         if resolved_outlier_mode == "channel" and resolved_outlier_residual_top_p != 0.0:
             raise ValueError(
@@ -961,10 +964,11 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
             category=str(category),
             residual_stages=int(resolve_category_value(vae_args.residual_stages, category)),
             steps=int(steps_per_category),
-            joint_decoder_steps=int(resolved_joint_decoder_steps),
-            joint_decoder_lr=float(resolved_joint_decoder_lr),
-            joint_decoder_group_size=int(resolved_joint_decoder_group_size),
-            joint_decoder_batch_size=resolved_joint_decoder_batch_size,
+            # 联合优化代码，已关闭。旧字段赋值保留如下：
+            # joint_decoder_steps=int(resolved_joint_decoder_steps),
+            # joint_decoder_lr=float(resolved_joint_decoder_lr),
+            # joint_decoder_group_size=int(resolved_joint_decoder_group_size),
+            # joint_decoder_batch_size=resolved_joint_decoder_batch_size,
             intra_parallel=tuple(resolve_category_value(cat_args.intra_parallel, category)),
             intra_part_sort_mode=normalize_intra_part_sort_mode(
                 resolve_category_value(cat_args.intra_part_sort_mode, category),
@@ -986,22 +990,22 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
     return resolved
 
 
-def resolve_lora_runtime_config(cat_args: NormalizedCatArgs, after_category: Optional[str]) -> ResolvedLoraRuntimeConfig:
-    return ResolvedLoraRuntimeConfig(
+def resolve_distill_runtime_config(cat_args: NormalizedCatArgs, after_category: Optional[str]) -> ResolvedDistillRuntimeConfig:
+    return ResolvedDistillRuntimeConfig(
         rank=int(resolve_after_category_value(cat_args.lora_rank, after_category)),
         alpha=float(resolve_after_category_value(cat_args.lora_alpha, after_category)),
         dropout=float(resolve_after_category_value(cat_args.lora_dropout, after_category)),
-        steps=int(resolve_after_category_value(cat_args.lora_steps, after_category)),
-        batch_size=int(resolve_after_category_value(cat_args.lora_batch_size, after_category)),
-        nsamples=int(resolve_after_category_value(cat_args.lora_nsamples, after_category)),
-        lr=float(resolve_after_category_value(cat_args.lora_lr, after_category)),
-        weight_decay=float(resolve_after_category_value(cat_args.lora_weight_decay, after_category)),
-        log_every=int(resolve_after_category_value(cat_args.lora_log_every, after_category)),
-        temperature=float(resolve_after_category_value(cat_args.lora_temperature, after_category)),
-        loss_alpha=float(resolve_after_category_value(cat_args.lora_loss_alpha, after_category)),
-        loss_type=str(resolve_after_category_value(cat_args.lora_loss_type, after_category)),
-        hidden_loss_weight=float(resolve_after_category_value(cat_args.lora_hidden_loss_weight, after_category)),
-        hidden_layer_weighting=str(cat_args.lora_hidden_layer_weighting),
+        steps=int(resolve_after_category_value(cat_args.distill_steps, after_category)),
+        batch_size=int(resolve_after_category_value(cat_args.distill_batch_size, after_category)),
+        nsamples=int(resolve_after_category_value(cat_args.distill_nsamples, after_category)),
+        lr=float(resolve_after_category_value(cat_args.distill_lr, after_category)),
+        weight_decay=float(resolve_after_category_value(cat_args.distill_weight_decay, after_category)),
+        log_every=int(resolve_after_category_value(cat_args.distill_log_every, after_category)),
+        temperature=float(resolve_after_category_value(cat_args.distill_temperature, after_category)),
+        loss_alpha=float(resolve_after_category_value(cat_args.distill_loss_alpha, after_category)),
+        loss_type=str(resolve_after_category_value(cat_args.distill_loss_type, after_category)),
+        hidden_loss_weight=float(resolve_after_category_value(cat_args.distill_hidden_loss_weight, after_category)),
+        hidden_layer_weighting=str(cat_args.distill_hidden_layer_weighting),
         use_dora=bool(resolve_after_category_value(cat_args.lora_use_dora, after_category)),
     )
 
@@ -1023,14 +1027,15 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="关闭默认的 projection-only 过滤，改为包含模型中全部 nn.Linear。",
     )
     parser.add_argument("--steps_per_category", type=str, default="default=2000", help=f"类别覆盖参数。示例：{_STEPS_PER_CATEGORY_SPEC.example}")
-    parser.add_argument("--joint_decoder_steps", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_STEPS_SPEC.example}")
-    parser.add_argument("--joint_decoder_lr", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_LR_SPEC.example}")
-    parser.add_argument("--joint_decoder_group_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_GROUP_SIZE_SPEC.example}")
-    parser.add_argument("--joint_decoder_batch_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_BATCH_SIZE_SPEC.example}")
+    # 联合优化代码，已关闭：不再注册 joint decoder CLI。
+    # parser.add_argument("--joint_decoder_steps", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_STEPS_SPEC.example}")
+    # parser.add_argument("--joint_decoder_lr", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_LR_SPEC.example}")
+    # parser.add_argument("--joint_decoder_group_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_GROUP_SIZE_SPEC.example}")
+    # parser.add_argument("--joint_decoder_batch_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_BATCH_SIZE_SPEC.example}")
     parser.add_argument("--skip_layers", type=str, default="", help="指定在 LLM 前向中始终使用原始线性权重的层，格式: layer_idx.category，例如 0.down_proj,30.q_proj。")
     parser.add_argument("--linear_group_size", type=int, default=32, help="跨层分组大小：每组同时训练多少个同类 Linear。")
     parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"类别覆盖参数。示例：{_INTRA_PARALLEL_SPEC.example}")
-    parser.add_argument("--intra_part_sort_mode", type=str, default="default=none", help=f"类别覆盖参数。示例：{_INTRA_PART_SORT_MODE_SPEC.example}")
+    # 排序代码，已关闭：不再注册 --intra_part_sort_mode CLI。
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument(
         "--gpu_resident_data",
@@ -1041,7 +1046,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=0)
     parser.add_argument("--eval_blocks", type=int, default=256)
-    parser.add_argument("--sort_prep_workers", type=int, default=0, help="排序预处理并行 worker 数。0=auto，1=串行，>1=显式 CPU 多进程。")
+    # 排序代码，已关闭：不再注册 --sort_prep_workers CLI。
     parser.add_argument("--outlier_protect_count", type=str, default="default=0", help=f"类别覆盖参数。示例：{_OUTLIER_PROTECT_COUNT_SPEC.example}")
     parser.add_argument("--outlier_low_rank", type=str, default="default=0", help=f"类别覆盖参数。示例：{_OUTLIER_LOW_RANK_SPEC.example}")
     parser.add_argument(
@@ -1139,7 +1144,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--lora_dataset",
+        "--distill_dataset",
         type=str,
         default="",
         help=(
@@ -1151,38 +1156,34 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_rank", type=str, default="default=8", help=f"after_category 覆盖参数。示例：{_LORA_RANK_SPEC.example}")
     parser.add_argument("--lora_alpha", type=str, default="default=16.0", help=f"after_category 覆盖参数。示例：{_LORA_ALPHA_SPEC.example}")
     parser.add_argument("--lora_dropout", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_LORA_DROPOUT_SPEC.example}")
-    parser.add_argument("--lora_steps", type=str, default="default=50", help=f"after_category 覆盖参数。示例：{_LORA_STEPS_SPEC.example}")
-    parser.add_argument("--lora_batch_size", type=str, default="default=2", help=f"after_category 覆盖参数。示例：{_LORA_BATCH_SIZE_SPEC.example}")
-    parser.add_argument("--lora_nsamples", type=str, default="default=128", help=f"after_category 覆盖参数。示例：{_LORA_NSAMPLES_SPEC.example}")
-    parser.add_argument("--lora_lr", type=str, default="default=1e-4", help=f"after_category 覆盖参数。示例：{_LORA_LR_SPEC.example}")
-    parser.add_argument("--lora_weight_decay", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_LORA_WEIGHT_DECAY_SPEC.example}")
-    parser.add_argument("--lora_log_every", type=str, default="default=1", help=f"after_category 覆盖参数。示例：{_LORA_LOG_EVERY_SPEC.example}")
-    parser.add_argument("--lora_temperature", type=str, default="default=1.0", help=f"after_category 覆盖参数。示例：{_LORA_TEMPERATURE_SPEC.example}")
-    parser.add_argument("--lora_loss_alpha", type=str, default="default=0.5", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_ALPHA_SPEC.example}")
-    parser.add_argument("--lora_loss_type", type=str, default="default=sft", help=f"after_category 覆盖参数。示例：{_LORA_LOSS_TYPE_SPEC.example}")
-    parser.add_argument("--lora_hidden_loss_weight", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_LORA_HIDDEN_LOSS_WEIGHT_SPEC.example}")
+    parser.add_argument("--distill_steps", type=str, default="default=50", help=f"after_category 覆盖参数。示例：{_DISTILL_STEPS_SPEC.example}")
+    parser.add_argument("--distill_batch_size", type=str, default="default=2", help=f"after_category 覆盖参数。示例：{_DISTILL_BATCH_SIZE_SPEC.example}")
+    parser.add_argument("--distill_nsamples", type=str, default="default=128", help=f"after_category 覆盖参数。示例：{_DISTILL_NSAMPLES_SPEC.example}")
+    parser.add_argument("--distill_lr", type=str, default="default=1e-4", help=f"after_category 覆盖参数。示例：{_DISTILL_LR_SPEC.example}")
+    parser.add_argument("--distill_weight_decay", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_DISTILL_WEIGHT_DECAY_SPEC.example}")
+    parser.add_argument("--distill_log_every", type=str, default="default=1", help=f"after_category 覆盖参数。示例：{_DISTILL_LOG_EVERY_SPEC.example}")
+    parser.add_argument("--distill_temperature", type=str, default="default=1.0", help=f"after_category 覆盖参数。示例：{_DISTILL_TEMPERATURE_SPEC.example}")
+    parser.add_argument("--distill_loss_alpha", type=str, default="default=0.5", help=f"after_category 覆盖参数。示例：{_DISTILL_LOSS_ALPHA_SPEC.example}")
+    parser.add_argument("--distill_loss_type", type=str, default="default=sft", help=f"after_category 覆盖参数。示例：{_DISTILL_LOSS_TYPE_SPEC.example}")
+    parser.add_argument("--distill_hidden_loss_weight", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_DISTILL_HIDDEN_LOSS_WEIGHT_SPEC.example}")
     parser.add_argument(
-        "--lora_hidden_layer_weighting",
+        "--distill_hidden_layer_weighting",
         type=str,
         default="uniform",
         help="LoRA hidden-state 对齐损失的层权重模式：uniform 或 linear_depth。",
     )
     parser.add_argument("--lora_use_dora", type=str, default="default=true", help=f"after_category 覆盖参数。示例：{_LORA_USE_DORA_SPEC.example}")
     parser.add_argument(
-        "--lora_tune_final_norm",
-        "--tune_final_norm",
-        dest="tune_final_norm",
-        type=lambda v: _parse_bool_like(v, arg_name="--tune_final_norm"),
+        "--distill_tune_final_norm",
+        type=lambda v: _parse_bool_like(v, arg_name="--distill_tune_final_norm"),
         default=False,
-        help="LoRA 补偿阶段是否同时微调模型最终 norm。",
+        help="每类后蒸馏阶段是否同时微调模型最终 norm。",
     )
     parser.add_argument(
-        "--lora_use_post_norm_head_linear",
-        "--use_post_norm_head_linear",
-        dest="use_post_norm_head_linear",
-        type=lambda v: _parse_bool_like(v, arg_name="--use_post_norm_head_linear"),
+        "--distill_use_post_norm_head_linear",
+        type=lambda v: _parse_bool_like(v, arg_name="--distill_use_post_norm_head_linear"),
         default=False,
-        help="LoRA 补偿阶段是否训练 post-norm head linear；最终保存前会融合回 lm_head。",
+        help="每类后蒸馏阶段是否训练 post-norm head linear；最终保存前会融合回 lm_head。",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -1214,11 +1215,6 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
 
         argv = sys.argv[1:]
     script_parser = build_cat_train_parser()
-    if any(str(arg) == "--lora_after_category" or str(arg).startswith("--lora_after_category=") for arg in argv):
-        script_parser.error(
-            "--lora_after_category has been removed; use --distill_after_category "
-            "remaining_lora|compressed_lora|decoder|both."
-        )
     raw_script_args, remaining = script_parser.parse_known_args(list(argv))
     cat_args = _normalize_cat_train_script_args(raw_script_args)
     _validate_outlier_protect_mode_args(cat_args)

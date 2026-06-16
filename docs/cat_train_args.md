@@ -7,8 +7,9 @@
 - [litebsq/vae_args.py](/home/shaoyuantian/program/VAELLM/litebsq/vae_args.py)
 - [litebsq/autoencoder.py](/home/shaoyuantian/program/VAELLM/litebsq/autoencoder.py)
 - [train_utils/cat_train_residual_protection.py](/home/shaoyuantian/program/VAELLM/train_utils/cat_train_residual_protection.py)
-- [train_utils/cat_joint_decoder.py](/home/shaoyuantian/program/VAELLM/train_utils/cat_joint_decoder.py)
 - [train_utils/lora_utils.py](/home/shaoyuantian/program/VAELLM/train_utils/lora_utils.py)
+
+当前排序代码和 joint decoder 联合优化代码已关闭；旧实现只以 `#` 注释形式保留在源码中。
 
 ## 1. 参数来源与解析顺序
 
@@ -37,12 +38,7 @@
 用于：
 
 - `steps_per_category`
-- `joint_decoder_steps`
-- `joint_decoder_lr`
-- `joint_decoder_group_size`
-- `joint_decoder_batch_size`
 - `intra_parallel`
-- `intra_part_sort_mode`
 - `outlier_protect_count`
 - `outlier_low_rank`
 - `outlier_residual_top_p`
@@ -81,23 +77,23 @@
 - `lora_rank`
 - `lora_alpha`
 - `lora_dropout`
-- `lora_steps`
-- `lora_batch_size`
-- `lora_nsamples`
-- `lora_lr`
-- `lora_weight_decay`
-- `lora_log_every`
-- `lora_temperature`
-- `lora_loss_alpha`
-- `lora_loss_type`
-- `lora_hidden_loss_weight`
+- `distill_steps`
+- `distill_batch_size`
+- `distill_nsamples`
+- `distill_lr`
+- `distill_weight_decay`
+- `distill_log_every`
+- `distill_temperature`
+- `distill_loss_alpha`
+- `distill_loss_type`
+- `distill_hidden_loss_weight`
 - `lora_use_dora`
 
 写法：
 
 ```bash
 --lora_rank default=8,after:q_proj=16
---lora_steps default=50,after:q_proj=200
+--distill_steps default=50,after:q_proj=200
 ```
 
 规则：
@@ -115,7 +111,7 @@
 | 布尔 | `true` / `false` |
 | 可空整数 | `none` / `256` |
 | `intra_parallel` | `1x1` / `4x1` |
-| `intra_part_sort_mode` | `none` / `spectral_cosine` / `act_spectral_cosine` |
+| `intra_part_sort_mode` | 排序代码已关闭；只保留内部固定 `none` |
 
 ### 2.4 仍保留旧字符串语法的参数
 
@@ -143,15 +139,15 @@
 | `--projection_suffixes` | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | 默认 projection-only 模式下允许的后缀 | 仅在未开启 `include_all_linears` 时生效 |
 | `--include_all_linears` | `False` | 关闭默认的 projection-only 过滤，改为收集模型中全部 `nn.Linear` | 开启后忽略 `projection_suffixes` 过滤 |
 | `--steps_per_category` | `default=2000` | 每个 group 的训练步数 | 类别 override；名字保留但语义就是每组步数 |
-| `--joint_decoder_steps` | `default=none` | 多阶段训练完成后的 decoder 联合微调步数 | 类别 override；`none` 表示回退到该类别的 `steps_per_category` |
-| `--joint_decoder_lr` | `default=none` | 多阶段 decoder 联合微调的学习率 | 类别 override；`none` 表示回退到全局 `--lr` |
-| `--joint_decoder_group_size` | `default=none` | 多阶段 decoder 联合微调时的 linear 子分组大小 | 类别 override；`none` 表示回退到 `linear_group_size` |
-| `--joint_decoder_batch_size` | `default=none` | 多阶段 decoder 联合微调时每步采样的 block patch 大小 | 类别 override；`none` 表示沿用 full-batch 联合优化；只支持 `intra_part_sort_mode=none` |
+| `--joint_decoder_steps` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
+| `--joint_decoder_lr` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
+| `--joint_decoder_group_size` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
+| `--joint_decoder_batch_size` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
 | `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式必须是 `layer_idx.category` |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
 | `--intra_parallel` | `default=1x1` | 单个 Linear 的层内切分 | 类别 override |
-| `--intra_part_sort_mode` | `default=none` | 每个 part 内的列排序方式 | 类别 override；支持 `none/spectral_cosine/act_spectral_cosine` |
-| `--sort_prep_workers` | `0` | 排序预处理并行 worker 数 | 全局单值；`0=auto, 1=串行, >1=显式 CPU 多进程`；只影响 `spectral_cosine/act_spectral_cosine` |
+| `--intra_part_sort_mode` | 已关闭 | 排序旧参数 | 不再注册；传入会报错 |
+| `--sort_prep_workers` | 已关闭 | 排序预处理旧参数 | 不再注册；传入会报错 |
 | `--batch_size` | `256` | VAE 训练与评估 DataLoader batch 大小 | 作用于块数据，不是 token batch |
 | `--log_every` | `50` | 每多少 step 打印一次训练日志 | `<=0` 等价关闭 |
 | `--eval_every` | `0` | 每多少 step 做一次 VAE / joint decoder 中间评估 | `0` 表示不做中间评估；joint decoder 前后完整重建损失仍会记录 |
@@ -166,35 +162,35 @@
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
 | `--outlier_residual_value_bits` | `8` | `blocked_quantized` 的残差 value 位宽 | `8` / `4` |
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
-| `--wa_mse_calib_dataset` | `""` | 动态采集时的校准混合数据集 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用；启用动态校准时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5` |
-| `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
-| `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
-| `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / act_spectral_cosine / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--wa_mse_calib_dataset` | `""` | 动态采集时的校准混合数据集 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用；启用动态校准时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5` |
+| `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_device` | `""` | 动态采集设备 | 为空时回退 `train_device` |
 | `--wa_mse_calib_log_every` | `0` | 动态采集日志间隔 | `0` 表示关闭 |
 | `--eval_ppl` | `true` | 是否在类别后评估阶段运行 PPL | 现在和 `convert` 解耦；`false` 时不跑 PPL |
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
 | `--distill_after_category` | `none` | 每训练完一个类别后的蒸馏模式 | `none` / `remaining_lora` / `compressed_lora` / `decoder` / `both`；非 `none` 要求开启 `--convert` |
-| `--lora_dataset` | `""` | 每类后蒸馏训练混合数据集 | `--distill_after_category != none` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
+| `--distill_dataset` | `""` | 每类后蒸馏训练混合数据集 | `--distill_after_category != none` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
 | `--lora_rank` | `default=8` | LoRA rank | after-category override |
 | `--lora_alpha` | `default=16.0` | LoRA alpha | after-category override |
 | `--lora_dropout` | `default=0.0` | LoRA dropout | after-category override |
-| `--lora_steps` | `default=50` | LoRA 最大步数 | `0` 表示跳过该轮 LoRA |
-| `--lora_batch_size` | `default=2` | LoRA 每卡 batch size | after-category override |
-| `--lora_nsamples` | `default=128` | LoRA 训练样本数 | 从 `--lora_dataset` 指定的数据集采样 |
-| `--lora_lr` | `default=1e-4` | LoRA 学习率 | after-category override |
-| `--lora_weight_decay` | `default=0.0` | LoRA 权重衰减 | after-category override |
-| `--lora_log_every` | `default=1` | LoRA 日志间隔 | after-category override |
-| `--lora_temperature` | `default=1.0` | LoRA 蒸馏温度 | after-category override |
-| `--lora_loss_alpha` | `default=0.5` | LoRA 蒸馏混合权重 | after-category override |
-| `--lora_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
-| `--lora_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
-| `--lora_hidden_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权，`linear_depth` 让后层权重线性增大并归一到平均权重为 1 |
+| `--distill_steps` | `default=50` | LoRA 最大步数 | `0` 表示跳过该轮 LoRA |
+| `--distill_batch_size` | `default=2` | LoRA 每卡 batch size | after-category override |
+| `--distill_nsamples` | `default=128` | LoRA 训练样本数 | 从 `--distill_dataset` 指定的数据集采样 |
+| `--distill_lr` | `default=1e-4` | LoRA 学习率 | after-category override |
+| `--distill_weight_decay` | `default=0.0` | LoRA 权重衰减 | after-category override |
+| `--distill_log_every` | `default=1` | LoRA 日志间隔 | after-category override |
+| `--distill_temperature` | `default=1.0` | LoRA 蒸馏温度 | after-category override |
+| `--distill_loss_alpha` | `default=0.5` | LoRA 蒸馏混合权重 | after-category override |
+| `--distill_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
+| `--distill_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
+| `--distill_hidden_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权，`linear_depth` 让后层权重线性增大并归一到平均权重为 1 |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 `remaining_lora` 支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
-| `--lora_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 `--distill_after_category=remaining_lora` 支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
-| `--lora_use_post_norm_head_linear` | `false` | 每类后 LoRA 蒸馏是否训练 post-norm head linear | 仅 `--distill_after_category=remaining_lora` 支持；最终保存前会融合回 `lm_head` |
-| `--lora_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
+| `--distill_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 `--distill_after_category=remaining_lora` 支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
+| `--distill_use_post_norm_head_linear` | `false` | 每类后 LoRA 蒸馏是否训练 post-norm head linear | 仅 `--distill_after_category=remaining_lora` 支持；最终保存前会融合回 `lm_head` |
+| `--distill_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
 | `--eval_hif4_act` | `false` | 是否在 cat_train 内部类别后评估阶段启用 HiFloat4 激活伪量化 | 同时作用于 PPL 和 lm_eval；不影响训练 |
 | `--seed` | `0` | 全流程随机种子 | LoRA 每轮会叠加轮次偏移 |
 | `--train_device` | `cuda` | VAE 训练与评估设备 | 例如 `cuda` / `cuda:0` / `cpu` |
@@ -236,24 +232,19 @@
   - 一个 group 的同一个 block 横跨 `num_models = linears_in_group * intra_parallel_parts` 个模型/part
   - 因此一次评估 `B` 个 blocks，实际覆盖 `B * num_models * codebook_dim` 个权重值
 - 同一类别内，如果 `residual_stages > 1`：
-  - 先做逐阶残差量化；若 `intra_part_sort_mode != none`，每个 stage 都会基于当前 residual 重新排序
+  - 先做逐阶残差量化；排序代码已关闭，每个 stage 都保持普通切分顺序
   - 所有 stage 仍复用同一组已解析结构参数：
     - `steps`
     - `codebook_bits`
     - `codebook_dim`
     - `recon_loss_type`
-    - `intra_part_sort_mode`
     - `base_ch`
     - `num_res_blocks`
     - `decoder_base_ch`
     - `decoder_num_res_blocks`
     - `norm_type`
     - `decoder_type`
-  - 全部 stage 训练完后，会再做一次 decoder 联合微调，步数由 `joint_decoder_steps` 控制
-- `joint_decoder_steps=none` 时，回退到该类别解析后的 `steps_per_category`
-- `joint_decoder_lr=none` 时，回退到全局 `lr`
-- `joint_decoder_group_size=none` 时，联合微调直接沿用当前类别的 `linear_group_size`
-- `joint_decoder_batch_size=none` 时，联合微调每步使用所有 blocks；设置为正整数时，每步只采样对应数量的 block patch，且只允许 `intra_part_sort_mode=none`
+  - joint decoder 联合优化代码已关闭；全部 stage 训练完后直接进入保存/替换流程
 - `decoder_type=linear` 或 `decoder_type=symmetric` 时，decoder 的 hidden dim / residual blocks 会强制对齐 encoder。
 - `decoder_type=asymmetric` 时，才独立使用 `decoder_base_ch` / `decoder_num_res_blocks`。
 
@@ -302,14 +293,14 @@
 |---|---|---|
 | `--bf16` | VAE dtype / LoRA SFT args | 为 `cat_train` 设置 `vae_weight_dtype=bf16` 和 `vae_autocast_dtype=bf16`，LoRA 也会透传 |
 | `--fp16` | VAE 数据 dtype / LoRA SFT args | 影响 VAE 训练数据张量 dtype 和 LoRA SFT args；不会覆盖 `vae_weight_dtype` |
-| `--lora_gradient_accumulation_steps` | LoRA `TrainingArguments` | LoRA 梯度累积 |
-| `--lora_optim` | LoRA `TrainingArguments` | LoRA 优化器名称 |
-| `--lora_max_grad_norm` | LoRA `TrainingArguments` | LoRA 梯度裁剪 |
-| `--lora_warmup_ratio` | LoRA `TrainingArguments` | LoRA warmup 比例 |
-| `--lora_group_by_length` | LoRA `TrainingArguments` | LoRA 按长度分组 |
-| `--lora_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型 |
-| `--lora_model_max_length` | LoRA trainer | LoRA 样本最大长度 |
-| `--lora_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |
+| `--distill_gradient_accumulation_steps` | LoRA `TrainingArguments` | LoRA 梯度累积 |
+| `--distill_optim` | LoRA `TrainingArguments` | LoRA 优化器名称 |
+| `--distill_max_grad_norm` | LoRA `TrainingArguments` | LoRA 梯度裁剪 |
+| `--distill_warmup_ratio` | LoRA `TrainingArguments` | LoRA warmup 比例 |
+| `--distill_group_by_length` | LoRA `TrainingArguments` | LoRA 按长度分组 |
+| `--distill_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型 |
+| `--distill_model_max_length` | LoRA trainer | LoRA 样本最大长度 |
+| `--distill_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |
 | `--eval_hif4_act` | cat_train eval | 是否在内部类别后评估时启用 HiFloat4 激活伪量化；默认 `false` |
 
 ## 6. 关键运行时语义
@@ -328,44 +319,19 @@
 
 - `residual_stages` 是按类别解析的。
 - 某类别为 `N>1` 时，会做逐阶残差量化：当前 stage 重建后，从 residual 中扣除该 stage 重建结果，再进入下一 stage。
-- 若 `intra_part_sort_mode != none`，每个 stage 都会基于当前 residual 重新排序，而不是复用 stage1 顺序。
-- 全部 stage 训练完后，会额外做一次 decoder 联合微调。
-- 但同一类别的各个 stage 不再有单独结构参数配置，自由度只剩“stage 数量”、`joint_decoder_steps`、`joint_decoder_lr`、`joint_decoder_group_size` 和 `joint_decoder_batch_size`。
+- 排序代码已关闭，每个 stage 都保持普通切分顺序。
+- joint decoder 联合优化代码已关闭，全部 stage 训练完后不会额外微调 decoder。
+- 同一类别的各个 stage 不再有单独结构参数配置，自由度只剩“stage 数量”和共享 VAE 结构参数。
 
 ### 6.3 `steps_per_category`
 
 - 当前实现里它表示“这个类别里每个 group 训练多少步”
 - 它不是“整个类别总步数”
 
-### 6.4 `joint_decoder_steps`
+### 6.4 joint decoder 联合优化
 
-- 只在 `residual_stages > 1` 时生效。
-- 它控制“全部 stage 训练完之后”的 decoder 联合微调步数。
-- `default=none` 表示自动回退到该类别已解析的 `steps_per_category`。
-
-### 6.5 `joint_decoder_group_size`
-
-- 只在 `residual_stages > 1` 时生效。
-- 它控制联合微调阶段一次打包多少条 linear 作为子分组优化。
-- `default=none` 表示自动回退到 `linear_group_size`。
-- 当它小于训练 group 时，前面的 VAE stage 训练仍按原 group 跑，只在最后的联合微调阶段拆小。
-- 当前 `recon_loss_type=cosine` 和 `relative_l1` 不支持把联合微调 group 拆小。
-
-### 6.6 `joint_decoder_lr`
-
-- 只在 `residual_stages > 1` 且 `joint_decoder_steps > 0` 时生效。
-- 它控制“全部 stage 训练完之后”的 decoder 联合微调学习率。
-- `default=none` 表示自动回退到全局 `--lr`。
-
-### 6.7 `joint_decoder_batch_size`
-
-- 只在 `residual_stages > 1` 且 `joint_decoder_steps > 0` 时生效。
-- 它控制联合微调时每步采样多少个 block patch。
-- `default=none` 表示保持原来的 full-batch 联合优化。
-- 设置为正整数时，只支持 `intra_part_sort_mode=none`；如果开启排序会直接报错。
-- joint 阶段只优化 decoder：输入是前面各 stage 已经生成好的固定 bit/latent，encoder 不再参与。
-- patch 模式下训练日志里的 `loss` 是“当前随机 patch”的 loss，不是完整权重 loss；它可能下降，但完整权重 loss 仍可能上升。
-- `intra_part_sort_mode=none` 时，joint 阶段不需要恢复排序，直接使用 decoder 输出和目标权重 block 对齐；这样也避免 deterministic 模式下 `torch.take` 反向传播触发非确定性 `put_`。
+- joint decoder 联合优化代码已关闭。
+- `--joint_decoder_steps`、`--joint_decoder_lr`、`--joint_decoder_group_size`、`--joint_decoder_batch_size` 不再注册；传入会直接报错。
 
 ### 6.8 `eval_every` / `eval_blocks`
 
@@ -414,7 +380,7 @@
 注意：
 
 - `compressed_lora` / `both` 如果 `--lora_use_dora` 解析为 `true` 会直接报错；v1 不做 DoRA 到低秩补丁的近似 SVD。
-- `compressed_lora` / `decoder` / `both` 如果开启 `--lora_tune_final_norm` 或 `--lora_use_post_norm_head_linear` 会直接报错，避免每类后移动最终 logits 路径。
+- `compressed_lora` / `decoder` / `both` 如果开启 `--distill_tune_final_norm` 或 `--distill_use_post_norm_head_linear` 会直接报错，避免每类后移动最终 logits 路径。
 - 最终普通 cat checkpoint 不保留 `PeftVAELinearProxy`；保存前若仍有 proxy 残留会直接报错。
 
 ### 6.12 `normalize_weight`
@@ -428,7 +394,6 @@
 - `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
 - `outlier_protect_mode=channel` 且 `outlier_protect_count > 0` 时，也复用同一条动态 activation 路径
 - `outlier_protect_mode=residual_sparse` 且 `outlier_residual_score` 使用 activation 加权模式时，也复用同一条动态 activation 路径
-- `intra_part_sort_mode` 若启用 `act_spectral_cosine`，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
 ### 6.13 离群保护模式
@@ -516,7 +481,7 @@ VAE reconstruction -> low_rank patch -> sparse_residual patch
 
 ```bash
 --lora_rank default=8,after:q_proj=16 \
---lora_steps default=50,after:q_proj=200
+--distill_steps default=50,after:q_proj=200
 ```
 
 以下旧复杂语法也不再支持：
@@ -532,10 +497,10 @@ VAE reconstruction -> low_rank patch -> sparse_residual patch
 3. override 参数缺少 `default`，且当前类别没有显式值
 4. override 参数包含未知 category / after-category key
 5. 动态 activation 重算失败，导致当前 group 缺少 activation 向量
-6. `outlier_protect_mode=channel` 且 `outlier_protect_count > 0`，或 `act_spectral_cosine`，或 `residual_sparse + activation 加权 score` 启用，但当前 group 的动态 activation 采集失败
+6. `outlier_protect_mode=channel` 且 `outlier_protect_count > 0`，或 `residual_sparse + activation 加权 score` 启用，但当前 group 的动态 activation 采集失败
 7. 切分后某个 part 的展平长度无法被该类别的 `codebook_dim` 整除
 8. `linear_group_size < 1`
-9. 设置了 `joint_decoder_batch_size`，但当前类别的 `intra_part_sort_mode != none`
+9. 传入已关闭的排序或 joint decoder CLI 参数
 10. 低秩模式下 `outlier_low_rank <= 0`
 11. 低秩模式下某个 Linear 的 `outlier_low_rank > min(out_features, in_features)`
 12. 低秩模式下同时设置了非零 `outlier_protect_count` 或非零 `outlier_residual_top_p`
@@ -599,18 +564,13 @@ python tools/cat_train.py \
   --train_device cuda
 ```
 
-### 9.5 residual stages + joint decoder patch
+### 9.5 residual stages
 
 ```bash
 python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
   --convert \
   --residual_stages default=2 \
-  --intra_part_sort_mode default=none \
-  --joint_decoder_steps default=100 \
-  --joint_decoder_lr default=1e-4 \
-  --joint_decoder_group_size default=32 \
-  --joint_decoder_batch_size default=8192 \
   --eval_every 100 \
   --eval_blocks 256 \
   --train_device cuda
@@ -618,10 +578,8 @@ python tools/cat_train.py \
 
 说明：
 
-- `joint_decoder_batch_size` 表示每个 joint step 采样多少个 blocks，不是 token batch，也不是 linear 数量。
-- joint patch 模式只支持 `intra_part_sort_mode=none`。
-- joint 前后会记录完整权重重建损失；`eval_every/eval_blocks` 只控制中间评估。
-- 如果 full loss after 大于 before，说明这组 joint 超参让完整权重重建变差，应先降低 `joint_decoder_lr` 或增大 `joint_decoder_batch_size`。
+- 排序代码已关闭，不再传 `--intra_part_sort_mode`。
+- joint decoder 联合优化代码已关闭，不再传 `--joint_decoder_*`。
 
 ### 9.6 low-rank outlier protection
 
@@ -664,14 +622,14 @@ python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
   --convert \
   --distill_after_category compressed_lora \
-  --lora_dataset wiki=1.0 \
+  --distill_dataset wiki=1.0 \
   --lora_rank default=8,after:q_proj=16 \
-  --lora_steps default=50,after:q_proj=200 \
-  --lora_hidden_loss_weight default=0.01 \
-  --lora_hidden_layer_weighting linear_depth \
+  --distill_steps default=50,after:q_proj=200 \
+  --distill_hidden_loss_weight default=0.01 \
+  --distill_hidden_layer_weighting linear_depth \
   --eval_ppl true \
   --eval_tasks boolq,rte,piqa \
-  --lora_hif4_act false \
+  --distill_hif4_act false \
   --eval_hif4_act false \
   --lora_use_dora default=false
 ```
@@ -683,14 +641,14 @@ python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
   --convert \
   --distill_after_category remaining_lora \
-  --lora_dataset wiki=1.0 \
+  --distill_dataset wiki=1.0 \
   --lora_rank default=8,after:q_proj=16 \
-  --lora_steps default=50,after:q_proj=200 \
-  --lora_hidden_loss_weight default=0.01 \
-  --lora_hidden_layer_weighting linear_depth \
+  --distill_steps default=50,after:q_proj=200 \
+  --distill_hidden_loss_weight default=0.01 \
+  --distill_hidden_layer_weighting linear_depth \
   --eval_ppl true \
   --eval_tasks boolq,rte,piqa \
-  --lora_hif4_act false \
+  --distill_hif4_act false \
   --eval_hif4_act false \
   --lora_use_dora default=true,after:q_proj=false
 ```
