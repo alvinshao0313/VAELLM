@@ -64,7 +64,7 @@ python tools/cat_train.py \
   --eval_every "0" \
   --eval_blocks "256" \
   --eval_ppl "false" \
-  --eval_tasks "" \
+  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
   --outlier_protect_count "default=0" \

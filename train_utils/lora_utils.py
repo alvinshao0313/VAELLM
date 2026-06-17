@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -7,9 +8,12 @@ import torch
 from torch import nn
 
 try:
-    from transformers import AutoTokenizer, TrainingArguments
+    from transformers import AutoTokenizer, TrainerCallback, TrainingArguments
+    from transformers.trainer_callback import ProgressCallback
 except ImportError:
     AutoTokenizer = None
+    ProgressCallback = None
+    TrainerCallback = None
     TrainingArguments = None
 
 from e2e_common.post_norm_head import ensure_post_norm_head_linear, resolve_post_norm_linear
@@ -62,6 +66,77 @@ class _ResolvedDistillStageConfig:
 class _ExtraTrainableModule:
     name: str
     module: nn.Module
+
+
+class _LoraTrainerLogCallback(TrainerCallback if TrainerCallback is not None else object):
+    def __init__(self, *, logger):
+        self.logger = logger
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not bool(getattr(state, "is_world_process_zero", True)):
+            return
+        if not logs:
+            return
+        values = dict(logs)
+        values.pop("total_flos", None)
+        ordered_keys = (
+            "loss",
+            "train_loss",
+            "eval_loss",
+            "learning_rate",
+            "grad_norm",
+            "epoch",
+        )
+        parts = []
+        for key in ordered_keys:
+            if key in values:
+                parts.append(f"{key}={values.pop(key)}")
+        for key in sorted(values):
+            parts.append(f"{key}={values[key]}")
+        if not parts:
+            return
+        _log_lora_trainer_message_to_file_handlers(
+            self.logger,
+            "LoRA train: step=%s %s",
+            str(getattr(state, "global_step", "unknown")),
+            " ".join(parts),
+        )
+
+
+class _QuietProgressCallback(ProgressCallback if ProgressCallback is not None else object):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        return
+
+
+def _log_lora_trainer_message_to_file_handlers(logger, message: str, *args) -> None:
+    record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        fn="",
+        lno=0,
+        msg=message,
+        args=args,
+        exc_info=None,
+    )
+    for handler in list(getattr(logger, "handlers", [])):
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        if record.levelno < handler.level:
+            continue
+        handler.handle(record)
+
+
+def _replace_progress_log_callback(trainer):
+    if ProgressCallback is None:
+        return trainer
+    callback_handler = getattr(trainer, "callback_handler", None)
+    callbacks = getattr(callback_handler, "callbacks", None)
+    if not isinstance(callbacks, list):
+        return trainer
+    for idx, callback in enumerate(callbacks):
+        if isinstance(callback, ProgressCallback) and not isinstance(callback, _QuietProgressCallback):
+            callbacks[idx] = _QuietProgressCallback()
+    return trainer
 
 
 def _ensure_lora_stack_available() -> None:
@@ -322,6 +397,7 @@ def _build_lora_trainer(
     eval_ds,
     sft_args,
     training_args,
+    logger,
     lora_config,
     cfg: _ResolvedDistillStageConfig,
     hif4_act_controller,
@@ -334,6 +410,7 @@ def _build_lora_trainer(
         args=sft_args,
         dataset_text_field="text",
         max_seq_length=int(getattr(training_args, "distill_model_max_length", 2048)),
+        callbacks=[_LoraTrainerLogCallback(logger=logger)],
     )
     if lora_config is not None:
         trainer_kwargs["peft_config"] = lora_config
@@ -343,7 +420,7 @@ def _build_lora_trainer(
     pre_mlp_hidden_loss_enabled = float(cfg.pre_mlp_hidden_loss_weight) > 0.0
     if resolved_lora_loss not in {"", "none", "sft"} or hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
         trainer_loss_type = "sft" if resolved_lora_loss in {"", "none"} else resolved_lora_loss
-        return CustomSFTTrainer(
+        trainer = CustomSFTTrainer(
             **trainer_kwargs,
             loss_type=trainer_loss_type,
             temperature=float(cfg.temperature),
@@ -354,7 +431,9 @@ def _build_lora_trainer(
             distill_hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
         )
-    return SFTTrainer(**trainer_kwargs)
+        return _replace_progress_log_callback(trainer)
+    trainer = SFTTrainer(**trainer_kwargs)
+    return _replace_progress_log_callback(trainer)
 
 
 def _train_and_merge_lora_model(
@@ -492,6 +571,7 @@ def lora_finetune_remaining_categories(
             eval_ds=eval_ds,
             sft_args=sft_args,
             training_args=training_args,
+            logger=logger,
             lora_config=lora_config,
             cfg=cfg,
             hif4_act_controller=hif4_act_controller,

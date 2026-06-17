@@ -281,6 +281,7 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
                 eval_ds=None,
                 sft_args=object(),
                 training_args=training_args,
+                logger=SimpleNamespace(info=lambda *args, **kwargs: None),
                 lora_config=None,
                 cfg=cfg,
                 hif4_act_controller=None,

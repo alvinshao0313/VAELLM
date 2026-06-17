@@ -328,6 +328,7 @@ def _run_compressed_category_distill(
             eval_ds=eval_ds,
             sft_args=sft_args,
             training_args=training_args,
+            logger=logger,
             lora_config=None,
             cfg=cfg,
             hif4_act_controller=hif4_act_controller,

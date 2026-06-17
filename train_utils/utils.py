@@ -32,14 +32,6 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 # torch.backends.cuda.matmul.allow_tf32 = False
 # torch.backends.cudnn.allow_tf32 = False
 DEV = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-_EXTERNAL_TRAINING_LOGGER_NAMES = (
-    "transformers",
-    "transformers.trainer",
-    "trl",
-    "peft",
-    "accelerate",
-    "datasets",
-)
 
 
 def pt_fsdp_state_dict(model: torch.nn.Module):
@@ -147,35 +139,6 @@ def _add_file_handler_once(
     logger.addHandler(file_handler)
 
 
-def _attach_external_log_file_handlers(
-    *,
-    log_file: str,
-    formatter: logging.Formatter,
-    level: int,
-) -> None:
-    root_logger = logging.getLogger()
-    if root_logger.level == logging.NOTSET or root_logger.level > level:
-        root_logger.setLevel(level)
-    _add_file_handler_once(
-        root_logger,
-        log_file=log_file,
-        formatter=formatter,
-        level=level,
-    )
-
-    for logger_name in _EXTERNAL_TRAINING_LOGGER_NAMES:
-        external_logger = logging.getLogger(logger_name)
-        if external_logger.level == logging.NOTSET or external_logger.level > level:
-            external_logger.setLevel(level)
-        if not external_logger.propagate:
-            _add_file_handler_once(
-                external_logger,
-                log_file=log_file,
-                formatter=formatter,
-                level=level,
-            )
-
-
 def cleanup_memory(verbos=True) -> None:
     """Run GC and clear GPU memory."""
     import gc
@@ -228,11 +191,6 @@ def get_logger(logger_name: Optional[str]) -> logging.Logger:
         os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
         _add_file_handler_once(
             logger,
-            log_file=log_file,
-            formatter=formatter,
-            level=logging.INFO,
-        )
-        _attach_external_log_file_handlers(
             log_file=log_file,
             formatter=formatter,
             level=logging.INFO,
