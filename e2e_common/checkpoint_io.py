@@ -118,23 +118,6 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
     else:
         vq_specs = list(stage_vq_specs[0])
         decoder_specs = list(stage_decoder_specs[0])
-    stage_restore_row_specs = None
-    stage_restore_col_specs = None
-    stage_part_restore_col_specs = None
-    if residual_stages > 1:
-        stage_restore_row_specs = [
-            _tensor_spec(module.get_stage_restore_row_indices(stage_idx))
-            for stage_idx in range(residual_stages)
-        ]
-        stage_restore_col_specs = [
-            _tensor_spec(module.get_stage_restore_col_indices(stage_idx))
-            for stage_idx in range(residual_stages)
-        ]
-        stage_part_restore_col_specs = [
-            _tensor_spec(module.get_stage_part_restore_col_indices(stage_idx))
-            for stage_idx in range(residual_stages)
-        ]
-
     return {
         "name": name,
         "in_features": int(module.in_features),
@@ -157,12 +140,6 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
         "decoders": decoder_specs,
         "stage_vq_weights": stage_vq_specs if residual_stages > 1 else None,
         "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
-        "restore_row_indices": _tensor_spec(getattr(module, "restore_row_indices", None)),
-        "restore_col_indices": _tensor_spec(getattr(module, "restore_col_indices", None)),
-        "part_restore_col_indices": _tensor_spec(getattr(module, "part_restore_col_indices", None)),
-        "stage_restore_row_indices": stage_restore_row_specs,
-        "stage_restore_col_indices": stage_restore_col_specs,
-        "stage_part_restore_col_indices": stage_part_restore_col_specs,
         "protected_input_indices": _tensor_spec(getattr(module, "protected_input_indices", None)),
         "protected_input_weight": _tensor_spec(getattr(module, "protected_input_weight", None)),
         "protected_output_indices": _tensor_spec(getattr(module, "protected_output_indices", None)),

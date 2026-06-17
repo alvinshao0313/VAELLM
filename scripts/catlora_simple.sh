@@ -59,13 +59,13 @@ python tools/cat_train.py \
   --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
-  --steps_per_category "default=10000" \
+  --steps_per_category "default=1" \
   --batch_size "8192" \
   --log_every "100" \
   --eval_every "0" \
   --eval_blocks "256" \
   --eval_ppl "false" \
-  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
+  --eval_tasks "" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
   --outlier_protect_count "default=0" \
@@ -118,7 +118,7 @@ python tools/cat_train.py \
   --lora_rank "default=128" \
   --lora_alpha "default=2896" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=5000" \
+  --distill_steps "default=5" \
   --distill_batch_size "default=1" \
   --distill_nsamples "default=20000" \
   --distill_lr "default=1e-4" \

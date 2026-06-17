@@ -482,21 +482,6 @@ def _build_vae_linear_from_stage_payload(
         parallel_parts=int(parallel_parts),
         parallel_rows=int(parallel_rows),
         parallel_cols=int(parallel_cols),
-        restore_row_indices=split_meta.restore_row_indices,
-        restore_col_indices=split_meta.restore_col_indices,
-        part_restore_col_indices=split_meta.part_restore_col_indices,
-        stage_restore_row_indices=[
-            None if getattr(meta, "restore_row_indices", None) is None else meta.restore_row_indices
-            for meta in stage_split_metas
-        ],
-        stage_restore_col_indices=[
-            None if getattr(meta, "restore_col_indices", None) is None else meta.restore_col_indices
-            for meta in stage_split_metas
-        ],
-        stage_part_restore_col_indices=[
-            None if getattr(meta, "part_restore_col_indices", None) is None else meta.part_restore_col_indices
-            for meta in stage_split_metas
-        ],
         compressed_in_features=int(split_meta.compressed_in_features),
         compressed_out_features=int(split_meta.compressed_out_features),
         protected_input_indices=split_meta.protected_input_indices,

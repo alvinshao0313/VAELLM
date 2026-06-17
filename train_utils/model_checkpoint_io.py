@@ -395,40 +395,6 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
             vq_specs = list(stage_vq_specs[0])
             decoder_specs = list(stage_decoder_specs[0])
 
-        restore_idx = getattr(module, "restore_row_indices", None)
-        restore_spec = None
-        if isinstance(restore_idx, torch.Tensor):
-            restore_spec = {
-                "shape": list(restore_idx.shape),
-                "dtype": _dtype_to_name(restore_idx.dtype),
-            }
-        restore_col_idx = getattr(module, "restore_col_indices", None)
-        restore_col_spec = None
-        if isinstance(restore_col_idx, torch.Tensor):
-            restore_col_spec = {
-                "shape": list(restore_col_idx.shape),
-                "dtype": _dtype_to_name(restore_col_idx.dtype),
-            }
-        part_restore_col_idx = getattr(module, "part_restore_col_indices", None)
-        part_restore_col_spec = None
-        if isinstance(part_restore_col_idx, torch.Tensor):
-            part_restore_col_spec = {
-                "shape": list(part_restore_col_idx.shape),
-                "dtype": _dtype_to_name(part_restore_col_idx.dtype),
-            }
-        stage_restore_row_specs = None
-        stage_restore_col_specs = None
-        stage_part_restore_col_specs = None
-        if residual_stages > 1:
-            stage_restore_row_specs = _tensor_spec_list(
-                [module.get_stage_restore_row_indices(stage_idx) for stage_idx in range(residual_stages)]
-            )
-            stage_restore_col_specs = _tensor_spec_list(
-                [module.get_stage_restore_col_indices(stage_idx) for stage_idx in range(residual_stages)]
-            )
-            stage_part_restore_col_specs = _tensor_spec_list(
-                [module.get_stage_part_restore_col_indices(stage_idx) for stage_idx in range(residual_stages)]
-            )
         protected_idx = getattr(module, "protected_input_indices", None)
         protected_idx_spec = None
         if isinstance(protected_idx, torch.Tensor):
@@ -483,12 +449,6 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "decoders": decoder_specs,
                 "stage_vq_weights": stage_vq_specs if residual_stages > 1 else None,
                 "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
-                "restore_row_indices": restore_spec,
-                "restore_col_indices": restore_col_spec,
-                "part_restore_col_indices": part_restore_col_spec,
-                "stage_restore_row_indices": stage_restore_row_specs,
-                "stage_restore_col_indices": stage_restore_col_specs,
-                "stage_part_restore_col_indices": stage_part_restore_col_specs,
                 "protected_input_indices": protected_idx_spec,
                 "protected_input_weight": protected_weight_spec,
                 "protected_output_indices": protected_out_idx_spec,
@@ -841,12 +801,6 @@ def _rebuild_converted_modules(
         #                 device=device,
         #             )
         #         )
-        restore_payload = None
-        restore_col_payload = None
-        part_restore_col_payload = None
-        stage_restore_row_payload = None
-        stage_restore_col_payload = None
-        stage_part_restore_col_payload = None
         protected_idx_payload = None
         protected_idx_spec = spec.get("protected_input_indices")
         if isinstance(protected_idx_spec, dict):
@@ -1012,12 +966,6 @@ def _rebuild_converted_modules(
             parallel_parts=parallel_parts,
             parallel_rows=int(spec.get("parallel_rows", parallel_parts)),
             parallel_cols=int(spec.get("parallel_cols", 1)),
-            restore_row_indices=restore_payload,
-            restore_col_indices=restore_col_payload,
-            part_restore_col_indices=part_restore_col_payload,
-            stage_restore_row_indices=stage_restore_row_payload,
-            stage_restore_col_indices=stage_restore_col_payload,
-            stage_part_restore_col_indices=stage_part_restore_col_payload,
             compressed_in_features=int(spec.get("compressed_in_features", spec["in_features"])),
             compressed_out_features=int(spec.get("compressed_out_features", spec["out_features"])),
             protected_input_indices=protected_idx_payload,

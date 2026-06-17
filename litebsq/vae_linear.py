@@ -50,12 +50,8 @@ class VAELinear(nn.Module):
         parallel_parts: int = 1,
         parallel_rows: Optional[int] = None,
         parallel_cols: Optional[int] = None,
-        restore_row_indices: Optional[torch.Tensor] = None,
-        restore_col_indices: Optional[torch.Tensor] = None,
-        part_restore_col_indices: Optional[torch.Tensor] = None,
-        stage_restore_row_indices: Optional[Sequence[Optional[torch.Tensor]]] = None,
-        stage_restore_col_indices: Optional[Sequence[Optional[torch.Tensor]]] = None,
-        stage_part_restore_col_indices: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        # 排序代码，已关闭：不再接受 restore_row_indices / restore_col_indices /
+        # part_restore_col_indices / stage_* restore 参数。
         compressed_in_features: Optional[int] = None,
         compressed_out_features: Optional[int] = None,
         protected_input_indices: Optional[torch.Tensor] = None,
@@ -148,8 +144,9 @@ class VAELinear(nn.Module):
             raise ValueError(
                 f"split_cols={split_cols} not divisible by parallel_cols={self.parallel_cols}"
             )
-        if restore_row_indices is not None or restore_col_indices is not None:
-            raise ValueError("排序代码已关闭；VAELinear 不再接受 restore_row_indices / restore_col_indices。")
+        # 排序代码，已关闭。旧全局 restore 参数校验保留如下；参数已从活动签名移除。
+        # if restore_row_indices is not None or restore_col_indices is not None:
+        #     raise ValueError("排序代码已关闭；VAELinear 不再接受 restore_row_indices / restore_col_indices。")
         # 排序代码，已关闭。旧全局 restore 注册逻辑保留如下：
         # if restore_row_indices is None:
         #     self.register_buffer("restore_row_indices", None, persistent=True)
@@ -180,8 +177,9 @@ class VAELinear(nn.Module):
         self.register_buffer("restore_row_indices", None, persistent=True)
         self.register_buffer("restore_col_indices", None, persistent=True)
         cols_per_part = split_cols // self.parallel_cols
-        if part_restore_col_indices is not None:
-            raise ValueError("排序代码已关闭；VAELinear 不再接受 part_restore_col_indices。")
+        # 排序代码，已关闭。旧 part restore 参数校验保留如下；参数已从活动签名移除。
+        # if part_restore_col_indices is not None:
+        #     raise ValueError("排序代码已关闭；VAELinear 不再接受 part_restore_col_indices。")
         # 排序代码，已关闭。旧 part restore 注册逻辑保留如下：
         # if part_restore_col_indices is None:
         #     self.register_buffer("part_restore_col_indices", None, persistent=True)
@@ -688,12 +686,13 @@ class VAELinear(nn.Module):
         # Keep legacy scalar field for compatibility.
         self.codebook_dim = int(self.stage_codebook_dims[0])
 
-        if (
-            stage_restore_row_indices is not None
-            or stage_restore_col_indices is not None
-            or stage_part_restore_col_indices is not None
-        ):
-            raise ValueError("排序代码已关闭；VAELinear 不再接受 stage restore indices。")
+        # 排序代码，已关闭。旧多 stage restore 参数校验保留如下；参数已从活动签名移除。
+        # if (
+        #     stage_restore_row_indices is not None
+        #     or stage_restore_col_indices is not None
+        #     or stage_part_restore_col_indices is not None
+        # ):
+        #     raise ValueError("排序代码已关闭；VAELinear 不再接受 stage restore indices。")
         # 排序代码，已关闭。旧多 stage restore 校验和注册逻辑保留如下：
         # normalized_stage_restore_rows = self._normalize_optional_stage_tensor_payload(
         #     stage_restore_row_indices,

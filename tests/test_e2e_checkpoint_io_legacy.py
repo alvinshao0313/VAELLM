@@ -8,7 +8,7 @@ from unittest import mock
 import torch
 from torch import nn
 
-from e2e_common.checkpoint_io import _remap_legacy_decoder_keys_if_needed
+from e2e_common.checkpoint_io import _collect_single_vae_linear_spec, _remap_legacy_decoder_keys_if_needed
 from litebsq.autoencoder import Decoder
 from litebsq.bitpack import (
     build_bitpack_u8_spec,
@@ -20,8 +20,19 @@ from tools.convert_cat_checkpoint_to_bitpack import convert_checkpoint
 from train_utils.model_checkpoint_io import (
     _build_distributed_run_output_dir,
     _decoder_to_spec,
+    _collect_vae_linear_specs,
     load_checkpoint_into_model,
     save_model_checkpoint,
+)
+
+
+_DISABLED_SORT_RESTORE_FIELDS = (
+    "restore_row_indices",
+    "restore_col_indices",
+    "part_restore_col_indices",
+    "stage_restore_row_indices",
+    "stage_restore_col_indices",
+    "stage_part_restore_col_indices",
 )
 
 
@@ -212,6 +223,18 @@ class VAELinearBitpackTest(unittest.TestCase):
 
 
 class CheckpointBitpackIOTest(unittest.TestCase):
+    def test_new_checkpoint_specs_omit_disabled_sort_restore_fields(self):
+        layer, _, _ = _build_single_stage_vae_linear()
+        model = _DummyModel()
+        model.proj = layer
+
+        cat_spec = _collect_vae_linear_specs(model)[0]
+        e2e_spec = _collect_single_vae_linear_spec("proj", layer)
+
+        for field_name in _DISABLED_SORT_RESTORE_FIELDS:
+            self.assertNotIn(field_name, cat_spec)
+            self.assertNotIn(field_name, e2e_spec)
+
     def test_save_and_load_checkpoint_uses_packed_uint8(self):
         layer, _, _ = _build_single_stage_vae_linear()
         model = _DummyModel()
