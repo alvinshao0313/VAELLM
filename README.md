@@ -11,12 +11,6 @@ conda activate bitvae
 export PYTHONPATH=.
 ```
 
-如果你不想切环境，也可以直接用：
-
-```bash
-/home/shaoyuantian/anaconda3/bin/conda run -n bitvae python ...
-```
-
 ## 主要入口
 
 - `scripts/catlora_simple.sh`
@@ -27,30 +21,14 @@ export PYTHONPATH=.
 - `scripts/eval.sh`
   - 入口：`tools/cat_eval.py`
   - 用途：对保存好的 checkpoint 做 PPL 和 lm-eval
-- `dense_e2e_fintuning/scripts/e2e_dense_lora.sh`
-  - 压缩模型 checkpoint（`S`）重建 dense 模型（`C`）后做标准 PEFT 蒸馏
-  - 入口参数是 `--student_checkpoint_dir`，不接受 `--student_model_path`
-  - `--decode_device auto` 会按当前进程可见设备解析：单卡可见时用 `cuda:0`，多卡可见时按 `LOCAL_RANK` 选卡
-  - `--dataset_num_proc` 控制数据预处理阶段的 `datasets.map(num_proc=...)`
-  - 多卡下只有主进程先做数据预处理并写 cache，其他 rank 等待后复用
-  - `--eval_strategy no` 会直接跳过 eval 数据的 prepare/tokenize/pack
-  - 默认是单数据源脚本（可按需改 `--dataset_mix`）
-  - 默认导出 `final_adapter/` + `run_meta.json` + `final_adapter/dense_adapter_meta.json`
-- `vae_e2e_fintuning/scripts/e2e_vae_decoder.sh`
+- `compressed_e2e_fintuning/scripts/e2e_decoder.sh`
   - 压缩模型 checkpoint 直接训练 VAELinear 内部参数，最终仍保存压缩 `final_model/`
-  - 支持 `--vae_train_mode decoder|low_rank|both`
-  - 三种模式说明见 `vae_e2e_fintuning/README.md`
-- `raw_e2e_fintuning/scripts/e2e_raw_lora.sh`
-  - 原模型（非 VAE）LoRA 基线
-  - 入口参数是 `--student_model_path`，不接受 `--student_checkpoint_dir`
-  - LoRA/AdaLoRA 参数名用 `--lora_*`、`--adalora_*`，不再使用 `--vae_*`
-  - 最终保存为 HF/PEFT 目录：`final_adapter/`、`run_meta.json`
-- `raw_e2e_fintuning/scripts/e2e_raw_lora_mix.sh`
-  - 原模型（非 VAE）mixed-dataset LoRA 基线
-  - 默认混合池：`openorca=0.45,fineweb_edu=0.30,race=0.15,sciq=0.07,alpaca=0.03`
-  - LoRA/AdaLoRA 参数名用 `--lora_*`、`--adalora_*`，不再使用 `--vae_*`
-  - 同样支持 `--dataset_num_proc`、主进程优先预处理、以及 `--eval_strategy no` 跳过 eval 预处理
-  - 同样保存为 HF/PEFT 格式
+  - 入口参数是 `--student_checkpoint_dir`，不接受 `--student_model_path`
+  - 支持 `--finetune_mode decoder|lora|both`
+  - `lora` 模式训练 checkpoint 内已有 `low_rank_a/b` 并写回压缩模型，不保存 PEFT adapter
+  - 三种模式说明见 `compressed_e2e_fintuning/README.md`
+- `compressed_e2e_fintuning/scripts/e2e_choice_kd.sh`
+  - 压缩模型 MCQA choice-KD 端到端微调脚本
 - `tools/convert_legacy_checkpoint.py`
   - 把旧格式 e2e checkpoint 转成当前紧凑格式
 - `tools/convert_cat_checkpoint_to_bitpack.py`
@@ -66,18 +44,10 @@ export PYTHONPATH=.
 bash scripts/catlora_simple.sh
 ```
 
-2. 如果是压缩 checkpoint（`S`），使用 dense e2e 继续训练：
+2. 如果需要继续端到端微调压缩 checkpoint，使用 compressed e2e：
 
 ```bash
-bash dense_e2e_fintuning/scripts/e2e_dense_lora.sh
-```
-
-如果你要直接训练原始模型（不经过 VAE 压缩）：
-
-```bash
-bash raw_e2e_fintuning/scripts/e2e_raw_lora.sh
-# 或
-bash raw_e2e_fintuning/scripts/e2e_raw_lora_mix.sh
+bash compressed_e2e_fintuning/scripts/e2e_decoder.sh
 ```
 
 3. 最后评估：
@@ -101,7 +71,7 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - `scripts/release/*`
   - `scripts/lbl_train_tools.sh`
   - `scripts/train_linear_by_category.sh`
-- `cat_train -> dense_e2e_fintuning -> cat_eval` 是压缩模型的推荐链路。
+- `cat_train -> compressed_e2e_fintuning -> cat_eval` 是压缩模型的推荐链路。
 - 当前 `cat_train` 保存的 `final_model/` 是 packed cat checkpoint：
   - `checkpoint_meta.json` 版本为 `5`
   - `vq_weight*` 现在按 `uint8 bit-pack` 落盘，不再按 `torch.bool` 一字节存
@@ -115,16 +85,11 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - `post_vae_low_rank`：VAE 训练完成后，对最终重建残差做 rank-k SVD 补丁
 - 推理时 `VAELinear` 的权重重建顺序固定为：
   - `VAE reconstruction -> low_rank patch -> sparse_residual patch`
-- `raw_e2e_fintuning` 是原始模型独立训练链路，输入输出保持 HF/PEFT 格式。
-- 两条训练轨完全隔离，不互相 import：
-  - `dense_e2e_fintuning`：输入 `--student_checkpoint_dir`，输出 `final_adapter/` + `run_meta.json`
-  - `raw_e2e_fintuning`：输入 `--student_model_path`，输出 `final_adapter/` + `run_meta.json`（可选 `final_merged_model/`）
-- `dense_e2e_fintuning` 可以直接加载当前 `tools/cat_train.py` 产出的 packed cat checkpoint；部分历史 decoder key 布局在加载时仍会自动 remap。
-- `dense_e2e_fintuning` 的 `decode_device=auto` 不再等价于“统一 0 卡”：
-  - 当前进程只看见 1 张卡：解析到 `cuda:0`
-  - 当前进程看见多张卡：解析到 `cuda:{LOCAL_RANK}`
-  - 如果想强制固定设备，请显式传 `cuda:N`
-- `dense_e2e_fintuning` 和 `raw_e2e_fintuning` 现在都支持 `--dataset_num_proc`：
+- `compressed_e2e_fintuning` 是唯一的压缩 checkpoint 端到端训练入口：
+  - `decoder`：训练 VAELinear decoder
+  - `lora`：训练已有低秩分支并写回 `low_rank_a/b`
+  - `both`：同时训练 decoder 和低秩分支
+- `compressed_e2e_fintuning` 支持 `--dataset_num_proc`：
   - 只影响数据预处理阶段的 `datasets.map(num_proc=...)`
   - 不影响 DataLoader worker，不影响训练并行
   - 多卡时用 `main_process_first` 让主进程先构建 datasets cache，其余 rank 复用

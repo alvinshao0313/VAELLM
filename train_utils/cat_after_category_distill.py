@@ -305,7 +305,11 @@ def _run_compressed_category_distill(
             return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
         resolved_lora_loss = str(cfg.loss_type).strip().lower()
-        use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"} or float(cfg.hidden_loss_weight) > 0.0
+        use_custom_trainer = (
+            resolved_lora_loss not in {"", "none", "sft"}
+            or float(cfg.hidden_loss_weight) > 0.0
+            or float(cfg.pre_mlp_hidden_loss_weight) > 0.0
+        )
         _log_lora_stage_start(
             logger=logger,
             cfg=cfg,

@@ -492,7 +492,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             adapter_config.get("modules_to_save"),
             str(adapter_has_post_norm_head),
         )
-        from dense_e2e_fintuning.checkpoint_bridge import build_dense_model_from_checkpoint
+        from e2e_common.compressed_dense_bridge import build_dense_model_from_checkpoint
         from e2e_common.post_norm_head import (
             ensure_post_norm_head_linear,
             fuse_post_norm_head_linear,

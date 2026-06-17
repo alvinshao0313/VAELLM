@@ -111,6 +111,83 @@ def compute_distill_hidden_alignment_loss(
     return (stacked * weights).mean()
 
 
+def compute_distill_pre_mlp_hidden_alignment_loss(
+    *,
+    teacher_pre_mlp_hiddens: Sequence[torch.Tensor],
+    student_pre_mlp_hiddens: Sequence[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    layer_weighting: str,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if teacher_pre_mlp_hiddens is None or student_pre_mlp_hiddens is None:
+        raise ValueError("Pre-MLP hidden states are required when pre-MLP hidden alignment loss is enabled.")
+    if len(teacher_pre_mlp_hiddens) != len(student_pre_mlp_hiddens):
+        raise ValueError(
+            "Teacher/student pre-MLP hidden state counts differ: "
+            f"{len(teacher_pre_mlp_hiddens)} vs {len(student_pre_mlp_hiddens)}."
+        )
+    if len(teacher_pre_mlp_hiddens) == 0:
+        raise ValueError("Pre-MLP hidden states must include at least one transformer block.")
+
+    layer_losses: List[torch.Tensor] = []
+    for layer_idx, (teacher_hidden, student_hidden) in enumerate(
+        zip(teacher_pre_mlp_hiddens, student_pre_mlp_hiddens)
+    ):
+        if tuple(teacher_hidden.shape) != tuple(student_hidden.shape):
+            raise ValueError(
+                f"Teacher/student pre-MLP hidden shape mismatch at block layer {layer_idx}: "
+                f"{tuple(teacher_hidden.shape)} vs {tuple(student_hidden.shape)}."
+            )
+        teacher_hidden = teacher_hidden.detach()
+        diff = student_hidden.float() - teacher_hidden.float()
+        numerator = _masked_mean_square(diff, attention_mask)
+        denominator = _masked_mean_square(teacher_hidden, attention_mask)
+        layer_losses.append(numerator / (denominator + float(eps)))
+
+    stacked = torch.stack(layer_losses)
+    weights = build_distill_hidden_layer_weights(
+        num_layers=len(layer_losses),
+        layer_weighting=layer_weighting,
+        device=stacked.device,
+        dtype=stacked.dtype,
+    )
+    return (stacked * weights).mean()
+
+
+@contextmanager
+def capture_pre_mlp_hiddens(model: nn.Module):
+    qwen_model = getattr(model, "model", None)
+    layers = getattr(qwen_model, "layers", None)
+    if layers is None:
+        raise ValueError("pre-MLP hidden alignment requires model.model.layers.")
+
+    captured: List[torch.Tensor] = []
+    handles = []
+
+    for layer_idx, layer in enumerate(layers):
+        module = getattr(layer, "post_attention_layernorm", None)
+        if not isinstance(module, nn.Module):
+            raise ValueError(
+                "pre-MLP hidden alignment requires every model.model.layers[*] "
+                f"to expose post_attention_layernorm; missing at layer {layer_idx}."
+            )
+
+        def hook(_module, inputs, _layer_idx=layer_idx):
+            if not inputs:
+                raise RuntimeError(f"post_attention_layernorm pre-hook at layer {_layer_idx} received no inputs.")
+            captured.append(inputs[0])
+
+        handles.append(module.register_forward_pre_hook(hook))
+
+    if not handles:
+        raise ValueError("pre-MLP hidden alignment requires at least one model.model.layers entry.")
+
+    try:
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
+
 
 def ensure_lora_training_stack_available() -> None:
     if LoraConfig is None or TaskType is None or get_peft_model is None:
@@ -169,7 +246,8 @@ else:
             temperature: float = 1.0,
             loss_alpha: float = 0.5,
             hidden_loss_weight: float = 0.0,
-            hidden_layer_weighting: str = "uniform",
+            pre_mlp_hidden_loss_weight: float = 0.0,
+            hidden_alignment_layer_weighting: str = "uniform",
             distill_hif4_act_controller: Optional[Hif4ActController] = None,
             teacher_param_snapshots: Optional[Sequence[Tuple[nn.Parameter, torch.Tensor]]] = None,
             **kwargs,
@@ -181,10 +259,15 @@ else:
             self.hidden_loss_weight = float(hidden_loss_weight)
             if self.hidden_loss_weight < 0.0:
                 raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
-            self.hidden_layer_weighting = str(hidden_layer_weighting).strip().lower()
-            if self.hidden_layer_weighting not in _DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES:
+            self.pre_mlp_hidden_loss_weight = float(pre_mlp_hidden_loss_weight)
+            if self.pre_mlp_hidden_loss_weight < 0.0:
                 raise ValueError(
-                    f"Unsupported hidden_layer_weighting: {hidden_layer_weighting}. "
+                    f"pre_mlp_hidden_loss_weight must be >= 0, got {self.pre_mlp_hidden_loss_weight}."
+                )
+            self.hidden_alignment_layer_weighting = str(hidden_alignment_layer_weighting).strip().lower()
+            if self.hidden_alignment_layer_weighting not in _DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES:
+                raise ValueError(
+                    f"Unsupported hidden_alignment_layer_weighting: {hidden_alignment_layer_weighting}. "
                     f"Supported: {', '.join(_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
                 )
             self.distill_hif4_act_controller = distill_hif4_act_controller
@@ -194,6 +277,7 @@ else:
             args = self.args
             loss_type = self.loss_type
             hidden_loss_enabled = float(self.hidden_loss_weight) > 0.0
+            pre_mlp_hidden_loss_enabled = float(self.pre_mlp_hidden_loss_weight) > 0.0
             teacher_inputs = dict(inputs)
             teacher_inputs.pop("labels", None)
             student_inputs = dict(inputs)
@@ -219,6 +303,8 @@ else:
             hif4_act_controller = self.distill_hif4_act_controller
             previous_hif4_enabled = bool(getattr(hif4_act_controller, "enabled", False))
             peft_model_for_teacher = unwrapped_model if isinstance(unwrapped_model, PeftModel) else model
+            teacher_pre_mlp_hiddens = None
+            student_pre_mlp_hiddens = None
 
             def set_temporary(temporary: bool) -> None:
                 for module in temporary_modules:
@@ -267,6 +353,7 @@ else:
 
             @torch.no_grad()
             def get_ori_outputs():
+                nonlocal teacher_pre_mlp_hiddens
                 set_temporary(False)
                 set_hif4_act_enabled(False)
                 adapter_context = (
@@ -274,29 +361,49 @@ else:
                     if hasattr(peft_model_for_teacher, "disable_adapter")
                     else nullcontext()
                 )
-                with adapter_context, teacher_param_context():
+                pre_mlp_context = capture_pre_mlp_hiddens(unwrapped_model) if pre_mlp_hidden_loss_enabled else nullcontext()
+                with adapter_context, teacher_param_context(), pre_mlp_context as captured_pre_mlp:
                     outputs = model(**teacher_inputs, output_hidden_states=hidden_loss_enabled)
+                if pre_mlp_hidden_loss_enabled:
+                    teacher_pre_mlp_hiddens = tuple(captured_pre_mlp)
                 return outputs
 
             def student_forward(model_inputs):
-                if hidden_loss_enabled:
-                    return model(**model_inputs, output_hidden_states=True)
-                return model(**model_inputs)
+                nonlocal student_pre_mlp_hiddens
+                pre_mlp_context = capture_pre_mlp_hiddens(unwrapped_model) if pre_mlp_hidden_loss_enabled else nullcontext()
+                with pre_mlp_context as captured_pre_mlp:
+                    if hidden_loss_enabled:
+                        outputs = model(**model_inputs, output_hidden_states=True)
+                    else:
+                        outputs = model(**model_inputs)
+                if pre_mlp_hidden_loss_enabled:
+                    student_pre_mlp_hiddens = tuple(captured_pre_mlp)
+                return outputs
 
             def add_hidden_alignment_loss(loss, teacher_outputs, student_outputs):
-                if not hidden_loss_enabled:
-                    return loss
-                hidden_loss = compute_distill_hidden_alignment_loss(
-                    teacher_hidden_states=teacher_outputs.hidden_states,
-                    student_hidden_states=student_outputs.hidden_states,
-                    attention_mask=full_inputs.get("attention_mask"),
-                    layer_weighting=self.hidden_layer_weighting,
-                )
-                return loss + float(self.hidden_loss_weight) * hidden_loss
+                if hidden_loss_enabled:
+                    hidden_loss = compute_distill_hidden_alignment_loss(
+                        teacher_hidden_states=teacher_outputs.hidden_states,
+                        student_hidden_states=student_outputs.hidden_states,
+                        attention_mask=full_inputs.get("attention_mask"),
+                        layer_weighting=self.hidden_alignment_layer_weighting,
+                    )
+                    loss = loss + float(self.hidden_loss_weight) * hidden_loss
+                if pre_mlp_hidden_loss_enabled:
+                    if teacher_pre_mlp_hiddens is None or student_pre_mlp_hiddens is None:
+                        raise RuntimeError("pre-MLP hidden alignment requires teacher and student captured hiddens.")
+                    pre_mlp_hidden_loss = compute_distill_pre_mlp_hidden_alignment_loss(
+                        teacher_pre_mlp_hiddens=teacher_pre_mlp_hiddens,
+                        student_pre_mlp_hiddens=student_pre_mlp_hiddens,
+                        attention_mask=full_inputs.get("attention_mask"),
+                        layer_weighting=self.hidden_alignment_layer_weighting,
+                    )
+                    loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
+                return loss
 
             try:
                 if loss_type in {"origin", "sft"}:
-                    if hidden_loss_enabled:
+                    if hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
                         teacher_outputs = get_ori_outputs()
                         prepare_student_path()
                         outputs = student_forward(full_inputs)

@@ -1708,6 +1708,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         (cat_args.distill_loss_alpha, "--distill_loss_alpha"),
         (cat_args.distill_loss_type, "--distill_loss_type"),
         (cat_args.distill_hidden_loss_weight, "--distill_hidden_loss_weight"),
+        (cat_args.distill_pre_mlp_hidden_loss_weight, "--distill_pre_mlp_hidden_loss_weight"),
         (cat_args.lora_use_dora, "--lora_use_dora"),
     )
     for table, arg_name in distill_tables:
@@ -1913,15 +1914,15 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         )
         log.info("Saved normalized parameter snapshot: %s", snapshot_path)
         lora_round_idx = 0
-        any_lora_after_overrides = any(table.is_override_enabled() for table, _ in lora_tables)
-        if any_lora_after_overrides:
+        any_distill_after_overrides = any(table.is_override_enabled() for table, _ in distill_tables)
+        if any_distill_after_overrides:
             log.info(
-                "LoRA after-category overrides enabled: keys=%s",
+                "Distill after-category overrides enabled: keys=%s",
                 ",".join(
                     sorted(
                         {
                             key
-                            for table, _arg_name in lora_tables
+                            for table, _arg_name in distill_tables
                             for key in table.by_after_category.keys()
                         }
                     )

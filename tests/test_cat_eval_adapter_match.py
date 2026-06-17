@@ -2,14 +2,18 @@ import argparse
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from tools.cat_eval import _compute_checkpoint_fingerprint, _validate_adapter_checkpoint_match
+from train_utils import lora_utils
 from train_utils.cat_train_args import process_cat_train_args, resolve_distill_runtime_config
 from train_utils.lora_training import (
     build_distill_hidden_layer_weights,
     compute_distill_hidden_alignment_loss,
+    compute_distill_pre_mlp_hidden_alignment_loss,
 )
 
 
@@ -68,33 +72,45 @@ class CatDistillHiddenArgsTest(unittest.TestCase):
         cfg = resolve_distill_runtime_config(cat_args, after_category=None)
 
         self.assertEqual(cfg.hidden_loss_weight, 0.0)
-        self.assertEqual(cfg.hidden_layer_weighting, "uniform")
+        self.assertEqual(cfg.pre_mlp_hidden_loss_weight, 0.0)
+        self.assertEqual(cfg.hidden_alignment_layer_weighting, "uniform")
 
     def test_distill_hidden_loss_resolves_after_category_overrides(self):
         cat_args, _hf_args, _training_args, _vae_args = process_cat_train_args(
             [
                 "--distill_hidden_loss_weight",
                 "default=0.01,after:q_proj=0.02",
-                "--distill_hidden_layer_weighting",
+                "--distill_pre_mlp_hidden_loss_weight",
+                "default=0.0,after:o_proj=0.01",
+                "--distill_hidden_alignment_layer_weighting",
                 "linear_depth",
             ]
         )
 
         default_cfg = resolve_distill_runtime_config(cat_args, after_category=None)
         q_proj_cfg = resolve_distill_runtime_config(cat_args, after_category="q_proj")
+        o_proj_cfg = resolve_distill_runtime_config(cat_args, after_category="o_proj")
 
         self.assertEqual(default_cfg.hidden_loss_weight, 0.01)
         self.assertEqual(q_proj_cfg.hidden_loss_weight, 0.02)
-        self.assertEqual(default_cfg.hidden_layer_weighting, "linear_depth")
-        self.assertEqual(q_proj_cfg.hidden_layer_weighting, "linear_depth")
+        self.assertEqual(default_cfg.pre_mlp_hidden_loss_weight, 0.0)
+        self.assertEqual(q_proj_cfg.pre_mlp_hidden_loss_weight, 0.0)
+        self.assertEqual(o_proj_cfg.pre_mlp_hidden_loss_weight, 0.01)
+        self.assertEqual(default_cfg.hidden_alignment_layer_weighting, "linear_depth")
+        self.assertEqual(q_proj_cfg.hidden_alignment_layer_weighting, "linear_depth")
+        self.assertEqual(o_proj_cfg.hidden_alignment_layer_weighting, "linear_depth")
 
     def test_distill_hidden_loss_rejects_negative_weight(self):
         with self.assertRaises(argparse.ArgumentTypeError):
             process_cat_train_args(["--distill_hidden_loss_weight", "default=-0.01"])
 
+    def test_distill_pre_mlp_hidden_loss_rejects_negative_weight(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            process_cat_train_args(["--distill_pre_mlp_hidden_loss_weight", "default=-0.01"])
+
     def test_distill_hidden_loss_rejects_unknown_weighting(self):
         with self.assertRaises(argparse.ArgumentTypeError):
-            process_cat_train_args(["--distill_hidden_layer_weighting", "quadratic"])
+            process_cat_train_args(["--distill_hidden_alignment_layer_weighting", "quadratic"])
 
 
 class CatDistillHiddenLossTest(unittest.TestCase):
@@ -175,6 +191,107 @@ class CatDistillHiddenLossTest(unittest.TestCase):
             dtype=torch.float32,
         )
         self.assertTrue(torch.allclose(loss, expected_weights[1] / 2.0))
+
+    def test_pre_mlp_hidden_loss_uses_captured_layer_inputs(self):
+        teacher = (
+            torch.ones(1, 2, 1),
+            torch.full((1, 2, 1), 2.0),
+        )
+        student = (
+            torch.full((1, 2, 1), 2.0),
+            torch.full((1, 2, 1), 4.0),
+        )
+
+        loss = compute_distill_pre_mlp_hidden_alignment_loss(
+            teacher_pre_mlp_hiddens=teacher,
+            student_pre_mlp_hiddens=student,
+            attention_mask=torch.ones(1, 2),
+            layer_weighting="uniform",
+        )
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(1.0)))
+
+    def test_pre_mlp_hidden_loss_attention_mask_excludes_padding_tokens(self):
+        teacher = (torch.tensor([[[1.0], [10.0]]]),)
+        student = (torch.tensor([[[2.0], [100.0]]]),)
+
+        loss = compute_distill_pre_mlp_hidden_alignment_loss(
+            teacher_pre_mlp_hiddens=teacher,
+            student_pre_mlp_hiddens=student,
+            attention_mask=torch.tensor([[1, 0]]),
+            layer_weighting="uniform",
+        )
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(1.0)))
+
+    def test_pre_mlp_hidden_loss_uses_linear_depth_weights(self):
+        teacher = (
+            torch.ones(1, 1, 1),
+            torch.ones(1, 1, 1),
+        )
+        student = (
+            torch.ones(1, 1, 1),
+            torch.full((1, 1, 1), 2.0),
+        )
+
+        loss = compute_distill_pre_mlp_hidden_alignment_loss(
+            teacher_pre_mlp_hiddens=teacher,
+            student_pre_mlp_hiddens=student,
+            attention_mask=None,
+            layer_weighting="linear_depth",
+        )
+
+        expected_weights = build_distill_hidden_layer_weights(
+            num_layers=2,
+            layer_weighting="linear_depth",
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        self.assertTrue(torch.allclose(loss, expected_weights[1] / 2.0))
+
+
+class CatDistillTrainerSelectionTest(unittest.TestCase):
+    def test_pre_mlp_hidden_loss_uses_custom_trainer_for_sft_loss(self):
+        captured_kwargs = {}
+
+        class FakeCustomTrainer:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+        class FakeSFTTrainer:
+            def __init__(self, **_kwargs):
+                raise AssertionError("SFTTrainer should not be selected when pre-MLP hidden loss is enabled.")
+
+        cfg = SimpleNamespace(
+            loss_type="sft",
+            temperature=1.0,
+            loss_alpha=0.5,
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.01,
+            hidden_alignment_layer_weighting="uniform",
+        )
+        training_args = SimpleNamespace(distill_model_max_length=128)
+
+        with patch.object(lora_utils, "CustomSFTTrainer", FakeCustomTrainer), patch.object(
+            lora_utils, "SFTTrainer", FakeSFTTrainer
+        ):
+            trainer = lora_utils._build_lora_trainer(
+                model=object(),
+                train_ds=[],
+                eval_ds=None,
+                sft_args=object(),
+                training_args=training_args,
+                lora_config=None,
+                cfg=cfg,
+                hif4_act_controller=None,
+                teacher_param_snapshots=[],
+            )
+
+        self.assertIsInstance(trainer, FakeCustomTrainer)
+        self.assertEqual(captured_kwargs["loss_type"], "sft")
+        self.assertEqual(captured_kwargs["hidden_loss_weight"], 0.0)
+        self.assertEqual(captured_kwargs["pre_mlp_hidden_loss_weight"], 0.01)
+        self.assertEqual(captured_kwargs["hidden_alignment_layer_weighting"], "uniform")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ class VAELLMOpenCompassModel(HuggingFaceBaseModel):
                 fingerprint["state_sha256"],
             )
 
-            from dense_e2e_fintuning.checkpoint_bridge import build_dense_model_from_checkpoint
+            from e2e_common.compressed_dense_bridge import build_dense_model_from_checkpoint
             from e2e_common.adapter_loading import (
                 adapter_has_post_norm_head_linear,
                 assert_adapter_load_result_clean,

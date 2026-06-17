@@ -1,13 +1,13 @@
-# VAE E2E Finetuning 三种训练形式
+# compressed_e2e_fintuning 三种训练形式
 
-`vae_e2e_fintuning` 输入 `cat_train.py` 产出的压缩 checkpoint，输出新的压缩 `final_model/`。
+`compressed_e2e_fintuning` 输入 `cat_train.py` 产出的压缩 checkpoint，输出新的压缩 `final_model/`。
 
 核心参数是：
 
 ```bash
---vae_train_mode decoder   # 默认
---vae_train_mode low_rank
---vae_train_mode both
+--finetune_mode decoder   # 默认
+--finetune_mode lora
+--finetune_mode both
 ```
 
 三种模式都使用同一套数据、loss、评估和保存流程；差别只在训练哪些参数。
@@ -23,7 +23,7 @@
 
 `hidden_loss_weight=0` 表示关闭。开启后会在现有 SFT/KD loss 之外，对齐 teacher 和 student 的所有 transformer block 输出 hidden states，即 `hidden_states[1:]`，跳过 embedding hidden state。
 
-`linear_depth` 会让越靠后的层权重越大，并把平均权重归一到 1。当前 `e2e_vae_decoder.sh` 使用较保守的：
+`linear_depth` 会让越靠后的层权重越大，并把平均权重归一到 1。当前 `e2e_decoder.sh` 使用较保守的：
 
 ```bash
 --hidden_loss_weight 0.003
@@ -39,8 +39,8 @@
 这是默认模式，等价于旧行为：
 
 ```bash
-bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh \
-  --vae_train_mode decoder
+bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
+  --finetune_mode decoder
 ```
 
 训练内容：
@@ -62,15 +62,15 @@ bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh \
 - 仍是压缩 checkpoint
 - 不产生 PEFT adapter
 
-## 2. `low_rank`
+## 2. `lora`
 
 只训练已有低秩分支，不训练 decoder。
 
 运行方式：
 
 ```bash
-bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh \
-  --vae_train_mode low_rank \
+bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
+  --finetune_mode lora \
   --decode_device auto \
   --decode_group_size 8 \
   --tune_final_norm false \
@@ -123,8 +123,8 @@ bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh \
 运行方式：
 
 ```bash
-bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh \
-  --vae_train_mode both
+bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
+  --finetune_mode both
 ```
 
 输入要求：
@@ -163,7 +163,7 @@ VAE reconstruction -> low_rank patch -> sparse_residual patch
 ## 参数选择建议
 
 - 普通 VAE decoder 继续训：用 `decoder`
-- 只修低秩离群补偿：用 `low_rank`
+- 只修低秩离群补偿：用 `lora`
 - decoder 和低秩补偿都明显不够：用 `both`
 
-`low_rank` 是最窄的优化路径，但它要求输入 checkpoint 已经有低秩分支。没有低秩分支时直接用 `decoder`。
+`lora` 是最窄的优化路径，但它要求输入 checkpoint 已经有低秩分支。没有低秩分支时直接用 `decoder`。

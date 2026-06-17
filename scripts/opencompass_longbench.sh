@@ -7,7 +7,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 
 DENSE_HF_PATH="${DENSE_HF_PATH:-Qwen/Qwen3-8B}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-.result/final_model}"
-ADAPTER_DIR="${ADAPTER_DIR:-.result/dense_e2e_fintuning/final_model_20260427_020212/final_adapter}"
+ADAPTER_DIR="${ADAPTER_DIR:-}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-Qwen/Qwen3-8B}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-8192}"
 MAX_OUT_LEN="${MAX_OUT_LEN:-1024}"
@@ -47,10 +47,10 @@ fi
 mkdir -p "${WORK_DIR}"
 mkdir -p "$(dirname "${MODEL_CONFIG_PATH}")"
 
-conda run -n bitvae python scripts/build_opencompass_longbench_config.py --output "${MODEL_CONFIG_PATH}"
+python scripts/build_opencompass_longbench_config.py --output "${MODEL_CONFIG_PATH}"
 trap 'rm -f "${MODEL_CONFIG_PATH}"' EXIT
 
-conda run -n bitvae opencompass \
+opencompass \
   --config-dir configs \
   --models "${MODEL_CONFIG_NAME}" \
   --datasets longbench \

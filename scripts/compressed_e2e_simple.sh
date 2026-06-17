@@ -11,8 +11,9 @@ export PYTHONHASHSEED="${SEED}"
 # Required:
 #   --student_checkpoint_dir ".result/your_cat_run/final_model"
 #   --dataset_mix "wiki=1.0"  or  --train_file "/path/to/train.jsonl"
-python -m vae_e2e_fintuning.main \
-  --run_root_dir ".result/vae_e2e_fintuning" \
+python -m compressed_e2e_fintuning.main \
+  --run_root_dir ".result/compressed_e2e_fintuning" \
+  --finetune_mode "decoder" \
   --seed "${SEED}" \
   --full_determinism "false" \
   --loss_type "sft" \

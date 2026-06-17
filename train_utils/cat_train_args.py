@@ -96,7 +96,8 @@ class NormalizedCatArgs:
     distill_loss_alpha: OverrideTable[float]
     distill_loss_type: OverrideTable[str]
     distill_hidden_loss_weight: OverrideTable[float]
-    distill_hidden_layer_weighting: str
+    distill_pre_mlp_hidden_loss_weight: OverrideTable[float]
+    distill_hidden_alignment_layer_weighting: str
     lora_use_dora: OverrideTable[bool]
     distill_tune_final_norm: bool
     distill_use_post_norm_head_linear: bool
@@ -180,7 +181,8 @@ class ResolvedDistillRuntimeConfig:
     loss_alpha: float
     loss_type: str
     hidden_loss_weight: float
-    hidden_layer_weighting: str
+    pre_mlp_hidden_loss_weight: float
+    hidden_alignment_layer_weighting: str
     use_dora: bool
 
 
@@ -191,7 +193,7 @@ _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "co
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "residual_sparse", "per_vae_low_rank", "post_vae_low_rank")
-_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+_DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
 _DISTILL_AFTER_CATEGORY_CHOICES = ("none", "remaining_lora", "compressed_lora", "decoder", "both")
 _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES = {"compressed_lora", "both"}
 _OUTLIER_RESIDUAL_SCORE_CHOICES = (
@@ -555,6 +557,17 @@ _DISTILL_HIDDEN_LOSS_WEIGHT_SPEC = _make_override_spec(
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=0.0,after:q_proj=0.01",
 )
+_DISTILL_PRE_MLP_HIDDEN_LOSS_WEIGHT_SPEC = _make_override_spec(
+    arg_name="--distill_pre_mlp_hidden_loss_weight",
+    parse_value=lambda raw: parse_float_text(
+        raw,
+        arg_name="--distill_pre_mlp_hidden_loss_weight",
+        min_value=0.0,
+        inclusive_min=True,
+    ),
+    allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=0.0,after:o_proj=0.01",
+)
 _LORA_USE_DORA_SPEC = _make_override_spec(
     arg_name="--lora_use_dora",
     parse_value=lambda raw: parse_bool_text(raw, arg_name="--lora_use_dora"),
@@ -684,10 +697,14 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         distill_loss_alpha=_parse_cat_override(raw_args.distill_loss_alpha, spec=_DISTILL_LOSS_ALPHA_SPEC),
         distill_loss_type=_parse_cat_override(raw_args.distill_loss_type, spec=_DISTILL_LOSS_TYPE_SPEC),
         distill_hidden_loss_weight=_parse_cat_override(raw_args.distill_hidden_loss_weight, spec=_DISTILL_HIDDEN_LOSS_WEIGHT_SPEC),
-        distill_hidden_layer_weighting=make_choice_parser(
-            arg_name="--distill_hidden_layer_weighting",
-            choices=_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES,
-        )(raw_args.distill_hidden_layer_weighting),
+        distill_pre_mlp_hidden_loss_weight=_parse_cat_override(
+            raw_args.distill_pre_mlp_hidden_loss_weight,
+            spec=_DISTILL_PRE_MLP_HIDDEN_LOSS_WEIGHT_SPEC,
+        ),
+        distill_hidden_alignment_layer_weighting=make_choice_parser(
+            arg_name="--distill_hidden_alignment_layer_weighting",
+            choices=_DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_CHOICES,
+        )(raw_args.distill_hidden_alignment_layer_weighting),
         lora_use_dora=_parse_cat_override(raw_args.lora_use_dora, spec=_LORA_USE_DORA_SPEC),
         distill_tune_final_norm=bool(raw_args.distill_tune_final_norm),
         distill_use_post_norm_head_linear=bool(raw_args.distill_use_post_norm_head_linear),
@@ -1005,7 +1022,10 @@ def resolve_distill_runtime_config(cat_args: NormalizedCatArgs, after_category: 
         loss_alpha=float(resolve_after_category_value(cat_args.distill_loss_alpha, after_category)),
         loss_type=str(resolve_after_category_value(cat_args.distill_loss_type, after_category)),
         hidden_loss_weight=float(resolve_after_category_value(cat_args.distill_hidden_loss_weight, after_category)),
-        hidden_layer_weighting=str(cat_args.distill_hidden_layer_weighting),
+        pre_mlp_hidden_loss_weight=float(
+            resolve_after_category_value(cat_args.distill_pre_mlp_hidden_loss_weight, after_category)
+        ),
+        hidden_alignment_layer_weighting=str(cat_args.distill_hidden_alignment_layer_weighting),
         use_dora=bool(resolve_after_category_value(cat_args.lora_use_dora, after_category)),
     )
 
@@ -1167,10 +1187,16 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_loss_type", type=str, default="default=sft", help=f"after_category 覆盖参数。示例：{_DISTILL_LOSS_TYPE_SPEC.example}")
     parser.add_argument("--distill_hidden_loss_weight", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_DISTILL_HIDDEN_LOSS_WEIGHT_SPEC.example}")
     parser.add_argument(
-        "--distill_hidden_layer_weighting",
+        "--distill_pre_mlp_hidden_loss_weight",
+        type=str,
+        default="default=0.0",
+        help=f"after_category 覆盖参数。示例：{_DISTILL_PRE_MLP_HIDDEN_LOSS_WEIGHT_SPEC.example}",
+    )
+    parser.add_argument(
+        "--distill_hidden_alignment_layer_weighting",
         type=str,
         default="uniform",
-        help="LoRA hidden-state 对齐损失的层权重模式：uniform 或 linear_depth。",
+        help="LoRA hidden alignment 辅助损失的层权重模式：uniform 或 linear_depth。",
     )
     parser.add_argument("--lora_use_dora", type=str, default="default=true", help=f"after_category 覆盖参数。示例：{_LORA_USE_DORA_SPEC.example}")
     parser.add_argument(

@@ -133,7 +133,7 @@ def validate_selected_low_rank_payloads(
     if not unique_ranks:
         raise ValueError("No selected VAELinear modules found for low-rank training.")
     if bool(require_uniform_rank) and len(unique_ranks) != 1:
-        raise ValueError(f"--vae_train_mode low_rank requires uniform low-rank rank, got {unique_ranks}.")
+        raise ValueError(f"--finetune_mode lora requires uniform low-rank rank, got {unique_ranks}.")
     return int(unique_ranks[0])
 
 

@@ -7,14 +7,13 @@ from datasets import Dataset, DatasetDict
 import torch
 from transformers.trainer_utils import IntervalStrategy
 
-from e2e_common.data import _record_to_text, build_datasets
-from raw_e2e_fintuning.args import parse_args
-from train_utils.lora_data import build_calibration_input_ids, prepare_distill_datasets
-from vae_e2e_fintuning.args import parse_args as parse_vae_e2e_args
-from vae_e2e_fintuning.trainer import (
+from compressed_e2e_fintuning.args import parse_args
+from compressed_e2e_fintuning.trainer import (
     build_vae_hidden_layer_weights,
     compute_vae_hidden_alignment_loss,
 )
+from e2e_common.data import _record_to_text, build_datasets
+from train_utils.lora_data import build_calibration_input_ids, prepare_distill_datasets
 
 
 class DummyTokenizer:
@@ -113,14 +112,21 @@ def _build_datasets_with_recorded_num_proc(args, training_args, tokenizer, datas
 
 
 class DatasetMixArgsTest(unittest.TestCase):
+    def _checkpoint_dir(self):
+        tmp = tempfile.TemporaryDirectory()
+        with open(f"{tmp.name}/checkpoint_meta.json", "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        self.addCleanup(tmp.cleanup)
+        return tmp.name
+
     def test_parse_args_normalizes_dataset_mix(self):
         e2e_args, _hf_args, training_args = parse_args(
-                [
-                    "--student_model_path",
-                    "dummy-model",
-                    "--dataset_mix",
-                    "openorca=3,fineweb_edu=1",
-                    "--max_steps",
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=3,fineweb_edu=1",
+                "--max_steps",
                 "10",
             ]
         )
@@ -134,8 +140,8 @@ class DatasetMixArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(
                 [
-                    "--student_model_path",
-                    "dummy-model",
+                    "--student_checkpoint_dir",
+                    self._checkpoint_dir(),
                     "--dataset_mix",
                     "openorca=1,openorca=1",
                     "--max_steps",
@@ -147,8 +153,8 @@ class DatasetMixArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(
                 [
-                    "--student_model_path",
-                    "dummy-model",
+                    "--student_checkpoint_dir",
+                    self._checkpoint_dir(),
                     "--dataset_mix",
                     "openorca=1",
                     "--text_field",
@@ -160,12 +166,12 @@ class DatasetMixArgsTest(unittest.TestCase):
 
     def test_parse_args_accepts_long_dataset_aliases(self):
         e2e_args, _hf_args, _training_args = parse_args(
-                [
-                    "--student_model_path",
-                    "dummy-model",
-                    "--dataset_mix",
-                    "longalpaca=2,longalign=1",
-                    "--max_steps",
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "longalpaca=2,longalign=1",
+                "--max_steps",
                 "10",
             ]
         )
@@ -178,7 +184,7 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(f"{tmpdir}/checkpoint_meta.json", "w", encoding="utf-8") as handle:
                 handle.write("{}")
-            args, _hf_args, _training_args = parse_vae_e2e_args(
+            args, _hf_args, _training_args = parse_args(
                 [
                     "--student_checkpoint_dir",
                     tmpdir,

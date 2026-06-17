@@ -21,7 +21,7 @@ def _model_dict_to_code(model: dict) -> str:
 def build_config() -> str:
     dense_hf_path = _env("DENSE_HF_PATH", "Qwen/Qwen3-8B")
     checkpoint_dir = _env("CHECKPOINT_DIR", ".result/final_model")
-    adapter_dir = _env("ADAPTER_DIR", ".result/dense_e2e_fintuning/final_model_20260427_020212/final_adapter")
+    adapter_dir = _env("ADAPTER_DIR", "")
     base_model_path = _env("BASE_MODEL_PATH", "Qwen/Qwen3-8B")
     access_token = _env("ACCESS_TOKEN", "")
     max_seq_len = int(_env("MAX_SEQ_LEN", "8192"))

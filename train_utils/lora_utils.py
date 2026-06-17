@@ -49,7 +49,8 @@ class _ResolvedDistillStageConfig:
     loss_alpha: float
     loss_type: str
     hidden_loss_weight: float
-    hidden_layer_weighting: str
+    pre_mlp_hidden_loss_weight: float
+    hidden_alignment_layer_weighting: str
     dataset: str
     use_dora: bool
     use_distill_hif4_act: bool
@@ -111,7 +112,8 @@ def _resolve_distill_stage_config(
         loss_alpha=float(runtime_cfg.loss_alpha),
         loss_type=str(runtime_cfg.loss_type),
         hidden_loss_weight=float(runtime_cfg.hidden_loss_weight),
-        hidden_layer_weighting=str(runtime_cfg.hidden_layer_weighting),
+        pre_mlp_hidden_loss_weight=float(runtime_cfg.pre_mlp_hidden_loss_weight),
+        hidden_alignment_layer_weighting=str(runtime_cfg.hidden_alignment_layer_weighting),
         dataset=str(getattr(cat_args, "distill_dataset", "")).strip().lower(),
         use_dora=bool(runtime_cfg.use_dora),
         use_distill_hif4_act=bool(getattr(training_args, "distill_hif4_act", False)),
@@ -236,11 +238,12 @@ def _log_lora_stage_start(
             int(cfg.seed),
         )
         logger.info(
-            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f hidden_loss_weight=%.6f hidden_layer_weighting=%s",
+            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f hidden_loss_weight=%.6f pre_mlp_hidden_loss_weight=%.6f hidden_alignment_layer_weighting=%s",
             float(cfg.loss_alpha),
             float(cfg.temperature),
             float(cfg.hidden_loss_weight),
-            str(cfg.hidden_layer_weighting),
+            float(cfg.pre_mlp_hidden_loss_weight),
+            str(cfg.hidden_alignment_layer_weighting),
         )
         return
 
@@ -337,7 +340,8 @@ def _build_lora_trainer(
 
     resolved_lora_loss = str(cfg.loss_type).strip().lower()
     hidden_loss_enabled = float(cfg.hidden_loss_weight) > 0.0
-    if resolved_lora_loss not in {"", "none", "sft"} or hidden_loss_enabled:
+    pre_mlp_hidden_loss_enabled = float(cfg.pre_mlp_hidden_loss_weight) > 0.0
+    if resolved_lora_loss not in {"", "none", "sft"} or hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
         trainer_loss_type = "sft" if resolved_lora_loss in {"", "none"} else resolved_lora_loss
         return CustomSFTTrainer(
             **trainer_kwargs,
@@ -345,7 +349,8 @@ def _build_lora_trainer(
             temperature=float(cfg.temperature),
             loss_alpha=float(cfg.loss_alpha),
             hidden_loss_weight=float(cfg.hidden_loss_weight),
-            hidden_layer_weighting=str(cfg.hidden_layer_weighting),
+            pre_mlp_hidden_loss_weight=float(cfg.pre_mlp_hidden_loss_weight),
+            hidden_alignment_layer_weighting=str(cfg.hidden_alignment_layer_weighting),
             distill_hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
         )
@@ -435,7 +440,11 @@ def lora_finetune_remaining_categories(
                 return model
 
         resolved_lora_loss = str(cfg.loss_type).strip().lower()
-        use_custom_trainer = resolved_lora_loss not in {"", "none", "sft"} or float(cfg.hidden_loss_weight) > 0.0
+        use_custom_trainer = (
+            resolved_lora_loss not in {"", "none", "sft"}
+            or float(cfg.hidden_loss_weight) > 0.0
+            or float(cfg.pre_mlp_hidden_loss_weight) > 0.0
+        )
         _log_lora_stage_start(
             logger=logger,
             cfg=cfg,

@@ -1,17 +1,30 @@
 import argparse
+import os
+import re
 import sys
-from typing import Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
 
-from train_utils.train_args import HFArguments, TrainingArguments
-from vae_e2e_fintuning.args import VAEDecoderE2EArguments, parse_args as parse_vae_args
+from transformers import HfArgumentParser
+
+from e2e_common.data import MCQA_DATASET_MIX_ALIASES, normalize_dataset_mix_spec
+from e2e_common.e2e_args import parse_decoder_layers, parse_target_modules
+from train_utils.model_checkpoint_io import resolve_checkpoint_dir
+from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_like, _parse_lora_loss_type
 
 
+_DEFAULT_RUN_ROOT = ".result/compressed_e2e_fintuning"
+_SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"}
+_MCQA_LOSS_TYPES = {"choice_kd", "choice_kd_ce"}
 _VALID_FINETUNE_MODES = {"decoder", "lora", "both"}
 _MODE_TO_VAE_TRAIN_MODE = {
     "decoder": "decoder",
     "lora": "low_rank",
     "both": "both",
 }
+_VALID_VAE_TRAIN_MODES = {"decoder", "low_rank", "both"}
+_VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
+_VALID_HIDDEN_LAYER_WEIGHTING = {"uniform", "linear_depth"}
 _DISALLOWED_DENSE_LORA_FLAGS = {
     "--lora_variant",
     "--lora_rank",
@@ -31,69 +44,341 @@ _DISALLOWED_DENSE_LORA_FLAGS = {
 }
 
 
-def _build_error_parser() -> argparse.ArgumentParser:
-    return argparse.ArgumentParser(description="Unified compressed checkpoint e2e finetuning.")
+@dataclass
+class VAEDecoderE2EArguments:
+    student_checkpoint_dir: str
+    run_root_dir: str = _DEFAULT_RUN_ROOT
+    resume_from_checkpoint: Optional[str] = None
+    teacher_model_path: Optional[str] = None
+    loss_type: str = "sft"
+    distill_temperature: float = 1.0
+    distill_alpha: float = 0.5
+    post_attn: bool = False
+    hidden_loss_weight: float = 0.0
+    hidden_layer_weighting: str = "uniform"
+    decoder_layers: str = "all"
+    target_modules: str = "all"
+    finetune_mode: str = "decoder"
+    decode_device: str = "auto"
+    decode_group_size: int = 8
+    layer_device_map: str = "auto"
+    parallel_stage_decode: bool = True
+    vae_decoder_checkpoint: bool = True
+    tune_final_norm: bool = False
+    use_post_norm_head_linear: bool = False
+    vae_tune_bias: bool = False
+    offload_mode: str = "streaming"
+    offload_checkpoint: bool = True
+    offload_prefetch_distance: int = 1
+    offload_min_tensor_bytes: int = 1048576
+    offload_pin_memory: bool = True
+    eval_hif4_act: bool = False
+    eval_tasks: Optional[str] = None
+    eval_num_fewshot: int = 0
+    eval_lm_batch_size: str = "auto"
+    eval_lm_limit: Optional[int] = None
+    eval_device: str = "cuda"
+    eval_prewarm_group_size: int = 8
+    skip_ppl_eval: bool = False
+    ppl_seqlen: int = 2048
+    ppl_limit: int = -1
+    dataset_mix: Optional[str] = None
+    dataset_task: str = "lm"
+    train_file: Optional[str] = None
+    eval_file: Optional[str] = None
+    text_field: str = "text"
+    dataset_num_proc: int = 1
+    max_train_samples: Optional[int] = None
+    max_eval_samples: Optional[int] = None
+    save_tokenizer: bool = True
+    decoder_layer_ids: Optional[List[int]] = field(default=None, init=False)
+    target_module_names: Optional[List[str]] = field(default=None, init=False)
+    dataset_mix_sources: Optional[List[str]] = field(default=None, init=False)
+    dataset_mix_weights: Optional[List[float]] = field(default=None, init=False)
+    dataset_mix_spec: Optional[str] = field(default=None, init=False)
+    explicit_cli_flags: Optional[List[str]] = field(default=None, init=False)
+    vae_train_mode: str = field(default="decoder", init=False)
+    internal_vae_train_mode: str = field(default="decoder", init=False)
+    e2e_stage: str = field(default="compressed_e2e_fintuning", init=False)
+    e2e_args_key: str = field(default="compressed_e2e_args", init=False)
 
 
-def _collect_explicit_cli_flags(argv: Sequence[str]) -> list[str]:
+def _collect_explicit_cli_flags(argv: Sequence[str]) -> List[str]:
     flags = set()
     for token in argv:
         text = str(token)
-        if not text.startswith("--"):
-            continue
-        option = text.split("=", 1)[0].strip()
-        if option:
-            flags.add(option)
-    return sorted(flags)
+        if text.startswith("--"):
+            flags.add(text.split("=", 1)[0].strip())
+    return sorted(flag for flag in flags if flag)
 
 
-def _normalize_finetune_mode(parser: argparse.ArgumentParser, value: str) -> str:
-    mode = str(value or "").strip().lower()
-    if mode not in _VALID_FINETUNE_MODES:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="End-to-end fine-tune compressed checkpoints.")
+    parser.add_argument("--student_checkpoint_dir", type=str, required=True)
+    parser.add_argument("--run_root_dir", type=str, default=_DEFAULT_RUN_ROOT)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--teacher_model_path", type=str, default=None)
+    parser.add_argument("--loss_type", type=_parse_lora_loss_type, default="sft")
+    parser.add_argument("--distill_temperature", type=float, default=1.0)
+    parser.add_argument("--distill_alpha", type=float, default=0.5)
+    parser.add_argument("--post_attn", type=lambda v: _parse_bool_like(v, arg_name="--post_attn"), default=False)
+    parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
+    parser.add_argument("--hidden_layer_weighting", type=str, default="uniform")
+    parser.add_argument("--decoder_layers", type=str, default="all")
+    parser.add_argument("--target_modules", type=str, default="all")
+    parser.add_argument("--finetune_mode", type=str, default="decoder")
+    parser.add_argument("--decode_device", type=str, default="auto")
+    parser.add_argument("--decode_group_size", type=int, default=8)
+    parser.add_argument("--layer_device_map", type=str, default="auto")
+    parser.add_argument(
+        "--parallel_stage_decode",
+        type=lambda v: _parse_bool_like(v, arg_name="--parallel_stage_decode"),
+        default=True,
+    )
+    parser.add_argument(
+        "--vae_decoder_checkpoint",
+        type=lambda v: _parse_bool_like(v, arg_name="--vae_decoder_checkpoint"),
+        default=True,
+    )
+    parser.add_argument(
+        "--tune_final_norm",
+        type=lambda v: _parse_bool_like(v, arg_name="--tune_final_norm"),
+        default=False,
+    )
+    parser.add_argument(
+        "--use_post_norm_head_linear",
+        type=lambda v: _parse_bool_like(v, arg_name="--use_post_norm_head_linear"),
+        default=False,
+    )
+    parser.add_argument(
+        "--vae_tune_bias",
+        type=lambda v: _parse_bool_like(v, arg_name="--vae_tune_bias"),
+        default=False,
+    )
+    parser.add_argument("--offload_mode", type=str, default="streaming")
+    parser.add_argument(
+        "--offload_checkpoint",
+        type=lambda v: _parse_bool_like(v, arg_name="--offload_checkpoint"),
+        default=True,
+    )
+    parser.add_argument("--offload_prefetch_distance", type=int, default=1)
+    parser.add_argument("--offload_min_tensor_bytes", type=int, default=1048576)
+    parser.add_argument(
+        "--offload_pin_memory",
+        type=lambda v: _parse_bool_like(v, arg_name="--offload_pin_memory"),
+        default=True,
+    )
+    parser.add_argument("--eval_hif4_act", type=lambda v: _parse_bool_like(v, arg_name="--eval_hif4_act"), default=False)
+    parser.add_argument("--eval_tasks", "--tasks", dest="eval_tasks", type=str, default=None)
+    parser.add_argument("--eval_num_fewshot", "--num_fewshot", dest="eval_num_fewshot", type=int, default=0)
+    parser.add_argument("--eval_lm_batch_size", "--lm_batch_size", dest="eval_lm_batch_size", type=str, default="auto")
+    parser.add_argument("--eval_lm_limit", "--lm_limit", dest="eval_lm_limit", type=int, default=None)
+    parser.add_argument("--eval_device", type=str, default="cuda")
+    parser.add_argument("--eval_prewarm_group_size", type=int, default=8)
+    parser.add_argument("--skip_ppl_eval", type=lambda v: _parse_bool_like(v, arg_name="--skip_ppl_eval"), default=False)
+    parser.add_argument("--ppl_seqlen", type=int, default=2048)
+    parser.add_argument("--ppl_limit", type=int, default=-1)
+    parser.add_argument("--dataset_mix", type=str, default=None)
+    parser.add_argument("--dataset_task", type=str, default="lm")
+    parser.add_argument("--train_file", type=str, default=None)
+    parser.add_argument("--eval_file", type=str, default=None)
+    parser.add_argument("--text_field", type=str, default="text")
+    parser.add_argument("--dataset_num_proc", type=int, default=1)
+    parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_eval_samples", type=int, default=None)
+    parser.add_argument("--save_tokenizer", type=lambda v: _parse_bool_like(v, arg_name="--save_tokenizer"), default=True)
+    return parser
+
+
+def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: VAEDecoderE2EArguments) -> None:
+    explicit_cli_flags = set(args.explicit_cli_flags or [])
+    dataset_mix_raw = None if args.dataset_mix is None else str(args.dataset_mix).strip()
+    if dataset_mix_raw:
+        try:
+            sources, weights, spec = normalize_dataset_mix_spec(dataset_mix_raw)
+        except ValueError as exc:
+            parser.error(str(exc))
+        conflicts = ["--train_file", "--eval_file", "--text_field", "--max_train_samples", "--max_eval_samples"]
+        used_conflicts = [flag for flag in conflicts if flag in explicit_cli_flags]
+        if used_conflicts:
+            parser.error("--dataset_mix cannot be combined with: " + ",".join(used_conflicts))
+        args.dataset_mix = dataset_mix_raw
+        args.dataset_mix_sources = sources
+        args.dataset_mix_weights = weights
+        args.dataset_mix_spec = spec
+        return
+
+    if not str(args.train_file or "").strip():
+        parser.error("Choose a data source: either --dataset_mix or --train_file.")
+    train_file = os.path.abspath(str(args.train_file))
+    if not os.path.exists(train_file):
+        parser.error(f"--train_file does not exist: {train_file}")
+    args.train_file = train_file
+    if args.eval_file:
+        eval_file = os.path.abspath(str(args.eval_file))
+        if not os.path.exists(eval_file):
+            parser.error(f"--eval_file does not exist: {eval_file}")
+        args.eval_file = eval_file
+
+
+def validate_args(
+    parser: argparse.ArgumentParser,
+    args: VAEDecoderE2EArguments,
+    training_args: Optional[TrainingArguments],
+) -> None:
+    checkpoint_dir = str(args.student_checkpoint_dir or "").strip()
+    if not checkpoint_dir:
+        parser.error("--student_checkpoint_dir is required.")
+    try:
+        args.student_checkpoint_dir = resolve_checkpoint_dir(checkpoint_dir)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+
+    dataset_task = str(args.dataset_task or "lm").strip().lower()
+    if dataset_task not in {"lm", "sft", "mcqa"}:
+        parser.error("--dataset_task must be one of: lm | sft | mcqa.")
+    args.dataset_task = dataset_task
+
+    _validate_dataset_inputs(parser, args)
+    if args.dataset_task == "sft":
+        if not args.dataset_mix_spec:
+            parser.error("--dataset_task sft currently requires --dataset_mix.")
+        unsupported = sorted(set(args.dataset_mix_sources or []) - _SFT_DATASET_MIX_ALIASES)
+        if unsupported:
+            parser.error(
+                "--dataset_task sft supports only these dataset_mix aliases: "
+                + ",".join(sorted(_SFT_DATASET_MIX_ALIASES))
+                + ". Unsupported: "
+                + ",".join(unsupported)
+            )
+    if args.dataset_task == "mcqa":
+        if not args.dataset_mix_spec:
+            parser.error("--dataset_task mcqa requires --dataset_mix.")
+        unsupported = sorted(set(args.dataset_mix_sources or []) - MCQA_DATASET_MIX_ALIASES)
+        if unsupported:
+            parser.error(
+                "--dataset_task mcqa supports only these dataset_mix aliases: "
+                + ",".join(sorted(MCQA_DATASET_MIX_ALIASES))
+                + ". Unsupported: "
+                + ",".join(unsupported)
+            )
+        if str(args.loss_type).strip().lower() not in _MCQA_LOSS_TYPES:
+            parser.error("--dataset_task mcqa requires --loss_type choice_kd or choice_kd_ce.")
+        if float(args.hidden_loss_weight) > 0.0:
+            parser.error("--dataset_task mcqa does not support --hidden_loss_weight > 0.")
+    if float(args.distill_temperature) <= 0.0:
+        parser.error("--distill_temperature must be > 0.")
+    if not (0.0 <= float(args.distill_alpha) <= 1.0):
+        parser.error("--distill_alpha must satisfy 0 <= alpha <= 1.")
+    if float(args.hidden_loss_weight) < 0.0:
+        parser.error("--hidden_loss_weight must be >= 0.")
+    hidden_layer_weighting = str(args.hidden_layer_weighting or "").strip().lower()
+    if hidden_layer_weighting not in _VALID_HIDDEN_LAYER_WEIGHTING:
+        parser.error("--hidden_layer_weighting must be one of: uniform | linear_depth.")
+    args.hidden_layer_weighting = hidden_layer_weighting
+    finetune_mode = str(args.finetune_mode or "").strip().lower()
+    if finetune_mode not in _VALID_FINETUNE_MODES:
         parser.error("--finetune_mode must be one of: decoder | lora | both.")
-    return mode
+    args.finetune_mode = finetune_mode
+    train_mode = _MODE_TO_VAE_TRAIN_MODE[finetune_mode]
+    if train_mode not in _VALID_VAE_TRAIN_MODES:
+        parser.error("Internal error: mapped --finetune_mode to invalid train mode.")
+    args.vae_train_mode = train_mode
+    args.internal_vae_train_mode = train_mode
+    decode_device = str(args.decode_device or "").strip().lower()
+    if not _VALID_DECODE_DEVICE_PATTERN.fullmatch(decode_device):
+        parser.error("--decode_device only supports: auto | cpu | cuda | cuda:<index>.")
+    args.decode_device = decode_device
+    if int(args.decode_group_size) < 1:
+        parser.error("--decode_group_size must be >= 1.")
+    if train_mode == "low_rank":
+        if bool(args.vae_tune_bias):
+            parser.error("--finetune_mode lora does not support --vae_tune_bias=true.")
+        if bool(args.tune_final_norm):
+            parser.error("--finetune_mode lora does not support --tune_final_norm=true.")
+        if bool(args.use_post_norm_head_linear):
+            parser.error("--finetune_mode lora does not support --use_post_norm_head_linear=true.")
+    if int(args.ppl_seqlen) < 1:
+        parser.error("--ppl_seqlen must be >= 1.")
+    if int(args.ppl_limit) == 0 or int(args.ppl_limit) < -1:
+        parser.error("--ppl_limit must be -1 or >= 1.")
+    eval_tasks = None if args.eval_tasks is None else str(args.eval_tasks).strip()
+    args.eval_tasks = eval_tasks or None
+    if int(args.eval_num_fewshot) < 0:
+        parser.error("--eval_num_fewshot must be >= 0.")
+    if args.eval_lm_limit is not None and int(args.eval_lm_limit) < 1:
+        parser.error("--eval_lm_limit must be >= 1 when provided.")
+    if not str(args.eval_lm_batch_size or "").strip():
+        parser.error("--eval_lm_batch_size cannot be empty.")
+    if not str(args.eval_device or "").strip():
+        parser.error("--eval_device cannot be empty.")
+    if int(args.eval_prewarm_group_size) < 1:
+        parser.error("--eval_prewarm_group_size must be >= 1.")
+    if int(args.dataset_num_proc) < 1:
+        parser.error("--dataset_num_proc must be >= 1.")
+    if args.max_train_samples is not None and int(args.max_train_samples) < 1:
+        parser.error("--max_train_samples must be >= 1 when provided.")
+    if args.max_eval_samples is not None and int(args.max_eval_samples) < 1:
+        parser.error("--max_eval_samples must be >= 1 when provided.")
+    offload_mode = str(args.offload_mode or "").strip().lower()
+    if offload_mode not in {"none", "saved_tensors", "streaming"}:
+        parser.error("--offload_mode must be one of: none | saved_tensors | streaming.")
+    args.offload_mode = offload_mode
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if offload_mode == "streaming" and world_size != 1:
+        parser.error("offload_mode=streaming only supports single-process multi-GPU. Do not launch it with torchrun/DDP.")
+    if int(args.offload_prefetch_distance) < 0:
+        parser.error("--offload_prefetch_distance must be >= 0.")
+    if int(args.offload_min_tensor_bytes) < 0:
+        parser.error("--offload_min_tensor_bytes must be >= 0.")
 
+    resume_path = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
+    if resume_path:
+        resume_path = os.path.abspath(resume_path)
+        if not os.path.isdir(resume_path):
+            parser.error(f"--resume_from_checkpoint must be a directory: {resume_path}")
+        trainer_state_path = os.path.join(resume_path, "trainer_state.json")
+        if not os.path.exists(trainer_state_path):
+            parser.error(f"--resume_from_checkpoint must contain trainer_state.json: {resume_path}")
+        args.resume_from_checkpoint = resume_path
+    else:
+        args.resume_from_checkpoint = None
 
-def _translate_argv(raw_argv: Sequence[str]) -> Tuple[list[str], str]:
-    parser = _build_error_parser()
-    translated = []
-    finetune_mode: Optional[str] = None
-    idx = 0
-    raw = [str(item) for item in raw_argv]
-    while idx < len(raw):
-        token = raw[idx]
-        option = token.split("=", 1)[0].strip() if token.startswith("--") else token
-        if option == "--vae_train_mode":
-            parser.error("compressed_e2e_fintuning uses --finetune_mode; do not pass --vae_train_mode.")
-        if option in _DISALLOWED_DENSE_LORA_FLAGS:
-            parser.error(f"compressed_e2e_fintuning does not expose dense PEFT flag: {option}")
-        if option == "--finetune_mode":
-            if "=" in token:
-                value = token.split("=", 1)[1]
-                idx += 1
-            else:
-                if idx + 1 >= len(raw) or raw[idx + 1].startswith("--"):
-                    parser.error("--finetune_mode requires a value: decoder | lora | both.")
-                value = raw[idx + 1]
-                idx += 2
-            finetune_mode = _normalize_finetune_mode(parser, value)
-            continue
-        translated.append(token)
-        idx += 1
+    if training_args is not None:
+        fsdp = getattr(training_args, "fsdp", "")
+        if not (fsdp is None or fsdp == "" or fsdp == []):
+            parser.error("compressed_e2e_fintuning uses manual layer model parallelism and does not support FSDP.")
 
-    if finetune_mode is None:
-        finetune_mode = "decoder"
-    translated.extend(["--vae_train_mode", _MODE_TO_VAE_TRAIN_MODE[finetune_mode]])
-    return translated, finetune_mode
+    args.decoder_layer_ids = parse_decoder_layers(args.decoder_layers)
+    args.target_module_names = parse_target_modules(args.target_modules)
+    args.layer_device_map = str(args.layer_device_map or "auto").strip().lower()
+    args.e2e_stage = "compressed_e2e_fintuning"
+    args.e2e_args_key = "compressed_e2e_args"
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[VAEDecoderE2EArguments, HFArguments, TrainingArguments]:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    translated_argv, finetune_mode = _translate_argv(raw_argv)
-    args, hf_args, training_args = parse_vae_args(translated_argv)
-    args.finetune_mode = str(finetune_mode)
-    args.internal_vae_train_mode = str(args.vae_train_mode)
-    args.e2e_stage = "compressed_e2e_fintuning"
-    args.e2e_args_key = "compressed_e2e_args"
-    args.explicit_cli_flags = sorted(set(args.explicit_cli_flags or []) | set(_collect_explicit_cli_flags(raw_argv)))
-    return args, hf_args, training_args
+    parser = build_parser()
+    removed_refresh_flags = [
+        flag
+        for flag in _collect_explicit_cli_flags(raw_argv)
+        if flag.startswith("--refresh_sparse_residual")
+    ]
+    if removed_refresh_flags:
+        parser.error("unrecognized arguments: " + " ".join(removed_refresh_flags))
+    explicit_flags = set(_collect_explicit_cli_flags(raw_argv))
+    if "--vae_train_mode" in explicit_flags:
+        parser.error("compressed_e2e_fintuning uses --finetune_mode; do not pass --vae_train_mode.")
+    disallowed_lora_flags = sorted(explicit_flags & _DISALLOWED_DENSE_LORA_FLAGS)
+    if disallowed_lora_flags:
+        parser.error(
+            "compressed_e2e_fintuning does not expose dense PEFT flags: "
+            + ",".join(disallowed_lora_flags)
+        )
+    raw_ns, remaining = parser.parse_known_args(raw_argv)
+    vae_e2e_args = VAEDecoderE2EArguments(**vars(raw_ns))
+    vae_e2e_args.explicit_cli_flags = _collect_explicit_cli_flags(raw_argv)
+    hf_parser = HfArgumentParser((HFArguments, TrainingArguments))
+    hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=list(remaining))
+    validate_args(parser, vae_e2e_args, training_args)
+    return vae_e2e_args, hf_args, training_args

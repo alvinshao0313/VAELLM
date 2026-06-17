@@ -6,13 +6,10 @@ from typing import Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 
-from dense_e2e_fintuning.trainables import inject_dense_peft_adapters, resolve_target_layer_ids
 from e2e_common.checkpoint_io import load_e2e_model_checkpoint
-from e2e_common.post_norm_head import ensure_post_norm_head_linear
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import NamedVAELinearDecodeTarget, decode_named_vae_linear_weights
-from rotation.model_utils import get_layers
 from train_utils.model_checkpoint_io import META_FILENAME, resolve_checkpoint_dir
 
 
@@ -54,7 +51,7 @@ def checkpoint_has_adapters(meta: Dict[str, object]) -> bool:
 
 def reject_checkpoint_with_adapters(meta: Dict[str, object]) -> None:
     if checkpoint_has_adapters(meta):
-        raise ValueError("dense_e2e_fintuning 首版只接受不带 adapter 的压缩 checkpoint。")
+        raise ValueError("Compressed dense bridge only accepts compact checkpoints without adapter modules.")
 
 
 def resolve_base_model_path(meta: Dict[str, object], teacher_model_path: Optional[str] = None) -> str:
@@ -255,46 +252,3 @@ def build_dense_model_from_checkpoint(
     if logger is not None:
         logger.info("Dense student is ready: source=%s converted_modules=%d", resolved_dir, converted)
     return model, meta, resolved_dir
-
-
-def rebuild_dense_peft_model_for_export(
-    student_checkpoint_dir: str,
-    *,
-    access_token: Optional[str],
-    args,
-    training_args,
-    state_dict: Dict[str, torch.Tensor],
-    decode_group_size: int = 8,
-    decode_device: str = "auto",
-    logger=None,
-) -> Tuple[nn.Module, Dict[str, object], object]:
-    dense_model, meta, _resolved_dir = build_dense_model_from_checkpoint(
-        student_checkpoint_dir,
-        access_token=access_token,
-        logger=logger,
-        decode_group_size=int(decode_group_size),
-        decode_device=decode_device,
-    )
-    if hasattr(dense_model, "config"):
-        dense_model.config.use_cache = False
-    if hasattr(dense_model, "enable_input_require_grads"):
-        dense_model.enable_input_require_grads()
-    if bool(getattr(args, "use_post_norm_head_linear", False)):
-        ensure_post_norm_head_linear(dense_model)
-
-    layers = list(get_layers(dense_model))
-    decoder_layer_ids = resolve_target_layer_ids(getattr(args, "decoder_layer_ids", None), len(layers))
-    peft_model, selection = inject_dense_peft_adapters(
-        dense_model,
-        args=args,
-        decoder_layer_ids=decoder_layer_ids,
-        total_step=int(training_args.max_steps),
-    )
-    load_result = peft_model.load_state_dict(state_dict, strict=True)
-    if getattr(load_result, "missing_keys", None) or getattr(load_result, "unexpected_keys", None):
-        raise RuntimeError(
-            f"Failed to rebuild dense export model from state_dict: "
-            f"missing={getattr(load_result, 'missing_keys', [])} "
-            f"unexpected={getattr(load_result, 'unexpected_keys', [])}"
-        )
-    return peft_model, meta, selection

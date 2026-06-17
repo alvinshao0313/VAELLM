@@ -12,7 +12,6 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
-CONDA_BIN="${CONDA_BIN:-/home/shaoyuantian/anaconda3/bin/conda}"
 MAX_STEPS="${MAX_STEPS:-500}"
 : "${STUDENT_CKPT:?Set STUDENT_CKPT to the stage1 final_model directory.}"
 INSTRUCT_DATASET_MIX="${INSTRUCT_DATASET_MIX:-openorca=0.50,alpaca=0.20,longalpaca=0.15,longalign=0.15}"
@@ -26,14 +25,15 @@ if [[ "${DISABLE_PROXY:-1}" == "1" ]]; then
   export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 fi
 
-"${CONDA_BIN}" run -n bitvae python -m vae_e2e_fintuning.main \
+python -m compressed_e2e_fintuning.main \
   --seed "${SEED}" \
   --data_seed "${SEED}" \
   --full_determinism true \
   --gradient_checkpointing false \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --student_checkpoint_dir "${STUDENT_CKPT}" \
-  --run_root_dir .result/vae_e2e_fintuning_stage2_instruct \
+  --run_root_dir .result/compressed_e2e_fintuning_stage2_instruct \
+  --finetune_mode decoder \
   --dataset_task sft \
   --dataset_mix "${INSTRUCT_DATASET_MIX}" \
   --dataset_num_proc "${DATASET_NUM_PROC:-64}" \

@@ -37,18 +37,19 @@ fi
 # - auto 会按当前 CUDA_VISIBLE_DEVICES 内可见 GPU 均分 Transformer layers。
 # - 训练保存 final_model 后会跑 lm-eval：${EVAL_TASKS}
 # - 冒烟建议：
-#   MAX_STEPS=30 bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh --skip_ppl_eval true --eval_tasks ""
+#   MAX_STEPS=30 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --skip_ppl_eval true --eval_tasks ""
 # - 用显存换速度：
-#   VAE_DECODER_CHECKPOINT=false bash vae_e2e_fintuning/scripts/e2e_vae_decoder.sh
+#   VAE_DECODER_CHECKPOINT=false bash compressed_e2e_fintuning/scripts/e2e_decoder.sh
 
-python -m vae_e2e_fintuning.main \
+python -m compressed_e2e_fintuning.main \
   --seed "${SEED}" \
   --data_seed "${SEED}" \
   --full_determinism "${FULL_DETERMINISM}" \
   --gradient_checkpointing false \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --student_checkpoint_dir "${STUDENT_CKPT}" \
-  --run_root_dir .result/vae_e2e_fintuning \
+  --run_root_dir .result/compressed_e2e_fintuning \
+  --finetune_mode decoder \
   --dataset_mix "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10" \
   --dataset_num_proc 64 \
   --loss_type kd_top_1000 \
