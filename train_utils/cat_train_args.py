@@ -39,9 +39,8 @@ from train_utils.utils import split_csv
 
 @dataclass
 class NormalizedCatArgs:
-    category_order: str
+    target_categories: str
     transpose_modules: str
-    projection_suffixes: str
     include_all_linears: bool
     steps_per_category: OverrideTable[int]
     # 联合优化代码，已关闭。旧字段保留如下：
@@ -206,6 +205,32 @@ _OUTLIER_RESIDUAL_SCORE_MODES_NEED_ACT = (
     "input_act_weighted_abs",
     "input_act_weighted_original_weight_abs",
 )
+
+
+def _normalize_target_categories(value: Optional[str]) -> str:
+    categories = split_csv(None if value is None else str(value))
+    if not categories:
+        raise ValueError("--target_categories must not be empty.")
+    reserved = [category for category in categories if category.strip().lower() in {"auto", "others"}]
+    if reserved:
+        raise ValueError(
+            "--target_categories only accepts explicit categories; "
+            f"unsupported values: {','.join(reserved)}"
+        )
+    seen: Set[str] = set()
+    duplicates: List[str] = []
+    for category in categories:
+        if category in seen and category not in duplicates:
+            duplicates.append(category)
+        seen.add(category)
+    if duplicates:
+        raise ValueError(
+            "--target_categories contains duplicate categories: "
+            + ",".join(duplicates)
+        )
+    return ",".join(categories)
+
+
 def parse_skip_layers(value: Optional[str]) -> Set[Tuple[int, str]]:
     entries = split_csv(None if value is None else str(value))
     out: Set[Tuple[int, str]] = set()
@@ -634,9 +659,8 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         arg_name="derived sparse residual block shape",
     )
     return NormalizedCatArgs(
-        category_order=str(raw_args.category_order),
+        target_categories=_normalize_target_categories(raw_args.target_categories),
         transpose_modules=str(raw_args.transpose_modules),
-        projection_suffixes=str(raw_args.projection_suffixes),
         include_all_linears=bool(raw_args.include_all_linears),
         steps_per_category=_parse_cat_override(raw_args.steps_per_category, spec=_STEPS_PER_CATEGORY_SPEC),
         # 联合优化代码，已关闭。原 joint CLI 解析保留如下：
@@ -1032,19 +1056,18 @@ def resolve_distill_runtime_config(cat_args: NormalizedCatArgs, after_category: 
 
 def build_cat_train_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument("--category_order", type=str, default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
-    parser.add_argument("--transpose_modules", type=str, default="v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument(
-        "--projection_suffixes",
+        "--target_categories",
         type=str,
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-        help="默认 projection-only 收集模式下，允许参与训练的投影层后缀列表。",
+        help="要压缩的类别及顺序，必须是显式逗号分隔列表。",
     )
+    parser.add_argument("--transpose_modules", type=str, default="v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument(
         "--include_all_linears",
         action="store_true",
         default=False,
-        help="关闭默认的 projection-only 过滤，改为包含模型中全部 nn.Linear。",
+        help="关闭默认的 decoder projection 路径限制，但仍只收集 target_categories 指定的类别。",
     )
     parser.add_argument("--steps_per_category", type=str, default="default=2000", help=f"类别覆盖参数。示例：{_STEPS_PER_CATEGORY_SPEC.example}")
     # 联合优化代码，已关闭：不再注册 joint decoder CLI。

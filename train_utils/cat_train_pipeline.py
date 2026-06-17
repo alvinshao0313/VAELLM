@@ -72,7 +72,6 @@ from train_utils.utils import (
     format_intra_parallel_desc as _format_intra_parallel_desc,
     format_namespace as _format_namespace,
     get_logger,
-    resolve_category_order as _resolve_category_order,
     set_seed,
     split_csv as _split_csv,
 )
@@ -409,13 +408,13 @@ def _collect_current_trainable_linears(
     *,
     transpose_modules: Sequence[str],
     only_decoder_projections: bool,
-    projection_suffixes: Sequence[str],
+    target_categories: Sequence[str],
 ) -> List[LinearRef]:
     return _collect_linears(
         model,
         transpose_modules,
         only_decoder_projections=only_decoder_projections,
-        projection_suffixes=projection_suffixes,
+        target_categories=target_categories,
     )
 
 
@@ -425,7 +424,7 @@ def _collect_sorted_category_refs(
     category: str,
     transpose_modules: Sequence[str],
     only_decoder_projections: bool,
-    projection_suffixes: Sequence[str],
+    target_categories: Sequence[str],
 ) -> Tuple[List[Tuple[int, LinearRef]], int]:
     refs_sorted: List[Tuple[int, LinearRef]] = []
     missing = 0
@@ -433,7 +432,7 @@ def _collect_sorted_category_refs(
         model,
         transpose_modules=transpose_modules,
         only_decoder_projections=only_decoder_projections,
-        projection_suffixes=projection_suffixes,
+        target_categories=target_categories,
     ):
         if ref.category != category:
             continue
@@ -1608,7 +1607,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     activation_runtime: Optional[Dict[str, object]] = None
     outlier_protect_axis = str(getattr(cat_args, "outlier_protect_axis", "input")).strip().lower()
     transpose_modules = _split_csv(cat_args.transpose_modules)
-    projection_suffixes = _split_csv(cat_args.projection_suffixes)
+    target_categories = _split_csv(cat_args.target_categories)
     only_decoder_projections = not bool(cat_args.include_all_linears)
     eval_tasks_text = str(getattr(cat_args, "eval_tasks", "")).strip()
     run_task_eval = bool(eval_tasks_text)
@@ -1621,11 +1620,18 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         model,
         transpose_modules=transpose_modules,
         only_decoder_projections=only_decoder_projections,
-        projection_suffixes=projection_suffixes,
+        target_categories=target_categories,
     )
     discovered_categories = [r.category for r in all_linears]
-    category_order = _resolve_category_order(cat_args.category_order, discovered_categories)
     discovered_category_set = set(discovered_categories)
+    missing_target_categories = [
+        category for category in target_categories if category not in discovered_category_set
+    ]
+    if missing_target_categories:
+        raise ValueError(
+            "target_categories contains categories not found in model: "
+            + ",".join(missing_target_categories)
+        )
     discovered_skip_keys = []
     for r in all_linears:
         li = _extract_layer_idx(r.name)
@@ -1651,7 +1657,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     if linear_group_size < 1:
         raise ValueError(f"linear_group_size must be >= 1, got {linear_group_size}")
 
-    active_categories = [c for c in category_order if c in discovered_category_set]
+    active_categories = list(target_categories)
     if not active_categories:
         raise ValueError("No active categories discovered for training.")
 
@@ -1919,7 +1925,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 category=cat,
                 transpose_modules=transpose_modules,
                 only_decoder_projections=only_decoder_projections,
-                projection_suffixes=projection_suffixes,
+                target_categories=target_categories,
             )
             if missing:
                 log.warning("[%s] %d modules missing layer_idx, skipped.", cat, missing)
@@ -2034,7 +2040,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     lora_round_idx=lora_round_idx,
                     transpose_modules=transpose_modules,
                     only_decoder_projections=only_decoder_projections,
-                    projection_suffixes=projection_suffixes,
+                    target_categories=target_categories,
                 )
                 model = distill_result.model
                 lora_round_idx = int(distill_result.next_lora_round_idx)

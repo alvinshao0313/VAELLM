@@ -32,6 +32,14 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 # torch.backends.cuda.matmul.allow_tf32 = False
 # torch.backends.cudnn.allow_tf32 = False
 DEV = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+_EXTERNAL_TRAINING_LOGGER_NAMES = (
+    "transformers",
+    "transformers.trainer",
+    "trl",
+    "peft",
+    "accelerate",
+    "datasets",
+)
 
 
 def pt_fsdp_state_dict(model: torch.nn.Module):
@@ -111,6 +119,63 @@ def config_logging(log_file, level=logging.INFO):
     logging.basicConfig(level=level, handlers=[console_handler, file_handler])
 
 
+def _has_file_handler(logger: logging.Logger, log_file: str) -> bool:
+    log_file_abs = os.path.abspath(log_file)
+    for handler in logger.handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        try:
+            if os.path.abspath(handler.baseFilename) == log_file_abs:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _add_file_handler_once(
+    logger: logging.Logger,
+    *,
+    log_file: str,
+    formatter: logging.Formatter,
+    level: int,
+) -> None:
+    if _has_file_handler(logger, log_file):
+        return
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+def _attach_external_log_file_handlers(
+    *,
+    log_file: str,
+    formatter: logging.Formatter,
+    level: int,
+) -> None:
+    root_logger = logging.getLogger()
+    if root_logger.level == logging.NOTSET or root_logger.level > level:
+        root_logger.setLevel(level)
+    _add_file_handler_once(
+        root_logger,
+        log_file=log_file,
+        formatter=formatter,
+        level=level,
+    )
+
+    for logger_name in _EXTERNAL_TRAINING_LOGGER_NAMES:
+        external_logger = logging.getLogger(logger_name)
+        if external_logger.level == logging.NOTSET or external_logger.level > level:
+            external_logger.setLevel(level)
+        if not external_logger.propagate:
+            _add_file_handler_once(
+                external_logger,
+                log_file=log_file,
+                formatter=formatter,
+                level=level,
+            )
+
+
 def cleanup_memory(verbos=True) -> None:
     """Run GC and clear GPU memory."""
     import gc
@@ -160,10 +225,18 @@ def get_logger(logger_name: Optional[str]) -> logging.Logger:
 
     log_file = os.environ.get("LOG_FILE")
     if log_file:
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        _add_file_handler_once(
+            logger,
+            log_file=log_file,
+            formatter=formatter,
+            level=logging.INFO,
+        )
+        _attach_external_log_file_handlers(
+            log_file=log_file,
+            formatter=formatter,
+            level=logging.INFO,
+        )
 
     return logger
 
@@ -210,17 +283,6 @@ def format_intra_parallel_desc(row_parts: int, col_parts: int) -> str:
     return f"[{row_parts},{col_parts}]"
 
 
-def resolve_category_order(order: str, discovered: Sequence[str]) -> List[str]:
-    if order.strip().lower() == "auto":
-        return sorted(set(discovered))
-    requested = split_csv(order)
-    if "others" in requested:
-        known = [c for c in requested if c != "others"]
-        rest = sorted([c for c in set(discovered) if c not in set(known)])
-        return known + rest
-    return requested
-
-
 @dataclass(frozen=True)
 class LinearRef:
     name: str
@@ -229,7 +291,7 @@ class LinearRef:
     transpose: bool
 
 
-def is_decoder_layer_projection(name: str, projection_suffixes: Sequence[str]) -> bool:
+def is_decoder_layer_projection(name: str, target_categories: Sequence[str]) -> bool:
     # Llama/Mistral/Qwen: "model.layers.{i}.<...>.<proj>"
     # OPT: "model.decoder.layers.{i}.<...>.<proj>"
     in_decoder_layers = (
@@ -240,7 +302,7 @@ def is_decoder_layer_projection(name: str, projection_suffixes: Sequence[str]) -
     )
     if not in_decoder_layers:
         return False
-    return any(name.endswith(f".{sfx}") or name.endswith(sfx) for sfx in projection_suffixes)
+    return any(name.endswith(f".{category}") or name.endswith(category) for category in target_categories)
 
 
 def collect_linears(
@@ -248,19 +310,19 @@ def collect_linears(
     transpose_modules: Sequence[str],
     *,
     only_decoder_projections: bool,
-    projection_suffixes: Sequence[str],
+    target_categories: Sequence[str],
 ) -> List[LinearRef]:
     transpose_set = set(transpose_modules)
-    suffix_set = set(projection_suffixes)
+    target_set = set(target_categories)
     out: List[LinearRef] = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
         category = name.split(".")[-1]
+        if category not in target_set:
+            continue
         if only_decoder_projections:
-            if category not in suffix_set:
-                continue
-            if not is_decoder_layer_projection(name, projection_suffixes):
+            if not is_decoder_layer_projection(name, target_categories):
                 continue
         out.append(
             LinearRef(

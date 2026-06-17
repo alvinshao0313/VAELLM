@@ -364,7 +364,7 @@ def run_after_category_distill(
     lora_round_idx: int,
     transpose_modules: Sequence[str],
     only_decoder_projections: bool,
-    projection_suffixes: Sequence[str],
+    target_categories: Sequence[str],
 ) -> AfterCategoryDistillResult:
     mode = str(getattr(cat_args, "distill_after_category", "none")).strip().lower()
     if mode == "none":
@@ -375,7 +375,7 @@ def run_after_category_distill(
             model,
             transpose_modules=transpose_modules,
             only_decoder_projections=only_decoder_projections,
-            projection_suffixes=projection_suffixes,
+            target_categories=target_categories,
         )
         remaining_categories = list(dict.fromkeys(r.category for r in current_remaining_linears))
         model = lora_finetune_remaining_categories(

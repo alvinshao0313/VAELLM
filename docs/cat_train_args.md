@@ -117,9 +117,8 @@
 
 以下参数没有并入 override 系统，仍然使用原有简单字符串格式：
 
-- `category_order`
+- `target_categories`
 - `transpose_modules`
-- `projection_suffixes`
 - `skip_layers`
 - `outlier_residual_codec`
 - `outlier_residual_index_bits`
@@ -127,17 +126,16 @@
 
 其中：
 
-- `category_order` 支持 `auto` 或逗号分隔列表
+- `target_categories` 必须是显式逗号分隔列表，不支持 `auto` / `others`
 - `skip_layers` 格式仍是 `layer_idx.category`，例如 `0.down_proj,30.q_proj`
 
 ## 3. 脚本私有参数（`cat_args`）
 
 | 参数 | 默认值 | 功能 | 备注 |
 |---|---:|---|---|
-| `--category_order` | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | 类别训练顺序 | 可设 `auto`；可包含 `others` |
+| `--target_categories` | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | 要压缩的类别及顺序 | 必须显式列出；不支持 `auto` / `others`；指定但模型中未发现会直接报错 |
 | `--transpose_modules` | `v_proj,o_proj,gate_proj,up_proj,down_proj` | 这些类别在切分前先转置权重 | 影响切分方向与整除性 |
-| `--projection_suffixes` | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | 默认 projection-only 模式下允许的后缀 | 仅在未开启 `include_all_linears` 时生效 |
-| `--include_all_linears` | `False` | 关闭默认的 projection-only 过滤，改为收集模型中全部 `nn.Linear` | 开启后忽略 `projection_suffixes` 过滤 |
+| `--include_all_linears` | `False` | 关闭默认 decoder projection 路径限制 | 仍只收集 `target_categories` 指定的类别 |
 | `--steps_per_category` | `default=2000` | 每个 group 的训练步数 | 类别 override；名字保留但语义就是每组步数 |
 | `--joint_decoder_steps` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
 | `--joint_decoder_lr` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
@@ -307,8 +305,8 @@
 
 ### 6.1 类别解析与分组
 
-- 线性层先按 `category_order` 排序，再按层号排序。
-- 默认只收集 decoder projection 相关的 `nn.Linear`；如果传 `--include_all_linears`，才会放开成全量 `nn.Linear`。
+- `target_categories` 同时指定要压缩的类别集合和类别训练顺序。
+- 默认只在 decoder projection 路径中收集 `target_categories` 指定类别；如果传 `--include_all_linears`，只放开路径限制，仍不会收集目标类别以外的 `nn.Linear`。
 - `skip_layers` 会在发现真实 `(layer_idx, category)` 后校验；如果有未知项，直接报错。
 - `linear_group_size` 控制同类别跨层分组大小。
 - 如果最后一个 group 不足 `linear_group_size`：

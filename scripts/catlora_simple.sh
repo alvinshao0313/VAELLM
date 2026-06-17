@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=7
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -54,12 +54,11 @@ python tools/cat_train.py \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --category_order "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
-  --projection_suffixes "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
-  --steps_per_category "default=1" \
+  --steps_per_category "default=10000" \
   --batch_size "8192" \
   --log_every "100" \
   --eval_every "0" \
@@ -118,7 +117,7 @@ python tools/cat_train.py \
   --lora_rank "default=128" \
   --lora_alpha "default=2896" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=5" \
+  --distill_steps "default=5000" \
   --distill_batch_size "default=1" \
   --distill_nsamples "default=20000" \
   --distill_lr "default=1e-4" \
