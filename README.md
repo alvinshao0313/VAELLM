@@ -18,6 +18,10 @@ export PYTHONPATH=.
   - 用途：按类别训练权重 VAE、把 `nn.Linear` 替换成 `VAELinear`、保存压缩模型
   - residual / low-rank 离群保护逻辑在 `train_utils/cat_train_residual_protection.py`
   - joint decoder 联合微调代码已关闭，旧实现仅以注释形式保留在 `train_utils/cat_joint_decoder.py`
+- `scripts/catlora_distill_from_checkpoint.sh`
+  - 入口：`tools/cat_distill_from_vae_checkpoint.py`
+  - 用途：从已经完成 VAE 压缩的 cat checkpoint 继续逐类别蒸馏，不重新训练 VAE
+  - 用法见 `docs/catlora_distill_from_checkpoint.md`
 - `scripts/eval.sh`
   - 入口：`tools/cat_eval.py`
   - 用途：对保存好的 checkpoint 做 PPL 和 lm-eval

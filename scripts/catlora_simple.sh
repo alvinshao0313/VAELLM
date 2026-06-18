@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=4
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -54,7 +54,7 @@ python tools/cat_train.py \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --target_categories "q_proj,k_proj,v_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
@@ -115,7 +115,7 @@ python tools/cat_train.py \
   --distill_after_category "compressed_lora" \
   --distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
   --lora_rank "default=128" \
-  --lora_alpha "default=2896" \
+  --lora_alpha "default=128" \
   --lora_dropout "default=0.03" \
   --distill_steps "default=5000" \
   --distill_batch_size "default=1" \
@@ -128,7 +128,7 @@ python tools/cat_train.py \
   --distill_loss_alpha "default=0.5" \
   --distill_loss_type "default=kd_top_1000" \
   --distill_hidden_loss_weight "default=0.01" \
-  --distill_pre_mlp_hidden_loss_weight "default=0.0,after:o_proj=0.01" \
+  --distill_pre_mlp_hidden_loss_weight "default=0.0" \
   --distill_hidden_alignment_layer_weighting "linear_depth" \
   --lora_use_dora "default=false" \
   --distill_tune_final_norm "false" \
