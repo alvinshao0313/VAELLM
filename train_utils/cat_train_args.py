@@ -20,7 +20,6 @@ from train_utils.cat_arg_overrides import (
     make_choice_parser,
     parse_bool_text,
     parse_float_text,
-    parse_intra_parallel_text,
     parse_intra_part_sort_mode_text,
     parse_int_text,
     parse_optional_int_text,
@@ -50,7 +49,6 @@ class NormalizedCatArgs:
     # joint_decoder_batch_size: OverrideTable[Optional[int]]
     skip_layers: str
     linear_group_size: int
-    intra_parallel: OverrideTable[Tuple[int, int]]
     intra_part_sort_mode: OverrideTable[str]
     batch_size: int
     gpu_resident_data: bool
@@ -151,7 +149,6 @@ class ResolvedCategoryRuntimeConfig:
     # joint_decoder_lr: float
     # joint_decoder_group_size: int
     # joint_decoder_batch_size: Optional[int]
-    intra_parallel: Tuple[int, int]
     intra_part_sort_mode: str
     codebook_bits: int
     codebook_dim: int
@@ -416,12 +413,6 @@ _STEPS_PER_CATEGORY_SPEC = _make_positive_int_override_spec(
 #     example="default=none,cat:down_proj=1024",
 #     min_value=1,
 # )
-_INTRA_PARALLEL_SPEC = _make_override_spec(
-    arg_name="--intra_parallel",
-    parse_value=lambda raw: parse_intra_parallel_text(raw, arg_name="--intra_parallel"),
-    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=1x1,cat:q_proj=4x1",
-)
 # 排序代码，已关闭：保留 spec 仅用于内部固定 default=none 的结构化配置。
 _INTRA_PART_SORT_MODE_SPEC = _make_override_spec(
     arg_name="--intra_part_sort_mode",
@@ -679,7 +670,6 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         # joint_decoder_batch_size=_parse_cat_override(raw_args.joint_decoder_batch_size, spec=_JOINT_DECODER_BATCH_SIZE_SPEC),
         skip_layers=str(raw_args.skip_layers),
         linear_group_size=int(raw_args.linear_group_size),
-        intra_parallel=_parse_cat_override(raw_args.intra_parallel, spec=_INTRA_PARALLEL_SPEC),
         intra_part_sort_mode=_parse_cat_override("default=none", spec=_INTRA_PART_SORT_MODE_SPEC),
         batch_size=int(raw_args.batch_size),
         gpu_resident_data=bool(raw_args.gpu_resident_data),
@@ -932,7 +922,6 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
         # (cat_args.joint_decoder_lr, "--joint_decoder_lr"),
         # (cat_args.joint_decoder_group_size, "--joint_decoder_group_size"),
         # (cat_args.joint_decoder_batch_size, "--joint_decoder_batch_size"),
-        (cat_args.intra_parallel, "--intra_parallel"),
         (cat_args.intra_part_sort_mode, "--intra_part_sort_mode"),
         (cat_args.outlier_protect_count, "--outlier_protect_count"),
         (cat_args.outlier_residual_top_p, "--outlier_residual_top_p"),
@@ -989,7 +978,6 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
             # joint_decoder_lr=float(resolved_joint_decoder_lr),
             # joint_decoder_group_size=int(resolved_joint_decoder_group_size),
             # joint_decoder_batch_size=resolved_joint_decoder_batch_size,
-            intra_parallel=tuple(resolve_category_value(cat_args.intra_parallel, category)),
             intra_part_sort_mode=normalize_intra_part_sort_mode(
                 resolve_category_value(cat_args.intra_part_sort_mode, category),
                 arg_name="--intra_part_sort_mode",
@@ -1056,7 +1044,6 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     # parser.add_argument("--joint_decoder_batch_size", type=str, default="default=none", help=f"类别覆盖参数。示例：{_JOINT_DECODER_BATCH_SIZE_SPEC.example}")
     parser.add_argument("--skip_layers", type=str, default="", help="指定在 LLM 前向中始终使用原始线性权重的层，格式: layer_idx.category，例如 0.down_proj,30.q_proj。")
     parser.add_argument("--linear_group_size", type=int, default=32, help="跨层分组大小：每组同时训练多少个同类 Linear。")
-    parser.add_argument("--intra_parallel", type=str, default="default=1x1", help=f"类别覆盖参数。示例：{_INTRA_PARALLEL_SPEC.example}")
     # 排序代码，已关闭：不再注册 --intra_part_sort_mode CLI。
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument(

@@ -68,7 +68,6 @@ from train_utils.utils import (
     collect_linears as _collect_linears,
     configure_deterministic_mode,
     extract_layer_idx as _extract_layer_idx,
-    format_intra_parallel_desc as _format_intra_parallel_desc,
     format_namespace as _format_namespace,
     get_logger,
     set_seed,
@@ -900,8 +899,8 @@ def train_group_vae_payload(
         )
     resolved_residual_codec = str(outlier_residual_codec).strip().lower()
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
-    row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
-    parts_per_linear = int(row_parts) * int(col_parts)
+    row_parts, col_parts = 1, 1
+    parts_per_linear = 1
     sort_mode = str(runtime_cfg.intra_part_sort_mode).strip().lower()
     # 排序代码，已关闭。原 act_spectral_cosine 动态 activation 触发条件保留如下：
     # needs_dynamic_activation = (
@@ -1082,7 +1081,6 @@ def train_group_vae_payload(
         #     prep_start_time = time.time()
         #     stage_prep_result = materialize_prepared_group_data(
         #         prepared_entries=prepared_entries,
-        #         intra_parallel=(row_parts, col_parts),
         #         codebook_dim=int(stage_codebook_dim),
         #         batch_size=int(materialize_batch_size),
         #         normalize_weight=False,
@@ -2030,9 +2028,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     for table, arg_name in distill_tables:
         validate_category_keys(table, active_categories, arg_name)
 
-    category_intra_parallel: Dict[str, Tuple[int, int]] = {
-        cat: tuple(resolved_category_cfgs[cat].intra_parallel) for cat in active_categories
-    }
     category_codebook: Dict[str, Tuple[int, int]] = {
         cat: (
             int(resolved_category_cfgs[cat].codebook_bits),
@@ -2140,39 +2135,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 int(cat_args.outlier_residual_block_shape[0]),
                 int(cat_args.outlier_residual_block_shape[1]),
             )
-    unique_parallel = sorted(set(category_intra_parallel.values()))
-    if unique_parallel:
-        if len(unique_parallel) == 1:
-            intra_row_parts, intra_col_parts = unique_parallel[0]
-            intra_parts_per_linear = int(intra_row_parts) * int(intra_col_parts)
-            intra_parallel_desc = _format_intra_parallel_desc(intra_row_parts, intra_col_parts)
-            log.info(
-                "并行配置: linear_group_size=%d, intra_parallel=%s (rows=%d, cols=%d), intra_part_sort_mode=%s, total_num_models=%d",
-                linear_group_size,
-                intra_parallel_desc,
-                intra_row_parts,
-                intra_col_parts,
-                unique_sort_mode_desc[0] if len(
-                    unique_sort_mode_desc) == 1 else f"per_category{{{','.join(f'{cat}:{category_sort_mode_desc[cat]}' for cat in active_categories)}}}",
-                linear_group_size * intra_parts_per_linear,
-            )
-        else:
-            per_cat_desc = ",".join(
-                f"{cat}:{_format_intra_parallel_desc(*category_intra_parallel[cat])}"
-                for cat in active_categories
-            )
-            models_per_group_values = sorted(
-                linear_group_size * int(rp) * int(cp)
-                for rp, cp in unique_parallel
-            )
-            log.info(
-                "并行配置: linear_group_size=%d, intra_parallel=per_category{%s}, intra_part_sort_mode=per_category{%s}, total_num_models_per_group=[%d,%d]",
-                linear_group_size,
-                per_cat_desc,
-                ",".join(f"{cat}:{category_sort_mode_desc[cat]}" for cat in active_categories),
-                models_per_group_values[0],
-                models_per_group_values[-1],
-            )
+    log.info(
+        "并行配置: linear_group_size=%d, intra_part_sort_mode=%s, total_num_models=%d",
+        linear_group_size,
+        unique_sort_mode_desc[0] if len(
+            unique_sort_mode_desc) == 1 else f"per_category{{{','.join(f'{cat}:{category_sort_mode_desc[cat]}' for cat in active_categories)}}}",
+        linear_group_size,
+    )
     unique_codebook = sorted(set(category_codebook.values()))
     if unique_codebook:
         if len(unique_codebook) == 1:
@@ -2246,18 +2215,12 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
 
             cat_cfg = resolved_category_cfgs[cat]
             refs = [ref for _, ref in refs_sorted]
-            cat_row_parts, cat_col_parts = category_intra_parallel[cat]
             cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
-            cat_parts_per_linear = int(cat_row_parts) * int(cat_col_parts)
-            cat_intra_parallel_desc = _format_intra_parallel_desc(cat_row_parts, cat_col_parts)
             log.info(
-                "=== Category: %s (%d linears, residual_stages=%d, intra_parallel=%s rows=%d cols=%d, codebook_bits=%d, codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
+                "=== Category: %s (%d linears, residual_stages=%d, codebook_bits=%d, codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
                 cat,
                 len(refs),
                 int(cat_cfg.residual_stages),
-                cat_intra_parallel_desc,
-                cat_row_parts,
-                cat_col_parts,
                 int(cat_codebook_bits),
                 int(cat_codebook_dim),
                 str(cat_cfg.recon_loss_type),
@@ -2345,11 +2308,10 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 layer_indices = [idx for idx, _ in refs_sorted[start:start + linear_group_size]]
                 group_tag = f"{cat}.L{layer_indices[0]}-{layer_indices[-1]}"
                 log.info(
-                    "---- Group: %s (linears=%d, intra_parallel=%s, num_models=%d) ----",
+                    "---- Group: %s (linears=%d, num_models=%d) ----",
                     group_tag,
                     len(group_refs),
-                    cat_intra_parallel_desc,
-                    len(group_refs) * cat_parts_per_linear,
+                    len(group_refs),
                 )
                 _train_group_vae_and_replace(
                     model=model,

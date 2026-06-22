@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=3
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -55,7 +55,7 @@ python tools/cat_train.py \
   --save_model \
   --convert_device "cuda" \
   --allow_tail_group "true" \
-  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --target_categories "q_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
@@ -67,8 +67,9 @@ python tools/cat_train.py \
   --eval_ppl "false" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
-  --intra_parallel "default=1x1" \
-  --outlier_protect_mode "none" \
+  --outlier_protect_mode "channel_residual_vae" \
+  --outlier_residual_vae_decoder_share_scope "category" \
+  --outlier_residual_vae_stages "default=2" \
   --outlier_protect_count "default=32" \
   --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.01" \

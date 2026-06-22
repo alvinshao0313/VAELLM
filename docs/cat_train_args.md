@@ -38,7 +38,6 @@
 用于：
 
 - `steps_per_category`
-- `intra_parallel`
 - `outlier_protect_count`
 - `outlier_residual_top_p`
 - `codebook_bits`
@@ -57,7 +56,6 @@
 ```bash
 --codebook_bits default=16,cat:q_proj=24
 --steps_per_category default=2000,cat:q_proj=500
---intra_parallel default=1x1,cat:q_proj=4x1
 --outlier_residual_top_p default=0.01,cat:down_proj=0.02
 ```
 
@@ -108,7 +106,6 @@
 | 浮点 | `1e-4` / `0.1` |
 | 布尔 | `true` / `false` |
 | 可空整数 | `none` / `256` |
-| `intra_parallel` | `1x1` / `4x1` |
 | `intra_part_sort_mode` | 排序代码已关闭；只保留内部固定 `none` |
 
 ### 2.4 仍保留旧字符串语法的参数
@@ -141,7 +138,6 @@
 | `--joint_decoder_batch_size` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
 | `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式必须是 `layer_idx.category` |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
-| `--intra_parallel` | `default=1x1` | 单个 Linear 的层内切分 | 类别 override |
 | `--intra_part_sort_mode` | 已关闭 | 排序旧参数 | 不再注册；传入会报错 |
 | `--sort_prep_workers` | 已关闭 | 排序预处理旧参数 | 不再注册；传入会报错 |
 | `--batch_size` | `256` | VAE 训练与评估 DataLoader batch 大小 | 作用于块数据，不是 token batch |
@@ -528,7 +524,6 @@ python tools/cat_train.py \
   --output_dir ./output_linear_by_category \
   --steps_per_category default=2000 \
   --linear_group_size 32 \
-  --intra_parallel default=2x1 \
   --codebook_bits default=16 \
   --codebook_dim default=8 \
   --residual_stages default=1 \

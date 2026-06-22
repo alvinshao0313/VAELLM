@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -37,7 +37,7 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --lora_rank "default=4" \
   --lora_alpha "default=4" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=500" \
+  --distill_steps "default=1000" \
   --distill_batch_size "default=1" \
   --distill_nsamples "default=20000" \
   --distill_lr "default=1e-4" \
