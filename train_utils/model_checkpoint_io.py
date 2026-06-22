@@ -20,6 +20,7 @@ from rotation.model_utils import get_model
 
 STATE_DICT_FILENAME = "pytorch_model.bin"
 META_FILENAME = "checkpoint_meta.json"
+SHARED_PROTECTED_RESIDUAL_DECODER_REGISTRY_ATTR = "_vaellm_shared_protected_residual_decoders"
 _DISABLED_SORT_RESTORE_FIELDS = (
     "restore_row_indices",
     "restore_col_indices",
@@ -28,6 +29,42 @@ _DISABLED_SORT_RESTORE_FIELDS = (
     "stage_restore_col_indices",
     "stage_part_restore_col_indices",
 )
+
+
+def _validate_shared_protected_residual_decoder_ref(ref: str) -> str:
+    ref = str(ref).strip()
+    if not ref:
+        raise ValueError("shared protected residual decoder ref cannot be empty.")
+    if "." in ref:
+        raise ValueError(f"shared protected residual decoder ref cannot contain '.': {ref!r}")
+    return ref
+
+
+def ensure_shared_protected_residual_decoder_registry(model: nn.Module) -> nn.ModuleDict:
+    registry = getattr(model, SHARED_PROTECTED_RESIDUAL_DECODER_REGISTRY_ATTR, None)
+    if registry is None:
+        registry = nn.ModuleDict()
+        setattr(model, SHARED_PROTECTED_RESIDUAL_DECODER_REGISTRY_ATTR, registry)
+    if not isinstance(registry, nn.ModuleDict):
+        raise TypeError(
+            f"{SHARED_PROTECTED_RESIDUAL_DECODER_REGISTRY_ATTR} must be nn.ModuleDict, got {type(registry)}"
+        )
+    return registry
+
+
+def get_shared_protected_residual_decoder_registry(model: nn.Module) -> nn.ModuleDict:
+    return ensure_shared_protected_residual_decoder_registry(model)
+
+
+def register_shared_protected_residual_decoder(model: nn.Module, ref: str, decoder: nn.Module) -> None:
+    ref = _validate_shared_protected_residual_decoder_ref(ref)
+    if not isinstance(decoder, nn.Module):
+        raise TypeError(f"shared protected residual decoder must be nn.Module, got {type(decoder)}")
+    registry = ensure_shared_protected_residual_decoder_registry(model)
+    existing = registry[ref] if ref in registry else None
+    if existing is not None and existing is not decoder:
+        raise ValueError(f"shared protected residual decoder ref already exists with a different module: {ref}")
+    registry[ref] = decoder
 
 
 def _has_disabled_sort_restore_payload(value: Any) -> bool:
@@ -353,6 +390,42 @@ def _build_decoder_from_spec(spec: Dict[str, Any]) -> Decoder:
     return decoder
 
 
+def _collect_shared_protected_residual_decoder_specs(model: nn.Module) -> List[Dict[str, Any]]:
+    registry = getattr(model, SHARED_PROTECTED_RESIDUAL_DECODER_REGISTRY_ATTR, None)
+    if registry is None:
+        return []
+    if not isinstance(registry, nn.ModuleDict):
+        raise TypeError(
+            f"{SHARED_PROTECTED_RESIDUAL_DECODER_REGISTRY_ATTR} must be nn.ModuleDict, got {type(registry)}"
+        )
+    specs: List[Dict[str, Any]] = []
+    for ref, decoder in registry.items():
+        specs.append(
+            {
+                "ref": _validate_shared_protected_residual_decoder_ref(ref),
+                "decoder": _decoder_to_spec(decoder),
+            }
+        )
+    return specs
+
+
+def _rebuild_shared_protected_residual_decoders(
+    model: nn.Module,
+    specs: Sequence[Dict[str, Any]],
+) -> Dict[str, nn.Module]:
+    registry = ensure_shared_protected_residual_decoder_registry(model)
+    registry.clear()
+    for item in specs:
+        if not isinstance(item, dict):
+            raise TypeError(f"shared_protected_residual_decoders entries must be dicts, got {type(item)}")
+        ref = _validate_shared_protected_residual_decoder_ref(str(item.get("ref", "")))
+        decoder_spec = item.get("decoder")
+        if not isinstance(decoder_spec, dict):
+            raise ValueError(f"shared protected residual decoder {ref!r} is missing decoder spec.")
+        registry[ref] = _build_decoder_from_spec(decoder_spec)
+    return dict(registry.items())
+
+
 def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
     specs: List[Dict[str, Any]] = []
     for name, module in model.named_modules():
@@ -426,6 +499,42 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
         low_rank_a_spec = _tensor_spec(getattr(module, "low_rank_a", None))
         low_rank_b_spec = _tensor_spec(getattr(module, "low_rank_b", None))
         sparse_residual_specs = _collect_sparse_residual_specs(module)
+        protected_residual_indices_spec = _tensor_spec(getattr(module, "protected_residual_indices", None))
+        protected_residual_stages = int(getattr(module, "protected_residual_stages", 0))
+        protected_residual_vq_specs = None
+        protected_residual_decoder_specs = None
+        protected_residual_stage_codebook_dims = None
+        protected_residual_shared_decoder_refs = None
+        if protected_residual_stages > 0:
+            protected_residual_vq_specs = [
+                validate_bitpack_u8_spec(
+                    module.get_protected_residual_stage_vq_spec(stage_idx),
+                    arg_name=f"protected_residual_vq[{stage_idx}]",
+                )
+                for stage_idx in range(protected_residual_stages)
+            ]
+            raw_shared_refs = getattr(module, "protected_residual_shared_decoder_refs", None)
+            if raw_shared_refs is not None:
+                protected_residual_shared_decoder_refs = [
+                    _validate_shared_protected_residual_decoder_ref(ref)
+                    for ref in raw_shared_refs
+                ]
+                if len(protected_residual_shared_decoder_refs) != protected_residual_stages:
+                    raise ValueError(
+                        f"[{name}] protected_residual_shared_decoder_refs length "
+                        f"{len(protected_residual_shared_decoder_refs)} != protected_residual_stages {protected_residual_stages}"
+                    )
+                registry = getattr(module, "_protected_residual_shared_stage_decoders", None)
+                if registry is None or len(registry) != protected_residual_stages:
+                    raise ValueError(f"[{name}] missing shared protected residual decoder objects.")
+            else:
+                protected_residual_decoder_specs = [
+                    _decoder_to_spec(module.get_protected_residual_stage_decoder(stage_idx))
+                    for stage_idx in range(protected_residual_stages)
+                ]
+            protected_residual_stage_codebook_dims = [
+                int(v) for v in getattr(module, "protected_residual_stage_codebook_dims", [])
+            ]
         specs.append(
             {
                 "name": name,
@@ -455,6 +564,16 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "protected_output_weight": protected_out_weight_spec,
                 "low_rank_a": low_rank_a_spec,
                 "low_rank_b": low_rank_b_spec,
+                "protected_residual_axis": getattr(module, "protected_residual_axis", None),
+                "protected_residual_indices": protected_residual_indices_spec,
+                "protected_residual_stages": protected_residual_stages,
+                "protected_residual_stage_codebook_dims": protected_residual_stage_codebook_dims,
+                "protected_residual_parallel_stage_decode": bool(
+                    getattr(module, "_protected_residual_parallel_decoder", None) is not None
+                ),
+                "protected_residual_stage_vq_weights": protected_residual_vq_specs,
+                "protected_residual_stage_decoders": protected_residual_decoder_specs,
+                "protected_residual_shared_decoder_refs": protected_residual_shared_decoder_refs,
                 **sparse_residual_specs,
             }
         )
@@ -469,19 +588,37 @@ def unload_vae_original_linear_weights(model: nn.Module) -> int:
     return unloaded
 
 
+def _refresh_vae_linear_runtime_after_state_load(model: nn.Module) -> None:
+    for module in model.modules():
+        if not isinstance(module, VAELinear):
+            continue
+        if getattr(module, "_parallel_stage_decoder", None) is not None:
+            module._build_parallel_stage_decode_plan()
+        if getattr(module, "_protected_residual_parallel_decoder", None) is not None:
+            module._build_protected_residual_parallel_decode_plan()
+        module.clear_decoded_weight_cache()
+
+
 @contextmanager
 def temporarily_pack_parallel_stage_decoders_for_checkpoint(model: nn.Module) -> Iterator[int]:
     packed_modules: List[VAELinear] = []
+    protected_packed_modules: List[VAELinear] = []
     try:
         for module in model.modules():
             if not isinstance(module, VAELinear):
                 continue
             if getattr(module, "_parallel_stage_decoder", None) is not None:
-                continue
-            if module.pack_parallel_stage_decoder_(trainable=False):
+                pass
+            elif module.pack_parallel_stage_decoder_(trainable=False):
                 packed_modules.append(module)
-        yield int(len(packed_modules))
+            if getattr(module, "_protected_residual_parallel_decoder", None) is not None:
+                continue
+            if module.pack_protected_residual_stage_decoder_(trainable=False):
+                protected_packed_modules.append(module)
+        yield int(len(packed_modules) + len(protected_packed_modules))
     finally:
+        for module in reversed(protected_packed_modules):
+            module.unpack_protected_residual_stage_decoder_()
         for module in reversed(packed_modules):
             module.unpack_parallel_stage_decoder_()
 
@@ -505,6 +642,7 @@ def save_model_checkpoint(
     with temporarily_pack_parallel_stage_decoders_for_checkpoint(model):
         state_dict = model.state_dict()
         vae_specs = _collect_vae_linear_specs(model)
+        shared_protected_residual_decoder_specs = _collect_shared_protected_residual_decoder_specs(model)
         torch.save(state_dict, state_path)
 
     if save_config and getattr(model, "config", None) is not None:
@@ -518,13 +656,15 @@ def save_model_checkpoint(
 
     meta: Dict[str, Any] = {
         "format": "vaellm_state_dict_with_meta",
-        "version": 6,
+        "version": 7 if shared_protected_residual_decoder_specs else 5,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "base_model_path": base_model_path,
         "state_dict_file": STATE_DICT_FILENAME,
         "converted_module_count": len(vae_specs),
         "converted_modules": vae_specs,
     }
+    if shared_protected_residual_decoder_specs:
+        meta["shared_protected_residual_decoders"] = shared_protected_residual_decoder_specs
     if extra_meta:
         meta["extra_meta"] = extra_meta
 
@@ -577,8 +717,10 @@ def _rebuild_converted_modules(
     model: nn.Module,
     converted_modules: Sequence[Dict[str, Any]],
     *,
+    shared_protected_residual_decoders: Optional[Dict[str, nn.Module]] = None,
     preserve_original_weights_from_base: bool = False,
 ) -> None:
+    shared_protected_residual_decoders = shared_protected_residual_decoders or {}
     for spec in converted_modules:
         name = str(spec["name"])
         _reject_disabled_sort_restore_metadata(name, spec)
@@ -841,6 +983,87 @@ def _rebuild_converted_modules(
                 raise ValueError(f"[{name}] protected_output_weight shape must be 2D, got {shape}")
             protected_out_weight_dtype = _name_to_dtype(str(protected_out_weight_spec.get("dtype", "float32")))
             protected_out_weight_payload = torch.zeros(shape, dtype=protected_out_weight_dtype, device=device)
+        protected_residual_idx_payload = None
+        protected_residual_idx_spec = spec.get("protected_residual_indices")
+        if isinstance(protected_residual_idx_spec, dict):
+            shape = tuple(int(v) for v in protected_residual_idx_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] protected_residual_indices shape must be 1D, got {shape}")
+            protected_residual_idx_dtype = _name_to_dtype(str(protected_residual_idx_spec.get("dtype", "int64")))
+            protected_residual_idx_payload = _build_unique_index_placeholder(
+                shape,
+                dtype=protected_residual_idx_dtype,
+                device=device,
+            )
+        protected_residual_stage_vq_payload = None
+        protected_residual_stage_vq_storage_specs = None
+        protected_residual_stage_decoder_payload = None
+        protected_residual_shared_stage_decoders = None
+        protected_residual_shared_decoder_refs = None
+        protected_residual_stages = int(spec.get("protected_residual_stages") or 0)
+        protected_residual_stage_codebook_dims = None
+        if protected_residual_stages > 0:
+            protected_residual_vq_specs = spec.get("protected_residual_stage_vq_weights")
+            protected_residual_decoder_specs = spec.get("protected_residual_stage_decoders")
+            protected_residual_shared_refs_raw = spec.get("protected_residual_shared_decoder_refs")
+            has_shared_protected_residual_decoders = protected_residual_shared_refs_raw is not None
+            if not isinstance(protected_residual_vq_specs, (list, tuple)):
+                raise ValueError(f"[{name}] missing/invalid protected_residual_stage_vq_weights.")
+            if has_shared_protected_residual_decoders:
+                if not isinstance(protected_residual_shared_refs_raw, (list, tuple)):
+                    raise ValueError(f"[{name}] protected_residual_shared_decoder_refs must be list/tuple.")
+                protected_residual_shared_decoder_refs = [
+                    _validate_shared_protected_residual_decoder_ref(ref)
+                    for ref in protected_residual_shared_refs_raw
+                ]
+                if len(protected_residual_shared_decoder_refs) != protected_residual_stages:
+                    raise ValueError(
+                        f"[{name}] protected_residual_shared_decoder_refs length "
+                        f"{len(protected_residual_shared_decoder_refs)} != protected_residual_stages {protected_residual_stages}"
+                    )
+                protected_residual_shared_stage_decoders = []
+                for ref in protected_residual_shared_decoder_refs:
+                    if ref not in shared_protected_residual_decoders:
+                        raise ValueError(f"[{name}] unknown shared protected residual decoder ref: {ref}")
+                    protected_residual_shared_stage_decoders.append(shared_protected_residual_decoders[ref])
+            elif not isinstance(protected_residual_decoder_specs, (list, tuple)):
+                raise ValueError(f"[{name}] missing/invalid protected_residual_stage_decoders.")
+            if len(protected_residual_vq_specs) != protected_residual_stages:
+                raise ValueError(
+                    f"[{name}] protected_residual_stage_vq_weights length {len(protected_residual_vq_specs)} "
+                    f"!= protected_residual_stages {protected_residual_stages}"
+                )
+            if not has_shared_protected_residual_decoders and len(protected_residual_decoder_specs) != protected_residual_stages:
+                raise ValueError(
+                    f"[{name}] protected_residual_stage_decoders length {len(protected_residual_decoder_specs)} "
+                    f"!= protected_residual_stages {protected_residual_stages}"
+                )
+            protected_residual_stage_vq_payload = []
+            protected_residual_stage_vq_storage_specs = []
+            protected_residual_stage_decoder_payload = [] if not has_shared_protected_residual_decoders else None
+            for stage_idx in range(protected_residual_stages):
+                vq_spec = protected_residual_vq_specs[stage_idx]
+                if not isinstance(vq_spec, dict):
+                    raise ValueError(f"[{name}] protected_residual_stage_vq_weights[{stage_idx}] must be a dict.")
+                normalized_vq_spec = _validate_packed_vq_spec(
+                    vq_spec,
+                    module_name=name,
+                    field_name=f"protected_residual_stage_vq_weights[{stage_idx}]",
+                )
+                protected_residual_stage_vq_payload.append(
+                    _make_vq_placeholders([normalized_vq_spec], device=device)[0]
+                )
+                protected_residual_stage_vq_storage_specs.append([normalized_vq_spec])
+                if not has_shared_protected_residual_decoders:
+                    decoder_spec = protected_residual_decoder_specs[stage_idx]
+                    if not isinstance(decoder_spec, dict):
+                        raise ValueError(f"[{name}] protected_residual_stage_decoders[{stage_idx}] must be a dict.")
+                    protected_residual_stage_decoder_payload.append(_build_decoder_from_spec(decoder_spec))
+            protected_residual_stage_codebook_dims = spec.get("protected_residual_stage_codebook_dims")
+            if protected_residual_stage_codebook_dims is not None:
+                protected_residual_stage_codebook_dims = [
+                    int(v) for v in protected_residual_stage_codebook_dims
+                ]
         low_rank_a_payload = None
         low_rank_a_spec = spec.get("low_rank_a")
         if isinstance(low_rank_a_spec, dict):
@@ -988,11 +1211,21 @@ def _rebuild_converted_modules(
             sparse_residual_zero_points=sparse_zero_points_payload,
             low_rank_a=low_rank_a_payload,
             low_rank_b=low_rank_b_payload,
+            protected_residual_axis=spec.get("protected_residual_axis"),
+            protected_residual_indices=protected_residual_idx_payload,
+            protected_residual_stage_vq_weights=protected_residual_stage_vq_payload,
+            protected_residual_stage_vq_storage_specs=protected_residual_stage_vq_storage_specs,
+            protected_residual_stage_decoders=protected_residual_stage_decoder_payload,
+            protected_residual_shared_decoder_refs=protected_residual_shared_decoder_refs,
+            protected_residual_shared_stage_decoders=protected_residual_shared_stage_decoders,
+            protected_residual_stage_codebook_dims=protected_residual_stage_codebook_dims,
             always_use_original=bool(spec.get("always_use_original", False)),
             protect_original_weight=bool(spec.get("protect_original_weight", False)),
         )
         if bool(spec.get("parallel_stage_decode", False)):
             new_module.pack_parallel_stage_decoder_(trainable=False)
+        if bool(spec.get("protected_residual_parallel_stage_decode", False)):
+            new_module.pack_protected_residual_stage_decoder_(trainable=False)
         set_module_by_name(model, name, new_module)
 
 
@@ -1143,10 +1376,15 @@ def load_checkpoint_into_model(
     _assert_supported_converted_modules_meta(meta)
 
     converted_modules = meta.get("converted_modules", [])
+    shared_protected_residual_decoders = _rebuild_shared_protected_residual_decoders(
+        model,
+        meta.get("shared_protected_residual_decoders", []),
+    )
     if converted_modules:
         _rebuild_converted_modules(
             model,
             converted_modules,
+            shared_protected_residual_decoders=shared_protected_residual_decoders,
             preserve_original_weights_from_base=bool(preserve_original_weights_from_base),
         )
 
@@ -1163,6 +1401,7 @@ def load_checkpoint_into_model(
                 state_dict[key] = value
 
     load_result = model.load_state_dict(state_dict, strict=strict)
+    _refresh_vae_linear_runtime_after_state_load(model)
     model.eval()
     return model, meta, load_result
 

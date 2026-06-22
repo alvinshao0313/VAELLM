@@ -304,7 +304,7 @@ def resolve_autoencoder_arch_spec(args) -> AutoEncoderArchSpec:
         decoder_num_res_blocks=int(decoder_num_res_blocks),
         decoder_type=str(decoder_type),
         norm_type=str(norm_type),
-        use_checkpoint=bool(getattr(args, "use_checkpoint", False)),
+        use_checkpoint=bool(getattr(args, "vae_decoder_checkpoint", False)),
     )
 
 

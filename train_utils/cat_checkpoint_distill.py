@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 import torch
@@ -8,6 +8,7 @@ from torch import nn
 
 from e2e_common.peft_proxy import PeftVAELinearProxy, iter_named_peft_vae_proxies
 from e2e_common.post_norm_head import fuse_post_norm_head_linear
+from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import (
     NamedVAELinearTarget,
@@ -45,6 +46,11 @@ class _NamedCategoryVAETarget:
     base_layer: VAELinear
 
 
+@dataclass
+class _CheckpointDistillResidency:
+    stashed_modules: Dict[str, nn.Module] = field(default_factory=dict)
+
+
 def _iter_named_vae_targets(model: nn.Module) -> List[_NamedCategoryVAETarget]:
     targets: List[_NamedCategoryVAETarget] = []
     skip_prefixes: List[str] = []
@@ -75,6 +81,143 @@ def _collect_vae_targets_by_category(model: nn.Module) -> Dict[str, List[_NamedC
     for target in _iter_named_vae_targets(model):
         by_category.setdefault(target.category, []).append(target)
     return by_category
+
+
+def _iter_vae_decoder_checkpoint_targets(base_layer: VAELinear):
+    seen = set()
+    for attr_name in ("decoder", "_parallel_stage_decoder"):
+        decoder = getattr(base_layer, attr_name, None)
+        if decoder is None or id(decoder) in seen:
+            continue
+        seen.add(id(decoder))
+        yield decoder
+
+    decoders = getattr(base_layer, "decoders", None)
+    if decoders is None:
+        return
+    for decoder in decoders:
+        if decoder is None or id(decoder) in seen:
+            continue
+        seen.add(id(decoder))
+        yield decoder
+
+
+def _apply_vae_decoder_checkpoint_override(*, model: nn.Module, vae_args, logger) -> int:
+    override = getattr(vae_args, "vae_decoder_checkpoint", None)
+    if override is None:
+        return 0
+
+    enabled = bool(override)
+    changed = 0
+    for target in _iter_named_vae_targets(model):
+        for decoder in _iter_vae_decoder_checkpoint_targets(target.base_layer):
+            if not hasattr(decoder, "use_checkpoint"):
+                continue
+            decoder.use_checkpoint = enabled
+            changed += 1
+
+    logger.info(
+        "Checkpoint distill VAE decoder checkpoint override: use_checkpoint=%s decoders=%d",
+        str(enabled).lower(),
+        int(changed),
+    )
+    return changed
+
+
+def _make_frozen_linear_from_vae_original(*, name: str, base_layer: VAELinear) -> nn.Linear:
+    original_weight = getattr(base_layer, "original_weight", None)
+    if original_weight is None:
+        raise RuntimeError(
+            f"{name}: original_weight is required to replace inactive checkpoint-distill VAELinear."
+        )
+    if tuple(original_weight.shape) != (int(base_layer.out_features), int(base_layer.in_features)):
+        raise ValueError(
+            f"{name}: original_weight shape {tuple(original_weight.shape)} != "
+            f"({int(base_layer.out_features)}, {int(base_layer.in_features)})"
+        )
+    bias = getattr(base_layer, "bias", None)
+    linear = nn.Linear(
+        int(base_layer.in_features),
+        int(base_layer.out_features),
+        bias=bias is not None,
+        device=original_weight.device,
+        dtype=original_weight.dtype,
+    )
+    linear.weight = nn.Parameter(original_weight.detach(), requires_grad=False)
+    if bias is not None:
+        if tuple(bias.shape) != (int(base_layer.out_features),):
+            raise ValueError(
+                f"{name}: bias shape {tuple(bias.shape)} != ({int(base_layer.out_features)},)"
+            )
+        linear.bias = nn.Parameter(bias.detach(), requires_grad=False)
+    linear.requires_grad_(False)
+    linear.eval()
+    return linear
+
+
+def _apply_checkpoint_distill_residency(
+    *,
+    model: nn.Module,
+    active_categories: Sequence[str],
+    residency: _CheckpointDistillResidency,
+    logger,
+) -> None:
+    active_set = {str(category) for category in active_categories}
+    restored = 0
+    for name, module in list(residency.stashed_modules.items()):
+        category = str(name).rsplit(".", 1)[-1]
+        if category not in active_set:
+            continue
+        set_module_by_name(model, name, module)
+        del residency.stashed_modules[name]
+        restored += 1
+
+    stashed = 0
+    active = 0
+    for target in list(_iter_named_vae_targets(model)):
+        if target.category in active_set:
+            if callable(getattr(target.module, "set_temporary", None)):
+                target.module.set_temporary(True)
+            else:
+                target.base_layer.set_temporary(True)
+            target.base_layer.clear_decoded_weight_cache()
+            active += 1
+            continue
+        target.base_layer.clear_decoded_weight_cache()
+        residency.stashed_modules[target.name] = target.module
+        set_module_by_name(
+            model,
+            target.name,
+            _make_frozen_linear_from_vae_original(name=target.name, base_layer=target.base_layer),
+        )
+        stashed += 1
+
+    logger.info(
+        "Checkpoint distill residency: active_categories=%s active_vae=%d newly_stashed=%d restored=%d total_stashed=%d",
+        ",".join(str(category) for category in active_categories),
+        int(active),
+        int(stashed),
+        int(restored),
+        int(len(residency.stashed_modules)),
+    )
+
+
+def _restore_checkpoint_distill_residency(
+    *,
+    model: nn.Module,
+    residency: _CheckpointDistillResidency,
+    logger,
+) -> None:
+    restored = 0
+    for name, module in list(residency.stashed_modules.items()):
+        if isinstance(module, PeftVAELinearProxy):
+            module.base_layer.clear_decoded_weight_cache()
+        elif isinstance(module, VAELinear):
+            module.clear_decoded_weight_cache()
+        set_module_by_name(model, name, module)
+        del residency.stashed_modules[name]
+        restored += 1
+    logger.info("Checkpoint distill residency: restored stashed VAELinear modules=%d", int(restored))
 
 
 def _set_active_vae_category_prefix(
@@ -220,6 +363,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     )
 
     model = _load_checkpoint_for_distill(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args, logger=logger)
+    _apply_vae_decoder_checkpoint_override(model=model, vae_args=vae_args, logger=logger)
     transpose_modules = _split_csv(cat_args.transpose_modules)
     target_categories = _split_csv(cat_args.target_categories)
     only_decoder_projections = not bool(cat_args.include_all_linears)
@@ -260,10 +404,17 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             token=hf_args.access_token,
         )
 
+    residency = _CheckpointDistillResidency()
     lora_round_idx = 0
     active_categories: List[str] = []
     for category in target_categories:
         active_categories.append(str(category))
+        _apply_checkpoint_distill_residency(
+            model=model,
+            active_categories=active_categories,
+            residency=residency,
+            logger=logger,
+        )
         prewarm_targets = _set_active_vae_category_prefix(
             model=model,
             active_categories=active_categories,
@@ -347,6 +498,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             tokenizer=eval_tokenizer,
         )
     if cat_args.save_model:
+        _restore_checkpoint_distill_residency(model=model, residency=residency, logger=logger)
         _save_final_model(
             model=model,
             run_output_dir=run_output_dir,

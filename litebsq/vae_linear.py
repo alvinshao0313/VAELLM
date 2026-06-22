@@ -74,6 +74,14 @@ class VAELinear(nn.Module):
         sparse_residual_zero_points: Optional[torch.Tensor] = None,
         low_rank_a: Optional[torch.Tensor] = None,
         low_rank_b: Optional[torch.Tensor] = None,
+        protected_residual_axis: Optional[str] = None,
+        protected_residual_indices: Optional[torch.Tensor] = None,
+        protected_residual_stage_vq_weights: Optional[Sequence[Any]] = None,
+        protected_residual_stage_vq_storage_specs: Optional[Sequence[Any]] = None,
+        protected_residual_stage_decoders: Optional[Sequence[Any]] = None,
+        protected_residual_shared_decoder_refs: Optional[Sequence[str]] = None,
+        protected_residual_shared_stage_decoders: Optional[Sequence[nn.Module]] = None,
+        protected_residual_stage_codebook_dims: Optional[Sequence[int]] = None,
         always_use_original: bool = False,
         protect_original_weight: bool = False,
     ):
@@ -598,6 +606,20 @@ class VAELinear(nn.Module):
         self.register_buffer("_parallel_stage_grouped_vq_runtime", None, persistent=False)
         self.register_buffer("_parallel_stage_model_indices", None, persistent=False)
         self.register_buffer("_parallel_stage_model_indices_runtime", None, persistent=False)
+        self.protected_residual_axis = None
+        self.protected_residual_stages = 0
+        self.protected_residual_stage_codebook_dims: List[int] = []
+        self._protected_residual_stage_vq_storage_specs: List[Dict[str, Any]] = []
+        self.protected_residual_parallel_stage_decode = False
+        self._protected_residual_parallel_layout: List[Tuple[int, int]] = []
+        self._protected_residual_parallel_layout_is_stage_major = False
+        self._protected_residual_parallel_grouped_vq_runtime_key: Optional[Tuple[str, torch.dtype]] = None
+        self._protected_residual_parallel_model_indices_runtime_key: Optional[str] = None
+        self.register_buffer("protected_residual_indices", None, persistent=True)
+        self.register_buffer("_protected_residual_parallel_grouped_vq_weight", None, persistent=False)
+        self.register_buffer("_protected_residual_parallel_grouped_vq_runtime", None, persistent=False)
+        self.register_buffer("_protected_residual_parallel_model_indices", None, persistent=False)
+        self.register_buffer("_protected_residual_parallel_model_indices_runtime", None, persistent=False)
 
         use_stage_payload = stage_vq_weights is not None or stage_decoders is not None
         if use_stage_payload:
@@ -869,6 +891,190 @@ class VAELinear(nn.Module):
                     f"expected={expected_numel} (compressed_out*compressed_in), stage_codebook_dim={stage_codebook_dim}"
                 )
 
+        self._init_protected_residual_payload(
+            axis=protected_residual_axis,
+            indices=protected_residual_indices,
+            stage_vq_weights=protected_residual_stage_vq_weights,
+            stage_vq_storage_specs=protected_residual_stage_vq_storage_specs,
+            stage_decoders=protected_residual_stage_decoders,
+            shared_decoder_refs=protected_residual_shared_decoder_refs,
+            shared_stage_decoders=protected_residual_shared_stage_decoders,
+            stage_codebook_dims=protected_residual_stage_codebook_dims,
+        )
+
+    def _init_protected_residual_payload(
+        self,
+        *,
+        axis: Optional[str],
+        indices: Optional[torch.Tensor],
+        stage_vq_weights: Optional[Sequence[Any]],
+        stage_vq_storage_specs: Optional[Sequence[Any]],
+        stage_decoders: Optional[Sequence[Any]],
+        shared_decoder_refs: Optional[Sequence[str]],
+        shared_stage_decoders: Optional[Sequence[nn.Module]],
+        stage_codebook_dims: Optional[Sequence[int]],
+    ) -> None:
+        payload_provided = any(
+            item is not None
+            for item in (
+                axis,
+                indices,
+                stage_vq_weights,
+                stage_vq_storage_specs,
+                stage_decoders,
+                shared_decoder_refs,
+                shared_stage_decoders,
+                stage_codebook_dims,
+            )
+        )
+        if not payload_provided:
+            return
+        use_shared_decoders = shared_stage_decoders is not None or shared_decoder_refs is not None
+        if axis is None or indices is None or stage_vq_weights is None:
+            raise ValueError(
+                "protected residual payload requires axis, indices, and stage_vq_weights."
+            )
+        if use_shared_decoders:
+            if stage_decoders is not None:
+                raise ValueError("protected residual payload cannot provide both private and shared decoders.")
+            if shared_stage_decoders is None or shared_decoder_refs is None:
+                raise ValueError(
+                    "shared protected residual payload requires shared_decoder_refs and shared_stage_decoders."
+                )
+        elif stage_decoders is None:
+            raise ValueError("protected residual payload requires stage_decoders when shared decoders are absent.")
+        resolved_axis = str(axis).strip().lower()
+        if resolved_axis not in {"input", "output"}:
+            raise ValueError(f"protected_residual_axis must be input or output, got {axis!r}.")
+        protected_idx = indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+        if protected_idx.ndim != 1:
+            raise ValueError(f"protected_residual_indices must be 1D, got shape={tuple(protected_idx.shape)}")
+        if int(protected_idx.numel()) == 0:
+            return
+        if int(torch.unique(protected_idx, sorted=False).numel()) != int(protected_idx.numel()):
+            raise ValueError("protected_residual_indices contains duplicates.")
+        limit = self.in_features if resolved_axis == "input" else self.out_features
+        if int(protected_idx.min().item()) < 0 or int(protected_idx.max().item()) >= int(limit):
+            raise ValueError(
+                f"protected_residual_indices must be within [0, {limit}), got "
+                f"[{int(protected_idx.min().item())}, {int(protected_idx.max().item())}]."
+            )
+        protected_idx = torch.sort(protected_idx).values.contiguous()
+        self.protected_residual_axis = resolved_axis
+        self.protected_residual_indices = protected_idx
+
+        stage_vq_payload = self._normalize_stage_payload(
+            stage_vq_weights,
+            parallel_parts=1,
+            payload_name="protected_residual_stage_vq_weights",
+        )
+        normalized_stage_vq_storage_specs = None
+        if stage_vq_storage_specs is not None:
+            normalized_stage_vq_storage_specs = self._normalize_stage_payload(
+                stage_vq_storage_specs,
+                parallel_parts=1,
+                payload_name="protected_residual_stage_vq_storage_specs",
+            )
+        if use_shared_decoders:
+            shared_refs = [str(ref) for ref in shared_decoder_refs]
+            shared_decoders = list(shared_stage_decoders)
+            if len(shared_refs) != len(shared_decoders):
+                raise ValueError(
+                    "protected residual shared decoder length mismatch: "
+                    f"refs={len(shared_refs)} vs decoders={len(shared_decoders)}"
+                )
+            if len(stage_vq_payload) != len(shared_decoders):
+                raise ValueError(
+                    "protected residual stage payload length mismatch: "
+                    f"stage_vq_weights={len(stage_vq_payload)} vs shared_decoders={len(shared_decoders)}"
+                )
+            for stage_idx, dec in enumerate(shared_decoders):
+                if not isinstance(dec, nn.Module):
+                    raise TypeError(
+                        f"protected_residual_shared_stage_decoders[{stage_idx}] must be nn.Module, got {type(dec)}"
+                    )
+            stage_decoder_payload = None
+            self.protected_residual_shared_decoder_refs = shared_refs
+            self.__dict__["_protected_residual_shared_stage_decoders"] = shared_decoders
+        else:
+            stage_decoder_payload = self._normalize_stage_payload(
+                stage_decoders,
+                parallel_parts=1,
+                payload_name="protected_residual_stage_decoders",
+            )
+            if len(stage_vq_payload) != len(stage_decoder_payload):
+                raise ValueError(
+                    "protected residual stage payload length mismatch: "
+                    f"stage_vq_weights={len(stage_vq_payload)} vs stage_decoders={len(stage_decoder_payload)}"
+                )
+            self.protected_residual_shared_decoder_refs = None
+            self.__dict__["_protected_residual_shared_stage_decoders"] = None
+        if normalized_stage_vq_storage_specs is not None and len(normalized_stage_vq_storage_specs) != len(stage_vq_payload):
+            raise ValueError(
+                "protected_residual_stage_vq_storage_specs length mismatch: "
+                f"{len(normalized_stage_vq_storage_specs)} vs {len(stage_vq_payload)}"
+            )
+        self.protected_residual_stages = int(len(stage_vq_payload))
+        if stage_codebook_dims is None:
+            self.protected_residual_stage_codebook_dims = [int(self.codebook_dim) for _ in range(self.protected_residual_stages)]
+        else:
+            dims = [int(v) for v in stage_codebook_dims]
+            if len(dims) == 1 and self.protected_residual_stages > 1:
+                dims = dims * self.protected_residual_stages
+            if len(dims) != self.protected_residual_stages:
+                raise ValueError(
+                    f"protected_residual_stage_codebook_dims length {len(dims)} != "
+                    f"protected_residual_stages {self.protected_residual_stages}"
+                )
+            self.protected_residual_stage_codebook_dims = dims
+
+        self._protected_residual_stage_vq_storage_specs: List[Dict[str, Any]] = []
+        expected_numel = int(protected_idx.numel()) * (self.out_features if resolved_axis == "input" else self.in_features)
+        for stage_idx, stage_parts in enumerate(stage_vq_payload):
+            w = stage_parts[0]
+            if not isinstance(w, torch.Tensor):
+                raise TypeError(f"protected_residual_stage_vq_weights[{stage_idx}] must be Tensor, got {type(w)}")
+            if normalized_stage_vq_storage_specs is None:
+                logical_shape = tuple(int(v) for v in w.shape)
+                packed_storage = pack_bool_tensor_to_uint8(w.detach().contiguous(), logical_shape=logical_shape)
+                storage_spec = build_bitpack_u8_spec(logical_shape=logical_shape)
+            else:
+                storage_spec = validate_bitpack_u8_spec(
+                    normalized_stage_vq_storage_specs[stage_idx][0],
+                    arg_name=f"protected_residual_stage_vq_storage_specs[{stage_idx}]",
+                )
+                if w.dtype != torch.uint8:
+                    raise ValueError("protected residual packed vq storage must be torch.uint8 when specs are provided.")
+                if tuple(int(v) for v in w.shape) != tuple(int(v) for v in storage_spec["shape"]):
+                    raise ValueError(
+                        f"protected residual vq storage shape {tuple(int(v) for v in w.shape)} != "
+                        f"{tuple(int(v) for v in storage_spec['shape'])}"
+                    )
+                packed_storage = w.detach().contiguous()
+            logical_shape = tuple(int(v) for v in storage_spec["logical_shape"])
+            if len(logical_shape) != 3 or int(logical_shape[1]) != 1:
+                raise ValueError(f"protected residual vq logical_shape must be [N_blocks,1,latent], got {logical_shape}")
+            stage_numel = int(logical_shape[0]) * int(self.protected_residual_stage_codebook_dims[stage_idx])
+            if stage_numel != expected_numel:
+                raise ValueError(
+                    f"protected residual stage {stage_idx} numel mismatch: {stage_numel} != {expected_numel}."
+                )
+            self._protected_residual_stage_vq_storage_specs.append(dict(storage_spec))
+            if stage_idx == 0:
+                self.register_buffer("protected_residual_vq_weight", packed_storage, persistent=True)
+            else:
+                self.register_buffer(f"protected_residual_vq_weight_s{stage_idx}", packed_storage, persistent=True)
+
+        if not use_shared_decoders:
+            for stage_idx, stage_parts in enumerate(stage_decoder_payload):
+                dec = stage_parts[0]
+                if not isinstance(dec, nn.Module):
+                    raise TypeError(f"protected_residual_stage_decoders[{stage_idx}] must be nn.Module, got {type(dec)}")
+                if stage_idx == 0:
+                    self.protected_residual_decoder = dec
+                else:
+                    setattr(self, f"protected_residual_decoder_s{stage_idx}", dec)
+
     @staticmethod
     def _normalize_stage_payload(
         payload: Sequence[Any],
@@ -1132,6 +1338,151 @@ class VAELinear(nn.Module):
         self._parallel_stage_model_indices_runtime_key = cache_key
         return out
 
+    def get_protected_residual_stage_vq_storage(self, stage_idx: int) -> torch.Tensor:
+        stage_idx = int(stage_idx)
+        if stage_idx < 0 or stage_idx >= int(self.protected_residual_stages):
+            raise IndexError(
+                f"protected residual stage_idx out of range: {stage_idx} vs {int(self.protected_residual_stages)}"
+            )
+        if stage_idx == 0:
+            return self.protected_residual_vq_weight
+        return getattr(self, f"protected_residual_vq_weight_s{stage_idx}")
+
+    def get_protected_residual_stage_vq_spec(self, stage_idx: int) -> Dict[str, Any]:
+        stage_idx = int(stage_idx)
+        if stage_idx < 0 or stage_idx >= len(self._protected_residual_stage_vq_storage_specs):
+            raise IndexError(
+                f"protected residual stage_idx out of range: {stage_idx} vs "
+                f"{len(self._protected_residual_stage_vq_storage_specs)}"
+            )
+        return dict(self._protected_residual_stage_vq_storage_specs[stage_idx])
+
+    def get_protected_residual_stage_vq_weight(self, stage_idx: int) -> torch.Tensor:
+        storage = self.get_protected_residual_stage_vq_storage(stage_idx)
+        spec = self.get_protected_residual_stage_vq_spec(stage_idx)
+        return unpack_uint8_tensor_to_bool(
+            storage,
+            logical_shape=tuple(int(v) for v in spec["logical_shape"]),
+        )
+
+    def get_protected_residual_stage_decoder(self, stage_idx: int) -> nn.Module:
+        stage_idx = int(stage_idx)
+        if stage_idx < 0 or stage_idx >= int(self.protected_residual_stages):
+            raise IndexError(
+                f"protected residual stage_idx out of range: {stage_idx} vs {int(self.protected_residual_stages)}"
+            )
+        shared_decoders = getattr(self, "_protected_residual_shared_stage_decoders", None)
+        if shared_decoders is not None:
+            return shared_decoders[stage_idx]
+        packed_decoder = getattr(self, "_protected_residual_parallel_decoder", None)
+        if packed_decoder is not None:
+            model_idx = self._protected_residual_parallel_model_index(stage_idx)
+            return packed_decoder.get_sub_decoder(model_idx)
+        if stage_idx == 0:
+            return self.protected_residual_decoder
+        return getattr(self, f"protected_residual_decoder_s{stage_idx}")
+
+    def _protected_residual_parallel_model_index(self, stage_idx: int) -> int:
+        target = (int(stage_idx), 0)
+        for model_idx, item in enumerate(getattr(self, "_protected_residual_parallel_layout", [])):
+            if tuple(item) == target:
+                return int(model_idx)
+        raise RuntimeError(f"protected residual parallel layout does not contain stage={int(stage_idx)}.")
+
+    def _clear_protected_residual_parallel_runtime_cache(self) -> None:
+        self._protected_residual_parallel_grouped_vq_runtime_key = None
+        self._protected_residual_parallel_model_indices_runtime_key = None
+        self._protected_residual_parallel_grouped_vq_runtime = None
+        self._protected_residual_parallel_model_indices_runtime = None
+
+    def _clear_protected_residual_parallel_plan(self) -> None:
+        self._clear_protected_residual_parallel_runtime_cache()
+        self._protected_residual_parallel_layout_is_stage_major = False
+        self._protected_residual_parallel_grouped_vq_weight = None
+        self._protected_residual_parallel_model_indices = None
+
+    def _build_protected_residual_parallel_grouped_vq_weight(self, layout: Sequence[Tuple[int, int]]) -> torch.Tensor:
+        if not layout:
+            raise RuntimeError("protected residual parallel layout cannot be empty.")
+        vq_tensors: List[torch.Tensor] = []
+        first_shape = None
+        for stage_idx, _part_idx in layout:
+            vq_weight = self.get_protected_residual_stage_vq_weight(stage_idx)
+            if vq_weight.ndim != 3 or int(vq_weight.shape[1]) != 1:
+                raise ValueError(
+                    f"protected residual parallel decode expects vq shape [N_blocks, 1, latent_dim], "
+                    f"got {tuple(vq_weight.shape)} for stage={int(stage_idx)}."
+                )
+            shape = tuple(int(v) for v in vq_weight.shape)
+            if first_shape is None:
+                first_shape = shape
+            elif shape != first_shape:
+                raise ValueError(
+                    f"protected residual parallel decode requires identical vq shapes, got {shape} vs {first_shape}."
+                )
+            vq_tensors.append(vq_weight.detach())
+        return torch.cat(vq_tensors, dim=1).contiguous()
+
+    def _build_protected_residual_parallel_decode_plan(self) -> None:
+        layout = list(getattr(self, "_protected_residual_parallel_layout", []))
+        expected = int(self.protected_residual_stages)
+        if len(layout) != expected:
+            raise RuntimeError(f"protected residual parallel layout length {len(layout)} != expected {expected}.")
+        stage_major = [(int(stage_idx), 0) for stage_idx in range(expected)]
+        model_indices = torch.empty((expected,), dtype=torch.long, device="cpu")
+        seen = set()
+        for model_idx, (stage_idx, part_idx) in enumerate(layout):
+            key = (int(stage_idx), int(part_idx))
+            if key in seen:
+                raise RuntimeError(f"protected residual parallel layout contains duplicate entry: {key}.")
+            if int(part_idx) != 0 or int(stage_idx) < 0 or int(stage_idx) >= expected:
+                raise RuntimeError(f"protected residual parallel layout entry out of range: {key}.")
+            seen.add(key)
+            model_indices[int(stage_idx)] = int(model_idx)
+        if len(seen) != expected:
+            raise RuntimeError(f"protected residual parallel layout covers {len(seen)} entries, expected {expected}.")
+        self._protected_residual_parallel_grouped_vq_weight = self._build_protected_residual_parallel_grouped_vq_weight(layout)
+        self._protected_residual_parallel_model_indices = model_indices
+        self._protected_residual_parallel_layout_is_stage_major = list(layout) == stage_major
+        self._clear_protected_residual_parallel_runtime_cache()
+
+    def _get_protected_residual_parallel_grouped_vq(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        grouped_vq = getattr(self, "_protected_residual_parallel_grouped_vq_weight", None)
+        if grouped_vq is None:
+            raise RuntimeError("protected residual parallel packed VQ buffer is missing.")
+        target_device = torch.device(device)
+        cache_key = (str(target_device), dtype)
+        cached = getattr(self, "_protected_residual_parallel_grouped_vq_runtime", None)
+        if (
+            isinstance(cached, torch.Tensor)
+            and self._protected_residual_parallel_grouped_vq_runtime_key == cache_key
+            and cached.device == target_device
+            and cached.dtype == dtype
+        ):
+            return cached
+        out = grouped_vq.to(device=target_device, dtype=dtype, non_blocking=True)
+        self._protected_residual_parallel_grouped_vq_runtime = out
+        self._protected_residual_parallel_grouped_vq_runtime_key = cache_key
+        return out
+
+    def _get_protected_residual_parallel_model_indices(self, device: torch.device) -> torch.Tensor:
+        indices = getattr(self, "_protected_residual_parallel_model_indices", None)
+        if indices is None:
+            raise RuntimeError("protected residual parallel model index plan is missing.")
+        target_device = torch.device(device)
+        cache_key = str(target_device)
+        cached = getattr(self, "_protected_residual_parallel_model_indices_runtime", None)
+        if (
+            isinstance(cached, torch.Tensor)
+            and self._protected_residual_parallel_model_indices_runtime_key == cache_key
+            and cached.device == target_device
+        ):
+            return cached
+        out = indices.to(device=target_device, non_blocking=True)
+        self._protected_residual_parallel_model_indices_runtime = out
+        self._protected_residual_parallel_model_indices_runtime_key = cache_key
+        return out
+
     def _restore_index_to_device(
         self,
         restore_idx: Optional[torch.Tensor],
@@ -1207,6 +1558,55 @@ class VAELinear(nn.Module):
                 delattr(self, f"decoder_s{stage_idx}")
         return True
 
+    def pack_protected_residual_stage_decoder_(self, *, trainable: bool = False) -> bool:
+        if int(getattr(self, "protected_residual_stages", 0)) <= 0:
+            self.protected_residual_parallel_stage_decode = False
+            return False
+        if getattr(self, "_protected_residual_shared_stage_decoders", None) is not None:
+            self.protected_residual_parallel_stage_decode = False
+            return False
+        packed_decoder = getattr(self, "_protected_residual_parallel_decoder", None)
+        if packed_decoder is not None:
+            packed_decoder.requires_grad_(bool(trainable))
+            packed_decoder.train(self.training)
+            self.protected_residual_parallel_stage_decode = True
+            if getattr(self, "_protected_residual_parallel_grouped_vq_weight", None) is None:
+                self._build_protected_residual_parallel_decode_plan()
+            return True
+        decoders = [
+            self.get_protected_residual_stage_decoder(stage_idx)
+            for stage_idx in range(int(self.protected_residual_stages))
+        ]
+        if len(decoders) <= 1:
+            self.protected_residual_parallel_stage_decode = False
+            return False
+        dims = [int(v) for v in getattr(self, "protected_residual_stage_codebook_dims", [])]
+        if len(dims) != int(self.protected_residual_stages):
+            raise ValueError(
+                f"protected_residual_stage_codebook_dims length {len(dims)} != "
+                f"protected_residual_stages={int(self.protected_residual_stages)}"
+            )
+        if len(set(dims)) != 1:
+            raise ValueError(
+                "protected residual parallel decode requires identical stage codebook dims, "
+                f"got {dims}."
+            )
+        packed_decoder = pack_decoders(decoders)
+        packed_decoder.requires_grad_(bool(trainable))
+        packed_decoder.train(self.training)
+        self._protected_residual_parallel_layout = [
+            (int(stage_idx), 0)
+            for stage_idx in range(int(self.protected_residual_stages))
+        ]
+        self._protected_residual_parallel_decoder = packed_decoder
+        self.protected_residual_parallel_stage_decode = True
+        self._build_protected_residual_parallel_decode_plan()
+
+        del self.protected_residual_decoder
+        for stage_idx in range(1, int(self.protected_residual_stages)):
+            delattr(self, f"protected_residual_decoder_s{stage_idx}")
+        return True
+
     def _enable_parallel_stage_decoder(self) -> None:
         self.pack_parallel_stage_decoder_(trainable=True)
 
@@ -1244,6 +1644,32 @@ class VAELinear(nn.Module):
         self._clear_parallel_stage_decode_plan()
         self._parallel_stage_layout = []
         self.parallel_stage_decode = False
+        return True
+
+    def unpack_protected_residual_stage_decoder_(self) -> bool:
+        packed_decoder = getattr(self, "_protected_residual_parallel_decoder", None)
+        if packed_decoder is None:
+            return False
+        layout = list(getattr(self, "_protected_residual_parallel_layout", []))
+        expected = int(self.protected_residual_stages)
+        if len(layout) != expected:
+            raise RuntimeError(f"protected residual parallel layout length {len(layout)} != expected {expected}.")
+        stage_decoders: List[Optional[nn.Module]] = [None for _stage_idx in range(expected)]
+        for model_idx, (stage_idx, part_idx) in enumerate(layout):
+            if int(part_idx) != 0:
+                raise RuntimeError(f"protected residual parallel layout has unexpected part={int(part_idx)}.")
+            stage_decoders[int(stage_idx)] = packed_decoder.get_sub_decoder(int(model_idx))
+        for stage_idx, decoder in enumerate(stage_decoders):
+            if decoder is None:
+                raise RuntimeError(f"protected residual parallel layout is incomplete for stage={stage_idx}.")
+            if stage_idx == 0:
+                self.protected_residual_decoder = decoder
+            else:
+                setattr(self, f"protected_residual_decoder_s{stage_idx}", decoder)
+        del self._protected_residual_parallel_decoder
+        self._clear_protected_residual_parallel_plan()
+        self._protected_residual_parallel_layout = []
+        self.protected_residual_parallel_stage_decode = False
         return True
 
     def get_stage_restore_row_indices(self, stage_idx: int) -> Optional[torch.Tensor]:
@@ -1503,6 +1929,114 @@ class VAELinear(nn.Module):
             return w_split.t().contiguous()
         return w_split.contiguous()
 
+    def _protected_residual_patch_shape(self) -> Tuple[int, int]:
+        idx = getattr(self, "protected_residual_indices", None)
+        if idx is None:
+            return (0, 0)
+        count = int(idx.numel())
+        if str(getattr(self, "protected_residual_axis", "")) == "input":
+            return int(self.out_features), count
+        return count, int(self.in_features)
+
+    def _decode_protected_residual_stage_patch(self, stage_idx: int, dtype: torch.dtype) -> torch.Tensor:
+        decoder = self.get_protected_residual_stage_decoder(stage_idx)
+        vq_weight = self.get_protected_residual_stage_vq_weight(stage_idx)
+        flat = self._decode_single_flat(decoder, vq_weight, dtype=dtype)
+        patch_shape = self._protected_residual_patch_shape()
+        expected = int(patch_shape[0]) * int(patch_shape[1])
+        if int(flat.numel()) != expected:
+            raise ValueError(
+                f"protected residual stage {int(stage_idx)} flat numel {int(flat.numel())} != expected {expected}."
+            )
+        return flat.view(*patch_shape).contiguous().to(dtype=dtype)
+
+    def _decode_protected_residual_patch_parallel_stages(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        packed_decoder = getattr(self, "_protected_residual_parallel_decoder", None)
+        if packed_decoder is None:
+            raise RuntimeError("protected residual parallel decode is enabled but packed decoder is missing.")
+        layout = list(getattr(self, "_protected_residual_parallel_layout", []))
+        expected_models = int(self.protected_residual_stages)
+        if len(layout) != expected_models:
+            raise RuntimeError(
+                f"protected residual parallel layout length {len(layout)} != expected {expected_models}."
+            )
+        param = next(packed_decoder.parameters(), None)
+        decode_device = param.device if param is not None else torch.device(device)
+        decode_dtype = param.dtype if param is not None else dtype
+        grouped_vq = self._get_protected_residual_parallel_grouped_vq(
+            dtype=decode_dtype,
+            device=decode_device,
+        )
+        stage_out = packed_decoder(grouped_vq)
+        if tuple(int(v) for v in stage_out.shape[:2]) != (int(grouped_vq.shape[0]), expected_models):
+            raise RuntimeError(
+                f"protected residual parallel decoder output shape mismatch: out={tuple(stage_out.shape)} "
+                f"expected leading={(int(grouped_vq.shape[0]), expected_models)}."
+            )
+        model_flats = stage_out.permute(1, 0, 2).contiguous().view(expected_models, -1)
+        if bool(getattr(self, "_protected_residual_parallel_layout_is_stage_major", False)):
+            stage_flats = model_flats
+        else:
+            indices = self._get_protected_residual_parallel_model_indices(model_flats.device).reshape(-1)
+            stage_flats = model_flats.index_select(0, indices)
+        patch_shape = self._protected_residual_patch_shape()
+        expected = int(patch_shape[0]) * int(patch_shape[1])
+        if int(stage_flats.shape[1]) != expected:
+            raise ValueError(
+                f"protected residual parallel flat width {int(stage_flats.shape[1])} != expected {expected}."
+            )
+        patch = stage_flats.view(expected_models, *patch_shape).sum(dim=0)
+        return patch.contiguous().to(device=device, dtype=dtype)
+
+    def _decode_protected_residual_patch(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if int(getattr(self, "protected_residual_stages", 0)) <= 0:
+            return None
+        idx = getattr(self, "protected_residual_indices", None)
+        if idx is None or int(idx.numel()) == 0:
+            return None
+        if bool(getattr(self, "protected_residual_parallel_stage_decode", False)):
+            return self._decode_protected_residual_patch_parallel_stages(dtype=dtype, device=device)
+        patch = None
+        for stage_idx in range(int(self.protected_residual_stages)):
+            stage_patch = self._decode_protected_residual_stage_patch(stage_idx, dtype=dtype)
+            stage_patch = stage_patch.to(device=device, dtype=dtype, non_blocking=True)
+            patch = stage_patch if patch is None else patch + stage_patch
+        return None if patch is None else patch.contiguous()
+
+    def _apply_protected_residual_vae_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        patch = self._decode_protected_residual_patch(dtype=dtype, device=full_weight.device)
+        if patch is None:
+            return full_weight
+        idx = getattr(self, "protected_residual_indices", None)
+        if idx is None:
+            return full_weight
+        idx = idx.to(device=full_weight.device, dtype=torch.long, non_blocking=True)
+        if str(getattr(self, "protected_residual_axis", "")) == "input":
+            if tuple(patch.shape) != (int(self.out_features), int(idx.numel())):
+                raise RuntimeError(
+                    f"protected input residual patch shape {tuple(patch.shape)} != "
+                    f"({int(self.out_features)}, {int(idx.numel())})."
+                )
+            full_weight.index_add_(1, idx, patch)
+            return full_weight
+        if tuple(patch.shape) != (int(idx.numel()), int(self.in_features)):
+            raise RuntimeError(
+                f"protected output residual patch shape {tuple(patch.shape)} != "
+                f"({int(idx.numel())}, {int(self.in_features)})."
+            )
+        full_weight.index_add_(0, idx, patch)
+        return full_weight
+
     def _materialize_full_weight(
         self,
         compressed_weight: torch.Tensor,
@@ -1586,6 +2120,7 @@ class VAELinear(nn.Module):
         compressed_weight: torch.Tensor,
         dtype: torch.dtype,
         *,
+        include_protected_residual: bool = True,
         include_low_rank: bool = True,
         include_sparse_residual: bool = True,
     ) -> torch.Tensor:
@@ -1593,6 +2128,8 @@ class VAELinear(nn.Module):
             compressed_weight,
             dtype=dtype,
         )
+        if bool(include_protected_residual):
+            full_weight = self._apply_protected_residual_vae_patch(full_weight, dtype=dtype)
         if bool(include_low_rank):
             full_weight = self._apply_low_rank_patch(full_weight, dtype=dtype)
         if bool(include_sparse_residual):
@@ -1603,6 +2140,7 @@ class VAELinear(nn.Module):
         self,
         dtype: torch.dtype,
         *,
+        include_protected_residual: bool = True,
         include_low_rank: bool = True,
         include_sparse_residual: bool = True,
     ) -> torch.Tensor:
@@ -1610,6 +2148,7 @@ class VAELinear(nn.Module):
         return self._finalize_decoded_weight_from_compressed(
             compressed_weight,
             dtype=dtype,
+            include_protected_residual=bool(include_protected_residual),
             include_low_rank=bool(include_low_rank),
             include_sparse_residual=bool(include_sparse_residual),
         )
@@ -1723,6 +2262,14 @@ class VAELinear(nn.Module):
         sparse_values = getattr(self, "sparse_residual_values", None)
         return isinstance(sparse_values, torch.Tensor) and int(sparse_values.numel()) > 0
 
+    def has_protected_residual_vae(self) -> bool:
+        idx = getattr(self, "protected_residual_indices", None)
+        return (
+            int(getattr(self, "protected_residual_stages", 0)) > 0
+            and isinstance(idx, torch.Tensor)
+            and int(idx.numel()) > 0
+        )
+
     def has_low_rank_residual(self) -> bool:
         low_rank_a = getattr(self, "low_rank_a", None)
         low_rank_b = getattr(self, "low_rank_b", None)
@@ -1745,6 +2292,7 @@ class VAELinear(nn.Module):
         self._cached_weight = None
         self.clear_sparse_residual_cache()
         self._clear_parallel_stage_decode_runtime_cache()
+        self._clear_protected_residual_parallel_runtime_cache()
 
     @torch.no_grad()
     def prime_sparse_residual_cache(

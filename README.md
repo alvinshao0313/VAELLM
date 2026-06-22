@@ -81,14 +81,13 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - `vq_weight*` 现在按 `uint8 bit-pack` 落盘，不再按 `torch.bool` 一字节存
   - checkpoint meta 会记录 `low_rank_a/b` 和 sparse residual payload 的 shape / dtype
   - 这里只压缩 VQ bit payload；`embed_tokens`、`lm_head` 等未压缩 dense 权重仍会保留
-- `cat_train` 当前支持 5 种离群保护模式：
+- `cat_train` 当前支持 4 种离群保护模式：
   - `none`：不做离群保护
   - `channel`：压缩前保护 top-N channel
+  - `channel_residual_vae`：主 VAE 压缩完整权重，训练后对选中 channel 的 residual 额外做多阶 VAE patch
   - `residual_sparse`：训练后保存稀疏残差补丁
-  - `per_vae_low_rank`：VAE 训练前先扣除原始权重的 rank-k SVD 主成分，让 VAE 训练残差
-  - `post_vae_low_rank`：VAE 训练完成后，对最终重建残差做 rank-k SVD 补丁
 - 推理时 `VAELinear` 的权重重建顺序固定为：
-  - `VAE reconstruction -> low_rank patch -> sparse_residual patch`
+  - `VAE reconstruction -> protected_channel_residual_vae patch -> low_rank patch -> sparse_residual patch`
 - `compressed_e2e_fintuning` 是唯一的压缩 checkpoint 端到端训练入口：
   - `decoder`：训练 VAELinear decoder
   - `lora`：训练已有低秩分支并写回 `low_rank_a/b`
@@ -105,7 +104,7 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
 - `train_utils` 当前按扁平模块组织：
   - `cat_train_args.py`：`tools/cat_train.py` 参数解析和类别 override
   - `cat_data_prep.py` / `cat_train_data.py`：权重切分、block 数据构造和恢复；排序代码已关闭
-  - `cat_train_residual_protection.py`：sparse residual 与 low-rank outlier protection
+  - `cat_train_residual_protection.py`：sparse residual protection
   - `cat_joint_decoder.py`：joint decoder 旧实现，已整体注释关闭
   - `model_checkpoint_io.py`：压缩模型 checkpoint 保存和加载
   - `lora_*`：after-category LoRA 数据、训练和融合

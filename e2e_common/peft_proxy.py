@@ -107,6 +107,18 @@ class PeftVAELinearProxy(nn.Module):
         self.per_decoded_linear = self._build_placeholder_decoded_linear()
         self._dense_base_materialized = False
         self._train_decoder_with_adapter = False
+        self._base_cache_decoded_weight_before_proxy = bool(
+            getattr(base_layer, "cache_decoded_weight", True)
+        )
+        self._base_had_skip_global_cache_prewarm_before_proxy = hasattr(
+            base_layer,
+            "_skip_global_cache_prewarm",
+        )
+        self._base_skip_global_cache_prewarm_before_proxy = getattr(
+            base_layer,
+            "_skip_global_cache_prewarm",
+            None,
+        )
 
         self.base_layer.cache_decoded_weight = False
         self.base_layer.clear_decoded_weight_cache()
@@ -202,6 +214,25 @@ def _select_peft_proxy_refs(
     return [(name, by_name[name]) for name in requested]
 
 
+def _restore_base_layer_cache_policy_from_proxy(proxy: PeftVAELinearProxy) -> None:
+    base_layer = proxy.base_layer
+    base_layer.cache_decoded_weight = bool(
+        getattr(proxy, "_base_cache_decoded_weight_before_proxy", True)
+    )
+
+    had_skip = bool(
+        getattr(proxy, "_base_had_skip_global_cache_prewarm_before_proxy", False)
+    )
+    if had_skip:
+        setattr(
+            base_layer,
+            "_skip_global_cache_prewarm",
+            getattr(proxy, "_base_skip_global_cache_prewarm_before_proxy", True),
+        )
+    elif hasattr(base_layer, "_skip_global_cache_prewarm"):
+        delattr(base_layer, "_skip_global_cache_prewarm")
+
+
 def _adapter_uses_dora(peft_linear: PeftLoraLinear, adapter_name: str) -> bool:
     use_dora = getattr(peft_linear, "use_dora", None)
     if isinstance(use_dora, dict):
@@ -255,6 +286,7 @@ def export_peft_proxy_lora_to_low_rank(
             )
         base_layer.low_rank_a = nn.Parameter(low_rank_a, requires_grad=False)
         base_layer.low_rank_b = nn.Parameter(low_rank_b, requires_grad=False)
+        _restore_base_layer_cache_policy_from_proxy(proxy)
         base_layer.clear_decoded_weight_cache()
         set_module_by_name(model, module_name, base_layer)
         exported += 1

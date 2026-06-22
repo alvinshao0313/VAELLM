@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=5
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -28,20 +28,22 @@ export HF_DATASETS_OFFLINE=1
 #   --joint_decoder_batch_size "default=524288"
 # --outlier_residual_top_p "default=0.01,cat:down_proj=0.02"
 # --outlier_residual_score "abs" / "input_act_weighted_abs" / "original_weight_abs" / "input_act_weighted_original_weight_abs"
+# --outlier_channel_scope "layer" / "category"
+# --outlier_protect_mode "channel_residual_vae"
+# --outlier_residual_vae_stages "default=1,cat:q_proj=2"
+# --outlier_residual_vae_decoder_share_scope "none" / "category"
 # --outlier_residual_min_abs "1e-6"
 #   原始权重打分只决定保留哪些位置，真正保存的仍是这些位置上的 residual
 #   若 |original-reconstructed| 小于该阈值，则该位置会从 top-p 中剔除，并继续往后补
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
-# --outlier_protect_mode "per_vae_low_rank" / "post_vae_low_rank"
-# --outlier_low_rank "default=16"
-#   低秩模式需同时设置 --outlier_residual_top_p "default=0"
 # --wa_mse_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
 # CAT_DISTILL_DATASET_NUM_PROC=16          # 蒸馏/校准数据 format 预处理并行进程数，位置在 lora_data.py
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
 # --distill_after_category "none|remaining_lora|compressed_lora|decoder|both"
+  # --unload_vae_original_weights_on_final_save \
 
 python tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
@@ -52,9 +54,8 @@ python tools/cat_train.py \
   --convert \
   --save_model \
   --convert_device "cuda" \
-  --unload_vae_original_weights_on_final_save \
   --allow_tail_group "true" \
-  --target_categories "q_proj,k_proj,v_proj" \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
@@ -67,18 +68,19 @@ python tools/cat_train.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --intra_parallel "default=1x1" \
-  --outlier_protect_count "default=0" \
-  --outlier_protect_axis "input" \
   --outlier_protect_mode "none" \
+  --outlier_protect_count "default=32" \
+  --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.01" \
   --outlier_residual_score "input_act_weighted_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
-  --wa_mse_calib_dataset "wiki=1" \
-  --wa_mse_calib_nsamples "512" \
-  --wa_mse_calib_seqlen "4096" \
+  --outlier_residual_vae_decoder_share_scope "category" \
+  --wa_mse_calib_dataset "alpaca=1" \
+  --wa_mse_calib_nsamples "128" \
+  --wa_mse_calib_seqlen "8192" \
   --wa_mse_calib_seed "31" \
   --wa_mse_calib_device "" \
   --wa_mse_calib_log_every "0" \
@@ -110,9 +112,9 @@ python tools/cat_train.py \
   --entropy_loss_weight "0.01" \
   --diversity_gamma "1.0" \
   --normalize_weight \
-  --use_checkpoint \
+  --vae_decoder_checkpoint "true" \
   --new_quant \
-  --distill_after_category "compressed_lora" \
+  --distill_after_category "none" \
   --distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
   --lora_rank "default=128" \
   --lora_alpha "default=128" \
@@ -122,7 +124,7 @@ python tools/cat_train.py \
   --distill_nsamples "default=20000" \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
-  --distill_log_every "default=2" \
+  --distill_log_every "default=100" \
   --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \

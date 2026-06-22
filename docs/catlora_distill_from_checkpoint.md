@@ -121,6 +121,49 @@ export CUDA_VISIBLE_DEVICES=4
 
 在 `compressed_lora` 模式下，每个类别蒸馏前会预热当前 active prefix 的 decoded weight cache。`decoder` / `both` 模式会训练 decoder 参数，因此不会做这个预热。
 
+## 从已蒸馏前缀 checkpoint 继续后续类别
+
+如果已经从全 VAE checkpoint 蒸馏好了 `q_proj,k_proj,v_proj`，并保存了一个新的 `final_model`，可以用这个 checkpoint 继续蒸馏后续类别。
+
+关键点是：已经完成蒸馏的类别仍然要放在 `--target_categories` 前缀里，但要把它们的 `distill_steps` 设成 `0`，避免重新训练和覆盖已有 `low_rank_a/b`。
+
+例如：从已经蒸馏好 qkv 的 checkpoint 继续蒸馏 `o_proj`：
+
+```bash
+VAE_CKPT=.result/catlora_distill/<qkv_run>/final_model \
+bash scripts/catlora_distill_from_checkpoint.sh \
+  --target_categories "q_proj,k_proj,v_proj,o_proj" \
+  --distill_steps "default=5000,after:q_proj=0,after:k_proj=0,after:v_proj=0"
+```
+
+这样运行时的实际效果是：
+
+1. `q_proj`：打开 `q_proj` 压缩路径，但 `after:q_proj=0`，不重新蒸馏。
+2. `k_proj`：打开 `q_proj,k_proj` 压缩路径，但 `after:k_proj=0`，不重新蒸馏。
+3. `v_proj`：打开 `q_proj,k_proj,v_proj` 压缩路径，但 `after:v_proj=0`，不重新蒸馏。
+4. `o_proj`：打开 `q_proj,k_proj,v_proj,o_proj` 压缩路径，并按 `default=5000` 真正蒸馏。
+
+如果要继续蒸馏多个后续类别，也同样把已完成前缀设为 0：
+
+```bash
+VAE_CKPT=.result/catlora_distill/<qkv_run>/final_model \
+bash scripts/catlora_distill_from_checkpoint.sh \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --distill_steps "default=5000,after:q_proj=0,after:k_proj=0,after:v_proj=0"
+```
+
+不要只写后续类别：
+
+```bash
+--target_categories "o_proj,gate_proj,up_proj,down_proj"
+```
+
+这样会让已经蒸馏好的 `q_proj,k_proj,v_proj` 不在 active prefix 里，运行时会被切回原始权重路径。
+
+也不要把已经蒸馏好的前缀保留在 `--target_categories` 里却不给它们设 `distill_steps=0`。否则脚本会尝试重新蒸馏这些类别；如果 checkpoint 里已有 `low_rank_a/b`，`compressed_lora` 导出时会拒绝覆盖。
+
+前提：输入 checkpoint 里必须已经包含所有要写进 `--target_categories` 的 `VAELinear`。这个脚本不会把新的 dense `nn.Linear` 压缩成 `VAELinear`。
+
 ## 输入 checkpoint 的原始权重
 
 如果 checkpoint 里保存了 `VAELinear.original_weight`，运行时会使用 checkpoint 中的原始权重。

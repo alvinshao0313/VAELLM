@@ -81,9 +81,6 @@ bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
 输入要求：
 
 - 输入 checkpoint 必须已经带有 `low_rank_a` 和 `low_rank_b`
-- 这些低秩分支通常来自 `cat_train.py` 的：
-  - `--outlier_protect_mode per_vae_low_rank`
-  - 或 `--outlier_protect_mode post_vae_low_rank`
 - 被 `--decoder_layers` 和 `--target_modules` 选中的 VAELinear 必须全部有完整低秩分支
 - 选中模块的低秩 rank 必须一致
 

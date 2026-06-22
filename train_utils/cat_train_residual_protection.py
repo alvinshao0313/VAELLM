@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -15,96 +15,6 @@ from litebsq.sparse_residual import (
 RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT = frozenset(
     {"input_act_weighted_abs", "input_act_weighted_original_weight_abs"}
 )
-LOW_RANK_OUTLIER_MODES = frozenset({"per_vae_low_rank", "post_vae_low_rank"})
-
-
-def compute_low_rank_svd_payload(
-    *,
-    linear_name: str,
-    weight: torch.Tensor,
-    rank: int,
-    target_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    weight_f = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    if weight_f.ndim != 2:
-        raise ValueError(f"{linear_name}: low-rank SVD expects 2D weight, got shape={tuple(weight_f.shape)}")
-    out_features, in_features = int(weight_f.shape[0]), int(weight_f.shape[1])
-    max_rank = min(out_features, in_features)
-    rank = int(rank)
-    if rank <= 0:
-        raise ValueError(f"{linear_name}: outlier_low_rank must be > 0, got {rank}.")
-    if rank > max_rank:
-        raise ValueError(
-            f"{linear_name}: outlier_low_rank={rank} exceeds min(out_features,in_features)={max_rank}."
-        )
-    u, s, vh = torch.linalg.svd(weight_f, full_matrices=False)
-    sqrt_s = torch.sqrt(s[:rank])
-    low_rank_a = (u[:, :rank] * sqrt_s.view(1, rank)).to(dtype=target_dtype).contiguous()
-    low_rank_b = (sqrt_s.view(rank, 1) * vh[:rank, :]).to(dtype=target_dtype).contiguous()
-    return low_rank_a, low_rank_b
-
-
-def subtract_low_rank_payload(
-    *,
-    weight: torch.Tensor,
-    low_rank_a: torch.Tensor,
-    low_rank_b: torch.Tensor,
-) -> torch.Tensor:
-    weight_f = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    patch = low_rank_a.detach().to(device="cpu", dtype=torch.float32) @ low_rank_b.detach().to(
-        device="cpu",
-        dtype=torch.float32,
-    )
-    if tuple(patch.shape) != tuple(weight_f.shape):
-        raise ValueError(
-            f"low-rank patch shape mismatch: patch={tuple(patch.shape)} vs weight={tuple(weight_f.shape)}"
-        )
-    return (weight_f - patch).contiguous()
-
-
-def build_per_vae_low_rank_payloads(
-    *,
-    prepared_entries: Sequence[object],
-    rank: int,
-) -> Tuple[List[Optional[Tuple[torch.Tensor, torch.Tensor]]], List[torch.Tensor]]:
-    low_rank_payloads: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
-    residual_weights: List[torch.Tensor] = []
-    for entry in prepared_entries:
-        split_weight = entry.prepared_weight.split_weight
-        low_rank_a, low_rank_b = compute_low_rank_svd_payload(
-            linear_name=entry.ref.name,
-            weight=split_weight,
-            rank=int(rank),
-            target_dtype=split_weight.dtype,
-        )
-        residual_weight = subtract_low_rank_payload(
-            weight=split_weight,
-            low_rank_a=low_rank_a,
-            low_rank_b=low_rank_b,
-        )
-        low_rank_payloads.append((low_rank_a, low_rank_b))
-        residual_weights.append(residual_weight)
-    return low_rank_payloads, residual_weights
-
-
-def build_post_vae_low_rank_payload(
-    *,
-    linear_name: str,
-    original_weight: torch.Tensor,
-    reconstructed_weight: torch.Tensor,
-    rank: int,
-    target_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    residual_weight = (
-        original_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
-        - reconstructed_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    )
-    return compute_low_rank_svd_payload(
-        linear_name=linear_name,
-        weight=residual_weight,
-        rank=int(rank),
-        target_dtype=target_dtype,
-    )
 
 
 def _select_sparse_residual_entries(

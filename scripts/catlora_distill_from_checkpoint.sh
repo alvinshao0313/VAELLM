@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -11,11 +11,11 @@ export CAT_DISTILL_DATASET_NUM_PROC="${CAT_DISTILL_DATASET_NUM_PROC:-16}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-VAE_CKPT="${VAE_CKPT:?set VAE_CKPT to cat VAE checkpoint}"
+
 
 python tools/cat_distill_from_vae_checkpoint.py \
   --model_path "Qwen/Qwen3-8B" \
-  --resume_from_checkpoint "${VAE_CKPT}" \
+  --resume_from_checkpoint ".result/catlora/no_outlier_protect_vae_only_Qwen_Qwen3-8B_20260618_075940" \
   --output_dir "./.result/catlora_distill" \
   --seed "31" \
   --deterministic "true" \
@@ -24,7 +24,8 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --save_model \
   --convert_device "cuda" \
   --unload_vae_original_weights_on_final_save \
-  --target_categories "q_proj,k_proj,v_proj" \
+  --vae_decoder_checkpoint "true" \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --eval_ppl "false" \
@@ -33,15 +34,15 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --outlier_protect_mode "none" \
   --distill_after_category "compressed_lora" \
   --distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
-  --lora_rank "default=128" \
-  --lora_alpha "default=128" \
+  --lora_rank "default=4" \
+  --lora_alpha "default=4" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=5000" \
+  --distill_steps "default=500" \
   --distill_batch_size "default=1" \
   --distill_nsamples "default=20000" \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
-  --distill_log_every "default=2" \
+  --distill_log_every "default=100" \
   --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \

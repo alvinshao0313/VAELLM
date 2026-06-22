@@ -167,7 +167,6 @@ class BlockVaeRuntimeConfig:
     joint_decoder_group_size: int = 1
     joint_decoder_batch_size: Optional[int] = None
     outlier_protect_count: int = 0
-    outlier_low_rank: int = 0
     outlier_residual_top_p: float = 0.0
 
 
@@ -822,7 +821,6 @@ def resolve_block_runtime_configs(
             codebook_bits=int(resolve_category_value(args.codebook_bits, category)),
             codebook_dim=int(resolve_category_value(args.codebook_dim, category)),
             outlier_protect_count=0,
-            outlier_low_rank=0,
             outlier_residual_top_p=0.0,
             recon_loss_type=str(resolve_category_value(args.recon_loss_type, category)),
             base_ch=int(resolve_category_value(args.base_ch, category)),

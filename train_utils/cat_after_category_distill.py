@@ -14,6 +14,7 @@ from e2e_common.peft_proxy import (
     materialize_peft_proxy_decoded_linears,
 )
 from litebsq.vae_linear import VAELinear
+from litebsq.vae_linear_prewarm import prime_model_vae_linear_cache
 from train_utils.hif4_act import (
     build_hif4_act_controller,
     register_hif4_act_hooks,
@@ -92,6 +93,41 @@ def _log_distill_dataset(logger, dataset_mix_spec, source_stats, nsamples: int) 
             "none" if source_info["config"] is None else str(source_info["config"]),
             str(source_info["train_split"]),
         )
+
+
+def _log_vae_linear_cache_status(model: nn.Module, logger, prefix: str) -> None:
+    total = 0
+    low_rank = 0
+    cached = 0
+    cache_off = 0
+    skip_prewarm = 0
+    proxy_count = 0
+
+    for module in model.modules():
+        if isinstance(module, PeftVAELinearProxy):
+            proxy_count += 1
+        if isinstance(module, VAELinear):
+            total += 1
+            if module.has_low_rank_residual():
+                low_rank += 1
+            cached_weight = getattr(module, "_cached_weight", None)
+            if isinstance(cached_weight, torch.Tensor):
+                cached += 1
+            if not bool(getattr(module, "cache_decoded_weight", True)):
+                cache_off += 1
+            if bool(getattr(module, "_skip_global_cache_prewarm", False)):
+                skip_prewarm += 1
+
+    logger.info(
+        "%s VAELinear cache status: total=%d proxy=%d low_rank=%d cached=%d cache_off=%d skip_prewarm=%d",
+        str(prefix),
+        int(total),
+        int(proxy_count),
+        int(low_rank),
+        int(cached),
+        int(cache_off),
+        int(skip_prewarm),
+    )
 
 
 def collect_compressed_category_targets(
@@ -298,6 +334,30 @@ def _run_compressed_category_distill(
 
     previous_use_cache = _freeze_model_for_lora(model, device=cfg.device, logger=logger)
     try:
+        _log_vae_linear_cache_status(
+            model,
+            logger,
+            prefix=f"After-category distill {category}: before prewarm",
+        )
+        prewarm_stats = prime_model_vae_linear_cache(
+            model,
+            dtype=torch.bfloat16 if bool(getattr(training_args, "bf16", False)) else None,
+            clear_existing=False,
+            group_size=8,
+            compute_device=cfg.device,
+            logger=logger,
+        )
+        logger.info(
+            "After-category distill %s: prewarmed VAELinear cache stats=%s",
+            str(category),
+            str(prewarm_stats),
+        )
+        _log_vae_linear_cache_status(
+            model,
+            logger,
+            prefix=f"After-category distill {category}: after prewarm",
+        )
+
         _set_proxy_decoder_adapter_mode(model, module_names, enabled=mode == "both")
         trainable = _enable_compressed_trainable_params(model, module_names, mode=mode)
         if not trainable:
@@ -345,6 +405,11 @@ def _run_compressed_category_distill(
         if use_lora:
             exported = export_peft_proxy_lora_to_low_rank(model, module_names=module_names)
             logger.info("After-category distill: exported compressed LoRA adapters to low_rank_a/b=%d.", int(exported))
+            _log_vae_linear_cache_status(
+                model,
+                logger,
+                prefix=f"After-category distill {category}: after export",
+            )
         return AfterCategoryDistillResult(
             model=model,
             next_lora_round_idx=next_round,

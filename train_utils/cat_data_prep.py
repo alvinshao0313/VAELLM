@@ -509,6 +509,8 @@ def _prepare_linear_weight_for_outlier_protection(
     activation_weight: Optional[torch.Tensor],
     outlier_protect_count: int,
     outlier_protect_axis: str,
+    protected_channel_indices: Optional[torch.Tensor] = None,
+    apply_channel_removal: bool = True,
 ) -> PreparedLinearWeight:
     axis = str(outlier_protect_axis).strip().lower()
     if axis not in {"input", "output"}:
@@ -527,6 +529,16 @@ def _prepare_linear_weight_for_outlier_protection(
     protect_count = int(outlier_protect_count)
     if protect_count < 0:
         raise ValueError(f"{linear_name}: outlier_protect_count must be >= 0, got {protect_count}.")
+    if protected_channel_indices is not None:
+        protected_idx = protected_channel_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+        if protected_idx.ndim != 1:
+            raise ValueError(f"{linear_name}: protected channel plan must be 1D, got shape={tuple(protected_idx.shape)}")
+        protected_idx = torch.sort(protected_idx).values.contiguous()
+        if int(protected_idx.numel()) != int(torch.unique(protected_idx, sorted=False).numel()):
+            raise ValueError(f"{linear_name}: protected channel plan contains duplicates.")
+        protect_count = int(protected_idx.numel())
+    else:
+        protected_idx = None
     if protect_count == 0:
         return PreparedLinearWeight(
             split_weight=weight,
@@ -539,33 +551,57 @@ def _prepare_linear_weight_for_outlier_protection(
             protected_output_weight=None,
         )
 
-    if act_cpu is None:
+    if protected_idx is None and act_cpu is None:
         raise ValueError(
             f"{linear_name}: outlier_protect_count={protect_count} requires activation vector."
         )
 
-    if axis == "input" and protect_count >= original_in_features:
+    if apply_channel_removal and axis == "input" and protect_count >= original_in_features:
         raise ValueError(
             f"{linear_name}: outlier_protect_count={protect_count} "
             f"protects too many input channels, "
             f"which is not smaller than in_features={original_in_features}."
         )
-    if axis == "output" and protect_count >= original_out_features:
+    if apply_channel_removal and axis == "output" and protect_count >= original_out_features:
         raise ValueError(
             f"{linear_name}: outlier_protect_count={protect_count} "
             f"protects too many output channels, "
             f"which is not smaller than out_features={original_out_features}."
         )
 
+    if protected_idx is not None:
+        limit = original_in_features if axis == "input" else original_out_features
+        if int(protected_idx.numel()) > 0 and (
+            int(protected_idx.min().item()) < 0 or int(protected_idx.max().item()) >= int(limit)
+        ):
+            raise ValueError(
+                f"{linear_name}: protected channel indices must be within [0, {limit}), got "
+                f"[{int(protected_idx.min().item())}, {int(protected_idx.max().item())}]."
+            )
+        if not apply_channel_removal:
+            return PreparedLinearWeight(
+                split_weight=weight,
+                compressed_in_features=original_in_features,
+                compressed_out_features=original_out_features,
+                activation_weight=act_cpu,
+                protected_input_indices=protected_idx if axis == "input" else None,
+                protected_input_weight=None,
+                protected_output_indices=None if axis == "input" else protected_idx,
+                protected_output_weight=None,
+            )
+
     weight_device = weight.device
-    act_dev = act_cpu.to(device=weight_device, dtype=torch.float32, non_blocking=True)
+    act_dev = None if act_cpu is None else act_cpu.to(device=weight_device, dtype=torch.float32, non_blocking=True)
     weight_f = weight.detach().to(device=weight_device, dtype=torch.float32).contiguous()
     if axis == "input":
         weight_in_major = weight_f.t().contiguous()  # [in, out]
-        weighted_rows = weight_in_major * act_dev.view(-1, 1)
-        channel_norm = torch.norm(weighted_rows, p=2, dim=1)
-        protected_idx = torch.topk(channel_norm, k=protect_count, largest=True).indices
-        protected_idx = torch.sort(protected_idx).values.contiguous()
+        if protected_idx is None:
+            weighted_rows = weight_in_major * act_dev.view(-1, 1)
+            channel_norm = torch.norm(weighted_rows, p=2, dim=1)
+            protected_idx = torch.topk(channel_norm, k=protect_count, largest=True).indices
+            protected_idx = torch.sort(protected_idx).values.contiguous().to(device=weight_device)
+        else:
+            protected_idx = protected_idx.to(device=weight_device, dtype=torch.long, non_blocking=True)
 
         keep_mask = torch.ones(original_in_features, dtype=torch.bool, device=weight_device)
         keep_mask[protected_idx] = False
@@ -575,23 +611,26 @@ def _prepare_linear_weight_for_outlier_protection(
 
         protected_weight = weight_in_major.index_select(0, protected_idx)
         compressed_weight = weight.index_select(1, compressed_idx).contiguous()
-        compressed_act = act_dev.index_select(0, compressed_idx)
+        compressed_act = None if act_dev is None else act_dev.index_select(0, compressed_idx)
 
         return PreparedLinearWeight(
             split_weight=compressed_weight,
             compressed_in_features=int(compressed_idx.numel()),
             compressed_out_features=original_out_features,
-            activation_weight=compressed_act.to(device="cpu", dtype=torch.float32).contiguous(),
+            activation_weight=None if compressed_act is None else compressed_act.to(device="cpu", dtype=torch.float32).contiguous(),
             protected_input_indices=protected_idx.to(device="cpu", dtype=torch.long).contiguous(),
             protected_input_weight=protected_weight.to(device="cpu", dtype=weight.dtype).contiguous(),
             protected_output_indices=None,
             protected_output_weight=None,
         )
 
-    weighted_weight = weight_f * act_dev.view(1, -1)
-    channel_norm = torch.norm(weighted_weight, p=2, dim=1)
-    protected_idx = torch.topk(channel_norm, k=protect_count, largest=True).indices
-    protected_idx = torch.sort(protected_idx).values.contiguous()
+    if protected_idx is None:
+        weighted_weight = weight_f * act_dev.view(1, -1)
+        channel_norm = torch.norm(weighted_weight, p=2, dim=1)
+        protected_idx = torch.topk(channel_norm, k=protect_count, largest=True).indices
+        protected_idx = torch.sort(protected_idx).values.contiguous()
+    else:
+        protected_idx = protected_idx.to(device=weight_device, dtype=torch.long, non_blocking=True)
 
     keep_mask = torch.ones(original_out_features, dtype=torch.bool, device=weight_device)
     keep_mask[protected_idx] = False
@@ -612,6 +651,120 @@ def _prepare_linear_weight_for_outlier_protection(
         protected_output_indices=protected_idx.to(device="cpu", dtype=torch.long).contiguous(),
         protected_output_weight=protected_weight.to(device="cpu", dtype=weight.dtype).contiguous(),
     )
+
+
+def _channel_score_for_outlier_plan(
+    *,
+    weight: torch.Tensor,
+    linear_name: str,
+    activation_weight: Optional[torch.Tensor],
+    outlier_protect_axis: str,
+    outlier_score_mode: str,
+) -> torch.Tensor:
+    axis = str(outlier_protect_axis).strip().lower()
+    if axis not in {"input", "output"}:
+        raise ValueError(f"Unsupported outlier_protect_axis={outlier_protect_axis}. Expected input or output.")
+    score_mode = str(outlier_score_mode).strip().lower()
+    if score_mode not in {"abs", "input_act_weighted_abs", "original_weight_abs", "input_act_weighted_original_weight_abs"}:
+        raise ValueError(
+            f"{linear_name}: unsupported outlier score mode {outlier_score_mode!r}. "
+            "Expected abs, input_act_weighted_abs, original_weight_abs, or input_act_weighted_original_weight_abs."
+        )
+    needs_activation = score_mode in {"input_act_weighted_abs", "input_act_weighted_original_weight_abs"}
+    weight_f = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if needs_activation:
+        if activation_weight is None:
+            raise ValueError(f"{linear_name}: {score_mode} requires activation vector.")
+        act = activation_weight.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
+        if int(act.numel()) != int(weight_f.shape[1]):
+            raise ValueError(
+                f"{linear_name}: activation vector size mismatch, got {int(act.numel())}, "
+                f"expected in_features={int(weight_f.shape[1])}."
+            )
+    else:
+        act = None
+
+    if axis == "input":
+        channel_weight = weight_f.t().contiguous()
+        if act is not None:
+            channel_weight = channel_weight * act.view(-1, 1)
+        return torch.norm(channel_weight, p=2, dim=1).contiguous()
+
+    channel_weight = weight_f
+    if act is not None:
+        channel_weight = channel_weight * act.view(1, -1)
+    return torch.norm(channel_weight, p=2, dim=1).contiguous()
+
+
+def build_outlier_channel_index_plan(
+    *,
+    group_refs: Sequence[LinearPrepRef],
+    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
+    outlier_protect_count: int,
+    outlier_protect_axis: str,
+    outlier_channel_scope: str,
+    outlier_score_mode: str,
+) -> Dict[str, torch.Tensor]:
+    protect_count = int(outlier_protect_count)
+    if protect_count < 0:
+        raise ValueError(f"outlier_protect_count must be >= 0, got {protect_count}")
+    scope = str(outlier_channel_scope).strip().lower()
+    if scope not in {"layer", "category"}:
+        raise ValueError(f"Unsupported outlier_channel_scope={outlier_channel_scope!r}. Expected layer or category.")
+
+    empty_plan = {
+        r.name: torch.empty(0, dtype=torch.long)
+        for r in group_refs
+    }
+    if protect_count == 0 or len(group_refs) == 0:
+        return empty_plan
+
+    per_linear_scores: Dict[str, torch.Tensor] = {}
+    for r in group_refs:
+        act = None if activation_weight_by_linear is None else activation_weight_by_linear.get(r.name)
+        per_linear_scores[r.name] = _channel_score_for_outlier_plan(
+            weight=r.weight,
+            linear_name=r.name,
+            activation_weight=act,
+            outlier_protect_axis=outlier_protect_axis,
+            outlier_score_mode=outlier_score_mode,
+        )
+
+    if scope == "layer":
+        out: Dict[str, torch.Tensor] = {}
+        for r in group_refs:
+            scores = per_linear_scores[r.name]
+            k = min(int(protect_count), int(scores.numel()))
+            if k < 1:
+                out[r.name] = torch.empty(0, dtype=torch.long)
+                continue
+            _, idx = torch.topk(scores, k=k, largest=True, sorted=False)
+            out[r.name] = torch.sort(idx.to(dtype=torch.long)).values.contiguous()
+        return out
+
+    flat_scores = []
+    flat_linear_indices = []
+    flat_channel_indices = []
+    for linear_idx, r in enumerate(group_refs):
+        scores = per_linear_scores[r.name]
+        flat_scores.append(scores)
+        flat_linear_indices.append(torch.full((int(scores.numel()),), int(linear_idx), dtype=torch.long))
+        flat_channel_indices.append(torch.arange(int(scores.numel()), dtype=torch.long))
+    all_scores = torch.cat(flat_scores, dim=0)
+    all_linear_indices = torch.cat(flat_linear_indices, dim=0)
+    all_channel_indices = torch.cat(flat_channel_indices, dim=0)
+    total_budget = min(int(protect_count) * int(len(group_refs)), int(all_scores.numel()))
+    if total_budget < 1:
+        return empty_plan
+    _, top_pos = torch.topk(all_scores, k=total_budget, largest=True, sorted=False)
+    selected_linear = all_linear_indices.index_select(0, top_pos)
+    selected_channel = all_channel_indices.index_select(0, top_pos)
+    out: Dict[str, torch.Tensor] = {}
+    for linear_idx, r in enumerate(group_refs):
+        mask = selected_linear == int(linear_idx)
+        idx = selected_channel.masked_select(mask)
+        out[r.name] = torch.sort(idx.to(dtype=torch.long)).values.contiguous()
+    return out
 
 
 def _build_wa_mse_part_metas(
@@ -717,6 +870,8 @@ def prepare_group_linear_entries(
     outlier_protect_axis: str,
     recon_loss_type: str,
     intra_part_sort_mode: Union[str, Sequence[str]] = "none",
+    outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
+    apply_outlier_channel_removal: bool = True,
 ) -> List[PreparedLinearEntry]:
     protect_count = int(outlier_protect_count)
     if protect_count < 0:
@@ -730,7 +885,7 @@ def prepare_group_linear_entries(
     # 排序代码，已关闭。原 activation sort 条件保留如下：
     # requires_act = resolved_sort_mode == "act_spectral_cosine"
     requires_act = False  # 排序代码，已关闭。
-    needs_activation = requires_act or use_wa_mse or protect_count > 0
+    needs_activation = requires_act or use_wa_mse or (protect_count > 0 and outlier_channel_plan is None)
     if needs_activation and activation_weight_by_linear is None:
         raise ValueError(
             "Activation vectors are required by outlier protection or wa_mse. "
@@ -755,6 +910,8 @@ def prepare_group_linear_entries(
                     activation_weight=act_for_linear,
                     outlier_protect_count=protect_count,
                     outlier_protect_axis=outlier_protect_axis,
+                    protected_channel_indices=None if outlier_channel_plan is None else outlier_channel_plan.get(r.name),
+                    apply_channel_removal=bool(apply_outlier_channel_removal),
                 ),
             )
         )

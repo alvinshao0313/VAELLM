@@ -24,10 +24,7 @@ from train_utils.cat_train_runtime import (
     save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
 )
 from train_utils.cat_train_residual_protection import (
-    LOW_RANK_OUTLIER_MODES as _LOW_RANK_OUTLIER_MODES,
     RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT as _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT,
-    build_per_vae_low_rank_payloads as _build_per_vae_low_rank_payloads,
-    build_post_vae_low_rank_payload as _build_post_vae_low_rank_payload,
     build_sparse_residual_payload as _build_sparse_residual_payload,
 )
 from litebsq.vae_args import apply_autoencoder_arch_defaults
@@ -37,6 +34,7 @@ from litebsq.sparse_residual import (
 )
 from train_utils.cat_data_prep import (
     LinearPrepRef,
+    build_outlier_channel_index_plan,
     format_intra_part_sort_mode,
     gather_wa_mse_act_max_batch,
     materialize_prepared_group_data,
@@ -61,6 +59,7 @@ from train_utils.cat_train_data import (
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.model_checkpoint_io import (
     _build_run_output_dir,
+    register_shared_protected_residual_decoder,
     save_model_checkpoint,
 )
 from train_utils.utils import (
@@ -78,6 +77,15 @@ from train_utils.utils import (
 
 
 log = get_logger("linear_by_category")
+
+
+def _safe_shared_decoder_ref(value: str) -> str:
+    text = str(value).strip()
+    chars = [ch if (ch.isalnum() or ch == "_") else "_" for ch in text]
+    out = "".join(chars).strip("_")
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out or "shared_protected_residual_decoder"
 
 
 def _fuse_q_scale_linear(linear: nn.Linear, q_scale: float) -> None:
@@ -462,8 +470,7 @@ def _build_vae_linear_from_stage_payload(
     always_use_original: bool,
     protect_original_weight: bool,
     sparse_residual_kwargs: Optional[Dict[str, object]] = None,
-    low_rank_a: Optional[torch.Tensor] = None,
-    low_rank_b: Optional[torch.Tensor] = None,
+    protected_residual_kwargs: Optional[Dict[str, object]] = None,
 ):
     from litebsq.vae_linear import VAELinear
 
@@ -483,17 +490,25 @@ def _build_vae_linear_from_stage_payload(
         parallel_cols=int(parallel_cols),
         compressed_in_features=int(split_meta.compressed_in_features),
         compressed_out_features=int(split_meta.compressed_out_features),
-        protected_input_indices=split_meta.protected_input_indices,
+        protected_input_indices=(
+            split_meta.protected_input_indices
+            if split_meta.protected_input_weight is not None
+            else None
+        ),
         protected_input_weight=split_meta.protected_input_weight,
-        protected_output_indices=split_meta.protected_output_indices,
+        protected_output_indices=(
+            split_meta.protected_output_indices
+            if split_meta.protected_output_weight is not None
+            else None
+        ),
         protected_output_weight=split_meta.protected_output_weight,
-        low_rank_a=low_rank_a,
-        low_rank_b=low_rank_b,
         always_use_original=bool(always_use_original),
         protect_original_weight=bool(protect_original_weight),
     )
     if sparse_residual_kwargs:
         common_kwargs.update(dict(sparse_residual_kwargs))
+    if protected_residual_kwargs:
+        common_kwargs.update(dict(protected_residual_kwargs))
     if residual_stages == 1:
         return VAELinear(
             vq_weight=stage_part_bits_payload[0],
@@ -537,10 +552,253 @@ def _decode_reconstructed_linear_weight(
         original_weight=None,
         always_use_original=False,
         protect_original_weight=False,
-        low_rank_a=None,
-        low_rank_b=None,
     )
     return temp_linear._decode_weight(dtype=torch.float32).detach().to(device="cpu", dtype=torch.float32)
+
+
+def _train_protected_residual_vae_payload(
+    *,
+    linear_name: str,
+    residual_slice: torch.Tensor,
+    runtime_cfg: ResolvedCategoryRuntimeConfig,
+    vae_args,
+    training_args,
+    train_device: str,
+    train_dtype: torch.dtype,
+    batch_size: int,
+    log_every: int,
+    deterministic: bool,
+    shuffle_seed: int,
+) -> Optional[Dict[str, object]]:
+    from litebsq.llm_vae import MultiLayerVAE
+
+    steps = int(runtime_cfg.steps)
+    if steps <= 0:
+        return None
+    recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
+    codebook_dim = int(runtime_cfg.codebook_dim)
+    stages = int(runtime_cfg.outlier_residual_vae_stages)
+    residual = residual_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if residual.ndim != 2:
+        raise ValueError(f"{linear_name}: protected residual slice must be 2D, got shape={tuple(residual.shape)}.")
+    if int(residual.numel()) == 0:
+        return None
+    if int(residual.numel()) % codebook_dim != 0:
+        raise ValueError(
+            f"{linear_name}: protected residual numel={int(residual.numel())} is not divisible by "
+            f"codebook_dim={codebook_dim}."
+        )
+
+    current = residual.view(-1, 1, codebook_dim).contiguous()
+    stage_bits: List[torch.Tensor] = []
+    stage_decoders: List[nn.Module] = []
+    stage_codebook_dims: List[int] = []
+    shared_stage_args = _clone_namespace(
+        vae_args,
+        parallel_layers=1,
+        residual_stages=int(stages),
+        codebook_bits=int(runtime_cfg.codebook_bits),
+        codebook_dim=int(codebook_dim),
+        base_ch=int(runtime_cfg.base_ch),
+        num_res_blocks=int(runtime_cfg.num_res_blocks),
+        norm_type=str(runtime_cfg.norm_type),
+        decoder_type=str(runtime_cfg.decoder_type),
+        decoder_base_ch=(
+            None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch)
+        ),
+        decoder_num_res_blocks=(
+            None if runtime_cfg.decoder_num_res_blocks is None else int(runtime_cfg.decoder_num_res_blocks)
+        ),
+        recon_loss_type=recon_loss,
+    )
+    apply_autoencoder_arch_defaults(shared_stage_args)
+    use_stage_norm = bool(getattr(shared_stage_args, "normalize_weight", False))
+
+    for stage_idx in range(stages):
+        stage_tag = f"{linear_name}/protected_residual_stage{stage_idx + 1}"
+        residual_data = current.detach().clone().contiguous()
+        if use_stage_norm:
+            stage_norm_mean, stage_norm_scale = _compute_stage_norm_stats(residual_data)
+            stage_train_data = _apply_stage_norm(residual_data, mean=stage_norm_mean, scale=stage_norm_scale)
+        else:
+            stage_norm_mean = None
+            stage_norm_scale = None
+            stage_train_data = residual_data
+
+        effective_batch_size = min(max(1, int(batch_size)), int(stage_train_data.shape[0]))
+        train_loader, eval_loader = _build_block_data_loaders(
+            stage_train_data,
+            batch_size=int(effective_batch_size),
+            shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
+        )
+        vae = MultiLayerVAE(shared_stage_args).to(train_device)
+        optimizer = create_optimizer(vae.parameters(), shared_stage_args, shared_stage_args.lr)
+        lr_scheduler = None
+        lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "constant")).strip().lower()
+        if lr_scheduler_name != "constant":
+            import transformers
+
+            lr_scheduler = transformers.get_scheduler(
+                lr_scheduler_name,
+                optimizer,
+                num_warmup_steps=int(getattr(shared_stage_args, "lr_warmup_steps", 0)),
+                num_training_steps=int(steps),
+            )
+        start = time.time()
+        train_iter = iter(train_loader)
+        vae.train()
+        for step in range(int(steps)):
+            try:
+                x_cpu, _idx = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                x_cpu, _idx = next(train_iter)
+            x = x_cpu.to(device=train_device, dtype=train_dtype, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            _x_recon, loss_dict = vae(x, is_train=True)
+            loss = loss_dict["loss"]
+            loss.backward()
+            optimizer.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+            if log_every > 0 and (step + 1) % int(log_every) == 0:
+                speed = (time.time() - start) / int(log_every)
+                log.info(
+                    "[%s] step=%d/%d loss=%.4e speed=%.4fs/it",
+                    stage_tag,
+                    step + 1,
+                    int(steps),
+                    float(loss.detach().float().item()),
+                    speed,
+                )
+                start = time.time()
+
+        vae.eval()
+        recon_chunks: List[torch.Tensor] = []
+        bit_chunks: List[torch.Tensor] = []
+        with torch.no_grad():
+            for x_cpu, _idx in eval_loader:
+                x = x_cpu.to(device=train_device, dtype=train_dtype, non_blocking=True)
+                x_recon, bit_idx = vae(x, is_train=False)
+                recon_chunks.append(x_recon.detach().to(device="cpu", dtype=stage_train_data.dtype))
+                bit_chunks.append(bit_idx.detach().to(device="cpu"))
+        stage_recon_norm = torch.cat(recon_chunks, dim=0)
+        stage_recon = (
+            _restore_stage_norm(stage_recon_norm, mean=stage_norm_mean, scale=stage_norm_scale)
+            if stage_norm_mean is not None and stage_norm_scale is not None
+            else stage_recon_norm
+        )
+        current = (current - stage_recon.to(dtype=current.dtype)).contiguous()
+        stage_bits.append(torch.cat(bit_chunks, dim=0).contiguous())
+        stage_codebook_dims.append(int(codebook_dim))
+
+        decoder_in_dim = int(getattr(vae.model.decoder, "in_dim"))
+        use_new_quant = bool(getattr(shared_stage_args, "new_quant", False))
+        quant_q_scale = (1.0 / math.sqrt(decoder_in_dim)) if use_new_quant else 1.0
+        dec = vae.model.decoder.get_sub_decoder(0)
+        _fuse_q_scale_into_decoder(dec, q_scale=float(quant_q_scale))
+        if use_stage_norm:
+            if stage_norm_mean is None or stage_norm_scale is None:
+                raise RuntimeError(f"{stage_tag}: stage norm stats missing while normalize_weight=True")
+            _fuse_norm_into_decoder(
+                dec,
+                mean=float(stage_norm_mean[0].item()),
+                std=float(stage_norm_scale[0].item()),
+            )
+        dec.to("cpu")
+        stage_decoders.append(dec)
+        del vae, train_loader, eval_loader, optimizer
+        if lr_scheduler is not None:
+            del lr_scheduler
+        torch.cuda.empty_cache()
+
+    return {
+        "stage_vq_weights": stage_bits,
+        "stage_decoders": stage_decoders,
+        "stage_codebook_dims": stage_codebook_dims,
+    }
+
+
+def _train_shared_protected_residual_vae_payloads(
+    *,
+    group_tag: str,
+    residual_slices_by_name: Dict[str, torch.Tensor],
+    runtime_cfg: ResolvedCategoryRuntimeConfig,
+    vae_args,
+    training_args,
+    train_device: str,
+    train_dtype: torch.dtype,
+    batch_size: int,
+    log_every: int,
+    deterministic: bool,
+    shuffle_seed: int,
+) -> Dict[str, Dict[str, object]]:
+    if not residual_slices_by_name:
+        return {}
+    codebook_dim = int(runtime_cfg.codebook_dim)
+    ordered_items = list(residual_slices_by_name.items())
+    block_counts: Dict[str, int] = {}
+    flat_chunks: List[torch.Tensor] = []
+    for linear_name, residual_slice in ordered_items:
+        residual = residual_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if residual.ndim != 2:
+            raise ValueError(f"{linear_name}: protected residual slice must be 2D, got shape={tuple(residual.shape)}.")
+        if int(residual.numel()) == 0:
+            continue
+        if int(residual.numel()) % codebook_dim != 0:
+            raise ValueError(
+                f"{linear_name}: protected residual numel={int(residual.numel())} is not divisible by "
+                f"codebook_dim={codebook_dim}."
+            )
+        blocks = int(residual.numel()) // int(codebook_dim)
+        block_counts[linear_name] = blocks
+        flat_chunks.append(residual.view(blocks, codebook_dim))
+    if not flat_chunks:
+        return {}
+
+    combined = torch.cat(flat_chunks, dim=0).contiguous()
+    shared_payload = _train_protected_residual_vae_payload(
+        linear_name=f"{group_tag}/shared_protected_residual",
+        residual_slice=combined,
+        runtime_cfg=runtime_cfg,
+        vae_args=vae_args,
+        training_args=training_args,
+        train_device=train_device,
+        train_dtype=train_dtype,
+        batch_size=batch_size,
+        log_every=log_every,
+        deterministic=deterministic,
+        shuffle_seed=shuffle_seed,
+    )
+    if shared_payload is None:
+        return {}
+
+    stage_bits_all = shared_payload["stage_vq_weights"]
+    shared_stage_decoders = shared_payload["stage_decoders"]
+    stage_codebook_dims = shared_payload["stage_codebook_dims"]
+    refs = [
+        _safe_shared_decoder_ref(f"{group_tag}.protected_residual.stage{stage_idx}")
+        for stage_idx in range(len(shared_stage_decoders))
+    ]
+
+    out: Dict[str, Dict[str, object]] = {}
+    offset = 0
+    for linear_name, _residual_slice in ordered_items:
+        blocks = int(block_counts.get(linear_name, 0))
+        if blocks <= 0:
+            continue
+        per_linear_stage_bits = [
+            stage_bits[offset: offset + blocks].contiguous()
+            for stage_bits in stage_bits_all
+        ]
+        offset += blocks
+        out[linear_name] = {
+            "stage_vq_weights": per_linear_stage_bits,
+            "shared_decoder_refs": list(refs),
+            "shared_stage_decoders": shared_stage_decoders,
+            "stage_codebook_dims": stage_codebook_dims,
+        }
+    return out
 
 
 def train_group_vae_payload(
@@ -562,6 +820,7 @@ def train_group_vae_payload(
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
     outlier_protect_mode: str = "channel",
+    outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
     outlier_residual_score: str = "abs",
     outlier_residual_min_abs: float = 1e-6,
     outlier_protect_axis: str = "input",
@@ -569,6 +828,7 @@ def train_group_vae_payload(
     outlier_residual_index_bits: int = 8,
     outlier_residual_value_bits: int = 8,
     outlier_residual_block_shape: Tuple[int, int] = (256, 256),
+    outlier_residual_vae_decoder_share_scope: str = "none",
     # 排序代码，已关闭。旧参数保留如下：
     # sort_executor=None,
     # sort_prep_workers_resolved: int = 1,
@@ -604,20 +864,25 @@ def train_group_vae_payload(
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
     stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
     outlier_protect_count = int(runtime_cfg.outlier_protect_count)
-    outlier_low_rank = int(runtime_cfg.outlier_low_rank)
     outlier_residual_top_p = float(runtime_cfg.outlier_residual_top_p)
     resolved_outlier_mode = str(outlier_protect_mode).strip().lower()
+    resolved_protected_residual_decoder_share_scope = str(outlier_residual_vae_decoder_share_scope).strip().lower()
     resolved_residual_score = str(outlier_residual_score).strip().lower()
     resolved_residual_min_abs = float(outlier_residual_min_abs)
     residual_sparse_enabled = resolved_outlier_mode == "residual_sparse"
-    low_rank_enabled = resolved_outlier_mode in _LOW_RANK_OUTLIER_MODES
+    channel_protection_enabled = resolved_outlier_mode in {"channel", "channel_residual_vae"} and int(outlier_protect_count) > 0
     residual_sparse_needs_activation = (
         residual_sparse_enabled and resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT
     )
-    if resolved_outlier_mode not in {"none", "channel", "residual_sparse", "per_vae_low_rank", "post_vae_low_rank"}:
+    if resolved_outlier_mode not in {"none", "channel", "channel_residual_vae", "residual_sparse"}:
         raise ValueError(
             f"[{group_tag}] unsupported outlier_protect_mode={outlier_protect_mode!r}. "
-            "Expected none, channel, residual_sparse, per_vae_low_rank, or post_vae_low_rank."
+            "Expected none, channel, channel_residual_vae, or residual_sparse."
+        )
+    if resolved_protected_residual_decoder_share_scope not in {"none", "category"}:
+        raise ValueError(
+            f"[{group_tag}] unsupported outlier_residual_vae_decoder_share_scope="
+            f"{outlier_residual_vae_decoder_share_scope!r}. Expected one of: none, category."
         )
     if residual_sparse_enabled and int(outlier_protect_count) != 0:
         raise ValueError(
@@ -633,20 +898,6 @@ def train_group_vae_payload(
             f"[{group_tag}] residual_sparse mode requires outlier_residual_min_abs >= 0, "
             f"got {resolved_residual_min_abs}."
         )
-    if low_rank_enabled:
-        if int(outlier_protect_count) != 0:
-            raise ValueError(
-                f"[{group_tag}] {resolved_outlier_mode} mode requires outlier_protect_count=0, got {outlier_protect_count}."
-            )
-        if float(outlier_residual_top_p) != 0.0:
-            raise ValueError(
-                f"[{group_tag}] {resolved_outlier_mode} mode requires outlier_residual_top_p=0, "
-                f"got {outlier_residual_top_p}."
-            )
-        if int(outlier_low_rank) <= 0:
-            raise ValueError(
-                f"[{group_tag}] {resolved_outlier_mode} mode requires outlier_low_rank > 0, got {outlier_low_rank}."
-            )
     resolved_residual_codec = str(outlier_residual_codec).strip().lower()
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
     row_parts, col_parts = int(runtime_cfg.intra_parallel[0]), int(runtime_cfg.intra_parallel[1])
@@ -661,7 +912,6 @@ def train_group_vae_payload(
     # )
     needs_dynamic_activation = (
         use_wa_mse_loss
-        or (resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0)
         or residual_sparse_needs_activation
     )
     effective_activation_weight: Optional[Dict[str, torch.Tensor]] = None
@@ -710,24 +960,14 @@ def train_group_vae_payload(
     prepared_entries = prepare_group_linear_entries(
         group_refs=prep_refs,
         activation_weight_by_linear=effective_activation_weight,
-        outlier_protect_count=int(outlier_protect_count) if resolved_outlier_mode == "channel" else 0,
+        outlier_protect_count=int(outlier_protect_count) if channel_protection_enabled else 0,
         outlier_protect_axis=str(outlier_protect_axis),
         recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
         intra_part_sort_mode=stage_sort_mode,
+        outlier_channel_plan=outlier_channel_plan if channel_protection_enabled else None,
+        apply_outlier_channel_removal=resolved_outlier_mode == "channel",
     )
-    low_rank_payloads: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None for _ in prepared_entries]
     initial_split_weights_by_linear: Optional[List[torch.Tensor]] = None
-    if resolved_outlier_mode == "per_vae_low_rank":
-        low_rank_payloads, initial_split_weights_by_linear = _build_per_vae_low_rank_payloads(
-            prepared_entries=prepared_entries,
-            rank=int(outlier_low_rank),
-        )
-        log.info(
-            "[%s] per-vae low-rank protection enabled: rank=%d linears=%d",
-            group_tag,
-            int(outlier_low_rank),
-            len(prepared_entries),
-        )
     target_common_result = materialize_prepared_group_data(
         prepared_entries=prepared_entries,
         intra_parallel=(row_parts, col_parts),
@@ -758,7 +998,7 @@ def train_group_vae_payload(
             f"[{group_tag}] split metadata mismatch: len(split_metas)={len(target_common_split_metas)} "
             f"vs len(group_refs)={len(group_refs)}"
         )
-    if resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0:
+    if channel_protection_enabled:
         per_linear_protected = []
         for ref, meta in zip(group_refs, target_common_split_metas):
             if str(outlier_protect_axis) == "output":
@@ -772,8 +1012,9 @@ def train_group_vae_payload(
                 f"{ref.name}:{protected_count}/{total_channels}"
             )
         log.info(
-            "[%s] outlier protection axis=%s count=%d protected_channels=%s",
+            "[%s] outlier protection mode=%s axis=%s count=%d protected_channels=%s",
             group_tag,
+            resolved_outlier_mode,
             str(outlier_protect_axis),
             int(outlier_protect_count),
             ",".join(per_linear_protected),
@@ -790,12 +1031,6 @@ def train_group_vae_payload(
             int(outlier_residual_value_bits),
             int(outlier_residual_block_shape[0]),
             int(outlier_residual_block_shape[1]),
-        )
-    if resolved_outlier_mode == "post_vae_low_rank":
-        log.info(
-            "[%s] post-vae low-rank protection enabled: rank=%d",
-            group_tag,
-            int(outlier_low_rank),
         )
     if use_wa_mse:
         log.info("[%s] wa_mse enabled with online act_max gather.", group_tag)
@@ -1285,6 +1520,105 @@ def train_group_vae_payload(
             f"residual_stages={residual_stages}"
         )
 
+    protected_residual_payload_by_name: Dict[str, Dict[str, object]] = {}
+    if resolved_outlier_mode == "channel_residual_vae" and int(outlier_protect_count) > 0:
+        protected_residual_entries: List[Tuple[LinearRef, str, torch.Tensor, torch.Tensor]] = []
+        for r, split_meta in zip(group_refs, target_common_split_metas):
+            if str(outlier_protect_axis) == "output":
+                protected_idx = split_meta.protected_output_indices
+                axis = "output"
+            else:
+                protected_idx = split_meta.protected_input_indices
+                axis = "input"
+            if not isinstance(protected_idx, torch.Tensor) or int(protected_idx.numel()) == 0:
+                continue
+            reconstructed_weight = _decode_reconstructed_linear_weight(
+                old_module=r.module,
+                transpose=r.transpose,
+                split_meta=split_meta,
+                stage_split_metas=all_stage_split_metas,
+                stage_part_bits_payload=all_stage_bits,
+                stage_part_decoders_payload=all_stage_decoders,
+                stage_codebook_dims=all_stage_codebook_dims,
+                parallel_rows=row_parts,
+                parallel_cols=col_parts,
+                parallel_parts=parts_per_linear,
+            )
+            residual_weight = (
+                r.module.weight.detach().to(device="cpu", dtype=torch.float32)
+                - reconstructed_weight.to(device="cpu", dtype=torch.float32)
+            ).contiguous()
+            idx_cpu = protected_idx.detach().to(device="cpu", dtype=torch.long).contiguous()
+            if axis == "input":
+                residual_slice = residual_weight.index_select(1, idx_cpu).contiguous()
+            else:
+                residual_slice = residual_weight.index_select(0, idx_cpu).contiguous()
+            protected_residual_entries.append((r, axis, idx_cpu, residual_slice))
+
+        shared_payload_by_name: Dict[str, Dict[str, object]] = {}
+        if resolved_protected_residual_decoder_share_scope == "category":
+            shared_payload_by_name = _train_shared_protected_residual_vae_payloads(
+                group_tag=group_tag,
+                residual_slices_by_name={
+                    r.name: residual_slice
+                    for r, _axis, _idx_cpu, residual_slice in protected_residual_entries
+                },
+                runtime_cfg=runtime_cfg,
+                vae_args=vae_args,
+                training_args=training_args,
+                train_device=train_device,
+                train_dtype=train_dtype,
+                batch_size=int(materialize_batch_size),
+                log_every=log_every,
+                deterministic=deterministic,
+                shuffle_seed=int(shuffle_seed),
+            )
+
+        for r, axis, idx_cpu, residual_slice in protected_residual_entries:
+            if resolved_protected_residual_decoder_share_scope == "category":
+                residual_payload = shared_payload_by_name.get(r.name)
+            else:
+                residual_payload = _train_protected_residual_vae_payload(
+                    linear_name=r.name,
+                    residual_slice=residual_slice,
+                    runtime_cfg=runtime_cfg,
+                    vae_args=vae_args,
+                    training_args=training_args,
+                    train_device=train_device,
+                    train_dtype=train_dtype,
+                    batch_size=int(materialize_batch_size),
+                    log_every=log_every,
+                    deterministic=deterministic,
+                    shuffle_seed=int(shuffle_seed),
+                )
+            if residual_payload is None:
+                continue
+            protected_residual_payload_by_name[r.name] = {
+                "protected_residual_axis": axis,
+                "protected_residual_indices": idx_cpu,
+                "protected_residual_stage_vq_weights": residual_payload["stage_vq_weights"],
+                "protected_residual_stage_codebook_dims": residual_payload["stage_codebook_dims"],
+            }
+            if resolved_protected_residual_decoder_share_scope == "category":
+                protected_residual_payload_by_name[r.name].update(
+                    {
+                        "protected_residual_shared_decoder_refs": residual_payload["shared_decoder_refs"],
+                        "protected_residual_shared_stage_decoders": residual_payload["shared_stage_decoders"],
+                    }
+                )
+            else:
+                protected_residual_payload_by_name[r.name]["protected_residual_stage_decoders"] = residual_payload["stage_decoders"]
+            log.info(
+                "[%s] protected residual VAE patch for %s: axis=%s channels=%d stages=%d steps=%d decoder_share_scope=%s",
+                group_tag,
+                r.name,
+                axis,
+                int(idx_cpu.numel()),
+                int(runtime_cfg.outlier_residual_vae_stages),
+                int(runtime_cfg.steps),
+                resolved_protected_residual_decoder_share_scope,
+            )
+
     for stage_decoders in all_stage_decoders:
         for decoder in stage_decoders:
             decoder.to("cpu")
@@ -1300,11 +1634,9 @@ def train_group_vae_payload(
         "all_stage_decoders": all_stage_decoders,
         "all_stage_codebook_dims": all_stage_codebook_dims,
         "all_stage_split_metas": all_stage_split_metas,
-        "low_rank_payloads": low_rank_payloads,
         "resolved_outlier_mode": resolved_outlier_mode,
         "residual_sparse_enabled": bool(residual_sparse_enabled),
         "effective_activation_weight": effective_activation_weight,
-        "outlier_low_rank": int(outlier_low_rank),
         "outlier_residual_top_p": float(outlier_residual_top_p),
         "resolved_residual_score": resolved_residual_score,
         "resolved_residual_min_abs": float(resolved_residual_min_abs),
@@ -1312,6 +1644,7 @@ def train_group_vae_payload(
         "outlier_residual_index_bits": int(outlier_residual_index_bits),
         "outlier_residual_value_bits": int(outlier_residual_value_bits),
         "outlier_residual_block_shape": tuple(int(v) for v in outlier_residual_block_shape),
+        "protected_residual_payload_by_name": protected_residual_payload_by_name,
     }
     del current_residual_weights, target_common_result
     torch.cuda.empty_cache()
@@ -1340,11 +1673,9 @@ def apply_group_vae_payload(
     all_stage_decoders = payload["all_stage_decoders"]
     all_stage_codebook_dims = payload["all_stage_codebook_dims"]
     all_stage_split_metas = payload["all_stage_split_metas"]
-    low_rank_payloads = payload["low_rank_payloads"]
     resolved_outlier_mode = str(payload["resolved_outlier_mode"])
     residual_sparse_enabled = bool(payload["residual_sparse_enabled"])
     effective_activation_weight = payload.get("effective_activation_weight")
-    outlier_low_rank = int(payload["outlier_low_rank"])
     outlier_residual_top_p = float(payload["outlier_residual_top_p"])
     resolved_residual_score = str(payload["resolved_residual_score"])
     resolved_residual_min_abs = float(payload["resolved_residual_min_abs"])
@@ -1352,6 +1683,7 @@ def apply_group_vae_payload(
     outlier_residual_index_bits = int(payload["outlier_residual_index_bits"])
     outlier_residual_value_bits = int(payload["outlier_residual_value_bits"])
     outlier_residual_block_shape = tuple(int(v) for v in payload["outlier_residual_block_shape"])
+    protected_residual_payload_by_name = payload.get("protected_residual_payload_by_name") or {}
 
     if (
         len(all_stage_bits) != residual_stages
@@ -1406,10 +1738,8 @@ def apply_group_vae_payload(
                 stage_part_decoders_payload.append(part_decoders[0])
 
         sparse_residual_kwargs = None
-        low_rank_a = None
-        low_rank_b = None
         reconstructed_weight = None
-        if residual_sparse_enabled or resolved_outlier_mode == "post_vae_low_rank":
+        if residual_sparse_enabled:
             reconstructed_weight = _decode_reconstructed_linear_weight(
                 old_module=old,
                 transpose=r.transpose,
@@ -1421,27 +1751,6 @@ def apply_group_vae_payload(
                 parallel_rows=row_parts,
                 parallel_cols=col_parts,
                 parallel_parts=parts_per_linear,
-            )
-        if resolved_outlier_mode == "per_vae_low_rank":
-            payload = low_rank_payloads[i]
-            if payload is None:
-                raise RuntimeError(f"[{group_tag}] missing per-vae low-rank payload for {r.name}.")
-            low_rank_a, low_rank_b = payload
-        elif resolved_outlier_mode == "post_vae_low_rank":
-            if reconstructed_weight is None:
-                raise RuntimeError(f"[{group_tag}] missing reconstructed weight for post-vae low-rank payload.")
-            low_rank_a, low_rank_b = _build_post_vae_low_rank_payload(
-                linear_name=r.name,
-                original_weight=old.weight,
-                reconstructed_weight=reconstructed_weight,
-                rank=int(outlier_low_rank),
-                target_dtype=old.weight.dtype,
-            )
-            log.info(
-                "[%s] post-vae low-rank patch for %s: rank=%d",
-                group_tag,
-                r.name,
-                int(outlier_low_rank),
             )
         if residual_sparse_enabled:
             activation_weight = None
@@ -1478,6 +1787,20 @@ def apply_group_vae_payload(
                 int(sparse_storage["codec_bytes"]),
                 int(sparse_storage["coo_bytes"]),
             )
+        protected_residual_kwargs = protected_residual_payload_by_name.get(r.name)
+        if protected_residual_kwargs:
+            shared_refs = protected_residual_kwargs.get("protected_residual_shared_decoder_refs")
+            shared_decoders = protected_residual_kwargs.get("protected_residual_shared_stage_decoders")
+            if shared_refs is not None or shared_decoders is not None:
+                if not isinstance(shared_refs, (list, tuple)) or not isinstance(shared_decoders, (list, tuple)):
+                    raise TypeError(f"[{group_tag}] invalid shared protected residual decoder payload for {r.name}.")
+                if len(shared_refs) != len(shared_decoders):
+                    raise ValueError(
+                        f"[{group_tag}] shared protected residual decoder ref/object length mismatch for {r.name}: "
+                        f"{len(shared_refs)} vs {len(shared_decoders)}"
+                    )
+                for ref, decoder in zip(shared_refs, shared_decoders):
+                    register_shared_protected_residual_decoder(model, str(ref), decoder)
         new_linear = _build_vae_linear_from_stage_payload(
             old_module=old,
             transpose=r.transpose,
@@ -1494,8 +1817,7 @@ def apply_group_vae_payload(
             always_use_original=skip_this,
             protect_original_weight=skip_this,
             sparse_residual_kwargs=sparse_residual_kwargs,
-            low_rank_a=low_rank_a,
-            low_rank_b=low_rank_b,
+            protected_residual_kwargs=protected_residual_kwargs,
         ).to(convert_device)
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
@@ -1522,6 +1844,7 @@ def _train_group_vae_and_replace(
     skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
     outlier_protect_mode: str = "channel",
+    outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
     outlier_residual_score: str = "abs",
     outlier_residual_min_abs: float = 1e-6,
     outlier_protect_axis: str = "input",
@@ -1553,6 +1876,7 @@ def _train_group_vae_and_replace(
         skip_layer_keys=skip_layer_keys,
         activation_runtime=activation_runtime,
         outlier_protect_mode=outlier_protect_mode,
+        outlier_channel_plan=outlier_channel_plan,
         outlier_residual_score=outlier_residual_score,
         outlier_residual_min_abs=outlier_residual_min_abs,
         outlier_protect_axis=outlier_protect_axis,
@@ -1560,6 +1884,7 @@ def _train_group_vae_and_replace(
         outlier_residual_index_bits=outlier_residual_index_bits,
         outlier_residual_value_bits=outlier_residual_value_bits,
         outlier_residual_block_shape=outlier_residual_block_shape,
+        outlier_residual_vae_decoder_share_scope=outlier_residual_vae_decoder_share_scope,
         deterministic=deterministic,
         shuffle_seed=shuffle_seed,
     )
@@ -1721,9 +2046,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     category_outlier_residual_top_p: Dict[str, float] = {
         cat: float(resolved_category_cfgs[cat].outlier_residual_top_p) for cat in active_categories
     }
-    category_outlier_low_rank: Dict[str, int] = {
-        cat: int(resolved_category_cfgs[cat].outlier_low_rank) for cat in active_categories
-    }
     category_sort_modes: Dict[str, str] = {
         cat: str(resolved_category_cfgs[cat].intra_part_sort_mode)
         for cat in active_categories
@@ -1739,12 +2061,17 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     any_wa_mse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip(
     ).lower() == "wa_mse" for cat in active_categories)
     any_outlier_protect = any(count > 0 for count in category_outlier_protect_count.values())
+    channel_protect_needs_activation = (
+        resolved_outlier_mode in {"channel", "channel_residual_vae"}
+        and resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT
+        and any_outlier_protect
+    )
     residual_sparse_needs_activation = (
         resolved_outlier_mode == "residual_sparse"
         and resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT
     )
     sort_needs_act = False  # 排序代码，已关闭。
-    if any_wa_mse or any_outlier_protect or sort_needs_act or residual_sparse_needs_activation:
+    if any_wa_mse or channel_protect_needs_activation or sort_needs_act or residual_sparse_needs_activation:
         activation_dataset = str(getattr(cat_args, "wa_mse_calib_dataset", "")).strip()
         if not activation_dataset:
             raise ValueError(
@@ -1766,7 +2093,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         enabled_features: List[str] = []
         if any_wa_mse:
             enabled_features.append("wa_mse")
-        if any_outlier_protect:
+        if channel_protect_needs_activation:
             enabled_features.append("outlier_protect")
         if residual_sparse_needs_activation:
             enabled_features.append("residual_sparse_score")
@@ -1813,21 +2140,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 int(cat_args.outlier_residual_block_shape[0]),
                 int(cat_args.outlier_residual_block_shape[1]),
             )
-    if resolved_outlier_mode in _LOW_RANK_OUTLIER_MODES:
-        unique_low_rank = sorted(set(category_outlier_low_rank.values()))
-        if len(unique_low_rank) == 1:
-            log.info(
-                "Low-rank protection enabled: mode=%s rank=%d",
-                resolved_outlier_mode,
-                int(unique_low_rank[0]),
-            )
-        else:
-            log.info(
-                "Low-rank protection enabled: mode=%s rank_by_category={%s}",
-                resolved_outlier_mode,
-                ",".join(f"{cat}:{category_outlier_low_rank[cat]}" for cat in active_categories),
-            )
-
     unique_parallel = sorted(set(category_intra_parallel.values()))
     if unique_parallel:
         if len(unique_parallel) == 1:
@@ -1957,6 +2269,73 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 # "none" if cat_cfg.joint_decoder_batch_size is None else str(int(cat_cfg.joint_decoder_batch_size)),
             )
             ordered_refs = [r for _, r in refs_sorted]
+            if bool(cat_args.allow_tail_group):
+                planned_refs = list(ordered_refs)
+            else:
+                planned_count = (len(ordered_refs) // int(linear_group_size)) * int(linear_group_size)
+                planned_refs = list(ordered_refs[:planned_count])
+            if skip_layer_keys:
+                eligible_plan_refs = []
+                for ref in planned_refs:
+                    layer_idx = _extract_layer_idx(ref.name)
+                    if layer_idx is not None and (int(layer_idx), ref.category) in skip_layer_keys:
+                        continue
+                    eligible_plan_refs.append(ref)
+            else:
+                eligible_plan_refs = planned_refs
+
+            outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None
+            if resolved_outlier_mode in {"channel", "channel_residual_vae"} and int(cat_cfg.outlier_protect_count) > 0:
+                plan_activation_weight: Optional[Dict[str, torch.Tensor]] = None
+                if resolved_residual_score in _RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT:
+                    if activation_runtime is None:
+                        raise ValueError(
+                            f"[{cat}] dynamic activation runtime is required for activation-weighted outlier channel scoring."
+                        )
+                    dynamic_act_max, new_cache = collect_act_max_for_linears(
+                        model=model,
+                        linear_items=[(r.name, r.module) for r in eligible_plan_refs],
+                        model_path=str(activation_runtime["model_path"]),
+                        access_token=activation_runtime.get("access_token"),
+                        dataset=str(activation_runtime.get("dataset", "")),
+                        nsamples=int(activation_runtime.get("nsamples", 512)),
+                        seqlen=int(activation_runtime.get("seqlen", 512)),
+                        seed=int(activation_runtime.get("seed", 0)),
+                        device=str(activation_runtime.get("device") or cat_args.train_device),
+                        cache=activation_runtime.get("cache"),  # type: ignore[arg-type]
+                        log_every=int(activation_runtime.get("log_every", 0)),
+                        logger=log,
+                    )
+                    activation_runtime["cache"] = new_cache
+                    plan_activation_weight = dynamic_act_max
+                plan_refs = [
+                    LinearPrepRef(
+                        name=r.name,
+                        weight=r.module.weight,
+                        in_features=int(r.module.in_features),
+                        out_features=int(r.module.out_features),
+                        transpose=bool(r.transpose),
+                    )
+                    for r in eligible_plan_refs
+                ]
+                outlier_channel_plan = build_outlier_channel_index_plan(
+                    group_refs=plan_refs,
+                    activation_weight_by_linear=plan_activation_weight,
+                    outlier_protect_count=int(cat_cfg.outlier_protect_count),
+                    outlier_protect_axis=outlier_protect_axis,
+                    outlier_channel_scope=str(cat_args.outlier_channel_scope),
+                    outlier_score_mode=resolved_residual_score,
+                )
+                for ref in planned_refs:
+                    outlier_channel_plan.setdefault(ref.name, torch.empty(0, dtype=torch.long))
+                log.info(
+                    "[%s] outlier channel plan: mode=%s scope=%s eligible_linears=%d total_channels=%d",
+                    cat,
+                    resolved_outlier_mode,
+                    str(cat_args.outlier_channel_scope),
+                    len(plan_refs),
+                    sum(int(v.numel()) for v in outlier_channel_plan.values()),
+                )
 
             for start in range(0, len(ordered_refs), linear_group_size):
                 group_refs = ordered_refs[start:start + linear_group_size]
@@ -1990,6 +2369,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     skip_layer_keys=skip_layer_keys,
                     activation_runtime=activation_runtime,
                     outlier_protect_mode=resolved_outlier_mode,
+                    outlier_channel_plan=outlier_channel_plan,
                     outlier_residual_score=resolved_residual_score,
                     outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
                     outlier_protect_axis=outlier_protect_axis,
@@ -1997,6 +2377,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     outlier_residual_index_bits=cat_args.outlier_residual_index_bits,
                     outlier_residual_value_bits=cat_args.outlier_residual_value_bits,
                     outlier_residual_block_shape=cat_args.outlier_residual_block_shape,
+                    outlier_residual_vae_decoder_share_scope=cat_args.outlier_residual_vae_decoder_share_scope,
                     deterministic=bool(cat_args.deterministic),
                     shuffle_seed=int(cat_args.seed) + int(cat_idx) * 100000 + int(start),
                 )
