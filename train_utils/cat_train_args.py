@@ -61,7 +61,7 @@ class NormalizedCatArgs:
     outlier_protect_mode: str
     outlier_channel_scope: str
     outlier_residual_top_p: OverrideTable[float]
-    outlier_residual_score: str
+    outlier_rank_metric: str
     outlier_residual_min_abs: float
     outlier_residual_codec: str
     outlier_residual_index_bits: int
@@ -70,6 +70,7 @@ class NormalizedCatArgs:
     outlier_protect_axis: str
     outlier_residual_vae_stages: OverrideTable[int]
     outlier_residual_vae_decoder_share_scope: str
+    outlier_residual_vae_batch_multiplier: int
     wa_mse_calib_dataset: str
     wa_mse_calib_nsamples: int
     wa_mse_calib_seqlen: int
@@ -196,15 +197,42 @@ _OUTLIER_RESIDUAL_VAE_DECODER_SHARE_SCOPE_CHOICES = ("none", "category")
 _DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
 _DISTILL_AFTER_CATEGORY_CHOICES = ("none", "remaining_lora", "compressed_lora", "decoder", "both")
 _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES = {"compressed_lora", "both"}
-_OUTLIER_RESIDUAL_SCORE_CHOICES = (
-    "abs",
-    "input_act_weighted_abs",
-    "original_weight_abs",
-    "input_act_weighted_original_weight_abs",
+_OUTLIER_RANK_METRIC_CHOICES = (
+    "sparse_residual_abs",
+    "sparse_residual_actmax_abs",
+    "sparse_weight_abs",
+    "sparse_weight_actmax_abs",
+    "channel_weight_abs",
+    "channel_weight_actmax_abs",
+    "channel_residual_abs",
+    "channel_residual_actmax_abs",
+    "channel_residual_actrms_abs",
 )
-_OUTLIER_RESIDUAL_SCORE_MODES_NEED_ACT = (
-    "input_act_weighted_abs",
-    "input_act_weighted_original_weight_abs",
+_SPARSE_OUTLIER_RANK_METRICS = (
+    "sparse_residual_abs",
+    "sparse_residual_actmax_abs",
+    "sparse_weight_abs",
+    "sparse_weight_actmax_abs",
+)
+_CHANNEL_OUTLIER_RANK_METRICS = (
+    "channel_weight_abs",
+    "channel_weight_actmax_abs",
+    "channel_residual_abs",
+    "channel_residual_actmax_abs",
+    "channel_residual_actrms_abs",
+)
+_CHANNEL_PRE_BASE_RANK_METRICS = (
+    "channel_weight_abs",
+    "channel_weight_actmax_abs",
+)
+_OUTLIER_RANK_METRICS_NEED_ACTMAX = (
+    "sparse_residual_actmax_abs",
+    "sparse_weight_actmax_abs",
+    "channel_weight_actmax_abs",
+    "channel_residual_actmax_abs",
+)
+_OUTLIER_RANK_METRICS_NEED_ACT_SQ_MEAN = (
+    "channel_residual_actrms_abs",
 )
 _OUTLIER_CHANNEL_MODES = ("channel", "channel_residual_vae")
 
@@ -682,7 +710,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_protect_mode=str(raw_args.outlier_protect_mode).strip().lower(),
         outlier_channel_scope=str(raw_args.outlier_channel_scope).strip().lower(),
         outlier_residual_top_p=_parse_cat_override(raw_args.outlier_residual_top_p, spec=_OUTLIER_RESIDUAL_TOP_P_SPEC),
-        outlier_residual_score=str(raw_args.outlier_residual_score).strip().lower(),
+        outlier_rank_metric=str(raw_args.outlier_rank_metric).strip().lower(),
         outlier_residual_min_abs=float(raw_args.outlier_residual_min_abs),
         outlier_residual_codec=str(raw_args.outlier_residual_codec).strip().lower(),
         outlier_residual_index_bits=resolved_index_bits,
@@ -691,6 +719,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_protect_axis=str(raw_args.outlier_protect_axis).strip().lower(),
         outlier_residual_vae_stages=_parse_cat_override(raw_args.outlier_residual_vae_stages, spec=_OUTLIER_RESIDUAL_VAE_STAGES_SPEC),
         outlier_residual_vae_decoder_share_scope=str(raw_args.outlier_residual_vae_decoder_share_scope).strip().lower(),
+        outlier_residual_vae_batch_multiplier=int(raw_args.outlier_residual_vae_batch_multiplier),
         wa_mse_calib_dataset=_parse_wa_mse_calib_dataset_text(
             raw_args.wa_mse_calib_dataset,
             arg_name="--wa_mse_calib_dataset",
@@ -763,7 +792,10 @@ def _override_table_contains(table: OverrideTable[object], predicate) -> bool:
 def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) -> None:
     channel_needs_activation = (
         str(cat_args.outlier_protect_mode).strip().lower() in _OUTLIER_CHANNEL_MODES
-        and str(cat_args.outlier_residual_score).strip().lower() in _OUTLIER_RESIDUAL_SCORE_MODES_NEED_ACT
+        and (
+            str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACTMAX
+            or str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACT_SQ_MEAN
+        )
         and _override_table_contains(cat_args.outlier_protect_count, lambda value: int(value) > 0)
     )
     dynamic_calib_enabled = (
@@ -774,7 +806,7 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
         or channel_needs_activation
         or (
             str(cat_args.outlier_protect_mode).strip().lower() == "residual_sparse"
-            and str(cat_args.outlier_residual_score).strip().lower() in _OUTLIER_RESIDUAL_SCORE_MODES_NEED_ACT
+            and str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACTMAX
         )
     )
     if dynamic_calib_enabled and not str(cat_args.wa_mse_calib_dataset).strip():
@@ -804,6 +836,40 @@ def _validate_distill_after_category_args(cat_args: NormalizedCatArgs) -> None:
                 )
 
 
+def validate_outlier_rank_metric(
+    outlier_mode: str,
+    outlier_rank_metric: str,
+    *,
+    channel_mode_uses_metric: bool = True,
+) -> None:
+    mode = str(outlier_mode).strip().lower()
+    metric = str(outlier_rank_metric).strip().lower()
+    if metric not in _OUTLIER_RANK_METRIC_CHOICES:
+        raise ValueError(
+            f"Unsupported --outlier_rank_metric={outlier_rank_metric!r}. "
+            f"Expected one of: {', '.join(_OUTLIER_RANK_METRIC_CHOICES)}."
+        )
+    if mode == "residual_sparse":
+        if metric not in _SPARSE_OUTLIER_RANK_METRICS:
+            raise ValueError(
+                f"outlier_rank_metric={metric!r} is only valid for "
+                "outlier_mode='channel_residual_vae', but got outlier_mode='residual_sparse'."
+            )
+        return
+    if mode == "channel_residual_vae":
+        if metric not in _CHANNEL_OUTLIER_RANK_METRICS:
+            raise ValueError(
+                f"outlier_rank_metric={metric!r} is only valid for "
+                "outlier_mode='residual_sparse', but got outlier_mode='channel_residual_vae'."
+            )
+        return
+    if mode == "channel" and bool(channel_mode_uses_metric) and metric not in _CHANNEL_PRE_BASE_RANK_METRICS:
+        raise ValueError(
+            f"outlier_rank_metric={metric!r} is not valid for outlier_mode='channel'. "
+            f"Expected one of: {', '.join(_CHANNEL_PRE_BASE_RANK_METRICS)}."
+        )
+
+
 def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
     mode = str(cat_args.outlier_protect_mode).strip().lower()
     codec = str(cat_args.outlier_residual_codec).strip().lower()
@@ -812,6 +878,7 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
     block_rows, block_cols = tuple(int(v) for v in cat_args.outlier_residual_block_shape)
     top_p_table = cat_args.outlier_residual_top_p
     protect_table = cat_args.outlier_protect_count
+    residual_vae_batch_multiplier = int(cat_args.outlier_residual_vae_batch_multiplier)
     if mode not in _OUTLIER_PROTECT_MODE_CHOICES:
         raise ValueError(
             f"Unsupported --outlier_protect_mode={cat_args.outlier_protect_mode!r}. "
@@ -852,10 +919,18 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
         index_bits=index_bits,
         arg_name="derived sparse residual block shape",
     )
-    if str(cat_args.outlier_residual_score).strip().lower() not in _OUTLIER_RESIDUAL_SCORE_CHOICES:
+    channel_mode_uses_metric = (
+        mode == "channel"
+        and _override_table_contains(protect_table, lambda value: int(value) > 0)
+    )
+    validate_outlier_rank_metric(
+        mode,
+        cat_args.outlier_rank_metric,
+        channel_mode_uses_metric=channel_mode_uses_metric,
+    )
+    if residual_vae_batch_multiplier < 1:
         raise ValueError(
-            f"Unsupported --outlier_residual_score={cat_args.outlier_residual_score!r}. "
-            f"Expected one of: {', '.join(_OUTLIER_RESIDUAL_SCORE_CHOICES)}."
+            f"--outlier_residual_vae_batch_multiplier must be >= 1, got {residual_vae_batch_multiplier}."
         )
     if float(cat_args.outlier_residual_min_abs) < 0.0:
         raise ValueError(
@@ -1078,14 +1153,13 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help=f"类别覆盖参数。仅 residual_sparse 模式生效。示例：{_OUTLIER_RESIDUAL_TOP_P_SPEC.example}",
     )
     parser.add_argument(
-        "--outlier_residual_score",
+        "--outlier_rank_metric",
         type=str,
-        choices=list(_OUTLIER_RESIDUAL_SCORE_CHOICES),
-        default="abs",
+        choices=list(_OUTLIER_RANK_METRIC_CHOICES),
+        default="sparse_residual_abs",
         help=(
-            "仅 residual_sparse 模式生效。选点打分方式："
-            "abs / input_act_weighted_abs / original_weight_abs / "
-            "input_act_weighted_original_weight_abs。"
+            "outlier/protected target 排序指标。residual_sparse 使用 sparse_*；"
+            "channel_residual_vae 使用 channel_*。"
         ),
     )
     parser.add_argument(
@@ -1123,6 +1197,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         choices=list(_OUTLIER_RESIDUAL_VAE_DECODER_SHARE_SCOPE_CHOICES),
         default="none",
         help="channel_residual_vae 模式下 protected residual VAE decoder 共享范围：none 为每个 linear 独立，category 为同类别共享。",
+    )
+    parser.add_argument(
+        "--outlier_residual_vae_batch_multiplier",
+        type=int,
+        default=1,
+        help="channel_residual_vae 模式下 protected residual VAE 的 batch 放大倍数；只影响 residual VAE，不影响 base VAE。category share scope 下建议设为 32。",
     )
     parser.add_argument(
         "--wa_mse_calib_dataset",

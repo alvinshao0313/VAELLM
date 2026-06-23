@@ -27,11 +27,13 @@ export HF_DATASETS_OFFLINE=1
 #   --joint_decoder_group_size "default=36"
 #   --joint_decoder_batch_size "default=524288"
 # --outlier_residual_top_p "default=0.01,cat:down_proj=0.02"
-# --outlier_residual_score "abs" / "input_act_weighted_abs" / "original_weight_abs" / "input_act_weighted_original_weight_abs"
+# --outlier_rank_metric "sparse_residual_abs" / "sparse_residual_actmax_abs" / "sparse_weight_abs" / "sparse_weight_actmax_abs"
+# --outlier_rank_metric "channel_weight_abs" / "channel_weight_actmax_abs" / "channel_residual_abs" / "channel_residual_actmax_abs" / "channel_residual_actrms_abs"
 # --outlier_channel_scope "layer" / "category"
 # --outlier_protect_mode "channel_residual_vae"
 # --outlier_residual_vae_stages "default=1,cat:q_proj=2"
 # --outlier_residual_vae_decoder_share_scope "none" / "category"
+# --outlier_residual_vae_batch_multiplier "32"
 # --outlier_residual_min_abs "1e-6"
 #   原始权重打分只决定保留哪些位置，真正保存的仍是这些位置上的 residual
 #   若 |original-reconstructed| 小于该阈值，则该位置会从 top-p 中剔除，并继续往后补
@@ -67,18 +69,19 @@ python tools/cat_train.py \
   --eval_ppl "false" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
-  --outlier_protect_mode "channel_residual_vae" \
+  --outlier_protect_mode "none" \
+  --outlier_channel_scope "category" \
   --outlier_residual_vae_decoder_share_scope "category" \
+  --outlier_residual_vae_batch_multiplier "32" \
   --outlier_residual_vae_stages "default=2" \
   --outlier_protect_count "default=32" \
   --outlier_protect_axis "input" \
-  --outlier_residual_top_p "default=0.01" \
-  --outlier_residual_score "input_act_weighted_abs" \
+  --outlier_residual_top_p "default=0.0" \
+  --outlier_rank_metric "channel_residual_actmax_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
-  --outlier_residual_vae_decoder_share_scope "category" \
   --wa_mse_calib_dataset "alpaca=1" \
   --wa_mse_calib_nsamples "128" \
   --wa_mse_calib_seqlen "8192" \

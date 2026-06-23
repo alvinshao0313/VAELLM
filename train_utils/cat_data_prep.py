@@ -653,47 +653,134 @@ def _prepare_linear_weight_for_outlier_protection(
     )
 
 
-def _channel_score_for_outlier_plan(
+def _canonical_weight_view(
     *,
     weight: torch.Tensor,
     linear_name: str,
-    activation_weight: Optional[torch.Tensor],
-    outlier_protect_axis: str,
-    outlier_score_mode: str,
+    transpose: bool,
+    expected_out_features: Optional[int],
+    expected_in_features: Optional[int],
 ) -> torch.Tensor:
-    axis = str(outlier_protect_axis).strip().lower()
-    if axis not in {"input", "output"}:
-        raise ValueError(f"Unsupported outlier_protect_axis={outlier_protect_axis}. Expected input or output.")
-    score_mode = str(outlier_score_mode).strip().lower()
-    if score_mode not in {"abs", "input_act_weighted_abs", "original_weight_abs", "input_act_weighted_original_weight_abs"}:
-        raise ValueError(
-            f"{linear_name}: unsupported outlier score mode {outlier_score_mode!r}. "
-            "Expected abs, input_act_weighted_abs, original_weight_abs, or input_act_weighted_original_weight_abs."
+    if weight.ndim != 2:
+        raise ValueError(f"{linear_name}: weight must be 2D, got shape={tuple(weight.shape)}.")
+    w = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if expected_out_features is None or expected_in_features is None:
+        return w.t().contiguous() if bool(transpose) else w
+    expected_shape = (int(expected_out_features), int(expected_in_features))
+    if tuple(w.shape) == expected_shape:
+        return w
+    if bool(transpose) and tuple(w.t().shape) == expected_shape:
+        return w.t().contiguous()
+    raise ValueError(
+        f"{linear_name}: cannot resolve canonical [out_features, in_features] view, "
+        f"got shape={tuple(w.shape)} expected={expected_shape} transpose={bool(transpose)}."
+    )
+
+
+def compute_channel_rank_score(
+    *,
+    metric: str,
+    weight: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    act_max: Optional[torch.Tensor],
+    act_sq_mean: Optional[torch.Tensor],
+    axis: str,
+    transpose: bool,
+    linear_name: str,
+    expected_in_features: Optional[int] = None,
+    expected_out_features: Optional[int] = None,
+) -> torch.Tensor:
+    resolved_axis = str(axis).strip().lower()
+    if resolved_axis not in {"input", "output"}:
+        raise ValueError(f"Unsupported outlier_protect_axis={axis}. Expected input or output.")
+    resolved_metric = str(metric).strip().lower()
+    if resolved_metric not in {
+        "channel_weight_abs",
+        "channel_weight_actmax_abs",
+        "channel_residual_abs",
+        "channel_residual_actmax_abs",
+        "channel_residual_actrms_abs",
+    }:
+        raise ValueError(f"{linear_name}: unsupported channel rank metric {metric!r}.")
+
+    weight_f = _canonical_weight_view(
+        weight=weight,
+        linear_name=linear_name,
+        transpose=bool(transpose),
+        expected_out_features=expected_out_features,
+        expected_in_features=expected_in_features,
+    )
+    out_features, in_features = int(weight_f.shape[0]), int(weight_f.shape[1])
+    if resolved_metric.startswith("channel_residual_"):
+        if residual is None:
+            raise ValueError(f"{linear_name}: {resolved_metric} requires final residual tensor.")
+        source = _canonical_weight_view(
+            weight=residual,
+            linear_name=f"{linear_name} residual",
+            transpose=bool(transpose),
+            expected_out_features=out_features,
+            expected_in_features=in_features,
         )
-    needs_activation = score_mode in {"input_act_weighted_abs", "input_act_weighted_original_weight_abs"}
-    weight_f = weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    if needs_activation:
-        if activation_weight is None:
-            raise ValueError(f"{linear_name}: {score_mode} requires activation vector.")
-        act = activation_weight.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
-        if int(act.numel()) != int(weight_f.shape[1]):
+        if tuple(source.shape) != tuple(weight_f.shape):
             raise ValueError(
-                f"{linear_name}: activation vector size mismatch, got {int(act.numel())}, "
-                f"expected in_features={int(weight_f.shape[1])}."
+                f"{linear_name}: residual shape mismatch for {resolved_metric}, "
+                f"got={tuple(source.shape)}, expected={tuple(weight_f.shape)}."
             )
     else:
-        act = None
+        source = weight_f
 
-    if axis == "input":
-        channel_weight = weight_f.t().contiguous()
-        if act is not None:
-            channel_weight = channel_weight * act.view(-1, 1)
-        return torch.norm(channel_weight, p=2, dim=1).contiguous()
+    act_max_vec = None
+    if resolved_metric.endswith("_actmax_abs"):
+        if act_max is None:
+            raise ValueError(f"{linear_name}: {resolved_metric} requires input activation max stats.")
+        act_max_vec = act_max.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
+        if int(act_max_vec.numel()) != in_features:
+            raise ValueError(
+                f"{linear_name}: activation max size mismatch for {resolved_metric}, "
+                f"got={int(act_max_vec.numel())}, expected in_features={in_features}."
+            )
 
-    channel_weight = weight_f
-    if act is not None:
-        channel_weight = channel_weight * act.view(1, -1)
-    return torch.norm(channel_weight, p=2, dim=1).contiguous()
+    act_sq_vec = None
+    if resolved_metric == "channel_residual_actrms_abs":
+        if act_sq_mean is None:
+            raise ValueError(
+                f"channel_residual_actrms_abs requires input activation second-moment stats, "
+                f"but no act_sq_mean was collected for layer {linear_name}."
+            )
+        act_sq_vec = act_sq_mean.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if int(act_sq_vec.numel()) != in_features:
+            raise ValueError(
+                f"{linear_name}: activation second-moment size mismatch for {resolved_metric}, "
+                f"got={int(act_sq_vec.numel())}, expected in_features={in_features}."
+            )
+
+    if resolved_axis == "input":
+        if act_sq_vec is not None:
+            score = source.pow(2).sum(dim=0) * act_sq_vec.clamp_min(0.0)
+        else:
+            score = torch.norm(source, p=2, dim=0)
+            if act_max_vec is not None:
+                score = score * act_max_vec
+        if int(score.numel()) != in_features:
+            raise ValueError(
+                f"{linear_name}: input channel score shape mismatch for {resolved_metric}, "
+                f"got={tuple(score.shape)}, expected=({in_features},)."
+            )
+        return score.contiguous()
+
+    if act_sq_vec is not None:
+        score = (source.pow(2) * act_sq_vec.clamp_min(0.0).view(1, -1)).sum(dim=1)
+    else:
+        channel_source = source
+        if act_max_vec is not None:
+            channel_source = channel_source * act_max_vec.view(1, -1)
+        score = torch.norm(channel_source, p=2, dim=1)
+    if int(score.numel()) != out_features:
+        raise ValueError(
+            f"{linear_name}: output channel score shape mismatch for {resolved_metric}, "
+            f"got={tuple(score.shape)}, expected=({out_features},)."
+        )
+    return score.contiguous()
 
 
 def build_outlier_channel_index_plan(
@@ -703,7 +790,7 @@ def build_outlier_channel_index_plan(
     outlier_protect_count: int,
     outlier_protect_axis: str,
     outlier_channel_scope: str,
-    outlier_score_mode: str,
+    outlier_rank_metric: str,
 ) -> Dict[str, torch.Tensor]:
     protect_count = int(outlier_protect_count)
     if protect_count < 0:
@@ -722,12 +809,17 @@ def build_outlier_channel_index_plan(
     per_linear_scores: Dict[str, torch.Tensor] = {}
     for r in group_refs:
         act = None if activation_weight_by_linear is None else activation_weight_by_linear.get(r.name)
-        per_linear_scores[r.name] = _channel_score_for_outlier_plan(
+        per_linear_scores[r.name] = compute_channel_rank_score(
+            metric=outlier_rank_metric,
             weight=r.weight,
+            residual=None,
             linear_name=r.name,
-            activation_weight=act,
-            outlier_protect_axis=outlier_protect_axis,
-            outlier_score_mode=outlier_score_mode,
+            act_max=act,
+            act_sq_mean=None,
+            axis=outlier_protect_axis,
+            transpose=bool(r.transpose),
+            expected_in_features=int(r.in_features),
+            expected_out_features=int(r.out_features),
         )
 
     if scope == "layer":

@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -35,9 +35,9 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --distill_after_category "compressed_lora" \
   --distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
   --lora_rank "default=4" \
-  --lora_alpha "default=4" \
+  --lora_alpha "default=512" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=1000" \
+  --distill_steps "default=5000,after:q_proj=3000,after:k_proj=3000,after:v_proj=6000,after:o_proj=3000,after:gate_proj=3000,after:up_proj=3000,after:down_proj=3000" \
   --distill_batch_size "default=1" \
   --distill_nsamples "default=20000" \
   --distill_lr "default=1e-4" \

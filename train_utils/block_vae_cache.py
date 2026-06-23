@@ -311,7 +311,7 @@ def _train_category_tasks_on_loaded_model(
             skip_layer_keys=set(),
             activation_runtime=None,
             outlier_protect_mode="none",
-            outlier_residual_score="abs",
+            outlier_rank_metric="sparse_residual_abs",
             outlier_residual_min_abs=0.0,
             outlier_protect_axis="input",
             outlier_residual_codec="coo_fp16",

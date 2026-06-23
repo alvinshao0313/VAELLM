@@ -12,8 +12,16 @@ from litebsq.sparse_residual import (
 )
 
 
-RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT = frozenset(
-    {"input_act_weighted_abs", "input_act_weighted_original_weight_abs"}
+RESIDUAL_SPARSE_RANK_METRICS = frozenset(
+    {
+        "sparse_residual_abs",
+        "sparse_residual_actmax_abs",
+        "sparse_weight_abs",
+        "sparse_weight_actmax_abs",
+    }
+)
+RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX = frozenset(
+    {"sparse_residual_actmax_abs", "sparse_weight_actmax_abs"}
 )
 
 
@@ -23,7 +31,7 @@ def _select_sparse_residual_entries(
     original_weight: torch.Tensor,
     reconstructed_weight: torch.Tensor,
     activation_weight: Optional[torch.Tensor],
-    score_mode: str,
+    rank_metric: str,
     top_p: float,
     min_abs: float,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -42,21 +50,21 @@ def _select_sparse_residual_entries(
 
     residual = (original_weight - reconstructed_weight).contiguous()
     abs_residual = residual.abs()
-    resolved_score_mode = str(score_mode).strip().lower()
-    if resolved_score_mode in {"abs", "input_act_weighted_abs"}:
+    resolved_rank_metric = str(rank_metric).strip().lower()
+    if resolved_rank_metric in {"sparse_residual_abs", "sparse_residual_actmax_abs"}:
         score = abs_residual
-    elif resolved_score_mode in {"original_weight_abs", "input_act_weighted_original_weight_abs"}:
+    elif resolved_rank_metric in {"sparse_weight_abs", "sparse_weight_actmax_abs"}:
         score = original_weight.abs()
     else:
         raise ValueError(
-            f"{linear_name}: unsupported residual sparse score mode {score_mode!r}. "
-            "Expected abs, input_act_weighted_abs, original_weight_abs, "
-            "or input_act_weighted_original_weight_abs."
+            f"{linear_name}: unsupported residual_sparse rank metric {rank_metric!r}. "
+            "Expected sparse_residual_abs, sparse_residual_actmax_abs, "
+            "sparse_weight_abs, or sparse_weight_actmax_abs."
         )
 
-    if resolved_score_mode in RESIDUAL_SPARSE_SCORE_MODES_NEED_ACT:
+    if resolved_rank_metric in RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX:
         if activation_weight is None:
-            raise ValueError(f"{linear_name}: {resolved_score_mode} requires activation_weight.")
+            raise ValueError(f"{linear_name}: {resolved_rank_metric} requires activation_weight.")
         act = activation_weight.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
         if int(act.numel()) != in_features:
             raise ValueError(
@@ -93,7 +101,7 @@ def build_sparse_residual_payload(
     original_weight: torch.Tensor,
     reconstructed_weight: torch.Tensor,
     activation_weight: Optional[torch.Tensor],
-    score_mode: str,
+    rank_metric: str,
     top_p: float,
     min_abs: float,
     codec: str,
@@ -106,7 +114,7 @@ def build_sparse_residual_payload(
         original_weight=original_weight,
         reconstructed_weight=reconstructed_weight,
         activation_weight=activation_weight,
-        score_mode=score_mode,
+        rank_metric=rank_metric,
         top_p=top_p,
         min_abs=min_abs,
     )

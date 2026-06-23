@@ -78,7 +78,7 @@ def _cache_matches(
     )
 
 
-def collect_act_max_for_linears(
+def collect_activation_stats_for_linears(
     *,
     model: nn.Module,
     linear_items: Sequence[Tuple[str, nn.Linear]],
@@ -92,7 +92,7 @@ def collect_act_max_for_linears(
     cache: Optional[ActivationCalibrationCache] = None,
     log_every: int = 0,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[Dict[str, torch.Tensor], ActivationCalibrationCache]:
+) -> Tuple[Dict[str, Dict[str, object]], ActivationCalibrationCache]:
     if not linear_items:
         return {}, cache if cache is not None else _build_calibration_cache(
             dataset=dataset,
@@ -126,11 +126,15 @@ def collect_act_max_for_linears(
     device_obj = torch.device(run_device)
 
     absmax_by_linear: Dict[str, torch.Tensor] = {}
+    sqsum_by_linear: Dict[str, torch.Tensor] = {}
+    count_by_linear: Dict[str, int] = {}
     handles = []
     for name, module in linear_items:
         if not isinstance(module, nn.Linear):
             raise TypeError(f"Target module for {name} must be nn.Linear, got {type(module)}")
         absmax_by_linear[name] = torch.zeros(int(module.in_features), dtype=torch.float32, device="cpu")
+        sqsum_by_linear[name] = torch.zeros(int(module.in_features), dtype=torch.float32, device="cpu")
+        count_by_linear[name] = 0
 
         def _hook_factory(one_name: str, in_features: int):
             def _hook(_module: nn.Module, inputs, _output):
@@ -141,8 +145,11 @@ def collect_act_max_for_linears(
                     return
                 if int(x.shape[-1]) != int(in_features):
                     return
-                cur = x.detach().reshape(-1, int(in_features)).abs().amax(dim=0).to(dtype=torch.float32, device="cpu")
+                x_flat = x.detach().reshape(-1, int(in_features)).to(dtype=torch.float32)
+                cur = x_flat.abs().amax(dim=0).to(dtype=torch.float32, device="cpu")
                 absmax_by_linear[one_name] = torch.maximum(absmax_by_linear[one_name], cur)
+                sqsum_by_linear[one_name] += x_flat.pow(2).sum(dim=0).to(dtype=torch.float32, device="cpu")
+                count_by_linear[one_name] += int(x_flat.shape[0])
 
             return _hook
 
@@ -178,4 +185,54 @@ def collect_act_max_for_linears(
         if was_training:
             model.train()
 
-    return absmax_by_linear, cache
+    stats_by_linear: Dict[str, Dict[str, object]] = {}
+    for name, _module in linear_items:
+        num_tokens = int(count_by_linear[name])
+        if num_tokens <= 0:
+            sq_mean = torch.zeros_like(sqsum_by_linear[name])
+        else:
+            sq_mean = (sqsum_by_linear[name] / float(num_tokens)).contiguous()
+        stats_by_linear[name] = {
+            "max": absmax_by_linear[name].contiguous(),
+            "sq_mean": sq_mean,
+            "rms": torch.sqrt(sq_mean.clamp_min(0.0)).contiguous(),
+            "num_tokens": int(num_tokens),
+        }
+
+    return stats_by_linear, cache
+
+
+def collect_act_max_for_linears(
+    *,
+    model: nn.Module,
+    linear_items: Sequence[Tuple[str, nn.Linear]],
+    model_path: str,
+    access_token: Optional[str],
+    dataset: str = "",
+    nsamples: int = 512,
+    seqlen: int = 512,
+    seed: int = 0,
+    device: str = "cuda",
+    cache: Optional[ActivationCalibrationCache] = None,
+    log_every: int = 0,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[Dict[str, torch.Tensor], ActivationCalibrationCache]:
+    stats_by_linear, cache = collect_activation_stats_for_linears(
+        model=model,
+        linear_items=linear_items,
+        model_path=model_path,
+        access_token=access_token,
+        dataset=dataset,
+        nsamples=nsamples,
+        seqlen=seqlen,
+        seed=seed,
+        device=device,
+        cache=cache,
+        log_every=log_every,
+        logger=logger,
+    )
+    return {
+        name: stats["max"]
+        for name, stats in stats_by_linear.items()
+        if isinstance(stats.get("max"), torch.Tensor)
+    }, cache

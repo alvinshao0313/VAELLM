@@ -52,3 +52,7 @@ notebook/
 tests/
 test/
 docs/重要日志/
+.ai-bridge/
+.agents/
+.cache/
+.vscode/
