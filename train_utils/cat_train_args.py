@@ -71,6 +71,10 @@ class NormalizedCatArgs:
     outlier_residual_vae_stages: OverrideTable[int]
     outlier_residual_vae_decoder_share_scope: str
     outlier_residual_vae_batch_multiplier: int
+    outlier_residual_vae_steps: int
+    outlier_residual_vae_lr: float
+    outlier_residual_vae_codebook_bits: OverrideTable[int]
+    outlier_residual_vae_codebook_dim: OverrideTable[int]
     wa_mse_calib_dataset: str
     wa_mse_calib_nsamples: int
     wa_mse_calib_seqlen: int
@@ -156,6 +160,8 @@ class ResolvedCategoryRuntimeConfig:
     outlier_protect_count: int
     outlier_residual_top_p: float
     outlier_residual_vae_stages: int
+    outlier_residual_vae_codebook_bits: int
+    outlier_residual_vae_codebook_dim: int
     recon_loss_type: str
     base_ch: int
     num_res_blocks: int
@@ -470,6 +476,18 @@ _OUTLIER_RESIDUAL_VAE_STAGES_SPEC = _make_positive_int_override_spec(
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
     example="default=1,cat:q_proj=2",
 )
+_OUTLIER_RESIDUAL_VAE_CODEBOOK_BITS_SPEC = _make_positive_int_override_spec(
+    arg_name="--outlier_residual_vae_codebook_bits",
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=0,cat:q_proj=4",
+    min_value=0,
+)
+_OUTLIER_RESIDUAL_VAE_CODEBOOK_DIM_SPEC = _make_positive_int_override_spec(
+    arg_name="--outlier_residual_vae_codebook_dim",
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=0,cat:q_proj=8",
+    min_value=0,
+)
 _CODEBOOK_BITS_SPEC = _make_positive_int_override_spec(
     arg_name="--codebook_bits",
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
@@ -718,8 +736,18 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_residual_block_shape=tuple(int(v) for v in resolved_block_shape),
         outlier_protect_axis=str(raw_args.outlier_protect_axis).strip().lower(),
         outlier_residual_vae_stages=_parse_cat_override(raw_args.outlier_residual_vae_stages, spec=_OUTLIER_RESIDUAL_VAE_STAGES_SPEC),
+        outlier_residual_vae_codebook_bits=_parse_cat_override(
+            raw_args.outlier_residual_vae_codebook_bits,
+            spec=_OUTLIER_RESIDUAL_VAE_CODEBOOK_BITS_SPEC,
+        ),
+        outlier_residual_vae_codebook_dim=_parse_cat_override(
+            raw_args.outlier_residual_vae_codebook_dim,
+            spec=_OUTLIER_RESIDUAL_VAE_CODEBOOK_DIM_SPEC,
+        ),
         outlier_residual_vae_decoder_share_scope=str(raw_args.outlier_residual_vae_decoder_share_scope).strip().lower(),
         outlier_residual_vae_batch_multiplier=int(raw_args.outlier_residual_vae_batch_multiplier),
+        outlier_residual_vae_steps=int(raw_args.outlier_residual_vae_steps),
+        outlier_residual_vae_lr=float(raw_args.outlier_residual_vae_lr),
         wa_mse_calib_dataset=_parse_wa_mse_calib_dataset_text(
             raw_args.wa_mse_calib_dataset,
             arg_name="--wa_mse_calib_dataset",
@@ -879,6 +907,8 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
     top_p_table = cat_args.outlier_residual_top_p
     protect_table = cat_args.outlier_protect_count
     residual_vae_batch_multiplier = int(cat_args.outlier_residual_vae_batch_multiplier)
+    residual_vae_steps = int(cat_args.outlier_residual_vae_steps)
+    residual_vae_lr = float(cat_args.outlier_residual_vae_lr)
     if mode not in _OUTLIER_PROTECT_MODE_CHOICES:
         raise ValueError(
             f"Unsupported --outlier_protect_mode={cat_args.outlier_protect_mode!r}. "
@@ -932,6 +962,10 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
         raise ValueError(
             f"--outlier_residual_vae_batch_multiplier must be >= 1, got {residual_vae_batch_multiplier}."
         )
+    if residual_vae_steps < 0:
+        raise ValueError("--outlier_residual_vae_steps must be >= 0.")
+    if residual_vae_lr < 0.0:
+        raise ValueError("--outlier_residual_vae_lr must be >= 0.")
     if float(cat_args.outlier_residual_min_abs) < 0.0:
         raise ValueError(
             f"--outlier_residual_min_abs must be >= 0, got {float(cat_args.outlier_residual_min_abs)}."
@@ -1001,6 +1035,8 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
         (cat_args.outlier_protect_count, "--outlier_protect_count"),
         (cat_args.outlier_residual_top_p, "--outlier_residual_top_p"),
         (cat_args.outlier_residual_vae_stages, "--outlier_residual_vae_stages"),
+        (cat_args.outlier_residual_vae_codebook_bits, "--outlier_residual_vae_codebook_bits"),
+        (cat_args.outlier_residual_vae_codebook_dim, "--outlier_residual_vae_codebook_dim"),
         (vae_args.codebook_bits, "--codebook_bits"),
         (vae_args.codebook_dim, "--codebook_dim"),
         (vae_args.residual_stages, "--residual_stages"),
@@ -1044,6 +1080,24 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
                 f"--outlier_residual_top_p resolved to {resolved_outlier_residual_top_p} for category "
                 f"'{category}', but --outlier_protect_mode=residual_sparse requires 0 < p <= 1."
             )
+        resolved_codebook_bits = int(resolve_category_value(vae_args.codebook_bits, category))
+        resolved_codebook_dim = int(resolve_category_value(vae_args.codebook_dim, category))
+        requested_residual_codebook_bits = int(
+            resolve_category_value(cat_args.outlier_residual_vae_codebook_bits, category)
+        )
+        requested_residual_codebook_dim = int(
+            resolve_category_value(cat_args.outlier_residual_vae_codebook_dim, category)
+        )
+        resolved_residual_codebook_bits = (
+            int(requested_residual_codebook_bits)
+            if int(requested_residual_codebook_bits) > 0
+            else int(resolved_codebook_bits)
+        )
+        resolved_residual_codebook_dim = (
+            int(requested_residual_codebook_dim)
+            if int(requested_residual_codebook_dim) > 0
+            else int(resolved_codebook_dim)
+        )
         resolved[category] = ResolvedCategoryRuntimeConfig(
             category=str(category),
             residual_stages=int(resolve_category_value(vae_args.residual_stages, category)),
@@ -1057,11 +1111,13 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
                 resolve_category_value(cat_args.intra_part_sort_mode, category),
                 arg_name="--intra_part_sort_mode",
             ),
-            codebook_bits=int(resolve_category_value(vae_args.codebook_bits, category)),
-            codebook_dim=int(resolve_category_value(vae_args.codebook_dim, category)),
+            codebook_bits=int(resolved_codebook_bits),
+            codebook_dim=int(resolved_codebook_dim),
             outlier_protect_count=int(resolve_category_value(cat_args.outlier_protect_count, category)),
             outlier_residual_top_p=resolved_outlier_residual_top_p,
             outlier_residual_vae_stages=int(resolve_category_value(cat_args.outlier_residual_vae_stages, category)),
+            outlier_residual_vae_codebook_bits=int(resolved_residual_codebook_bits),
+            outlier_residual_vae_codebook_dim=int(resolved_residual_codebook_dim),
             recon_loss_type=str(resolve_category_value(vae_args.recon_loss_type, category)).strip().lower(),
             base_ch=int(resolve_category_value(vae_args.base_ch, category)),
             num_res_blocks=int(resolve_category_value(vae_args.num_res_blocks, category)),
@@ -1192,6 +1248,26 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outlier_protect_axis", type=str, choices=["input", "output"], default="input", help="Choose whether outlier protection preserves input channels or output channels.")
     parser.add_argument("--outlier_residual_vae_stages", type=str, default="default=1", help=f"channel_residual_vae 模式下 protected channel residual VAE 阶数。示例：{_OUTLIER_RESIDUAL_VAE_STAGES_SPEC.example}")
     parser.add_argument(
+        "--outlier_residual_vae_codebook_bits",
+        type=str,
+        default="default=0",
+        help=(
+            "channel_residual_vae 模式下 protected residual VAE 的 codebook bits。"
+            "0 表示继承 base VAE --codebook_bits。"
+            f"示例：{_OUTLIER_RESIDUAL_VAE_CODEBOOK_BITS_SPEC.example}"
+        ),
+    )
+    parser.add_argument(
+        "--outlier_residual_vae_codebook_dim",
+        type=str,
+        default="default=0",
+        help=(
+            "channel_residual_vae 模式下 protected residual VAE 的 codebook dim。"
+            "0 表示继承 base VAE --codebook_dim。"
+            f"示例：{_OUTLIER_RESIDUAL_VAE_CODEBOOK_DIM_SPEC.example}"
+        ),
+    )
+    parser.add_argument(
         "--outlier_residual_vae_decoder_share_scope",
         type=str,
         choices=list(_OUTLIER_RESIDUAL_VAE_DECODER_SHARE_SCOPE_CHOICES),
@@ -1203,6 +1279,18 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="channel_residual_vae 模式下 protected residual VAE 的 batch 放大倍数；只影响 residual VAE，不影响 base VAE。category share scope 下建议设为 32。",
+    )
+    parser.add_argument(
+        "--outlier_residual_vae_steps",
+        type=int,
+        default=0,
+        help="Number of optimization steps for protected residual VAE. If 0, reuse the base VAE residual stage steps.",
+    )
+    parser.add_argument(
+        "--outlier_residual_vae_lr",
+        type=float,
+        default=0.0,
+        help="Learning rate for protected residual VAE. If 0, reuse the base VAE learning rate.",
     )
     parser.add_argument(
         "--wa_mse_calib_dataset",

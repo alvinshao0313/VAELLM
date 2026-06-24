@@ -847,17 +847,22 @@ def _train_protected_residual_vae_payload(
     train_device: str,
     train_dtype: torch.dtype,
     batch_size: int,
+    steps: int,
+    lr: float,
     log_every: int,
     deterministic: bool,
     shuffle_seed: int,
 ) -> Optional[Dict[str, object]]:
     from litebsq.llm_vae import MultiLayerVAE
 
-    steps = int(runtime_cfg.steps)
-    if steps <= 0:
+    protected_steps = int(steps)
+    if protected_steps <= 0:
         return None
+    protected_lr = float(lr)
+    if protected_lr <= 0.0:
+        raise ValueError(f"{linear_name}: protected residual VAE lr must be > 0, got {protected_lr}.")
     recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
-    codebook_dim = int(runtime_cfg.codebook_dim)
+    codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
     stages = int(runtime_cfg.outlier_residual_vae_stages)
     residual = residual_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
     if residual.ndim != 2:
@@ -871,14 +876,18 @@ def _train_protected_residual_vae_payload(
         )
 
     current = residual.view(-1, 1, codebook_dim).contiguous()
+    initial_rms = float(current.float().pow(2).mean().sqrt().item())
     stage_bits: List[torch.Tensor] = []
     stage_decoders: List[nn.Module] = []
     stage_codebook_dims: List[int] = []
+    last_loss = None
+    last_recon = None
+    last_commit = None
     shared_stage_args = _clone_namespace(
         vae_args,
         parallel_layers=1,
         residual_stages=int(stages),
-        codebook_bits=int(runtime_cfg.codebook_bits),
+        codebook_bits=int(runtime_cfg.outlier_residual_vae_codebook_bits),
         codebook_dim=int(codebook_dim),
         base_ch=int(runtime_cfg.base_ch),
         num_res_blocks=int(runtime_cfg.num_res_blocks),
@@ -913,7 +922,7 @@ def _train_protected_residual_vae_payload(
             shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
         )
         vae = MultiLayerVAE(shared_stage_args).to(train_device)
-        optimizer = create_optimizer(vae.parameters(), shared_stage_args, shared_stage_args.lr)
+        optimizer = create_optimizer(vae.parameters(), shared_stage_args, protected_lr)
         lr_scheduler = None
         lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "constant")).strip().lower()
         if lr_scheduler_name != "constant":
@@ -923,12 +932,12 @@ def _train_protected_residual_vae_payload(
                 lr_scheduler_name,
                 optimizer,
                 num_warmup_steps=int(getattr(shared_stage_args, "lr_warmup_steps", 0)),
-                num_training_steps=int(steps),
+                num_training_steps=int(protected_steps),
             )
         start = time.time()
         train_iter = iter(train_loader)
         vae.train()
-        for step in range(int(steps)):
+        for step in range(int(protected_steps)):
             try:
                 x_cpu, _idx = next(train_iter)
             except StopIteration:
@@ -942,13 +951,20 @@ def _train_protected_residual_vae_payload(
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
+            last_loss = float(loss.detach().float().item())
+            recon_value = loss_dict.get("train/recon_loss")
+            if isinstance(recon_value, torch.Tensor):
+                last_recon = float(recon_value.detach().float().item())
+            commit_value = loss_dict.get("train/commitment_loss")
+            if isinstance(commit_value, torch.Tensor):
+                last_commit = float(commit_value.detach().float().item())
             if log_every > 0 and (step + 1) % int(log_every) == 0:
                 speed = (time.time() - start) / int(log_every)
                 log.info(
                     "[%s] step=%d/%d loss=%.4e speed=%.4fs/it",
                     stage_tag,
                     step + 1,
-                    int(steps),
+                    int(protected_steps),
                     float(loss.detach().float().item()),
                     speed,
                 )
@@ -997,6 +1013,13 @@ def _train_protected_residual_vae_payload(
         "stage_vq_weights": stage_bits,
         "stage_decoders": stage_decoders,
         "stage_codebook_dims": stage_codebook_dims,
+        "metrics": {
+            "protected_residual_rms_before": float(initial_rms),
+            "protected_residual_rms_after": float(current.float().pow(2).mean().sqrt().item()),
+            "residual_vae_final_loss": last_loss,
+            "residual_vae_final_recon": last_recon,
+            "residual_vae_final_commit": last_commit,
+        },
     }
 
 
@@ -1010,13 +1033,15 @@ def _train_shared_protected_residual_vae_payloads(
     train_device: str,
     train_dtype: torch.dtype,
     batch_size: int,
+    steps: int,
+    lr: float,
     log_every: int,
     deterministic: bool,
     shuffle_seed: int,
 ) -> Dict[str, Dict[str, object]]:
     if not residual_slices_by_name:
         return {}
-    codebook_dim = int(runtime_cfg.codebook_dim)
+    codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
     ordered_items = list(residual_slices_by_name.items())
     block_counts: Dict[str, int] = {}
     flat_chunks: List[torch.Tensor] = []
@@ -1047,6 +1072,8 @@ def _train_shared_protected_residual_vae_payloads(
         train_device=train_device,
         train_dtype=train_dtype,
         batch_size=batch_size,
+        steps=int(steps),
+        lr=float(lr),
         log_every=log_every,
         deterministic=deterministic,
         shuffle_seed=shuffle_seed,
@@ -1078,6 +1105,7 @@ def _train_shared_protected_residual_vae_payloads(
             "shared_decoder_refs": list(refs),
             "shared_stage_decoders": shared_stage_decoders,
             "stage_codebook_dims": stage_codebook_dims,
+            "metrics": shared_payload.get("metrics"),
         }
     return out
 
@@ -1112,6 +1140,8 @@ def train_group_vae_payload(
     outlier_residual_block_shape: Tuple[int, int] = (256, 256),
     outlier_residual_vae_decoder_share_scope: str = "none",
     outlier_residual_vae_batch_multiplier: int = 1,
+    outlier_residual_vae_steps: int = 0,
+    outlier_residual_vae_lr: float = 0.0,
     # 排序代码，已关闭。旧参数保留如下：
     # sort_executor=None,
     # sort_prep_workers_resolved: int = 1,
@@ -1135,6 +1165,16 @@ def train_group_vae_payload(
             f"got {residual_vae_batch_multiplier}."
         )
     protected_residual_vae_batch_size = int(materialize_batch_size) * int(residual_vae_batch_multiplier)
+    requested_residual_vae_steps = int(outlier_residual_vae_steps)
+    requested_residual_vae_lr = float(outlier_residual_vae_lr)
+    if requested_residual_vae_steps < 0:
+        raise ValueError(
+            f"[{group_tag}] outlier_residual_vae_steps must be >= 0, got {requested_residual_vae_steps}."
+        )
+    if requested_residual_vae_lr < 0.0:
+        raise ValueError(
+            f"[{group_tag}] outlier_residual_vae_lr must be >= 0, got {requested_residual_vae_lr}."
+        )
 
     train_dtype = _resolve_train_dtype(training_args)
 
@@ -1153,6 +1193,18 @@ def train_group_vae_payload(
     stage_num_res_blocks = int(runtime_cfg.num_res_blocks)
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
     stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
+    protected_residual_vae_steps = (
+        int(requested_residual_vae_steps)
+        if int(requested_residual_vae_steps) > 0
+        else int(stage_steps)
+    )
+    protected_residual_vae_lr = (
+        float(requested_residual_vae_lr)
+        if float(requested_residual_vae_lr) > 0.0
+        else float(getattr(vae_args, "lr"))
+    )
+    protected_residual_vae_codebook_bits = int(runtime_cfg.outlier_residual_vae_codebook_bits)
+    protected_residual_vae_codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
     outlier_protect_count = int(runtime_cfg.outlier_protect_count)
     outlier_residual_top_p = float(runtime_cfg.outlier_residual_top_p)
     resolved_outlier_mode = str(outlier_protect_mode).strip().lower()
@@ -1185,12 +1237,14 @@ def train_group_vae_payload(
         )
     if resolved_outlier_mode == "channel_residual_vae" and int(outlier_protect_count) > 0:
         log.info(
-            "[%s] protected residual VAE batch: base_batch=%d multiplier=%d residual_batch=%d share_scope=%s",
+            "[%s] protected residual VAE schedule: steps=%d lr=%.6g batch=%d share_scope=%s codebook_bits=%d codebook_dim=%d",
             group_tag,
-            int(materialize_batch_size),
-            int(residual_vae_batch_multiplier),
+            int(protected_residual_vae_steps),
+            float(protected_residual_vae_lr),
             int(protected_residual_vae_batch_size),
             resolved_protected_residual_decoder_share_scope,
+            int(protected_residual_vae_codebook_bits),
+            int(protected_residual_vae_codebook_dim),
         )
     if residual_sparse_enabled and int(outlier_protect_count) != 0:
         raise ValueError(
@@ -1878,7 +1932,7 @@ def train_group_vae_payload(
             parts_per_linear=int(parts_per_linear),
             outlier_protect_axis=str(outlier_protect_axis),
             final_stage_idx=int(final_base_residual_stage_idx),
-            codebook_dim=int(runtime_cfg.codebook_dim),
+            codebook_dim=int(protected_residual_vae_codebook_dim),
         )
         protected_numel = sum(int(residual_slice.numel()) for _r, _axis, _idx_cpu, residual_slice in protected_residual_entries)
         if protected_numel > 0:
@@ -1924,6 +1978,8 @@ def train_group_vae_payload(
                 train_device=train_device,
                 train_dtype=train_dtype,
                 batch_size=int(protected_residual_vae_batch_size),
+                steps=int(protected_residual_vae_steps),
+                lr=float(protected_residual_vae_lr),
                 log_every=log_every,
                 deterministic=deterministic,
                 shuffle_seed=int(shuffle_seed),
@@ -1942,6 +1998,8 @@ def train_group_vae_payload(
                     train_device=train_device,
                     train_dtype=train_dtype,
                     batch_size=int(protected_residual_vae_batch_size),
+                    steps=int(protected_residual_vae_steps),
+                    lr=float(protected_residual_vae_lr),
                     log_every=log_every,
                     deterministic=deterministic,
                     shuffle_seed=int(shuffle_seed),
@@ -1964,14 +2022,16 @@ def train_group_vae_payload(
             else:
                 protected_residual_payload_by_name[r.name]["protected_residual_stage_decoders"] = residual_payload["stage_decoders"]
             log.info(
-                "[%s] protected residual VAE patch for %s: axis=%s channels=%d stages=%d steps=%d decoder_share_scope=%s",
+                "[%s] protected residual VAE patch for %s: axis=%s channels=%d stages=%d steps=%d decoder_share_scope=%s codebook_bits=%d codebook_dim=%d",
                 group_tag,
                 r.name,
                 axis,
                 int(idx_cpu.numel()),
                 int(runtime_cfg.outlier_residual_vae_stages),
-                int(runtime_cfg.steps),
+                int(protected_residual_vae_steps),
                 resolved_protected_residual_decoder_share_scope,
+                int(protected_residual_vae_codebook_bits),
+                int(protected_residual_vae_codebook_dim),
             )
 
     for stage_decoders in all_stage_decoders:
@@ -1999,6 +2059,8 @@ def train_group_vae_payload(
         "outlier_residual_index_bits": int(outlier_residual_index_bits),
         "outlier_residual_value_bits": int(outlier_residual_value_bits),
         "outlier_residual_block_shape": tuple(int(v) for v in outlier_residual_block_shape),
+        "resolved_protected_residual_vae_codebook_bits": int(protected_residual_vae_codebook_bits),
+        "resolved_protected_residual_vae_codebook_dim": int(protected_residual_vae_codebook_dim),
         "protected_residual_payload_by_name": protected_residual_payload_by_name,
     }
     del current_residual_weights, target_common_result
@@ -2210,6 +2272,8 @@ def _train_group_vae_and_replace(
     outlier_residual_block_shape: Tuple[int, int] = (256, 256),
     outlier_residual_vae_decoder_share_scope: str = "none",
     outlier_residual_vae_batch_multiplier: int = 1,
+    outlier_residual_vae_steps: int = 0,
+    outlier_residual_vae_lr: float = 0.0,
     # 排序代码，已关闭。旧参数保留如下：
     # sort_executor=None,
     # sort_prep_workers_resolved: int = 1,
@@ -2245,6 +2309,8 @@ def _train_group_vae_and_replace(
         outlier_residual_block_shape=outlier_residual_block_shape,
         outlier_residual_vae_decoder_share_scope=outlier_residual_vae_decoder_share_scope,
         outlier_residual_vae_batch_multiplier=outlier_residual_vae_batch_multiplier,
+        outlier_residual_vae_steps=outlier_residual_vae_steps,
+        outlier_residual_vae_lr=outlier_residual_vae_lr,
         deterministic=deterministic,
         shuffle_seed=shuffle_seed,
     )
@@ -2395,6 +2461,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         cat: (
             int(resolved_category_cfgs[cat].codebook_bits),
             int(resolved_category_cfgs[cat].codebook_dim),
+        )
+        for cat in active_categories
+    }
+    category_residual_vae_codebook: Dict[str, Tuple[int, int]] = {
+        cat: (
+            int(resolved_category_cfgs[cat].outlier_residual_vae_codebook_bits),
+            int(resolved_category_cfgs[cat].outlier_residual_vae_codebook_dim),
         )
         for cat in active_categories
     }
@@ -2583,13 +2656,16 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             cat_cfg = resolved_category_cfgs[cat]
             refs = [ref for _, ref in refs_sorted]
             cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
+            cat_residual_vae_codebook_bits, cat_residual_vae_codebook_dim = category_residual_vae_codebook[cat]
             log.info(
-                "=== Category: %s (%d linears, residual_stages=%d, codebook_bits=%d, codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
+                "=== Category: %s (%d linears, residual_stages=%d, codebook_bits=%d, codebook_dim=%d, residual_vae_codebook_bits=%d, residual_vae_codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
                 cat,
                 len(refs),
                 int(cat_cfg.residual_stages),
                 int(cat_codebook_bits),
                 int(cat_codebook_dim),
+                int(cat_residual_vae_codebook_bits),
+                int(cat_residual_vae_codebook_dim),
                 str(cat_cfg.recon_loss_type),
                 category_sort_mode_desc[cat],
                 int(cat_cfg.steps),
@@ -2713,6 +2789,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     outlier_residual_block_shape=cat_args.outlier_residual_block_shape,
                     outlier_residual_vae_decoder_share_scope=cat_args.outlier_residual_vae_decoder_share_scope,
                     outlier_residual_vae_batch_multiplier=cat_args.outlier_residual_vae_batch_multiplier,
+                    outlier_residual_vae_steps=cat_args.outlier_residual_vae_steps,
+                    outlier_residual_vae_lr=cat_args.outlier_residual_vae_lr,
                     deterministic=bool(cat_args.deterministic),
                     shuffle_seed=int(cat_args.seed) + int(cat_idx) * 100000 + int(start),
                 )

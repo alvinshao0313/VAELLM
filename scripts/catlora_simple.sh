@@ -34,6 +34,8 @@ export HF_DATASETS_OFFLINE=1
 # --outlier_residual_vae_stages "default=1,cat:q_proj=2"
 # --outlier_residual_vae_decoder_share_scope "none" / "category"
 # --outlier_residual_vae_batch_multiplier "32"
+# --outlier_residual_vae_steps "1500"
+# --outlier_residual_vae_lr "0.002"
 # --outlier_residual_min_abs "1e-6"
 #   原始权重打分只决定保留哪些位置，真正保存的仍是这些位置上的 residual
 #   若 |original-reconstructed| 小于该阈值，则该位置会从 top-p 中剔除，并继续往后补
@@ -69,15 +71,19 @@ python tools/cat_train.py \
   --eval_ppl "false" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
-  --outlier_protect_mode "none" \
+  --outlier_protect_mode "channel_residual_vae" \
   --outlier_channel_scope "category" \
   --outlier_residual_vae_decoder_share_scope "category" \
-  --outlier_residual_vae_batch_multiplier "32" \
-  --outlier_residual_vae_stages "default=2" \
+  --outlier_residual_vae_batch_multiplier "4" \
+  --outlier_residual_vae_steps "1500" \
+  --outlier_residual_vae_lr "1e-3" \
+  --outlier_residual_vae_stages "default=1" \
+  --outlier_residual_vae_codebook_bits "default=4" \
+  --outlier_residual_vae_codebook_dim "default=8" \
   --outlier_protect_count "default=32" \
   --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.0" \
-  --outlier_rank_metric "channel_residual_actmax_abs" \
+  --outlier_rank_metric "channel_weight_actmax_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \

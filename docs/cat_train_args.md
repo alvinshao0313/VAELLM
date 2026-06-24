@@ -156,6 +156,8 @@
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
 | `--outlier_residual_vae_stages` | `default=1` | protected channel residual VAE 阶数 | 类别 override |
 | `--outlier_residual_vae_batch_multiplier` | `1` | protected residual VAE batch 放大倍数 | 只影响 protected residual VAE，不影响 base VAE stage1/stage2；category shared residual VAE 推荐 `32`，实际 batch 会被 residual block 总数限制 |
+| `--outlier_residual_vae_steps` | `0` | protected residual VAE 独立训练步数 | `0` 表示继承 base VAE residual stage steps；category shared residual VAE 推荐 `1000~1500` |
+| `--outlier_residual_vae_lr` | `0.0` | protected residual VAE 独立学习率 | `0` 表示继承 base VAE lr；category shared residual VAE 推荐 `0.001~0.003`，当前建议 `0.002` |
 | `--wa_mse_calib_dataset` | `""` | 动态采集时的校准混合数据集 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用；启用动态校准时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5` |
 | `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
 | `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
@@ -406,6 +408,7 @@
 - `channel_weight_abs/channel_weight_actmax_abs` 按原始权重通道范数排序。
 - `channel_residual_abs/channel_residual_actmax_abs/channel_residual_actrms_abs` 在 base VAE stages 结束后，按 final residual 的通道误差排序。
 - `outlier_residual_vae_batch_multiplier` 只放大 protected residual VAE 的训练 batch；默认 `1` 保持旧行为，`category` shared residual VAE 建议 `32`。
+- `outlier_residual_vae_steps/outlier_residual_vae_lr` 只控制 protected residual VAE；默认 `0` 分别继承 base VAE 的 steps/lr。
 
 `residual_sparse` 的约束：
 
