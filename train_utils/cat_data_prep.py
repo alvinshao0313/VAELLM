@@ -791,20 +791,17 @@ def build_outlier_channel_index_plan(
     outlier_protect_axis: str,
     outlier_channel_scope: str,
     outlier_rank_metric: str,
+    outlier_protect_min_per_layer: int = 0,
 ) -> Dict[str, torch.Tensor]:
-    protect_count = int(outlier_protect_count)
-    if protect_count < 0:
-        raise ValueError(f"outlier_protect_count must be >= 0, got {protect_count}")
-    scope = str(outlier_channel_scope).strip().lower()
-    if scope not in {"layer", "category"}:
-        raise ValueError(f"Unsupported outlier_channel_scope={outlier_channel_scope!r}. Expected layer or category.")
-
-    empty_plan = {
-        r.name: torch.empty(0, dtype=torch.long)
-        for r in group_refs
-    }
-    if protect_count == 0 or len(group_refs) == 0:
-        return empty_plan
+    if int(outlier_protect_count) == 0 or len(group_refs) == 0:
+        plan, _stats = select_outlier_channel_indices_from_scores(
+            scores_by_name={},
+            linear_names=[r.name for r in group_refs],
+            outlier_protect_count=outlier_protect_count,
+            outlier_protect_min_per_layer=outlier_protect_min_per_layer,
+            outlier_channel_scope=outlier_channel_scope,
+        )
+        return plan
 
     per_linear_scores: Dict[str, torch.Tensor] = {}
     for r in group_refs:
@@ -822,41 +819,175 @@ def build_outlier_channel_index_plan(
             expected_out_features=int(r.out_features),
         )
 
+    plan, _stats = select_outlier_channel_indices_from_scores(
+        scores_by_name=per_linear_scores,
+        linear_names=[r.name for r in group_refs],
+        outlier_protect_count=outlier_protect_count,
+        outlier_protect_min_per_layer=outlier_protect_min_per_layer,
+        outlier_channel_scope=outlier_channel_scope,
+    )
+    return plan
+
+
+def select_outlier_channel_indices_from_scores(
+    *,
+    scores_by_name: Dict[str, torch.Tensor],
+    linear_names: Sequence[str],
+    outlier_protect_count: int,
+    outlier_protect_min_per_layer: int = 0,
+    outlier_channel_scope: str,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
+    protect_count = int(outlier_protect_count)
+    if protect_count < 0:
+        raise ValueError(f"outlier_protect_count must be >= 0, got {protect_count}")
+    min_per_layer = int(outlier_protect_min_per_layer)
+    if min_per_layer < 0:
+        raise ValueError(f"outlier_protect_min_per_layer must be >= 0, got {min_per_layer}")
+    if min_per_layer > protect_count:
+        raise ValueError(
+            "outlier_protect_min_per_layer must be <= outlier_protect_count, "
+            f"got min_per_layer={min_per_layer}, protect_count={protect_count}"
+        )
+    scope = str(outlier_channel_scope).strip().lower()
+    if scope not in {"layer", "category"}:
+        raise ValueError(f"Unsupported outlier_channel_scope={outlier_channel_scope!r}. Expected layer or category.")
+
+    empty_plan = {
+        str(name): torch.empty(0, dtype=torch.long)
+        for name in linear_names
+    }
+    if protect_count == 0 or len(linear_names) == 0:
+        stats = {
+            "min_per_layer": int(min_per_layer),
+            "floor_selected_count": 0,
+            "global_selected_count": 0,
+            "num_zero_protected_linears": int(len(linear_names)),
+        }
+        return empty_plan, stats
+
     if scope == "layer":
         out: Dict[str, torch.Tensor] = {}
-        for r in group_refs:
-            scores = per_linear_scores[r.name]
+        for name in linear_names:
+            scores = scores_by_name[str(name)]
             k = min(int(protect_count), int(scores.numel()))
             if k < 1:
-                out[r.name] = torch.empty(0, dtype=torch.long)
+                out[str(name)] = torch.empty(0, dtype=torch.long)
                 continue
             _, idx = torch.topk(scores, k=k, largest=True, sorted=False)
-            out[r.name] = torch.sort(idx.to(dtype=torch.long)).values.contiguous()
-        return out
+            out[str(name)] = torch.sort(idx.to(device="cpu", dtype=torch.long)).values.contiguous()
+        stats = {
+            "min_per_layer": int(min_per_layer),
+            "floor_selected_count": 0,
+            "global_selected_count": 0,
+            "num_zero_protected_linears": sum(1 for idx in out.values() if int(idx.numel()) == 0),
+        }
+        return out, stats
 
     flat_scores = []
     flat_linear_indices = []
     flat_channel_indices = []
-    for linear_idx, r in enumerate(group_refs):
-        scores = per_linear_scores[r.name]
+    for linear_idx, name in enumerate(linear_names):
+        scores = scores_by_name[str(name)]
         flat_scores.append(scores)
         flat_linear_indices.append(torch.full((int(scores.numel()),), int(linear_idx), dtype=torch.long))
         flat_channel_indices.append(torch.arange(int(scores.numel()), dtype=torch.long))
+    if not flat_scores:
+        return empty_plan, {
+            "min_per_layer": int(min_per_layer),
+            "floor_selected_count": 0,
+            "global_selected_count": 0,
+            "num_zero_protected_linears": int(len(linear_names)),
+        }
     all_scores = torch.cat(flat_scores, dim=0)
     all_linear_indices = torch.cat(flat_linear_indices, dim=0)
     all_channel_indices = torch.cat(flat_channel_indices, dim=0)
-    total_budget = min(int(protect_count) * int(len(group_refs)), int(all_scores.numel()))
+    total_budget = min(int(protect_count) * int(len(linear_names)), int(all_scores.numel()))
     if total_budget < 1:
-        return empty_plan
-    _, top_pos = torch.topk(all_scores, k=total_budget, largest=True, sorted=False)
-    selected_linear = all_linear_indices.index_select(0, top_pos)
-    selected_channel = all_channel_indices.index_select(0, top_pos)
-    out: Dict[str, torch.Tensor] = {}
-    for linear_idx, r in enumerate(group_refs):
-        mask = selected_linear == int(linear_idx)
-        idx = selected_channel.masked_select(mask)
-        out[r.name] = torch.sort(idx.to(dtype=torch.long)).values.contiguous()
-    return out
+        return empty_plan, {
+            "min_per_layer": int(min_per_layer),
+            "floor_selected_count": 0,
+            "global_selected_count": 0,
+            "num_zero_protected_linears": int(len(linear_names)),
+        }
+
+    if min_per_layer == 0:
+        _, top_pos = torch.topk(all_scores, k=total_budget, largest=True, sorted=False)
+        selected_linear = all_linear_indices.index_select(0, top_pos)
+        selected_channel = all_channel_indices.index_select(0, top_pos)
+        out: Dict[str, torch.Tensor] = {}
+        for linear_idx, name in enumerate(linear_names):
+            mask = selected_linear == int(linear_idx)
+            idx = selected_channel.masked_select(mask)
+            out[str(name)] = torch.sort(idx.to(device="cpu", dtype=torch.long)).values.contiguous()
+        stats = {
+            "min_per_layer": int(min_per_layer),
+            "floor_selected_count": 0,
+            "global_selected_count": sum(int(idx.numel()) for idx in out.values()),
+            "num_zero_protected_linears": sum(1 for idx in out.values() if int(idx.numel()) == 0),
+        }
+        return out, stats
+
+    selected_by_name: Dict[str, torch.Tensor] = {}
+    selected_masks_by_name: Dict[str, torch.Tensor] = {}
+    floor_selected_count = 0
+    for name in linear_names:
+        resolved_name = str(name)
+        scores = scores_by_name[resolved_name]
+        k = min(int(min_per_layer), int(scores.numel()))
+        mask = torch.zeros((int(scores.numel()),), dtype=torch.bool)
+        if k > 0:
+            _, idx = torch.topk(scores, k=k, largest=True, sorted=False)
+            idx = idx.to(device="cpu", dtype=torch.long)
+            mask[idx] = True
+            selected_by_name[resolved_name] = idx
+            floor_selected_count += int(idx.numel())
+        else:
+            selected_by_name[resolved_name] = torch.empty(0, dtype=torch.long)
+        selected_masks_by_name[resolved_name] = mask
+
+    remaining_budget = int(total_budget) - int(floor_selected_count)
+    global_selected_count = 0
+    if remaining_budget > 0:
+        extra_scores = []
+        extra_linear_indices = []
+        extra_channel_indices = []
+        for linear_idx, name in enumerate(linear_names):
+            resolved_name = str(name)
+            scores = scores_by_name[resolved_name]
+            remaining_mask = ~selected_masks_by_name[resolved_name]
+            remaining_idx = torch.arange(int(scores.numel()), dtype=torch.long).masked_select(remaining_mask)
+            if int(remaining_idx.numel()) == 0:
+                continue
+            extra_scores.append(scores.index_select(0, remaining_idx))
+            extra_linear_indices.append(torch.full((int(remaining_idx.numel()),), int(linear_idx), dtype=torch.long))
+            extra_channel_indices.append(remaining_idx)
+        if extra_scores:
+            all_extra_scores = torch.cat(extra_scores, dim=0)
+            all_extra_linear_indices = torch.cat(extra_linear_indices, dim=0)
+            all_extra_channel_indices = torch.cat(extra_channel_indices, dim=0)
+            k_extra = min(int(remaining_budget), int(all_extra_scores.numel()))
+            _, extra_pos = torch.topk(all_extra_scores, k=k_extra, largest=True, sorted=False)
+            selected_extra_linear = all_extra_linear_indices.index_select(0, extra_pos)
+            selected_extra_channel = all_extra_channel_indices.index_select(0, extra_pos)
+            global_selected_count = int(k_extra)
+            for linear_idx, name in enumerate(linear_names):
+                resolved_name = str(name)
+                extra_idx = selected_extra_channel.masked_select(selected_extra_linear == int(linear_idx))
+                if int(extra_idx.numel()) > 0:
+                    selected_by_name[resolved_name] = torch.cat([selected_by_name[resolved_name], extra_idx], dim=0)
+
+    out = {}
+    for name in linear_names:
+        resolved_name = str(name)
+        idx = torch.unique(selected_by_name[resolved_name].to(device="cpu", dtype=torch.long), sorted=True)
+        out[resolved_name] = idx.contiguous()
+    stats = {
+        "min_per_layer": int(min_per_layer),
+        "floor_selected_count": int(floor_selected_count),
+        "global_selected_count": int(global_selected_count),
+        "num_zero_protected_linears": sum(1 for idx in out.values() if int(idx.numel()) == 0),
+    }
+    return out, stats
 
 
 def _build_wa_mse_part_metas(

@@ -81,6 +81,7 @@ python tools/cat_train.py \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
   --outlier_protect_count "default=32" \
+  --outlier_protect_min_per_layer 1 \
   --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.0" \
   --outlier_rank_metric "channel_weight_actmax_abs" \

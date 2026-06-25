@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -17,16 +17,17 @@ python tools/cat_residual_from_base.py \
   --target_categories "o_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --outlier_protect_mode "channel_residual_vae" \
-  --outlier_rank_metric "channel_residual_actrms_abs" \
+  --outlier_rank_metric "channel_residual_actmax_abs" \
   --outlier_protect_axis "input" \
   --outlier_channel_scope "category" \
   --outlier_protect_count "32" \
+  --outlier_protect_min_per_layer "16" \
   --outlier_residual_vae_decoder_share_scope "category" \
   --outlier_residual_vae_batch_multiplier "16" \
   --outlier_residual_vae_steps "1500" \
-  --outlier_residual_vae_lr "0.001" \
-  --outlier_residual_vae_stages "1" \
-  --outlier_residual_vae_codebook_bits "64" \
+  --outlier_residual_vae_lr "3e-3" \
+  --outlier_residual_vae_stages "2" \
+  --outlier_residual_vae_codebook_bits "32" \
   --outlier_residual_vae_codebook_dim "32" \
   --base_batch_size "8192" \
   --wa_mse_calib_dataset "alpaca=1" \
@@ -43,7 +44,7 @@ python tools/cat_residual_from_base.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --eval_hif4_act "false" \
-  --eval_before_residual "true" \
+  --eval_before_residual "false" \
   --eval_after_residual "true" \
   --log_every "100" \
   --bf16 "true" \

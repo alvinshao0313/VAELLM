@@ -58,6 +58,7 @@ class NormalizedCatArgs:
     # 排序代码，已关闭。旧字段保留如下：
     # sort_prep_workers: int
     outlier_protect_count: OverrideTable[int]
+    outlier_protect_min_per_layer: int
     outlier_protect_mode: str
     outlier_channel_scope: str
     outlier_residual_top_p: OverrideTable[float]
@@ -725,6 +726,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         # 排序代码，已关闭。旧字段赋值保留如下：
         # sort_prep_workers=1,
         outlier_protect_count=_parse_cat_override(raw_args.outlier_protect_count, spec=_OUTLIER_PROTECT_COUNT_SPEC),
+        outlier_protect_min_per_layer=int(raw_args.outlier_protect_min_per_layer),
         outlier_protect_mode=str(raw_args.outlier_protect_mode).strip().lower(),
         outlier_channel_scope=str(raw_args.outlier_channel_scope).strip().lower(),
         outlier_residual_top_p=_parse_cat_override(raw_args.outlier_residual_top_p, spec=_OUTLIER_RESIDUAL_TOP_P_SPEC),
@@ -906,6 +908,7 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
     block_rows, block_cols = tuple(int(v) for v in cat_args.outlier_residual_block_shape)
     top_p_table = cat_args.outlier_residual_top_p
     protect_table = cat_args.outlier_protect_count
+    min_per_layer = int(cat_args.outlier_protect_min_per_layer)
     residual_vae_batch_multiplier = int(cat_args.outlier_residual_vae_batch_multiplier)
     residual_vae_steps = int(cat_args.outlier_residual_vae_steps)
     residual_vae_lr = float(cat_args.outlier_residual_vae_lr)
@@ -918,6 +921,18 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
         raise ValueError(
             f"Unsupported --outlier_channel_scope={cat_args.outlier_channel_scope!r}. "
             f"Expected one of: {', '.join(_OUTLIER_CHANNEL_SCOPE_CHOICES)}."
+        )
+    if min_per_layer < 0:
+        raise ValueError(f"--outlier_protect_min_per_layer must be >= 0, got {min_per_layer}.")
+    invalid_min_entries = [
+        f"{selector}={int(value)}"
+        for selector, value in _iter_override_entries(protect_table)
+        if int(value) < min_per_layer
+    ]
+    if invalid_min_entries:
+        raise ValueError(
+            "--outlier_protect_min_per_layer must be <= --outlier_protect_count for every selector. "
+            f"min_per_layer={min_per_layer}, counts: " + ",".join(invalid_min_entries)
         )
     if (
         str(cat_args.outlier_residual_vae_decoder_share_scope).strip().lower()
@@ -1188,6 +1203,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_blocks", type=int, default=256)
     # 排序代码，已关闭：不再注册 --sort_prep_workers CLI。
     parser.add_argument("--outlier_protect_count", type=str, default="default=0", help=f"类别覆盖参数。示例：{_OUTLIER_PROTECT_COUNT_SPEC.example}")
+    parser.add_argument("--outlier_protect_min_per_layer", type=int, default=0)
     parser.add_argument(
         "--outlier_protect_mode",
         type=str,

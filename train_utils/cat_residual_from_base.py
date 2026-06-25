@@ -22,7 +22,7 @@ from litebsq.vae_linear_prewarm import (
     prime_named_vae_linear_cache,
 )
 from train_utils.activation_utils import collect_activation_stats_for_linears
-from train_utils.cat_data_prep import compute_channel_rank_score
+from train_utils.cat_data_prep import compute_channel_rank_score, select_outlier_channel_indices_from_scores
 from train_utils.cat_train_args import ResolvedCategoryRuntimeConfig
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.cat_train_pipeline import (
@@ -130,6 +130,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outlier_protect_axis", default=None, choices=("input", "output"))
     parser.add_argument("--outlier_channel_scope", default=None, choices=("layer", "category"))
     parser.add_argument("--outlier_protect_count", type=int, default=None)
+    parser.add_argument("--outlier_protect_min_per_layer", type=int, default=0)
     parser.add_argument("--sparse_residual_ratio", type=float, default=None)
     parser.add_argument(
         "--outlier_residual_vae_decoder_share_scope",
@@ -263,6 +264,7 @@ def validate_residual_from_base_args(args: argparse.Namespace, *, provided: set)
         "--outlier_protect_axis",
         "--outlier_channel_scope",
         "--outlier_protect_count",
+        "--outlier_protect_min_per_layer",
         "--outlier_residual_vae_steps",
         "--outlier_residual_vae_lr",
         "--outlier_residual_vae_codebook_bits",
@@ -315,6 +317,10 @@ def validate_residual_from_base_args(args: argparse.Namespace, *, provided: set)
             raise ValueError("--outlier_channel_scope layer/category is required in channel_residual_vae mode.")
         if args.outlier_protect_count is None or int(args.outlier_protect_count) <= 0:
             raise ValueError("--outlier_protect_count must be > 0 in channel_residual_vae mode.")
+        if int(args.outlier_protect_min_per_layer) < 0:
+            raise ValueError("--outlier_protect_min_per_layer must be >= 0.")
+        if int(args.outlier_protect_min_per_layer) > int(args.outlier_protect_count):
+            raise ValueError("--outlier_protect_min_per_layer must be <= --outlier_protect_count.")
         if args.outlier_residual_vae_steps is None or int(args.outlier_residual_vae_steps) <= 0:
             raise ValueError("--outlier_residual_vae_steps must be > 0 in channel_residual_vae mode.")
         if args.outlier_residual_vae_lr is None or float(args.outlier_residual_vae_lr) <= 0.0:
@@ -794,37 +800,13 @@ def _select_channel_plan(
             expected_out_features=int(target.module.out_features),
         )
 
-    protect_count = int(args.outlier_protect_count)
-    if str(args.outlier_channel_scope) == "layer":
-        plan = {}
-        for target in targets:
-            scores = scores_by_name[target.name]
-            k = min(protect_count, int(scores.numel()))
-            if k < 1:
-                plan[target.name] = torch.empty(0, dtype=torch.long)
-            else:
-                _values, idx = torch.topk(scores, k=k, largest=True, sorted=False)
-                plan[target.name] = torch.sort(idx.to(dtype=torch.long)).values.contiguous()
-    else:
-        flat_scores = []
-        flat_linear_indices = []
-        flat_channel_indices = []
-        for linear_idx, target in enumerate(targets):
-            scores = scores_by_name[target.name]
-            flat_scores.append(scores)
-            flat_linear_indices.append(torch.full((int(scores.numel()),), linear_idx, dtype=torch.long))
-            flat_channel_indices.append(torch.arange(int(scores.numel()), dtype=torch.long))
-        all_scores = torch.cat(flat_scores, dim=0)
-        all_linear_indices = torch.cat(flat_linear_indices, dim=0)
-        all_channel_indices = torch.cat(flat_channel_indices, dim=0)
-        total_budget = min(protect_count * len(targets), int(all_scores.numel()))
-        _values, top_pos = torch.topk(all_scores, k=total_budget, largest=True, sorted=False)
-        selected_linear = all_linear_indices.index_select(0, top_pos)
-        selected_channel = all_channel_indices.index_select(0, top_pos)
-        plan = {}
-        for linear_idx, target in enumerate(targets):
-            idx = selected_channel.masked_select(selected_linear == int(linear_idx))
-            plan[target.name] = torch.sort(idx.to(dtype=torch.long)).values.contiguous()
+    plan, selection_stats = select_outlier_channel_indices_from_scores(
+        scores_by_name=scores_by_name,
+        linear_names=[target.name for target in targets],
+        outlier_protect_count=int(args.outlier_protect_count),
+        outlier_protect_min_per_layer=int(args.outlier_protect_min_per_layer),
+        outlier_channel_scope=str(args.outlier_channel_scope),
+    )
 
     score_values = torch.cat([score.reshape(-1).to(dtype=torch.float32) for score in scores_by_name.values()])
     return plan, {
@@ -832,6 +814,10 @@ def _select_channel_plan(
         "topk": float(sum(int(idx.numel()) for idx in plan.values())),
         "score_max": float(score_values.max().item()) if int(score_values.numel()) else 0.0,
         "score_mean": float(score_values.mean().item()) if int(score_values.numel()) else 0.0,
+        "min_per_layer": float(selection_stats["min_per_layer"]),
+        "floor_selected_count": float(selection_stats["floor_selected_count"]),
+        "global_selected_count": float(selection_stats["global_selected_count"]),
+        "num_zero_protected_linears": float(selection_stats["num_zero_protected_linears"]),
     }
 
 
@@ -1046,6 +1032,7 @@ def _process_channel_residual_vae_category(
         "axis": str(args.outlier_protect_axis),
         "scope": str(args.outlier_channel_scope),
         "protect_count": int(args.outlier_protect_count),
+        "protect_min_per_layer": int(args.outlier_protect_min_per_layer),
         "actual_protected_channels_per_layer": {
             target.name: int(plan[target.name].numel()) for target in targets
         },

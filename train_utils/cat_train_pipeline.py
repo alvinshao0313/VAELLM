@@ -41,6 +41,7 @@ from train_utils.cat_data_prep import (
     gather_wa_mse_act_max_batch,
     materialize_prepared_group_data,
     prepare_group_linear_entries,
+    select_outlier_channel_indices_from_scores,
 )
 from train_utils.activation_utils import (
     ActivationCalibrationCache,
@@ -515,6 +516,7 @@ def _select_channel_residual_vae_plan_from_final_residual(
     activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
     activation_sq_mean_by_linear: Optional[Dict[str, torch.Tensor]],
     final_stage_idx: int,
+    outlier_protect_min_per_layer: int = 0,
 ) -> Tuple[List[object], Dict[str, float]]:
     protect_count = int(outlier_protect_count)
     if protect_count < 0:
@@ -568,42 +570,15 @@ def _select_channel_residual_vae_plan_from_final_residual(
             expected_out_features=int(r.module.out_features),
         )
 
+    selected_plan, selection_stats = select_outlier_channel_indices_from_scores(
+        scores_by_name=per_linear_scores,
+        linear_names=[r.name for r in group_refs],
+        outlier_protect_count=int(protect_count),
+        outlier_protect_min_per_layer=int(outlier_protect_min_per_layer),
+        outlier_channel_scope=scope,
+    )
     if protect_count == 0 or not per_linear_scores:
         selected_plan = empty_plan
-    elif scope == "layer":
-        selected_plan = {}
-        for r in group_refs:
-            scores = per_linear_scores[r.name]
-            k = min(int(protect_count), int(scores.numel()))
-            if k < 1:
-                selected_plan[r.name] = torch.empty(0, dtype=torch.long)
-                continue
-            _, idx = torch.topk(scores, k=k, largest=True, sorted=False)
-            selected_plan[r.name] = torch.sort(idx.to(device="cpu", dtype=torch.long)).values.contiguous()
-    else:
-        flat_scores = []
-        flat_linear_indices = []
-        flat_channel_indices = []
-        for linear_idx, r in enumerate(group_refs):
-            scores = per_linear_scores[r.name]
-            flat_scores.append(scores)
-            flat_linear_indices.append(torch.full((int(scores.numel()),), int(linear_idx), dtype=torch.long))
-            flat_channel_indices.append(torch.arange(int(scores.numel()), dtype=torch.long))
-        all_scores = torch.cat(flat_scores, dim=0)
-        all_linear_indices = torch.cat(flat_linear_indices, dim=0)
-        all_channel_indices = torch.cat(flat_channel_indices, dim=0)
-        total_budget = min(int(protect_count) * int(len(group_refs)), int(all_scores.numel()))
-        if total_budget < 1:
-            selected_plan = empty_plan
-        else:
-            _, top_pos = torch.topk(all_scores, k=total_budget, largest=True, sorted=False)
-            selected_linear = all_linear_indices.index_select(0, top_pos)
-            selected_channel = all_channel_indices.index_select(0, top_pos)
-            selected_plan = {}
-            for linear_idx, r in enumerate(group_refs):
-                mask = selected_linear == int(linear_idx)
-                idx = selected_channel.masked_select(mask)
-                selected_plan[r.name] = torch.sort(idx.to(dtype=torch.long)).values.contiguous()
 
     updated_split_metas: List[object] = []
     for r, split_meta in zip(group_refs, target_common_split_metas):
@@ -639,6 +614,10 @@ def _select_channel_residual_vae_plan_from_final_residual(
         "topk": float(int(selected_count)),
         "score_max": float(score_values.max().item()) if int(score_values.numel()) else 0.0,
         "score_mean": float(score_values.mean().item()) if int(score_values.numel()) else 0.0,
+        "min_per_layer": float(selection_stats["min_per_layer"]),
+        "floor_selected_count": float(selection_stats["floor_selected_count"]),
+        "global_selected_count": float(selection_stats["global_selected_count"]),
+        "num_zero_protected_linears": float(selection_stats["num_zero_protected_linears"]),
     }
 
 
@@ -1134,6 +1113,7 @@ def train_group_vae_payload(
     outlier_rank_metric: str = "sparse_residual_abs",
     outlier_residual_min_abs: float = 1e-6,
     outlier_protect_axis: str = "input",
+    outlier_protect_min_per_layer: int = 0,
     outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
     outlier_residual_index_bits: int = 8,
     outlier_residual_value_bits: int = 8,
@@ -1923,6 +1903,7 @@ def train_group_vae_payload(
             activation_weight_by_linear=effective_activation_weight,
             activation_sq_mean_by_linear=effective_activation_sq_mean,
             final_stage_idx=int(final_base_residual_stage_idx),
+            outlier_protect_min_per_layer=int(outlier_protect_min_per_layer),
         )
         protected_residual_entries = _build_protected_residual_entries_from_final_residual(
             group_tag=group_tag,
@@ -2266,6 +2247,7 @@ def _train_group_vae_and_replace(
     outlier_rank_metric: str = "sparse_residual_abs",
     outlier_residual_min_abs: float = 1e-6,
     outlier_protect_axis: str = "input",
+    outlier_protect_min_per_layer: int = 0,
     outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
     outlier_residual_index_bits: int = 8,
     outlier_residual_value_bits: int = 8,
@@ -2303,6 +2285,7 @@ def _train_group_vae_and_replace(
         outlier_rank_metric=outlier_rank_metric,
         outlier_residual_min_abs=outlier_residual_min_abs,
         outlier_protect_axis=outlier_protect_axis,
+        outlier_protect_min_per_layer=outlier_protect_min_per_layer,
         outlier_residual_codec=outlier_residual_codec,
         outlier_residual_index_bits=outlier_residual_index_bits,
         outlier_residual_value_bits=outlier_residual_value_bits,
@@ -2735,6 +2718,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     outlier_protect_axis=outlier_protect_axis,
                     outlier_channel_scope=str(cat_args.outlier_channel_scope),
                     outlier_rank_metric=resolved_outlier_rank_metric,
+                    outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
                 )
                 for ref in planned_refs:
                     outlier_channel_plan.setdefault(ref.name, torch.empty(0, dtype=torch.long))
@@ -2783,6 +2767,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     outlier_rank_metric=resolved_outlier_rank_metric,
                     outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
                     outlier_protect_axis=outlier_protect_axis,
+                    outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
                     outlier_residual_codec=cat_args.outlier_residual_codec,
                     outlier_residual_index_bits=cat_args.outlier_residual_index_bits,
                     outlier_residual_value_bits=cat_args.outlier_residual_value_bits,
