@@ -1110,6 +1110,7 @@ def prepare_group_linear_entries(
     *,
     group_refs: Sequence[LinearPrepRef],
     activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
+    activation_abs_mean_by_linear: Optional[Dict[str, torch.Tensor]] = None,
     outlier_protect_count: int,
     outlier_protect_axis: str,
     recon_loss_type: str,

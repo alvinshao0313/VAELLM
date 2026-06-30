@@ -59,36 +59,12 @@ python tools/cat_train.py \
   --save_model \
   --convert_device "cuda" \
   --allow_tail_group "true" \
-  --target_categories "q_proj" \
+  --target_categories "down_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
   --steps_per_category "default=10000" \
   --batch_size "8192" \
-  --log_every "100" \
-  --eval_every "0" \
-  --eval_blocks "256" \
-  --eval_ppl "false" \
-  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
-  --ppl_limit "-1" \
-  --outlier_protect_mode "channel_residual_vae" \
-  --outlier_channel_scope "category" \
-  --outlier_residual_vae_decoder_share_scope "category" \
-  --outlier_residual_vae_batch_multiplier "4" \
-  --outlier_residual_vae_steps "1500" \
-  --outlier_residual_vae_lr "1e-3" \
-  --outlier_residual_vae_stages "default=1" \
-  --outlier_residual_vae_codebook_bits "default=4" \
-  --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_protect_count "default=32" \
-  --outlier_protect_min_per_layer 1 \
-  --outlier_protect_axis "input" \
-  --outlier_residual_top_p "default=0.0" \
-  --outlier_rank_metric "channel_weight_actmax_abs" \
-  --outlier_residual_min_abs "0.0" \
-  --outlier_residual_codec "blocked_quantized" \
-  --outlier_residual_index_bits "8" \
-  --outlier_residual_value_bits "8" \
   --wa_mse_calib_dataset "alpaca=1" \
   --wa_mse_calib_nsamples "128" \
   --wa_mse_calib_seqlen "8192" \
@@ -125,6 +101,30 @@ python tools/cat_train.py \
   --normalize_weight \
   --vae_decoder_checkpoint "true" \
   --new_quant \
+  --log_every "100" \
+  --eval_every "0" \
+  --eval_blocks "256" \
+  --eval_ppl "false" \
+  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
+  --ppl_limit "-1" \
+  --outlier_protect_mode "none" \
+  --outlier_channel_scope "category" \
+  --outlier_residual_vae_decoder_share_scope "category" \
+  --outlier_residual_vae_batch_multiplier "4" \
+  --outlier_residual_vae_steps "1500" \
+  --outlier_residual_vae_lr "1e-3" \
+  --outlier_residual_vae_stages "default=1" \
+  --outlier_residual_vae_codebook_bits "default=4" \
+  --outlier_residual_vae_codebook_dim "default=8" \
+  --outlier_protect_count "default=32" \
+  --outlier_protect_min_per_layer 1 \
+  --outlier_protect_axis "input" \
+  --outlier_residual_top_p "default=0.0" \
+  --outlier_rank_metric "channel_weight_actmax_abs" \
+  --outlier_residual_min_abs "0.0" \
+  --outlier_residual_codec "blocked_quantized" \
+  --outlier_residual_index_bits "8" \
+  --outlier_residual_value_bits "8" \
   --distill_after_category "none" \
   --distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
   --lora_rank "default=128" \

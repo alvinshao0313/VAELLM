@@ -50,8 +50,8 @@ export HF_DATASETS_OFFLINE=1
 python tools/cat_residual_from_base.py \
   --model_path "Qwen/Qwen3-8B" \
   --base_vae_checkpoint ".result/catlora/no_outlier_protect_vae_only_Qwen_Qwen3-8B_20260618_075940" \
-  --output_dir ".result/catlora_residual_from_base/" \
-  --target_categories "o_proj" \
+  --output_dir ".result/catlora_residual_from_base/down_proj" \
+  --target_categories "down_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --outlier_protect_mode "channel_residual_vae" \
   --outlier_rank_metric "channel_residual_actmean_abs" \
