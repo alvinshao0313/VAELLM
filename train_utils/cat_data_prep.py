@@ -683,6 +683,7 @@ def compute_channel_rank_score(
     weight: torch.Tensor,
     residual: Optional[torch.Tensor],
     act_max: Optional[torch.Tensor],
+    act_mean: Optional[torch.Tensor],
     act_sq_mean: Optional[torch.Tensor],
     axis: str,
     transpose: bool,
@@ -697,8 +698,10 @@ def compute_channel_rank_score(
     if resolved_metric not in {
         "channel_weight_abs",
         "channel_weight_actmax_abs",
+        "channel_weight_actmean_abs",
         "channel_residual_abs",
         "channel_residual_actmax_abs",
+        "channel_residual_actmean_abs",
         "channel_residual_actrms_abs",
     }:
         raise ValueError(f"{linear_name}: unsupported channel rank metric {metric!r}.")
@@ -740,6 +743,17 @@ def compute_channel_rank_score(
                 f"got={int(act_max_vec.numel())}, expected in_features={in_features}."
             )
 
+    act_mean_vec = None
+    if resolved_metric.endswith("_actmean_abs"):
+        if act_mean is None:
+            raise ValueError(f"{linear_name}: {resolved_metric} requires input activation mean stats.")
+        act_mean_vec = act_mean.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
+        if int(act_mean_vec.numel()) != in_features:
+            raise ValueError(
+                f"{linear_name}: activation mean size mismatch for {resolved_metric}, "
+                f"got={int(act_mean_vec.numel())}, expected in_features={in_features}."
+            )
+
     act_sq_vec = None
     if resolved_metric == "channel_residual_actrms_abs":
         if act_sq_mean is None:
@@ -761,6 +775,8 @@ def compute_channel_rank_score(
             score = torch.norm(source, p=2, dim=0)
             if act_max_vec is not None:
                 score = score * act_max_vec
+            if act_mean_vec is not None:
+                score = score * act_mean_vec
         if int(score.numel()) != in_features:
             raise ValueError(
                 f"{linear_name}: input channel score shape mismatch for {resolved_metric}, "
@@ -774,6 +790,8 @@ def compute_channel_rank_score(
         channel_source = source
         if act_max_vec is not None:
             channel_source = channel_source * act_max_vec.view(1, -1)
+        if act_mean_vec is not None:
+            channel_source = channel_source * act_mean_vec.view(1, -1)
         score = torch.norm(channel_source, p=2, dim=1)
     if int(score.numel()) != out_features:
         raise ValueError(
@@ -787,6 +805,7 @@ def build_outlier_channel_index_plan(
     *,
     group_refs: Sequence[LinearPrepRef],
     activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
+    activation_abs_mean_by_linear: Optional[Dict[str, torch.Tensor]] = None,
     outlier_protect_count: int,
     outlier_protect_axis: str,
     outlier_channel_scope: str,
@@ -806,12 +825,14 @@ def build_outlier_channel_index_plan(
     per_linear_scores: Dict[str, torch.Tensor] = {}
     for r in group_refs:
         act = None if activation_weight_by_linear is None else activation_weight_by_linear.get(r.name)
+        act_mean = None if activation_abs_mean_by_linear is None else activation_abs_mean_by_linear.get(r.name)
         per_linear_scores[r.name] = compute_channel_rank_score(
             metric=outlier_rank_metric,
             weight=r.weight,
             residual=None,
             linear_name=r.name,
             act_max=act,
+            act_mean=act_mean,
             act_sq_mean=None,
             axis=outlier_protect_axis,
             transpose=bool(r.transpose),

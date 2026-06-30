@@ -148,7 +148,7 @@
 | `--outlier_protect_mode` | `channel` | 离群值保护模式 | `none` / `channel` / `channel_residual_vae` / `residual_sparse`，互斥 |
 | `--outlier_channel_scope` | `layer` | channel 计数范围 | `layer` 为每层独立 top-N；`category` 为同类所有层全局排序，总预算为 `N * 有效 linear 数` |
 | `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；`residual_sparse` 要求 `0 < p <= 1` |
-| `--outlier_rank_metric` | `sparse_residual_abs` | 离群选择排序指标 | `residual_sparse` 只允许 `sparse_*`；`channel_residual_vae` 只允许 `channel_*`；`channel` 实际保护通道时只允许 `channel_weight_*` |
+| `--outlier_rank_metric` | `sparse_residual_abs` | 离群选择排序指标 | `residual_sparse` 只允许 `sparse_*`；`channel_residual_vae` 只允许 `channel_*`；`channel` 实际保护通道时只允许 `channel_weight_*`；`actmax` 使用激活绝对值最大值，`actmean` 使用激活绝对值均值 |
 | `--outlier_residual_min_abs` | `1e-6` | `residual_sparse` 模式下 residual 的最小绝对值门槛 | 全局单值；若 `|original-reconstructed| < threshold`，该位置会从 top-p 中剔除，并继续往后补 |
 | `--outlier_residual_codec` | `coo_fp16` | `residual_sparse` 的存储格式 | `coo_fp16` / `blocked_quantized` |
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
@@ -387,9 +387,9 @@
 
 ### 6.13 `wa_mse` 与 activation 依赖
 
-- `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 `act_max`
+- `recon_loss_type=wa_mse` 时，会在当前 group 上动态重算 activation stats，其中 `act_max` 仍供 `wa_mse` 使用。
 - `outlier_protect_mode=channel/channel_residual_vae` 且 `outlier_rank_metric` 使用 activation 加权或 second-moment 模式时，也复用同一条动态 activation 路径
-- `outlier_protect_mode=residual_sparse` 且 `outlier_rank_metric` 使用 activation max 加权模式时，也复用同一条动态 activation 路径
+- `outlier_protect_mode=residual_sparse` 且 `outlier_rank_metric` 使用 activation max/mean 加权模式时，也复用同一条动态 activation 路径
 - 当前 `cat_train` 不再支持通过静态 activation 字典驱动这三类逻辑
 
 ### 6.13 离群保护模式
@@ -405,8 +405,8 @@
 
 - `outlier_channel_scope=layer` 时，每个 linear 独立保护 `outlier_protect_count` 个 channel。
 - `outlier_channel_scope=category` 时，同一 category 的有效 linear 一起排序，总预算为 `outlier_protect_count * 有效 linear 数`，不同层可分配到不同数量的 channel。
-- `channel_weight_abs/channel_weight_actmax_abs` 按原始权重通道范数排序。
-- `channel_residual_abs/channel_residual_actmax_abs/channel_residual_actrms_abs` 在 base VAE stages 结束后，按 final residual 的通道误差排序。
+- `channel_weight_abs/channel_weight_actmax_abs/channel_weight_actmean_abs` 按原始权重通道范数排序；`actmax` 乘校准集激活绝对值最大值，`actmean` 乘校准集激活绝对值均值。
+- `channel_residual_abs/channel_residual_actmax_abs/channel_residual_actmean_abs/channel_residual_actrms_abs` 在 base VAE stages 结束后，按 final residual 的通道误差排序。
 - `outlier_residual_vae_batch_multiplier` 只放大 protected residual VAE 的训练 batch；默认 `1` 保持旧行为，`category` shared residual VAE 建议 `32`。
 - `outlier_residual_vae_steps/outlier_residual_vae_lr` 只控制 protected residual VAE；默认 `0` 分别继承 base VAE 的 steps/lr。
 

@@ -1,14 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ $# -lt 1 ]; then
+  echo "Usage: bash $0 <CUDA_VISIBLE_DEVICES> [extra args...]"
+  echo "Example: bash $0 0"
+  echo "Example: bash $0 1"
+  echo "Example: bash $0 0,1"
+  exit 1
+fi
+
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=$1
+shift
+
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
+
+  # --outlier_protect_mode "channel_residual_vae" \
+  # --outlier_rank_metric "channel_residual_actmax_abs" \
+  # --outlier_rank_metric "channel_residual_actmean_abs" \
+  # --outlier_protect_axis "input" \
+  # --outlier_channel_scope "category" \
+  # --outlier_protect_count "64" \
+  # --outlier_protect_min_per_layer "32" \
+  # --outlier_residual_vae_decoder_share_scope "category" \
+  # --outlier_residual_vae_batch_multiplier "16" \
+  # --outlier_residual_vae_steps "2000" \
+  # --outlier_residual_vae_lr "5e-3" \
+  # --outlier_residual_vae_stages "2" \
+  # --outlier_residual_vae_codebook_bits "64" \
+  # --outlier_residual_vae_codebook_dim "32" \
+
+
+  # --outlier_protect_mode "residual_sparse" \
+  # --outlier_rank_metric "sparse_residual_abs" \
+  # --outlier_rank_metric "sparse_residual_actmean_abs" \
+  # --sparse_residual_ratio "0.01" \
+  # --outlier_residual_min_abs "1e-6" \
+  # --outlier_residual_codec "blocked_quantized" \
+  # --outlier_residual_index_bits "8" \
+  # --outlier_residual_value_bits "8" \
 
 python tools/cat_residual_from_base.py \
   --model_path "Qwen/Qwen3-8B" \
@@ -17,17 +54,17 @@ python tools/cat_residual_from_base.py \
   --target_categories "o_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --outlier_protect_mode "channel_residual_vae" \
-  --outlier_rank_metric "channel_residual_actmax_abs" \
+  --outlier_rank_metric "channel_residual_actmean_abs" \
   --outlier_protect_axis "input" \
   --outlier_channel_scope "category" \
-  --outlier_protect_count "32" \
-  --outlier_protect_min_per_layer "16" \
+  --outlier_protect_count "64" \
+  --outlier_protect_min_per_layer "32" \
   --outlier_residual_vae_decoder_share_scope "category" \
   --outlier_residual_vae_batch_multiplier "16" \
-  --outlier_residual_vae_steps "1500" \
+  --outlier_residual_vae_steps "3000" \
   --outlier_residual_vae_lr "3e-3" \
   --outlier_residual_vae_stages "2" \
-  --outlier_residual_vae_codebook_bits "32" \
+  --outlier_residual_vae_codebook_bits "64" \
   --outlier_residual_vae_codebook_dim "32" \
   --base_batch_size "8192" \
   --wa_mse_calib_dataset "alpaca=1" \

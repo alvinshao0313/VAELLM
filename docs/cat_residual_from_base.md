@@ -38,16 +38,16 @@ output_dir/
 
 必须传：
 
-- `--outlier_rank_metric sparse_residual_abs|sparse_residual_actmax_abs|sparse_weight_abs|sparse_weight_actmax_abs`
+- `--outlier_rank_metric sparse_residual_abs|sparse_residual_actmax_abs|sparse_residual_actmean_abs|sparse_weight_abs|sparse_weight_actmax_abs|sparse_weight_actmean_abs`
 - `--sparse_residual_ratio`
 
-如果 metric 带 `actmax`，会根据 `wa_mse_calib_*` 参数现场采集 activation stats。
+如果 metric 带 `actmax` 或 `actmean`，会根据 `wa_mse_calib_*` 参数现场采集 activation stats。
 
 `--outlier_protect_mode channel_residual_vae`
 
 必须传：
 
-- `--outlier_rank_metric channel_weight_abs|channel_weight_actmax_abs|channel_residual_abs|channel_residual_actmax_abs|channel_residual_actrms_abs`
+- `--outlier_rank_metric channel_weight_abs|channel_weight_actmax_abs|channel_weight_actmean_abs|channel_residual_abs|channel_residual_actmax_abs|channel_residual_actmean_abs|channel_residual_actrms_abs`
 - `--outlier_protect_axis input|output`
 - `--outlier_channel_scope layer|category`
 - `--outlier_protect_count`
@@ -56,13 +56,13 @@ output_dir/
 - `--outlier_residual_vae_steps`
 - `--outlier_residual_vae_lr`
 
-如果 metric 带 `actmax` 或 `actrms`，会根据 `wa_mse_calib_*` 参数现场采集 activation stats。
+如果 metric 带 `actmax`、`actmean` 或 `actrms`，会根据 `wa_mse_calib_*` 参数现场采集 activation stats。
 
 ## Activation Stats
 
 `cat_residual_from_base.py` 不支持读取提前保存的 activation stats。
 
-如果 `--outlier_rank_metric` 需要 activation，例如带 `actmax` 或 `actrms` 的 metric，每次运行都会按下面这些参数重新采集目标 linear 的 activation max / second moment / RMS：
+如果 `--outlier_rank_metric` 需要 activation，例如带 `actmax`、`actmean` 或 `actrms` 的 metric，每次运行都会按下面这些参数重新采集目标 linear 的 activation max / abs mean / second moment / RMS：
 
 - `--wa_mse_calib_dataset`
 - `--wa_mse_calib_nsamples`

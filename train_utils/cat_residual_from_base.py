@@ -32,6 +32,7 @@ from train_utils.cat_train_pipeline import (
 )
 from train_utils.cat_train_residual_protection import (
     RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX,
+    RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN,
     build_sparse_residual_payload,
 )
 from train_utils.model_checkpoint_io import (
@@ -55,14 +56,18 @@ from train_utils.utils import (
 _SPARSE_METRICS = {
     "sparse_residual_abs",
     "sparse_residual_actmax_abs",
+    "sparse_residual_actmean_abs",
     "sparse_weight_abs",
     "sparse_weight_actmax_abs",
+    "sparse_weight_actmean_abs",
 }
 _CHANNEL_METRICS = {
     "channel_weight_abs",
     "channel_weight_actmax_abs",
+    "channel_weight_actmean_abs",
     "channel_residual_abs",
     "channel_residual_actmax_abs",
+    "channel_residual_actmean_abs",
     "channel_residual_actrms_abs",
 }
 _ACTMAX_METRICS = {
@@ -71,12 +76,18 @@ _ACTMAX_METRICS = {
     "channel_weight_actmax_abs",
     "channel_residual_actmax_abs",
 }
+_ACTMEAN_METRICS = {
+    "sparse_residual_actmean_abs",
+    "sparse_weight_actmean_abs",
+    "channel_weight_actmean_abs",
+    "channel_residual_actmean_abs",
+}
 _ACTRMS_METRICS = {"channel_residual_actrms_abs"}
 
 
 def _metric_requires_activation(metric: Optional[str]) -> bool:
     resolved = "" if metric is None else str(metric).strip().lower()
-    return resolved in _ACTMAX_METRICS or resolved in _ACTRMS_METRICS
+    return resolved in _ACTMAX_METRICS or resolved in _ACTMEAN_METRICS or resolved in _ACTRMS_METRICS
 
 
 @dataclass(frozen=True)
@@ -439,6 +450,7 @@ def _collect_online_activation_stats(
 
     out: Dict[str, Dict[str, torch.Tensor]] = {}
     has_max = False
+    has_abs_mean = False
     has_sq_mean = False
     has_rms = False
     for name, raw_stats in stats_by_linear.items():
@@ -447,6 +459,10 @@ def _collect_online_activation_stats(
         if isinstance(max_tensor, torch.Tensor):
             fields["max"] = max_tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
             has_max = True
+        abs_mean_tensor = raw_stats.get("abs_mean")
+        if isinstance(abs_mean_tensor, torch.Tensor):
+            fields["abs_mean"] = abs_mean_tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            has_abs_mean = True
         sq_mean_tensor = raw_stats.get("sq_mean")
         if isinstance(sq_mean_tensor, torch.Tensor):
             fields["sq_mean"] = sq_mean_tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -459,6 +475,8 @@ def _collect_online_activation_stats(
 
     if metric in _ACTMAX_METRICS and not has_max:
         raise ValueError(f"{metric} requires activation max stats from collect_activation_stats_for_linears.")
+    if metric in _ACTMEAN_METRICS and not has_abs_mean:
+        raise ValueError(f"{metric} requires activation mean stats from collect_activation_stats_for_linears.")
     if metric in _ACTRMS_METRICS and not (has_sq_mean or has_rms):
         raise ValueError(
             "channel_residual_actrms_abs requires activation second-moment stats from "
@@ -477,9 +495,10 @@ def _collect_online_activation_stats(
             )
 
     logger.info(
-        "[activation_stats] collected stats for %d linears: has_max=%s has_sq_mean=%s has_rms=%s",
+        "[activation_stats] collected stats for %d linears: has_max=%s has_abs_mean=%s has_sq_mean=%s has_rms=%s",
         int(len(out)),
         str(bool(has_max)),
+        str(bool(has_abs_mean)),
         str(bool(has_sq_mean)),
         str(bool(has_rms)),
     )
@@ -792,6 +811,7 @@ def _select_channel_plan(
             weight=_original_weight(target),
             residual=residual_by_name[target.name],
             act_max=stats.get("max"),
+            act_mean=stats.get("abs_mean"),
             act_sq_mean=stats.get("sq_mean"),
             axis=axis,
             transpose=bool(target.transpose),
@@ -1081,10 +1101,15 @@ def _process_sparse_category(
     total_coo_bytes = 0
     for target in targets:
         activation_weight = None
+        activation_mean = None
         if str(args.outlier_rank_metric) in RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX:
             activation_weight = act_stats.get(target.name, {}).get("max")
             if activation_weight is None:
                 raise ValueError(f"{target.name}: {args.outlier_rank_metric} requires act max stats.")
+        if str(args.outlier_rank_metric) in RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN:
+            activation_mean = act_stats.get(target.name, {}).get("abs_mean")
+            if activation_mean is None:
+                raise ValueError(f"{target.name}: {args.outlier_rank_metric} requires act mean stats.")
         block_shape = args.outlier_residual_block_shape
         if block_shape is None:
             block_shape = get_default_block_shape_for_index_bits(int(args.outlier_residual_index_bits))
@@ -1093,6 +1118,7 @@ def _process_sparse_category(
             original_weight=_original_weight(target),
             reconstructed_weight=reconstructed_by_name[target.name],
             activation_weight=activation_weight,
+            activation_mean=activation_mean,
             rank_metric=str(args.outlier_rank_metric),
             top_p=float(args.sparse_residual_ratio),
             min_abs=float(args.outlier_residual_min_abs),

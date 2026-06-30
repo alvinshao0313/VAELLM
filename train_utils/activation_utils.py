@@ -126,6 +126,7 @@ def collect_activation_stats_for_linears(
     device_obj = torch.device(run_device)
 
     absmax_by_linear: Dict[str, torch.Tensor] = {}
+    abssum_by_linear: Dict[str, torch.Tensor] = {}
     sqsum_by_linear: Dict[str, torch.Tensor] = {}
     count_by_linear: Dict[str, int] = {}
     handles = []
@@ -134,6 +135,7 @@ def collect_activation_stats_for_linears(
             raise TypeError(f"Target module for {name} must be an nn.Module with in_features, got {type(module)}")
         in_features = int(getattr(module, "in_features"))
         absmax_by_linear[name] = torch.zeros(in_features, dtype=torch.float32, device="cpu")
+        abssum_by_linear[name] = torch.zeros(in_features, dtype=torch.float32, device="cpu")
         sqsum_by_linear[name] = torch.zeros(in_features, dtype=torch.float32, device="cpu")
         count_by_linear[name] = 0
 
@@ -147,8 +149,10 @@ def collect_activation_stats_for_linears(
                 if int(x.shape[-1]) != int(hook_in_features):
                     return
                 x_flat = x.detach().reshape(-1, int(hook_in_features)).to(dtype=torch.float32)
-                cur = x_flat.abs().amax(dim=0).to(dtype=torch.float32, device="cpu")
+                x_abs = x_flat.abs()
+                cur = x_abs.amax(dim=0).to(dtype=torch.float32, device="cpu")
                 absmax_by_linear[one_name] = torch.maximum(absmax_by_linear[one_name], cur)
+                abssum_by_linear[one_name] += x_abs.sum(dim=0).to(dtype=torch.float32, device="cpu")
                 sqsum_by_linear[one_name] += x_flat.pow(2).sum(dim=0).to(dtype=torch.float32, device="cpu")
                 count_by_linear[one_name] += int(x_flat.shape[0])
 
@@ -173,7 +177,7 @@ def collect_activation_stats_for_linears(
             for i, inp in enumerate(cache.input_ids, start=1):
                 _ = model(input_ids=inp.to(device_obj, non_blocking=True))
                 if logger is not None and int(log_every) > 0 and (i % int(log_every) == 0 or i == total):
-                    logger.info("act_max recalib progress: %d/%d", i, total)
+                    logger.info("activation stats recalib progress: %d/%d", i, total)
     finally:
         for h in handles:
             h.remove()
@@ -190,11 +194,14 @@ def collect_activation_stats_for_linears(
     for name, _module in linear_items:
         num_tokens = int(count_by_linear[name])
         if num_tokens <= 0:
+            abs_mean = torch.zeros_like(abssum_by_linear[name])
             sq_mean = torch.zeros_like(sqsum_by_linear[name])
         else:
+            abs_mean = (abssum_by_linear[name] / float(num_tokens)).contiguous()
             sq_mean = (sqsum_by_linear[name] / float(num_tokens)).contiguous()
         stats_by_linear[name] = {
             "max": absmax_by_linear[name].contiguous(),
+            "abs_mean": abs_mean,
             "sq_mean": sq_mean,
             "rms": torch.sqrt(sq_mean.clamp_min(0.0)).contiguous(),
             "num_tokens": int(num_tokens),

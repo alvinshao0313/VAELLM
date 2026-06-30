@@ -207,36 +207,51 @@ _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES = {"compressed_lora", "both"}
 _OUTLIER_RANK_METRIC_CHOICES = (
     "sparse_residual_abs",
     "sparse_residual_actmax_abs",
+    "sparse_residual_actmean_abs",
     "sparse_weight_abs",
     "sparse_weight_actmax_abs",
+    "sparse_weight_actmean_abs",
     "channel_weight_abs",
     "channel_weight_actmax_abs",
+    "channel_weight_actmean_abs",
     "channel_residual_abs",
     "channel_residual_actmax_abs",
+    "channel_residual_actmean_abs",
     "channel_residual_actrms_abs",
 )
 _SPARSE_OUTLIER_RANK_METRICS = (
     "sparse_residual_abs",
     "sparse_residual_actmax_abs",
+    "sparse_residual_actmean_abs",
     "sparse_weight_abs",
     "sparse_weight_actmax_abs",
+    "sparse_weight_actmean_abs",
 )
 _CHANNEL_OUTLIER_RANK_METRICS = (
     "channel_weight_abs",
     "channel_weight_actmax_abs",
+    "channel_weight_actmean_abs",
     "channel_residual_abs",
     "channel_residual_actmax_abs",
+    "channel_residual_actmean_abs",
     "channel_residual_actrms_abs",
 )
 _CHANNEL_PRE_BASE_RANK_METRICS = (
     "channel_weight_abs",
     "channel_weight_actmax_abs",
+    "channel_weight_actmean_abs",
 )
 _OUTLIER_RANK_METRICS_NEED_ACTMAX = (
     "sparse_residual_actmax_abs",
     "sparse_weight_actmax_abs",
     "channel_weight_actmax_abs",
     "channel_residual_actmax_abs",
+)
+_OUTLIER_RANK_METRICS_NEED_ACTMEAN = (
+    "sparse_residual_actmean_abs",
+    "sparse_weight_actmean_abs",
+    "channel_weight_actmean_abs",
+    "channel_residual_actmean_abs",
 )
 _OUTLIER_RANK_METRICS_NEED_ACT_SQ_MEAN = (
     "channel_residual_actrms_abs",
@@ -824,6 +839,7 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
         str(cat_args.outlier_protect_mode).strip().lower() in _OUTLIER_CHANNEL_MODES
         and (
             str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACTMAX
+            or str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACTMEAN
             or str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACT_SQ_MEAN
         )
         and _override_table_contains(cat_args.outlier_protect_count, lambda value: int(value) > 0)
@@ -836,7 +852,10 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
         or channel_needs_activation
         or (
             str(cat_args.outlier_protect_mode).strip().lower() == "residual_sparse"
-            and str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACTMAX
+            and (
+                str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACTMAX
+                or str(cat_args.outlier_rank_metric).strip().lower() in _OUTLIER_RANK_METRICS_NEED_ACTMEAN
+            )
         )
     )
     if dynamic_calib_enabled and not str(cat_args.wa_mse_calib_dataset).strip():

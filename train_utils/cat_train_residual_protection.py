@@ -16,12 +16,20 @@ RESIDUAL_SPARSE_RANK_METRICS = frozenset(
     {
         "sparse_residual_abs",
         "sparse_residual_actmax_abs",
+        "sparse_residual_actmean_abs",
         "sparse_weight_abs",
         "sparse_weight_actmax_abs",
+        "sparse_weight_actmean_abs",
     }
 )
 RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX = frozenset(
     {"sparse_residual_actmax_abs", "sparse_weight_actmax_abs"}
+)
+RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN = frozenset(
+    {"sparse_residual_actmean_abs", "sparse_weight_actmean_abs"}
+)
+RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTIVATION = (
+    RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX | RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN
 )
 
 
@@ -31,6 +39,7 @@ def _select_sparse_residual_entries(
     original_weight: torch.Tensor,
     reconstructed_weight: torch.Tensor,
     activation_weight: Optional[torch.Tensor],
+    activation_mean: Optional[torch.Tensor],
     rank_metric: str,
     top_p: float,
     min_abs: float,
@@ -51,15 +60,19 @@ def _select_sparse_residual_entries(
     residual = (original_weight - reconstructed_weight).contiguous()
     abs_residual = residual.abs()
     resolved_rank_metric = str(rank_metric).strip().lower()
-    if resolved_rank_metric in {"sparse_residual_abs", "sparse_residual_actmax_abs"}:
+    if resolved_rank_metric in {
+        "sparse_residual_abs",
+        "sparse_residual_actmax_abs",
+        "sparse_residual_actmean_abs",
+    }:
         score = abs_residual
-    elif resolved_rank_metric in {"sparse_weight_abs", "sparse_weight_actmax_abs"}:
+    elif resolved_rank_metric in {"sparse_weight_abs", "sparse_weight_actmax_abs", "sparse_weight_actmean_abs"}:
         score = original_weight.abs()
     else:
         raise ValueError(
             f"{linear_name}: unsupported residual_sparse rank metric {rank_metric!r}. "
-            "Expected sparse_residual_abs, sparse_residual_actmax_abs, "
-            "sparse_weight_abs, or sparse_weight_actmax_abs."
+            "Expected sparse_residual_abs, sparse_residual_actmax_abs, sparse_residual_actmean_abs, "
+            "sparse_weight_abs, sparse_weight_actmax_abs, or sparse_weight_actmean_abs."
         )
 
     if resolved_rank_metric in RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX:
@@ -69,6 +82,16 @@ def _select_sparse_residual_entries(
         if int(act.numel()) != in_features:
             raise ValueError(
                 f"{linear_name}: activation_weight size mismatch for residual_sparse, "
+                f"got {int(act.numel())}, expected {in_features}."
+            )
+        score = score * act.view(1, in_features)
+    if resolved_rank_metric in RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN:
+        if activation_mean is None:
+            raise ValueError(f"{linear_name}: {resolved_rank_metric} requires activation_mean.")
+        act = activation_mean.detach().to(device="cpu", dtype=torch.float32).contiguous().abs()
+        if int(act.numel()) != in_features:
+            raise ValueError(
+                f"{linear_name}: activation_mean size mismatch for residual_sparse, "
                 f"got {int(act.numel())}, expected {in_features}."
             )
         score = score * act.view(1, in_features)
@@ -101,6 +124,7 @@ def build_sparse_residual_payload(
     original_weight: torch.Tensor,
     reconstructed_weight: torch.Tensor,
     activation_weight: Optional[torch.Tensor],
+    activation_mean: Optional[torch.Tensor] = None,
     rank_metric: str,
     top_p: float,
     min_abs: float,
@@ -114,6 +138,7 @@ def build_sparse_residual_payload(
         original_weight=original_weight,
         reconstructed_weight=reconstructed_weight,
         activation_weight=activation_weight,
+        activation_mean=activation_mean,
         rank_metric=rank_metric,
         top_p=top_p,
         min_abs=min_abs,

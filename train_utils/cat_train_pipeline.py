@@ -26,6 +26,7 @@ from train_utils.cat_train_runtime import (
 )
 from train_utils.cat_train_residual_protection import (
     RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX as _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX,
+    RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN as _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN,
     build_sparse_residual_payload as _build_sparse_residual_payload,
 )
 from litebsq.vae_args import apply_autoencoder_arch_defaults
@@ -514,6 +515,7 @@ def _select_channel_residual_vae_plan_from_final_residual(
     outlier_channel_scope: str,
     outlier_rank_metric: str,
     activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
+    activation_abs_mean_by_linear: Optional[Dict[str, torch.Tensor]],
     activation_sq_mean_by_linear: Optional[Dict[str, torch.Tensor]],
     final_stage_idx: int,
     outlier_protect_min_per_layer: int = 0,
@@ -556,12 +558,14 @@ def _select_channel_residual_vae_plan_from_final_residual(
                 f"stage_idx={final_stage_idx} axis={axis}."
             )
         act_max = None if activation_weight_by_linear is None else activation_weight_by_linear.get(r.name)
+        act_mean = None if activation_abs_mean_by_linear is None else activation_abs_mean_by_linear.get(r.name)
         act_sq_mean = None if activation_sq_mean_by_linear is None else activation_sq_mean_by_linear.get(r.name)
         per_linear_scores[r.name] = compute_channel_rank_score(
             metric=outlier_rank_metric,
             weight=r.module.weight.detach().to(device="cpu", dtype=torch.float32).contiguous(),
             residual=residual_weight,
             act_max=act_max,
+            act_mean=act_mean,
             act_sq_mean=act_sq_mean,
             axis=axis,
             transpose=bool(r.transpose),
@@ -1195,11 +1199,19 @@ def train_group_vae_payload(
     channel_protection_enabled = resolved_outlier_mode in {
         "channel", "channel_residual_vae"} and int(outlier_protect_count) > 0
     residual_sparse_needs_activation = (
-        residual_sparse_enabled and resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX
+        residual_sparse_enabled
+        and (
+            resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX
+            or resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN
+        )
     )
     channel_rank_needs_actmax = (
         channel_protection_enabled
         and resolved_outlier_rank_metric in {"channel_weight_actmax_abs", "channel_residual_actmax_abs"}
+    )
+    channel_rank_needs_actmean = (
+        channel_protection_enabled
+        and resolved_outlier_rank_metric in {"channel_weight_actmean_abs", "channel_residual_actmean_abs"}
     )
     channel_rank_needs_sq_mean = (
         channel_protection_enabled
@@ -1252,8 +1264,15 @@ def train_group_vae_payload(
     #     or (resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0)
     #     or residual_sparse_needs_activation
     # )
-    needs_dynamic_activation = use_wa_mse_loss or residual_sparse_needs_activation or channel_rank_needs_actmax or channel_rank_needs_sq_mean
+    needs_dynamic_activation = (
+        use_wa_mse_loss
+        or residual_sparse_needs_activation
+        or channel_rank_needs_actmax
+        or channel_rank_needs_actmean
+        or channel_rank_needs_sq_mean
+    )
     effective_activation_weight: Optional[Dict[str, torch.Tensor]] = None
+    effective_activation_abs_mean: Optional[Dict[str, torch.Tensor]] = None
     effective_activation_sq_mean: Optional[Dict[str, torch.Tensor]] = None
     if needs_dynamic_activation:
         if activation_runtime is None:
@@ -1282,6 +1301,11 @@ def train_group_vae_payload(
             for name, stats in dynamic_act_stats.items()
             if isinstance(stats.get("max"), torch.Tensor)
         }
+        effective_activation_abs_mean = {
+            name: stats["abs_mean"]
+            for name, stats in dynamic_act_stats.items()
+            if isinstance(stats.get("abs_mean"), torch.Tensor)
+        }
         effective_activation_sq_mean = {
             name: stats["sq_mean"]
             for name, stats in dynamic_act_stats.items()
@@ -1309,6 +1333,7 @@ def train_group_vae_payload(
     prepared_entries = prepare_group_linear_entries(
         group_refs=prep_refs,
         activation_weight_by_linear=effective_activation_weight,
+        activation_abs_mean_by_linear=effective_activation_abs_mean,
         outlier_protect_count=(
             int(outlier_protect_count)
             if resolved_outlier_mode == "channel" and channel_protection_enabled
@@ -1901,6 +1926,7 @@ def train_group_vae_payload(
             outlier_channel_scope=str(outlier_channel_scope),
             outlier_rank_metric=resolved_outlier_rank_metric,
             activation_weight_by_linear=effective_activation_weight,
+            activation_abs_mean_by_linear=effective_activation_abs_mean,
             activation_sq_mean_by_linear=effective_activation_sq_mean,
             final_stage_idx=int(final_base_residual_stage_idx),
             outlier_protect_min_per_layer=int(outlier_protect_min_per_layer),
@@ -2033,6 +2059,7 @@ def train_group_vae_payload(
         "resolved_outlier_mode": resolved_outlier_mode,
         "residual_sparse_enabled": bool(residual_sparse_enabled),
         "effective_activation_weight": effective_activation_weight,
+        "effective_activation_abs_mean": effective_activation_abs_mean,
         "outlier_residual_top_p": float(outlier_residual_top_p),
         "resolved_outlier_rank_metric": resolved_outlier_rank_metric,
         "resolved_residual_min_abs": float(resolved_residual_min_abs),
@@ -2074,6 +2101,7 @@ def apply_group_vae_payload(
     resolved_outlier_mode = str(payload["resolved_outlier_mode"])
     residual_sparse_enabled = bool(payload["residual_sparse_enabled"])
     effective_activation_weight = payload.get("effective_activation_weight")
+    effective_activation_abs_mean = payload.get("effective_activation_abs_mean")
     outlier_residual_top_p = float(payload["outlier_residual_top_p"])
     resolved_outlier_rank_metric = str(payload["resolved_outlier_rank_metric"])
     resolved_residual_min_abs = float(payload["resolved_residual_min_abs"])
@@ -2152,12 +2180,19 @@ def apply_group_vae_payload(
             )
         if residual_sparse_enabled:
             activation_weight = None
+            activation_mean = None
             if resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX:
                 if effective_activation_weight is None or r.name not in effective_activation_weight:
                     raise ValueError(
                         f"[{group_tag}] missing activation vector for residual_sparse scoring at linear '{r.name}'."
                     )
                 activation_weight = effective_activation_weight[r.name]
+            if resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN:
+                if effective_activation_abs_mean is None or r.name not in effective_activation_abs_mean:
+                    raise ValueError(
+                        f"[{group_tag}] missing activation mean vector for residual_sparse scoring at linear '{r.name}'."
+                    )
+                activation_mean = effective_activation_abs_mean[r.name]
             if reconstructed_weight is None:
                 raise RuntimeError(f"[{group_tag}] missing reconstructed weight for residual_sparse payload.")
             sparse_residual_kwargs, sparse_nnz, sparse_storage = _build_sparse_residual_payload(
@@ -2165,6 +2200,7 @@ def apply_group_vae_payload(
                 original_weight=old.weight,
                 reconstructed_weight=reconstructed_weight,
                 activation_weight=activation_weight,
+                activation_mean=activation_mean,
                 rank_metric=resolved_outlier_rank_metric,
                 top_p=outlier_residual_top_p,
                 min_abs=resolved_residual_min_abs,
@@ -2479,14 +2515,19 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         resolved_outlier_mode in {"channel", "channel_residual_vae"}
         and resolved_outlier_rank_metric in {
             "channel_weight_actmax_abs",
+            "channel_weight_actmean_abs",
             "channel_residual_actmax_abs",
+            "channel_residual_actmean_abs",
             "channel_residual_actrms_abs",
         }
         and any_outlier_protect
     )
     residual_sparse_needs_activation = (
         resolved_outlier_mode == "residual_sparse"
-        and resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX
+        and (
+            resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX
+            or resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN
+        )
     )
     sort_needs_act = False  # 排序代码，已关闭。
     if any_wa_mse or channel_protect_needs_activation or sort_needs_act or residual_sparse_needs_activation:
@@ -2676,7 +2717,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None
             if resolved_outlier_mode == "channel" and int(cat_cfg.outlier_protect_count) > 0:
                 plan_activation_weight: Optional[Dict[str, torch.Tensor]] = None
-                if resolved_outlier_rank_metric == "channel_weight_actmax_abs":
+                plan_activation_abs_mean: Optional[Dict[str, torch.Tensor]] = None
+                if resolved_outlier_rank_metric in {"channel_weight_actmax_abs", "channel_weight_actmean_abs"}:
                     if activation_runtime is None:
                         raise ValueError(
                             f"[{cat}] dynamic activation runtime is required for activation-weighted outlier channel scoring."
@@ -2701,6 +2743,11 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         for name, stats in dynamic_act_stats.items()
                         if isinstance(stats.get("max"), torch.Tensor)
                     }
+                    plan_activation_abs_mean = {
+                        name: stats["abs_mean"]
+                        for name, stats in dynamic_act_stats.items()
+                        if isinstance(stats.get("abs_mean"), torch.Tensor)
+                    }
                 plan_refs = [
                     LinearPrepRef(
                         name=r.name,
@@ -2714,6 +2761,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 outlier_channel_plan = build_outlier_channel_index_plan(
                     group_refs=plan_refs,
                     activation_weight_by_linear=plan_activation_weight,
+                    activation_abs_mean_by_linear=plan_activation_abs_mean,
                     outlier_protect_count=int(cat_cfg.outlier_protect_count),
                     outlier_protect_axis=outlier_protect_axis,
                     outlier_channel_scope=str(cat_args.outlier_channel_scope),
