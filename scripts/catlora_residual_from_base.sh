@@ -56,15 +56,15 @@ python tools/cat_residual_from_base.py \
   --outlier_protect_mode "channel_residual_vae" \
   --outlier_rank_metric "channel_residual_actmean_abs" \
   --outlier_protect_axis "input" \
-  --outlier_channel_scope "category" \
-  --outlier_protect_count "64" \
-  --outlier_protect_min_per_layer "32" \
+  --outlier_channel_scope "layer" \
+  --outlier_protect_count "128" \
+  --outlier_protect_min_per_layer "96" \
   --outlier_residual_vae_decoder_share_scope "category" \
   --outlier_residual_vae_batch_multiplier "16" \
-  --outlier_residual_vae_steps "3000" \
-  --outlier_residual_vae_lr "3e-3" \
+  --outlier_residual_vae_steps "2000" \
+  --outlier_residual_vae_lr "5e-2" \
   --outlier_residual_vae_stages "2" \
-  --outlier_residual_vae_codebook_bits "64" \
+  --outlier_residual_vae_codebook_bits "128" \
   --outlier_residual_vae_codebook_dim "32" \
   --base_batch_size "8192" \
   --wa_mse_calib_dataset "alpaca=1" \

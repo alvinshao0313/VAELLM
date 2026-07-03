@@ -185,7 +185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_res_blocks", type=int, default=1)
     parser.add_argument("--decoder_base_ch", type=int, default=128)
     parser.add_argument("--decoder_num_res_blocks", type=int, default=1)
-    parser.add_argument("--norm_type", default="layer", choices=("group", "batch", "layer", "no"))
+    parser.add_argument("--norm_type", default="layer", choices=("group", "batch", "layer", "rms", "no"))
     parser.add_argument("--decoder_type", default="symmetric", choices=("linear", "symmetric", "asymmetric"))
     parser.add_argument("--recon_loss_type", default="mse")
     parser.add_argument("--quantizer_type", default="BSQ")

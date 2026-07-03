@@ -154,6 +154,7 @@
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
 | `--outlier_residual_value_bits` | `8` | `blocked_quantized` 的残差 value 位宽 | `8` / `4` |
 | `--outlier_protect_axis` | `input` | 保护输入还是输出通道 | `input` / `output` |
+| `--outlier_protect_channel_quant` | `none` | `channel` 模式下 protected channel 权重存储格式 | `none` / `fp8_e4m3` / `fp8_e5m2` / `int8`；per-channel 对称量化，scale 为 bf16 |
 | `--outlier_residual_vae_stages` | `default=1` | protected channel residual VAE 阶数 | 类别 override |
 | `--outlier_residual_vae_batch_multiplier` | `1` | protected residual VAE batch 放大倍数 | 只影响 protected residual VAE，不影响 base VAE stage1/stage2；category shared residual VAE 推荐 `32`，实际 batch 会被 residual block 总数限制 |
 | `--outlier_residual_vae_steps` | `0` | protected residual VAE 独立训练步数 | `0` 表示继承 base VAE residual stage steps；category shared residual VAE 推荐 `1000~1500` |
@@ -217,7 +218,7 @@
 | `--decoder_base_ch` | `default=none` | asymmetric decoder hidden dim；`none` 回退到 `base_ch` |
 | `--decoder_num_res_blocks` | `default=none` | asymmetric decoder 残差块数；`none` 回退到 `num_res_blocks` |
 | `--recon_loss_type` | `default=mse` | 重建损失类型 |
-| `--norm_type` | `default=group` | `group/batch/layer/no` |
+| `--norm_type` | `default=group` | `group/batch/layer/rms/no`；`rms` 为 RMSNorm |
 | `--decoder_type` | `default=linear` | `linear/symmetric/asymmetric` |
 
 重要语义：
@@ -397,7 +398,7 @@
 `outlier_protect_mode` 当前支持 4 个值：
 
 - `none`：不做离群保护。
-- `channel`：VAE 压缩前保护 top-N input/output channel，保护数量来自 `outlier_protect_count`。
+- `channel`：VAE 压缩前保护 top-N input/output channel，保护数量来自 `outlier_protect_count`。可选 `--outlier_protect_channel_quant` 对 protected 权重做 per-channel 量化存储（scale 为 bf16）。
 - `channel_residual_vae`：主 VAE 仍压缩完整权重；训练后只取选中 channel 的 `original - reconstructed` residual，并为每个 linear 单独训练额外多阶 VAE patch。
 - `residual_sparse`：VAE / joint decoder 训练结束后，保存最终重建残差里的 top-p 稀疏补丁。
 

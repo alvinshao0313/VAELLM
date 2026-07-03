@@ -8,6 +8,12 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import torch
 # import torch.nn.functional as F
 
+from litebsq.protected_channel_quant import (
+    PROTECTED_CHANNEL_QUANT_NONE,
+    encode_protected_channel_weight,
+    normalize_protected_channel_quant_format,
+)
+
 
 @dataclass(frozen=True)
 class LinearPrepRef:
@@ -26,7 +32,7 @@ class WAMSEPartMeta:
     row_offset: int
     rows_part: int
     col_offset: int
-    act_max: torch.Tensor  # [in_features], float32 on train device
+    act_max: torch.Tensor  # historical name; for amse this stores hessian_diag/sq_mean
     col_index_map: Optional[torch.Tensor] = None  # [cols_part], long on train device; sorted-col -> original channel idx
 
 
@@ -44,8 +50,12 @@ class LinearSplitMeta:
     compressed_out_features: int
     protected_input_indices: Optional[torch.Tensor]  # [num_protected], long on cpu; original input channel indices
     protected_input_weight: Optional[torch.Tensor]  # [num_protected, out_features], same dtype as original weight on cpu
+    protected_input_qvalues: Optional[torch.Tensor]  # [num_protected, out_features], uint8 on cpu
+    protected_input_scales: Optional[torch.Tensor]  # [num_protected], bf16 on cpu
     protected_output_indices: Optional[torch.Tensor]  # [num_protected], long on cpu; original output channel indices
     protected_output_weight: Optional[torch.Tensor]  # [num_protected, in_features], same dtype as original weight on cpu
+    protected_output_qvalues: Optional[torch.Tensor]  # [num_protected, in_features], uint8 on cpu
+    protected_output_scales: Optional[torch.Tensor]  # [num_protected], bf16 on cpu
 
 
 @dataclass(frozen=True)
@@ -56,8 +66,12 @@ class PreparedLinearWeight:
     activation_weight: Optional[torch.Tensor]  # input-axis act vector used by wa_mse, float32 on cpu
     protected_input_indices: Optional[torch.Tensor]  # [num_protected], long on cpu
     protected_input_weight: Optional[torch.Tensor]  # [num_protected, out_features], original dtype on cpu
-    protected_output_indices: Optional[torch.Tensor]  # [num_protected], long on cpu
-    protected_output_weight: Optional[torch.Tensor]  # [num_protected, in_features], original dtype on cpu
+    protected_input_qvalues: Optional[torch.Tensor] = None
+    protected_input_scales: Optional[torch.Tensor] = None
+    protected_output_indices: Optional[torch.Tensor] = None
+    protected_output_weight: Optional[torch.Tensor] = None
+    protected_output_qvalues: Optional[torch.Tensor] = None
+    protected_output_scales: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -502,6 +516,20 @@ def split_linear_into_parts(
     return parts
 
 
+def _split_protected_channel_payload(
+    protected_weight: torch.Tensor,
+    *,
+    outlier_protect_channel_quant: str,
+    storage_dtype: torch.dtype,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    quant_format = normalize_protected_channel_quant_format(outlier_protect_channel_quant)
+    protected_cpu = protected_weight.detach().to(device="cpu", dtype=storage_dtype).contiguous()
+    if quant_format == PROTECTED_CHANNEL_QUANT_NONE:
+        return protected_cpu, None, None
+    qvalues, scales = encode_protected_channel_weight(protected_cpu, quant_format=quant_format)
+    return None, qvalues, scales
+
+
 def _prepare_linear_weight_for_outlier_protection(
     *,
     weight: torch.Tensor,
@@ -511,6 +539,7 @@ def _prepare_linear_weight_for_outlier_protection(
     outlier_protect_axis: str,
     protected_channel_indices: Optional[torch.Tensor] = None,
     apply_channel_removal: bool = True,
+    outlier_protect_channel_quant: str = PROTECTED_CHANNEL_QUANT_NONE,
 ) -> PreparedLinearWeight:
     axis = str(outlier_protect_axis).strip().lower()
     if axis not in {"input", "output"}:
@@ -612,6 +641,11 @@ def _prepare_linear_weight_for_outlier_protection(
         protected_weight = weight_in_major.index_select(0, protected_idx)
         compressed_weight = weight.index_select(1, compressed_idx).contiguous()
         compressed_act = None if act_dev is None else act_dev.index_select(0, compressed_idx)
+        protected_input_weight, protected_input_qvalues, protected_input_scales = _split_protected_channel_payload(
+            protected_weight,
+            outlier_protect_channel_quant=outlier_protect_channel_quant,
+            storage_dtype=weight.dtype,
+        )
 
         return PreparedLinearWeight(
             split_weight=compressed_weight,
@@ -619,7 +653,9 @@ def _prepare_linear_weight_for_outlier_protection(
             compressed_out_features=original_out_features,
             activation_weight=None if compressed_act is None else compressed_act.to(device="cpu", dtype=torch.float32).contiguous(),
             protected_input_indices=protected_idx.to(device="cpu", dtype=torch.long).contiguous(),
-            protected_input_weight=protected_weight.to(device="cpu", dtype=weight.dtype).contiguous(),
+            protected_input_weight=protected_input_weight,
+            protected_input_qvalues=protected_input_qvalues,
+            protected_input_scales=protected_input_scales,
             protected_output_indices=None,
             protected_output_weight=None,
         )
@@ -640,6 +676,11 @@ def _prepare_linear_weight_for_outlier_protection(
 
     protected_weight = weight.index_select(0, protected_idx).contiguous()
     compressed_weight = weight.index_select(0, compressed_idx).contiguous()
+    protected_output_weight, protected_output_qvalues, protected_output_scales = _split_protected_channel_payload(
+        protected_weight,
+        outlier_protect_channel_quant=outlier_protect_channel_quant,
+        storage_dtype=weight.dtype,
+    )
 
     return PreparedLinearWeight(
         split_weight=compressed_weight,
@@ -649,7 +690,9 @@ def _prepare_linear_weight_for_outlier_protection(
         protected_input_indices=None,
         protected_input_weight=None,
         protected_output_indices=protected_idx.to(device="cpu", dtype=torch.long).contiguous(),
-        protected_output_weight=protected_weight.to(device="cpu", dtype=weight.dtype).contiguous(),
+        protected_output_weight=protected_output_weight,
+        protected_output_qvalues=protected_output_qvalues,
+        protected_output_scales=protected_output_scales,
     )
 
 
@@ -1117,6 +1160,7 @@ def prepare_group_linear_entries(
     intra_part_sort_mode: Union[str, Sequence[str]] = "none",
     outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
     apply_outlier_channel_removal: bool = True,
+    outlier_protect_channel_quant: str = PROTECTED_CHANNEL_QUANT_NONE,
 ) -> List[PreparedLinearEntry]:
     protect_count = int(outlier_protect_count)
     if protect_count < 0:
@@ -1126,14 +1170,15 @@ def prepare_group_linear_entries(
         intra_part_sort_mode,
         arg_name="intra_part_sort_mode",
     )
-    use_wa_mse = str(recon_loss_type).lower() == "wa_mse"
+    resolved_recon_loss = str(recon_loss_type).strip().lower()
+    use_wa_mse = resolved_recon_loss in {"wa_mse", "amse"}
     # 排序代码，已关闭。原 activation sort 条件保留如下：
     # requires_act = resolved_sort_mode == "act_spectral_cosine"
     requires_act = False  # 排序代码，已关闭。
     needs_activation = requires_act or use_wa_mse or (protect_count > 0 and outlier_channel_plan is None)
     if needs_activation and activation_weight_by_linear is None:
         raise ValueError(
-            "Activation vectors are required by outlier protection or wa_mse. "
+            "Activation vectors are required by outlier protection or channel-weighted recon loss. "
             "No activation source was provided for the current group."
         )
 
@@ -1143,7 +1188,7 @@ def prepare_group_linear_entries(
         if needs_activation:
             if activation_weight_by_linear is None or r.name not in activation_weight_by_linear:
                 raise KeyError(
-                    f"Missing activation vector for linear '{r.name}' required by outlier protection or wa_mse."
+                    f"Missing activation vector for linear '{r.name}' required by outlier protection or recon_loss_type={resolved_recon_loss}."
                 )
             act_for_linear = activation_weight_by_linear[r.name]
         prepared_entries.append(
@@ -1157,6 +1202,7 @@ def prepare_group_linear_entries(
                     outlier_protect_axis=outlier_protect_axis,
                     protected_channel_indices=None if outlier_channel_plan is None else outlier_channel_plan.get(r.name),
                     apply_channel_removal=bool(apply_outlier_channel_removal),
+                    outlier_protect_channel_quant=outlier_protect_channel_quant,
                 ),
             )
         )
@@ -1186,7 +1232,8 @@ def materialize_prepared_group_data(
         intra_part_sort_mode,
         arg_name="intra_part_sort_mode",
     )
-    use_wa_mse = str(recon_loss_type).lower() == "wa_mse"
+    resolved_recon_loss = str(recon_loss_type).strip().lower()
+    use_wa_mse = resolved_recon_loss in {"wa_mse", "amse"}
     # 排序代码，已关闭。原 activation-sort 判断保留如下：
     # requires_act = resolved_sort_mode == "act_spectral_cosine"
     requires_act = False
@@ -1223,8 +1270,12 @@ def materialize_prepared_group_data(
             activation_weight=prepared_weight.activation_weight,
             protected_input_indices=prepared_weight.protected_input_indices,
             protected_input_weight=prepared_weight.protected_input_weight,
+            protected_input_qvalues=prepared_weight.protected_input_qvalues,
+            protected_input_scales=prepared_weight.protected_input_scales,
             protected_output_indices=prepared_weight.protected_output_indices,
             protected_output_weight=prepared_weight.protected_output_weight,
+            protected_output_qvalues=prepared_weight.protected_output_qvalues,
+            protected_output_scales=prepared_weight.protected_output_scales,
         )
         act_for_sort = current_prepared_weight.activation_weight if requires_act else None
         stage_entries.append((r, current_prepared_weight, act_for_sort))
@@ -1317,8 +1368,12 @@ def materialize_prepared_group_data(
                 compressed_out_features=int(prepared_weight.compressed_out_features),
                 protected_input_indices=prepared_weight.protected_input_indices,
                 protected_input_weight=prepared_weight.protected_input_weight,
+                protected_input_qvalues=prepared_weight.protected_input_qvalues,
+                protected_input_scales=prepared_weight.protected_input_scales,
                 protected_output_indices=prepared_weight.protected_output_indices,
                 protected_output_weight=prepared_weight.protected_output_weight,
+                protected_output_qvalues=prepared_weight.protected_output_qvalues,
+                protected_output_scales=prepared_weight.protected_output_scales,
             )
         )
 
@@ -1361,7 +1416,9 @@ def materialize_prepared_group_data(
     part_metas: List[WAMSEPartMeta] = []
     if use_wa_mse:
         if not wa_mse_activation_weight_by_linear:
-            raise ValueError("recon_loss_type=wa_mse requires activation vectors for the current group.")
+            raise ValueError(
+                f"recon_loss_type={resolved_recon_loss} requires channel weight vectors for the current group."
+            )
         part_metas = _build_wa_mse_part_metas(
             group_refs=wa_mse_group_refs,
             intra_parallel=(row_parts, col_parts),
@@ -1371,13 +1428,13 @@ def materialize_prepared_group_data(
         )
         if len(part_metas) != num_models:
             raise RuntimeError(
-                f"wa_mse internal mismatch: len(part_metas)={len(part_metas)} vs num_models={num_models}"
+                f"channel weight internal mismatch: len(part_metas)={len(part_metas)} vs num_models={num_models}"
             )
         expected_flat_len = int(stacked_data.shape[0]) * int(codebook_dim)
         for meta in part_metas:
             if int(meta.rows_part) * int(meta.cols) != expected_flat_len:
                 raise ValueError(
-                    f"wa_mse index map mismatch for {meta.linear_name}: "
+                    f"channel weight index map mismatch for {meta.linear_name}: "
                     f"rows_part*cols={int(meta.rows_part) * int(meta.cols)} vs expected={expected_flat_len}"
                 )
 

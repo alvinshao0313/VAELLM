@@ -164,7 +164,7 @@ class Normalize(nn.Module):
         self.in_channels = int(in_channels)
         self.norm_type = str(norm_type)
 
-        if self.norm_type not in {"group", "batch", "layer", "no"}:
+        if self.norm_type not in {"group", "batch", "layer", "rms", "no"}:
             raise ValueError(f"Unsupported norm_type: {norm_type}")
 
         if self.norm_type == "group":
@@ -187,6 +187,12 @@ class Normalize(nn.Module):
                 self.norm = nn.LayerNorm(self.in_channels, elementwise_affine=False)
                 self.weight = nn.Parameter(torch.ones(self.num_models, self.in_channels))
                 self.bias = nn.Parameter(torch.zeros(self.num_models, self.in_channels))
+        elif self.norm_type == "rms":
+            if self.num_models == 1:
+                self.norm = nn.RMSNorm(self.in_channels, eps=1e-6)
+            else:
+                self.norm = nn.RMSNorm(self.in_channels, eps=1e-6, elementwise_affine=False)
+                self.weight = nn.Parameter(torch.ones(self.num_models, self.in_channels))
         else:
             self.norm = nn.Identity()
 
@@ -212,6 +218,11 @@ class Normalize(nn.Module):
             if self.num_models == 1:
                 return out
             return out * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+        if self.norm_type == "rms":
+            out = self.norm(x)
+            if self.num_models == 1:
+                return out
+            return out * self.weight.unsqueeze(0)
 
         flat = self._flatten_parallel(x)
         out = self.norm(flat)
@@ -225,7 +236,7 @@ class Normalize(nn.Module):
         ref_weight = getattr(self.norm, "weight", None)
         if isinstance(ref_weight, torch.Tensor):
             new_norm = new_norm.to(device=ref_weight.device, dtype=ref_weight.dtype)
-        elif self.norm_type == "layer" and isinstance(getattr(self, "weight", None), torch.Tensor):
+        elif self.norm_type in {"layer", "rms"} and isinstance(getattr(self, "weight", None), torch.Tensor):
             new_norm = new_norm.to(device=self.weight.device, dtype=self.weight.dtype)
         elif self.norm_type == "batch":
             new_norm = new_norm.to(device=self.norm.running_mean.device, dtype=self.norm.running_mean.dtype)
@@ -241,6 +252,14 @@ class Normalize(nn.Module):
                 with torch.no_grad():
                     new_norm.norm.weight.copy_(self.weight[model_idx])
                     new_norm.norm.bias.copy_(self.bias[model_idx])
+            return new_norm
+
+        if self.norm_type == "rms":
+            if self.num_models == 1:
+                new_norm.norm.load_state_dict(self.norm.state_dict())
+            else:
+                with torch.no_grad():
+                    new_norm.norm.weight.copy_(self.weight[model_idx])
             return new_norm
 
         start = model_idx * self.in_channels
@@ -342,6 +361,15 @@ def pack_normalizes(norms: Sequence["Normalize"]) -> "Normalize":
             with torch.no_grad():
                 packed.weight[idx].copy_(norm.norm.weight)
                 packed.bias[idx].copy_(norm.norm.bias)
+        return packed
+
+    if norm_type == "rms":
+        if len(norms) == 1:
+            packed.norm.load_state_dict(first.norm.state_dict())
+            return packed
+        for idx, norm in enumerate(norms):
+            with torch.no_grad():
+                packed.weight[idx].copy_(norm.norm.weight)
         return packed
 
     if norm_type == "group":

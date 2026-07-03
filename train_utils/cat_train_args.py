@@ -5,6 +5,11 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import transformers
 
+from litebsq.protected_channel_quant import (
+    PROTECTED_CHANNEL_QUANT_CHOICES,
+    PROTECTED_CHANNEL_QUANT_NONE,
+    normalize_protected_channel_quant_format,
+)
 from litebsq.sparse_residual import (
     SPARSE_RESIDUAL_FORMAT_CHOICES,
     SPARSE_RESIDUAL_FORMAT_COO_FP16,
@@ -69,6 +74,7 @@ class NormalizedCatArgs:
     outlier_residual_value_bits: int
     outlier_residual_block_shape: Tuple[int, int]
     outlier_protect_axis: str
+    outlier_protect_channel_quant: str
     outlier_residual_vae_stages: OverrideTable[int]
     outlier_residual_vae_decoder_share_scope: str
     outlier_residual_vae_batch_multiplier: int
@@ -195,8 +201,8 @@ class ResolvedDistillRuntimeConfig:
 _SKIP_LAYER_PATTERN = re.compile(r"^(\d+)\.([A-Za-z0-9_]+)$")
 _CATEGORY_OVERRIDE_SELECTORS = ("default", "cat")
 _AFTER_CATEGORY_OVERRIDE_SELECTORS = ("default", "after")
-_CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse")
-_CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
+_CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse", "amse")
+_CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "rms", "no")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "channel_residual_vae", "residual_sparse")
 _OUTLIER_CHANNEL_SCOPE_CHOICES = ("layer", "category")
@@ -545,7 +551,7 @@ _DECODER_NUM_RES_BLOCKS_SPEC = _make_optional_int_override_spec(
 _RECON_LOSS_TYPE_SPEC = _make_choice_override_spec(
     arg_name="--recon_loss_type",
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=mse,cat:q_proj=wa_mse",
+    example="default=mse,cat:q_proj=wa_mse,cat:down_proj=amse",
     choices=_CAT_RECON_LOSS_CHOICES,
 )
 _NORM_TYPE_SPEC = _make_choice_override_spec(
@@ -752,6 +758,10 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_residual_value_bits=int(raw_args.outlier_residual_value_bits),
         outlier_residual_block_shape=tuple(int(v) for v in resolved_block_shape),
         outlier_protect_axis=str(raw_args.outlier_protect_axis).strip().lower(),
+        outlier_protect_channel_quant=normalize_protected_channel_quant_format(
+            raw_args.outlier_protect_channel_quant,
+            arg_name="--outlier_protect_channel_quant",
+        ),
         outlier_residual_vae_stages=_parse_cat_override(raw_args.outlier_residual_vae_stages, spec=_OUTLIER_RESIDUAL_VAE_STAGES_SPEC),
         outlier_residual_vae_codebook_bits=_parse_cat_override(
             raw_args.outlier_residual_vae_codebook_bits,
@@ -943,6 +953,18 @@ def _validate_outlier_protect_mode_args(cat_args: NormalizedCatArgs) -> None:
         )
     if min_per_layer < 0:
         raise ValueError(f"--outlier_protect_min_per_layer must be >= 0, got {min_per_layer}.")
+    channel_quant = normalize_protected_channel_quant_format(cat_args.outlier_protect_channel_quant)
+    if channel_quant != PROTECTED_CHANNEL_QUANT_NONE:
+        if mode != "channel":
+            raise ValueError(
+                f"--outlier_protect_channel_quant={cat_args.outlier_protect_channel_quant!r} "
+                f"is only valid when --outlier_protect_mode=channel."
+            )
+        if not _override_table_contains(protect_table, lambda value: int(value) > 0):
+            raise ValueError(
+                f"--outlier_protect_channel_quant={cat_args.outlier_protect_channel_quant!r} "
+                "requires --outlier_protect_count > 0 for at least one selector."
+            )
     invalid_min_entries = [
         f"{selector}={int(value)}"
         for selector, value in _iter_override_entries(protect_table)
@@ -1281,6 +1303,13 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="仅 blocked_quantized 生效。残差 value 量化位宽：4 或 8。",
     )
     parser.add_argument("--outlier_protect_axis", type=str, choices=["input", "output"], default="input", help="Choose whether outlier protection preserves input channels or output channels.")
+    parser.add_argument(
+        "--outlier_protect_channel_quant",
+        type=str,
+        choices=list(PROTECTED_CHANNEL_QUANT_CHOICES),
+        default=PROTECTED_CHANNEL_QUANT_NONE,
+        help="仅 channel 模式生效。protected channel 权重存储格式：none / fp8_e4m3 / fp8_e5m2 / int8。",
+    )
     parser.add_argument("--outlier_residual_vae_stages", type=str, default="default=1", help=f"channel_residual_vae 模式下 protected channel residual VAE 阶数。示例：{_OUTLIER_RESIDUAL_VAE_STAGES_SPEC.example}")
     parser.add_argument(
         "--outlier_residual_vae_codebook_bits",

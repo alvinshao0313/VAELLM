@@ -496,6 +496,10 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "shape": list(protected_out_weight.shape),
                 "dtype": _dtype_to_name(protected_out_weight.dtype),
             }
+        protected_input_qvalues_spec = _tensor_spec(getattr(module, "protected_input_qvalues", None))
+        protected_input_scales_spec = _tensor_spec(getattr(module, "protected_input_scales", None))
+        protected_output_qvalues_spec = _tensor_spec(getattr(module, "protected_output_qvalues", None))
+        protected_output_scales_spec = _tensor_spec(getattr(module, "protected_output_scales", None))
         low_rank_a_spec = _tensor_spec(getattr(module, "low_rank_a", None))
         low_rank_b_spec = _tensor_spec(getattr(module, "low_rank_b", None))
         sparse_residual_specs = _collect_sparse_residual_specs(module)
@@ -560,8 +564,15 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
                 "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
                 "protected_input_indices": protected_idx_spec,
                 "protected_input_weight": protected_weight_spec,
+                "protected_input_qvalues": protected_input_qvalues_spec,
+                "protected_input_scales": protected_input_scales_spec,
                 "protected_output_indices": protected_out_idx_spec,
                 "protected_output_weight": protected_out_weight_spec,
+                "protected_output_qvalues": protected_output_qvalues_spec,
+                "protected_output_scales": protected_output_scales_spec,
+                "protected_channel_quant_format": str(
+                    getattr(module, "protected_channel_quant_format", "none")
+                ),
                 "low_rank_a": low_rank_a_spec,
                 "low_rank_b": low_rank_b_spec,
                 "protected_residual_axis": getattr(module, "protected_residual_axis", None),
@@ -983,6 +994,38 @@ def _rebuild_converted_modules(
                 raise ValueError(f"[{name}] protected_output_weight shape must be 2D, got {shape}")
             protected_out_weight_dtype = _name_to_dtype(str(protected_out_weight_spec.get("dtype", "float32")))
             protected_out_weight_payload = torch.zeros(shape, dtype=protected_out_weight_dtype, device=device)
+        protected_input_qvalues_payload = None
+        protected_input_qvalues_spec = spec.get("protected_input_qvalues")
+        if isinstance(protected_input_qvalues_spec, dict):
+            shape = tuple(int(v) for v in protected_input_qvalues_spec.get("shape", []))
+            if len(shape) != 2:
+                raise ValueError(f"[{name}] protected_input_qvalues shape must be 2D, got {shape}")
+            protected_input_qvalues_dtype = _name_to_dtype(str(protected_input_qvalues_spec.get("dtype", "uint8")))
+            protected_input_qvalues_payload = torch.zeros(shape, dtype=protected_input_qvalues_dtype, device=device)
+        protected_input_scales_payload = None
+        protected_input_scales_spec = spec.get("protected_input_scales")
+        if isinstance(protected_input_scales_spec, dict):
+            shape = tuple(int(v) for v in protected_input_scales_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] protected_input_scales shape must be 1D, got {shape}")
+            protected_input_scales_dtype = _name_to_dtype(str(protected_input_scales_spec.get("dtype", "bfloat16")))
+            protected_input_scales_payload = torch.zeros(shape, dtype=protected_input_scales_dtype, device=device)
+        protected_output_qvalues_payload = None
+        protected_output_qvalues_spec = spec.get("protected_output_qvalues")
+        if isinstance(protected_output_qvalues_spec, dict):
+            shape = tuple(int(v) for v in protected_output_qvalues_spec.get("shape", []))
+            if len(shape) != 2:
+                raise ValueError(f"[{name}] protected_output_qvalues shape must be 2D, got {shape}")
+            protected_output_qvalues_dtype = _name_to_dtype(str(protected_output_qvalues_spec.get("dtype", "uint8")))
+            protected_output_qvalues_payload = torch.zeros(shape, dtype=protected_output_qvalues_dtype, device=device)
+        protected_output_scales_payload = None
+        protected_output_scales_spec = spec.get("protected_output_scales")
+        if isinstance(protected_output_scales_spec, dict):
+            shape = tuple(int(v) for v in protected_output_scales_spec.get("shape", []))
+            if len(shape) != 1:
+                raise ValueError(f"[{name}] protected_output_scales shape must be 1D, got {shape}")
+            protected_output_scales_dtype = _name_to_dtype(str(protected_output_scales_spec.get("dtype", "bfloat16")))
+            protected_output_scales_payload = torch.zeros(shape, dtype=protected_output_scales_dtype, device=device)
         protected_residual_idx_payload = None
         protected_residual_idx_spec = spec.get("protected_residual_indices")
         if isinstance(protected_residual_idx_spec, dict):
@@ -1193,8 +1236,13 @@ def _rebuild_converted_modules(
             compressed_out_features=int(spec.get("compressed_out_features", spec["out_features"])),
             protected_input_indices=protected_idx_payload,
             protected_input_weight=protected_weight_payload,
+            protected_input_qvalues=protected_input_qvalues_payload,
+            protected_input_scales=protected_input_scales_payload,
             protected_output_indices=protected_out_idx_payload,
             protected_output_weight=protected_out_weight_payload,
+            protected_output_qvalues=protected_output_qvalues_payload,
+            protected_output_scales=protected_output_scales_payload,
+            protected_channel_quant_format=str(spec.get("protected_channel_quant_format", "none")),
             sparse_residual_format=str(spec.get("sparse_residual_format", "coo_fp16")),
             sparse_residual_row_indices=sparse_row_idx_payload,
             sparse_residual_col_indices=sparse_col_idx_payload,

@@ -20,7 +20,7 @@ from train_utils.cat_train_args import ResolvedCategoryRuntimeConfig, parse_skip
 
 _CATEGORY_SELECTORS = ("default", "cat")
 _RECON_LOSS_TYPE_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse")
-_NORM_TYPE_CHOICES = ("group", "batch", "layer", "no")
+_NORM_TYPE_CHOICES = ("group", "batch", "layer", "rms", "no")
 _DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OPTIMIZER_CHOICES = ("adam", "adamw", "sgd", "rmsprop")
 _LR_SCHEDULER_CHOICES = ("none", "linear", "cosine", "constant", "constant_with_warmup")

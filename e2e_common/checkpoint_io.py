@@ -142,8 +142,13 @@ def _collect_single_vae_linear_spec(name: str, module) -> Dict[str, Any]:
         "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
         "protected_input_indices": _tensor_spec(getattr(module, "protected_input_indices", None)),
         "protected_input_weight": _tensor_spec(getattr(module, "protected_input_weight", None)),
+        "protected_input_qvalues": _tensor_spec(getattr(module, "protected_input_qvalues", None)),
+        "protected_input_scales": _tensor_spec(getattr(module, "protected_input_scales", None)),
         "protected_output_indices": _tensor_spec(getattr(module, "protected_output_indices", None)),
         "protected_output_weight": _tensor_spec(getattr(module, "protected_output_weight", None)),
+        "protected_output_qvalues": _tensor_spec(getattr(module, "protected_output_qvalues", None)),
+        "protected_output_scales": _tensor_spec(getattr(module, "protected_output_scales", None)),
+        "protected_channel_quant_format": str(getattr(module, "protected_channel_quant_format", "none")),
         **_collect_sparse_residual_specs(module),
     }
 

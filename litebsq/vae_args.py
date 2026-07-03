@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 
-_AUTOENCODER_NORM_CHOICES = ("group", "batch", "layer", "no")
+_AUTOENCODER_NORM_CHOICES = ("group", "batch", "layer", "rms", "no")
 _AUTOENCODER_DECODER_CHOICES = ("linear", "symmetric", "asymmetric")
 _DYNAMIC_ARCH_FIELDS = (
     "base_ch",

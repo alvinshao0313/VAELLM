@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=5
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -30,6 +30,7 @@ export HF_DATASETS_OFFLINE=1
 # --outlier_rank_metric "sparse_residual_abs" / "sparse_residual_actmax_abs" / "sparse_residual_actmean_abs" / "sparse_weight_abs" / "sparse_weight_actmax_abs" / "sparse_weight_actmean_abs"
 # --outlier_rank_metric "channel_weight_abs" / "channel_weight_actmax_abs" / "channel_weight_actmean_abs" / "channel_residual_abs" / "channel_residual_actmax_abs" / "channel_residual_actmean_abs" / "channel_residual_actrms_abs"
 # --outlier_channel_scope "layer" / "category"
+# --outlier_protect_channel_quant "none" / "fp8_e4m3" / "fp8_e5m2" / "int8"
 # --outlier_protect_mode "channel_residual_vae"
 # --outlier_residual_vae_stages "default=1,cat:q_proj=2"
 # --outlier_residual_vae_decoder_share_scope "none" / "category"
@@ -59,7 +60,7 @@ python tools/cat_train.py \
   --save_model \
   --convert_device "cuda" \
   --allow_tail_group "true" \
-  --target_categories "down_proj" \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --linear_group_size "36" \
@@ -75,11 +76,11 @@ python tools/cat_train.py \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
   --base_ch "default=128" \
-  --num_res_blocks "default=1" \
+  --num_res_blocks "default=0" \
   --decoder_base_ch "default=128" \
   --decoder_num_res_blocks "default=1" \
   --norm_type "default=layer" \
-  --decoder_type "default=symmetric" \
+  --decoder_type "default=linear" \
   --recon_loss_type "default=mse" \
   --quantizer_type "BSQ" \
   --gamma0 "1.0" \
@@ -107,20 +108,21 @@ python tools/cat_train.py \
   --eval_ppl "false" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
-  --outlier_protect_mode "none" \
-  --outlier_channel_scope "category" \
-  --outlier_residual_vae_decoder_share_scope "category" \
+  --outlier_protect_mode "channel" \
+  --outlier_channel_scope "layer" \
+  --outlier_protect_channel_quant "none" \
+  --outlier_residual_vae_decoder_share_scope "none" \
   --outlier_residual_vae_batch_multiplier "4" \
   --outlier_residual_vae_steps "1500" \
   --outlier_residual_vae_lr "1e-3" \
   --outlier_residual_vae_stages "default=1" \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_protect_count "default=32" \
+  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=32,cat:o_proj=32,cat:gate_proj=32,cat:up_proj=32,cat:down_proj=128" \
   --outlier_protect_min_per_layer 1 \
   --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.0" \
-  --outlier_rank_metric "channel_weight_actmax_abs" \
+  --outlier_rank_metric "channel_weight_actmean_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \

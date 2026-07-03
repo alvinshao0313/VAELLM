@@ -12,6 +12,11 @@ from litebsq.bitpack import (
     validate_bitpack_u8_spec,
 )
 
+from litebsq.protected_channel_quant import (
+    PROTECTED_CHANNEL_QUANT_NONE,
+    decode_protected_channel_weight,
+    normalize_protected_channel_quant_format,
+)
 from litebsq.sparse_residual import (
     SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED,
     SPARSE_RESIDUAL_FORMAT_CHOICES,
@@ -56,8 +61,13 @@ class VAELinear(nn.Module):
         compressed_out_features: Optional[int] = None,
         protected_input_indices: Optional[torch.Tensor] = None,
         protected_input_weight: Optional[torch.Tensor] = None,
+        protected_input_qvalues: Optional[torch.Tensor] = None,
+        protected_input_scales: Optional[torch.Tensor] = None,
         protected_output_indices: Optional[torch.Tensor] = None,
         protected_output_weight: Optional[torch.Tensor] = None,
+        protected_output_qvalues: Optional[torch.Tensor] = None,
+        protected_output_scales: Optional[torch.Tensor] = None,
+        protected_channel_quant_format: str = PROTECTED_CHANNEL_QUANT_NONE,
         sparse_residual_format: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
         sparse_residual_row_indices: Optional[torch.Tensor] = None,
         sparse_residual_col_indices: Optional[torch.Tensor] = None,
@@ -210,6 +220,11 @@ class VAELinear(nn.Module):
         #     self.register_buffer("part_restore_col_indices", part_restore_idx, persistent=True)
         self.register_buffer("part_restore_col_indices", None, persistent=True)
 
+        self.protected_channel_quant_format = normalize_protected_channel_quant_format(
+            protected_channel_quant_format
+        )
+        use_protected_channel_quant = self.protected_channel_quant_format != PROTECTED_CHANNEL_QUANT_NONE
+
         if protected_input_indices is None:
             self.register_buffer("protected_input_indices", None, persistent=True)
         else:
@@ -240,6 +255,10 @@ class VAELinear(nn.Module):
         if protected_input_weight is None:
             self.register_parameter("protected_input_weight", None)
         else:
+            if use_protected_channel_quant:
+                raise ValueError(
+                    "protected_input_weight cannot be provided when protected_channel_quant_format != 'none'."
+                )
             if isinstance(protected_input_weight, nn.Parameter):
                 protected_weight = protected_input_weight
             else:
@@ -258,12 +277,51 @@ class VAELinear(nn.Module):
                 )
             protected_weight.requires_grad = False
             self.register_parameter("protected_input_weight", protected_weight)
+
+        if protected_input_qvalues is None:
+            self.register_buffer("protected_input_qvalues", None, persistent=True)
+        else:
+            if not use_protected_channel_quant:
+                raise ValueError(
+                    "protected_input_qvalues requires protected_channel_quant_format != 'none'."
+                )
+            qvalues = protected_input_qvalues.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+            if qvalues.ndim != 2:
+                raise ValueError(f"protected_input_qvalues must be 2D, got shape={tuple(qvalues.shape)}")
+            if int(qvalues.shape[0]) != protected_count or int(qvalues.shape[1]) != self.out_features:
+                raise ValueError(
+                    f"protected_input_qvalues shape {tuple(qvalues.shape)} != "
+                    f"({protected_count}, {self.out_features})"
+                )
+            self.register_buffer("protected_input_qvalues", qvalues, persistent=True)
+
+        if protected_input_scales is None:
+            self.register_buffer("protected_input_scales", None, persistent=True)
+        else:
+            if not use_protected_channel_quant:
+                raise ValueError(
+                    "protected_input_scales requires protected_channel_quant_format != 'none'."
+                )
+            scales = protected_input_scales.detach().to(device="cpu", dtype=torch.bfloat16).reshape(-1).contiguous()
+            if int(scales.numel()) != protected_count:
+                raise ValueError(
+                    f"protected_input_scales length {int(scales.numel())} != protected_count {protected_count}"
+                )
+            self.register_buffer("protected_input_scales", scales, persistent=True)
+
         if protected_count == 0 and self.compressed_in_features != self.in_features:
             raise ValueError(
                 f"compressed_in_features={self.compressed_in_features} requires protected_input_indices to be present."
             )
-        if protected_count > 0 and self.protected_input_weight is None:
-            raise ValueError("protected_input_weight is required when protected_input_indices is provided.")
+        if protected_count > 0:
+            if use_protected_channel_quant:
+                if self.protected_input_qvalues is None or self.protected_input_scales is None:
+                    raise ValueError(
+                        "protected_input_qvalues and protected_input_scales are required when "
+                        "protected_input_indices is provided with quantized protected channels."
+                    )
+            elif self.protected_input_weight is None:
+                raise ValueError("protected_input_weight is required when protected_input_indices is provided.")
 
         if protected_output_indices is None:
             self.register_buffer("protected_output_indices", None, persistent=True)
@@ -299,6 +357,10 @@ class VAELinear(nn.Module):
         if protected_output_weight is None:
             self.register_parameter("protected_output_weight", None)
         else:
+            if use_protected_channel_quant:
+                raise ValueError(
+                    "protected_output_weight cannot be provided when protected_channel_quant_format != 'none'."
+                )
             if isinstance(protected_output_weight, nn.Parameter):
                 protected_out_weight = protected_output_weight
             else:
@@ -320,12 +382,51 @@ class VAELinear(nn.Module):
                 )
             protected_out_weight.requires_grad = False
             self.register_parameter("protected_output_weight", protected_out_weight)
+
+        if protected_output_qvalues is None:
+            self.register_buffer("protected_output_qvalues", None, persistent=True)
+        else:
+            if not use_protected_channel_quant:
+                raise ValueError(
+                    "protected_output_qvalues requires protected_channel_quant_format != 'none'."
+                )
+            out_qvalues = protected_output_qvalues.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+            if out_qvalues.ndim != 2:
+                raise ValueError(f"protected_output_qvalues must be 2D, got shape={tuple(out_qvalues.shape)}")
+            if int(out_qvalues.shape[0]) != protected_out_count or int(out_qvalues.shape[1]) != self.in_features:
+                raise ValueError(
+                    f"protected_output_qvalues shape {tuple(out_qvalues.shape)} != "
+                    f"({protected_out_count}, {self.in_features})"
+                )
+            self.register_buffer("protected_output_qvalues", out_qvalues, persistent=True)
+
+        if protected_output_scales is None:
+            self.register_buffer("protected_output_scales", None, persistent=True)
+        else:
+            if not use_protected_channel_quant:
+                raise ValueError(
+                    "protected_output_scales requires protected_channel_quant_format != 'none'."
+                )
+            out_scales = protected_output_scales.detach().to(device="cpu", dtype=torch.bfloat16).reshape(-1).contiguous()
+            if int(out_scales.numel()) != protected_out_count:
+                raise ValueError(
+                    f"protected_output_scales length {int(out_scales.numel())} != protected_out_count {protected_out_count}"
+                )
+            self.register_buffer("protected_output_scales", out_scales, persistent=True)
+
         if protected_out_count == 0 and self.compressed_out_features != self.out_features:
             raise ValueError(
                 f"compressed_out_features={self.compressed_out_features} requires protected_output_indices to be present."
             )
-        if protected_out_count > 0 and self.protected_output_weight is None:
-            raise ValueError("protected_output_weight is required when protected_output_indices is provided.")
+        if protected_out_count > 0:
+            if use_protected_channel_quant:
+                if self.protected_output_qvalues is None or self.protected_output_scales is None:
+                    raise ValueError(
+                        "protected_output_qvalues and protected_output_scales are required when "
+                        "protected_output_indices is provided with quantized protected channels."
+                    )
+            elif self.protected_output_weight is None:
+                raise ValueError("protected_output_weight is required when protected_output_indices is provided.")
 
         resolved_sparse_format = str(sparse_residual_format).strip().lower()
         if resolved_sparse_format not in SPARSE_RESIDUAL_FORMAT_CHOICES:
@@ -2037,6 +2138,56 @@ class VAELinear(nn.Module):
         full_weight.index_add_(0, idx, patch)
         return full_weight
 
+    def _decode_protected_input_weight_rows(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        qvalues = getattr(self, "protected_input_qvalues", None)
+        if isinstance(qvalues, torch.Tensor) and int(qvalues.numel()) > 0:
+            scales = getattr(self, "protected_input_scales", None)
+            if scales is None:
+                raise RuntimeError("protected_input_scales is missing while protected_input_qvalues is set.")
+            return decode_protected_channel_weight(
+                qvalues,
+                scales,
+                quant_format=str(self.protected_channel_quant_format),
+                dtype=dtype,
+                device=device,
+            )
+        protected_weight = getattr(self, "protected_input_weight", None)
+        if protected_weight is None:
+            raise RuntimeError("protected_input_weight is missing while protected_input_indices is set.")
+        if protected_weight.device != device or protected_weight.dtype != dtype:
+            protected_weight = protected_weight.to(device=device, dtype=dtype, non_blocking=True)
+        return protected_weight.contiguous()
+
+    def _decode_protected_output_weight_rows(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        qvalues = getattr(self, "protected_output_qvalues", None)
+        if isinstance(qvalues, torch.Tensor) and int(qvalues.numel()) > 0:
+            scales = getattr(self, "protected_output_scales", None)
+            if scales is None:
+                raise RuntimeError("protected_output_scales is missing while protected_output_qvalues is set.")
+            return decode_protected_channel_weight(
+                qvalues,
+                scales,
+                quant_format=str(self.protected_channel_quant_format),
+                dtype=dtype,
+                device=device,
+            )
+        protected_out_weight = getattr(self, "protected_output_weight", None)
+        if protected_out_weight is None:
+            raise RuntimeError("protected_output_weight is missing while protected_output_indices is set.")
+        if protected_out_weight.device != device or protected_out_weight.dtype != dtype:
+            protected_out_weight = protected_out_weight.to(device=device, dtype=dtype, non_blocking=True)
+        return protected_out_weight.contiguous()
+
     def _materialize_full_weight(
         self,
         compressed_weight: torch.Tensor,
@@ -2058,16 +2209,15 @@ class VAELinear(nn.Module):
                 dtype=dtype,
                 device=full_weight.device,
             )
-            protected_out_weight = getattr(self, "protected_output_weight", None)
-            if protected_out_weight is None:
-                raise RuntimeError("protected_output_weight is missing while protected_output_indices is set.")
+            protected_out_weight = self._decode_protected_output_weight_rows(
+                dtype=dtype,
+                device=full_weight.device,
+            )
             # When output protection is enabled, compressed_in_features should still match original in_features.
             if int(protected_out_weight.shape[1]) != int(self.compressed_in_features):
                 raise RuntimeError(
                     "protected_output_weight shape is incompatible with compressed_in_features."
                 )
-            if protected_out_weight.device != full_weight.device or protected_out_weight.dtype != dtype:
-                protected_out_weight = protected_out_weight.to(device=full_weight.device, dtype=dtype, non_blocking=True)
             full_out.index_copy_(0, protected_out_idx, protected_out_weight)
             keep_out_mask = torch.ones(self.out_features, dtype=torch.bool, device=full_weight.device)
             keep_out_mask[protected_out_idx] = False
@@ -2096,12 +2246,11 @@ class VAELinear(nn.Module):
             dtype=dtype,
             device=full_weight.device,
         )
-        protected_weight = getattr(self, "protected_input_weight", None)
-        if protected_weight is None:
-            raise RuntimeError("protected_input_weight is missing while protected_input_indices is set.")
+        protected_weight = self._decode_protected_input_weight_rows(
+            dtype=dtype,
+            device=full_weight.device,
+        )
         protected_weight = protected_weight.t().contiguous()
-        if protected_weight.device != full_weight.device or protected_weight.dtype != dtype:
-            protected_weight = protected_weight.to(device=full_weight.device, dtype=dtype, non_blocking=True)
         full_in.index_copy_(1, protected_idx, protected_weight)
 
         keep_mask = torch.ones(self.in_features, dtype=torch.bool, device=full_weight.device)

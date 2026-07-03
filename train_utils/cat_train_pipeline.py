@@ -596,8 +596,12 @@ def _select_channel_residual_vae_plan_from_final_residual(
                     split_meta,
                     protected_input_indices=idx,
                     protected_input_weight=None,
+                    protected_input_qvalues=None,
+                    protected_input_scales=None,
                     protected_output_indices=None,
                     protected_output_weight=None,
+                    protected_output_qvalues=None,
+                    protected_output_scales=None,
                 )
             )
         else:
@@ -606,8 +610,12 @@ def _select_channel_residual_vae_plan_from_final_residual(
                     split_meta,
                     protected_input_indices=None,
                     protected_input_weight=None,
+                    protected_input_qvalues=None,
+                    protected_input_scales=None,
                     protected_output_indices=idx,
                     protected_output_weight=None,
+                    protected_output_qvalues=None,
+                    protected_output_scales=None,
                 )
             )
 
@@ -735,8 +743,21 @@ def _build_vae_linear_from_stage_payload(
     protect_original_weight: bool,
     sparse_residual_kwargs: Optional[Dict[str, object]] = None,
     protected_residual_kwargs: Optional[Dict[str, object]] = None,
+    protected_channel_quant_format: str = "none",
 ):
     from litebsq.vae_linear import VAELinear
+
+    def _has_protected_input_payload(split_meta) -> bool:
+        return (
+            split_meta.protected_input_weight is not None
+            or split_meta.protected_input_qvalues is not None
+        )
+
+    def _has_protected_output_payload(split_meta) -> bool:
+        return (
+            split_meta.protected_output_weight is not None
+            or split_meta.protected_output_qvalues is not None
+        )
 
     residual_stages = int(len(stage_part_bits_payload))
     if residual_stages < 1:
@@ -756,16 +777,21 @@ def _build_vae_linear_from_stage_payload(
         compressed_out_features=int(split_meta.compressed_out_features),
         protected_input_indices=(
             split_meta.protected_input_indices
-            if split_meta.protected_input_weight is not None
+            if _has_protected_input_payload(split_meta)
             else None
         ),
         protected_input_weight=split_meta.protected_input_weight,
+        protected_input_qvalues=split_meta.protected_input_qvalues,
+        protected_input_scales=split_meta.protected_input_scales,
         protected_output_indices=(
             split_meta.protected_output_indices
-            if split_meta.protected_output_weight is not None
+            if _has_protected_output_payload(split_meta)
             else None
         ),
         protected_output_weight=split_meta.protected_output_weight,
+        protected_output_qvalues=split_meta.protected_output_qvalues,
+        protected_output_scales=split_meta.protected_output_scales,
+        protected_channel_quant_format=str(protected_channel_quant_format),
         always_use_original=bool(always_use_original),
         protect_original_weight=bool(protect_original_weight),
     )
@@ -1117,6 +1143,7 @@ def train_group_vae_payload(
     outlier_rank_metric: str = "sparse_residual_abs",
     outlier_residual_min_abs: float = 1e-6,
     outlier_protect_axis: str = "input",
+    outlier_protect_channel_quant: str = "none",
     outlier_protect_min_per_layer: int = 0,
     outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
     outlier_residual_index_bits: int = 8,
@@ -1254,6 +1281,7 @@ def train_group_vae_payload(
         )
     resolved_residual_codec = str(outlier_residual_codec).strip().lower()
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
+    use_channel_weight_loss = stage_recon_loss in {"wa_mse", "amse"}
     row_parts, col_parts = 1, 1
     parts_per_linear = 1
     sort_mode = str(runtime_cfg.intra_part_sort_mode).strip().lower()
@@ -1265,7 +1293,7 @@ def train_group_vae_payload(
     #     or residual_sparse_needs_activation
     # )
     needs_dynamic_activation = (
-        use_wa_mse_loss
+        use_channel_weight_loss
         or residual_sparse_needs_activation
         or channel_rank_needs_actmax
         or channel_rank_needs_actmean
@@ -1277,7 +1305,7 @@ def train_group_vae_payload(
     if needs_dynamic_activation:
         if activation_runtime is None:
             raise ValueError(
-                f"[{group_tag}] dynamic activation runtime is required for wa_mse or outlier protection."
+                f"[{group_tag}] dynamic activation runtime is required for wa_mse/amse or outlier protection."
             )
         calib_device = str(activation_runtime.get("device") or train_device)
         linear_items = [(r.name, r.module) for r in group_refs]
@@ -1330,9 +1358,16 @@ def train_group_vae_payload(
         )
         for r in group_refs
     ]
+    stage_recon_loss_resolved = str(stage_recon_loss).strip().lower()
+    if stage_recon_loss_resolved == "wa_mse":
+        prep_channel_weight_by_linear = effective_activation_weight
+    elif stage_recon_loss_resolved == "amse":
+        prep_channel_weight_by_linear = effective_activation_sq_mean
+    else:
+        prep_channel_weight_by_linear = effective_activation_weight
     prepared_entries = prepare_group_linear_entries(
         group_refs=prep_refs,
-        activation_weight_by_linear=effective_activation_weight,
+        activation_weight_by_linear=prep_channel_weight_by_linear,
         activation_abs_mean_by_linear=effective_activation_abs_mean,
         outlier_protect_count=(
             int(outlier_protect_count)
@@ -1340,6 +1375,7 @@ def train_group_vae_payload(
             else 0
         ),
         outlier_protect_axis=str(outlier_protect_axis),
+        outlier_protect_channel_quant=str(outlier_protect_channel_quant),
         recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
         intra_part_sort_mode=stage_sort_mode,
         outlier_channel_plan=outlier_channel_plan if resolved_outlier_mode == "channel" and channel_protection_enabled else None,
@@ -1411,7 +1447,7 @@ def train_group_vae_payload(
             int(outlier_residual_block_shape[1]),
         )
     if use_wa_mse:
-        log.info("[%s] wa_mse enabled with online act_max gather.", group_tag)
+        log.info("[%s] %s enabled with online channel weight gather.", group_tag, stage_recon_loss)
     need_stage_payload = bool(do_convert or residual_stages > 1)
     all_stage_bits: List[torch.Tensor] = []
     all_stage_decoders: List[List[nn.Module]] = []
@@ -1523,7 +1559,11 @@ def train_group_vae_payload(
         effective_batch_size = int(stage_train_data.shape[0]) if batch_size_is_all else int(materialize_batch_size)
         # eval 固定覆盖完整 residual stage，但始终按 batch 重构，避免 all-batch 一次前向 OOM。
         eval_batch_size = int(materialize_batch_size)
-        all_batch_gpu_cache = bool(batch_size_is_all and stage_recon_loss != "wa_mse" and not gpu_resident_enabled)
+        all_batch_gpu_cache = bool(
+            batch_size_is_all
+            and stage_recon_loss not in {"wa_mse", "amse"}
+            and not gpu_resident_enabled
+        )
         if int(effective_batch_size) < 1:
             raise RuntimeError(f"[{stage_tag}] effective VAE batch size must be >= 1, got {effective_batch_size}.")
         if batch_size_is_all:
@@ -1627,7 +1667,7 @@ def train_group_vae_payload(
             if gpu_resident_enabled:
                 if batch_size_is_all:
                     x = x_all
-                    if stage_recon_loss == "wa_mse":
+                    if stage_recon_loss in {"wa_mse", "amse"}:
                         block_idx_batch = torch.arange(num_stage_blocks, device=train_device, dtype=torch.long)
                         act_max_batch = gather_wa_mse_act_max_batch(
                             block_idx_batch=block_idx_batch,
@@ -1640,7 +1680,7 @@ def train_group_vae_payload(
                     block_idx_batch = _next_gpu_train_indices()
                     block_idx_gpu = block_idx_batch.to(device=train_device, dtype=torch.long, non_blocking=True)
                     x = gpu_stage_train_data.index_select(0, block_idx_gpu)
-                    if stage_recon_loss == "wa_mse":
+                    if stage_recon_loss in {"wa_mse", "amse"}:
                         act_max_batch = gather_wa_mse_act_max_batch(
                             block_idx_batch=block_idx_gpu,
                             part_metas=part_metas,
@@ -1658,7 +1698,7 @@ def train_group_vae_payload(
                     x_batch, block_idx_batch = next(train_iter)
 
                 x = x_batch.to(device=train_device, dtype=train_dtype, non_blocking=True)
-                if stage_recon_loss == "wa_mse":
+                if stage_recon_loss in {"wa_mse", "amse"}:
                     act_max_batch = gather_wa_mse_act_max_batch(
                         block_idx_batch=block_idx_batch,
                         part_metas=part_metas,
@@ -2070,6 +2110,7 @@ def train_group_vae_payload(
         "resolved_protected_residual_vae_codebook_bits": int(protected_residual_vae_codebook_bits),
         "resolved_protected_residual_vae_codebook_dim": int(protected_residual_vae_codebook_dim),
         "protected_residual_payload_by_name": protected_residual_payload_by_name,
+        "protected_channel_quant_format": str(outlier_protect_channel_quant),
     }
     del current_residual_weights, target_common_result
     torch.cuda.empty_cache()
@@ -2110,6 +2151,7 @@ def apply_group_vae_payload(
     outlier_residual_value_bits = int(payload["outlier_residual_value_bits"])
     outlier_residual_block_shape = tuple(int(v) for v in payload["outlier_residual_block_shape"])
     protected_residual_payload_by_name = payload.get("protected_residual_payload_by_name") or {}
+    protected_channel_quant_format = str(payload.get("protected_channel_quant_format", "none"))
 
     if (
         len(all_stage_bits) != residual_stages
@@ -2252,6 +2294,7 @@ def apply_group_vae_payload(
             protect_original_weight=skip_this,
             sparse_residual_kwargs=sparse_residual_kwargs,
             protected_residual_kwargs=protected_residual_kwargs,
+            protected_channel_quant_format=protected_channel_quant_format,
         ).to(convert_device)
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)
@@ -2283,6 +2326,7 @@ def _train_group_vae_and_replace(
     outlier_rank_metric: str = "sparse_residual_abs",
     outlier_residual_min_abs: float = 1e-6,
     outlier_protect_axis: str = "input",
+    outlier_protect_channel_quant: str = "none",
     outlier_protect_min_per_layer: int = 0,
     outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
     outlier_residual_index_bits: int = 8,
@@ -2321,6 +2365,7 @@ def _train_group_vae_and_replace(
         outlier_rank_metric=outlier_rank_metric,
         outlier_residual_min_abs=outlier_residual_min_abs,
         outlier_protect_axis=outlier_protect_axis,
+        outlier_protect_channel_quant=outlier_protect_channel_quant,
         outlier_protect_min_per_layer=outlier_protect_min_per_layer,
         outlier_residual_codec=outlier_residual_codec,
         outlier_residual_index_bits=outlier_residual_index_bits,
@@ -2376,6 +2421,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     model = _load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
     activation_runtime: Optional[Dict[str, object]] = None
     outlier_protect_axis = str(getattr(cat_args, "outlier_protect_axis", "input")).strip().lower()
+    outlier_protect_channel_quant = str(getattr(cat_args, "outlier_protect_channel_quant", "none")).strip().lower()
     transpose_modules = _split_csv(cat_args.transpose_modules)
     target_categories = _split_csv(cat_args.target_categories)
     only_decoder_projections = not bool(cat_args.include_all_linears)
@@ -2510,6 +2556,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
 
     any_wa_mse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip(
     ).lower() == "wa_mse" for cat in active_categories)
+    any_amse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip(
+    ).lower() == "amse" for cat in active_categories)
+    any_channel_weight_loss = any_wa_mse or any_amse
     any_outlier_protect = any(count > 0 for count in category_outlier_protect_count.values())
     channel_protect_needs_activation = (
         resolved_outlier_mode in {"channel", "channel_residual_vae"}
@@ -2530,7 +2579,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         )
     )
     sort_needs_act = False  # 排序代码，已关闭。
-    if any_wa_mse or channel_protect_needs_activation or sort_needs_act or residual_sparse_needs_activation:
+    if any_channel_weight_loss or channel_protect_needs_activation or sort_needs_act or residual_sparse_needs_activation:
         activation_dataset = str(getattr(cat_args, "wa_mse_calib_dataset", "")).strip()
         if not activation_dataset:
             raise ValueError(
@@ -2552,6 +2601,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         enabled_features: List[str] = []
         if any_wa_mse:
             enabled_features.append("wa_mse")
+        if any_amse:
+            enabled_features.append("amse")
         if channel_protect_needs_activation:
             enabled_features.append("outlier_protect")
         if residual_sparse_needs_activation:
@@ -2815,6 +2866,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     outlier_rank_metric=resolved_outlier_rank_metric,
                     outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
                     outlier_protect_axis=outlier_protect_axis,
+                    outlier_protect_channel_quant=outlier_protect_channel_quant,
                     outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
                     outlier_residual_codec=cat_args.outlier_residual_codec,
                     outlier_residual_index_bits=cat_args.outlier_residual_index_bits,

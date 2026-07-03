@@ -423,6 +423,18 @@ class AutoEncoder(nn.Module):
             errors = (x_recon_f - x_f).pow(2)
             weights = x_f.abs() * act_f
             return (errors * weights).mean()
+        if self.recon_loss_type == "amse":
+            if act_max is None:
+                raise ValueError("recon_loss_type=amse requires hessian_diag/channel_weight tensor.")
+            if act_max.shape != x.shape:
+                raise ValueError(
+                    f"amse shape mismatch: hessian_diag={tuple(act_max.shape)} vs x={tuple(x.shape)}"
+                )
+            x_f = x.float()
+            x_recon_f = x_recon.float()
+            h_f = act_max.float()
+            errors = (x_recon_f - x_f).pow(2)
+            return (errors * h_f).mean()
         return torch.zeros((), device=x.device, dtype=torch.float32)
 
     def _forward_train(self, x: Tensor, act_max: Optional[Tensor] = None):
