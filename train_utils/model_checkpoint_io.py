@@ -357,6 +357,7 @@ def _decoder_to_spec(decoder: Decoder) -> Dict[str, Any]:
     hidden_dim = int(getattr(decoder, "hidden_dim"))
     num_res_blocks = int(getattr(decoder, "num_res_blocks"))
     norm_type = str(getattr(decoder, "norm_type"))
+    activation_type = str(getattr(decoder, "activation_type", "swish"))
 
     first_param = next(decoder.parameters(), None)
     param_dtype = _dtype_to_name(first_param.dtype) if first_param is not None else "float32"
@@ -367,6 +368,7 @@ def _decoder_to_spec(decoder: Decoder) -> Dict[str, Any]:
         "hidden_dim": int(hidden_dim),
         "num_res_blocks": int(num_res_blocks),
         "norm_type": str(norm_type),
+        "activation_type": str(activation_type),
         "decoder_type": str(decoder.decoder_type),
         "use_checkpoint": bool(decoder.use_checkpoint),
         "param_dtype": param_dtype,
@@ -380,6 +382,7 @@ def _build_decoder_from_spec(spec: Dict[str, Any]) -> Decoder:
         hidden_dim=int(spec["hidden_dim"]),
         num_res_blocks=int(spec["num_res_blocks"]),
         norm_type=str(spec["norm_type"]),
+        activation_type=str(spec.get("activation_type", "swish")),
         decoder_type=str(spec["decoder_type"]),
         use_checkpoint=bool(spec["use_checkpoint"]),
         num_models=1,

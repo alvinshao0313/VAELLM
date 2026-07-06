@@ -155,12 +155,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outlier_residual_vae_codebook_bits", type=int, default=0)
     parser.add_argument("--outlier_residual_vae_codebook_dim", type=int, default=0)
     parser.add_argument("--base_batch_size", type=int, default=8192)
-    parser.add_argument("--wa_mse_calib_dataset", type=str, default="")
-    parser.add_argument("--wa_mse_calib_nsamples", type=int, default=512)
-    parser.add_argument("--wa_mse_calib_seqlen", type=int, default=512)
-    parser.add_argument("--wa_mse_calib_seed", type=int, default=0)
-    parser.add_argument("--wa_mse_calib_device", type=str, default="")
-    parser.add_argument("--wa_mse_calib_log_every", type=int, default=0)
+    parser.add_argument("--activation_calib_dataset", type=str, default="")
+    parser.add_argument("--activation_calib_nsamples", type=int, default=512)
+    parser.add_argument("--activation_calib_seqlen", type=int, default=512)
+    parser.add_argument("--activation_calib_seed", type=int, default=0)
+    parser.add_argument("--activation_calib_device", type=str, default="")
+    parser.add_argument("--activation_calib_log_every", type=int, default=0)
     parser.add_argument("--replace_existing_residual_protection", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--access_token", default=None)
@@ -186,6 +186,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder_base_ch", type=int, default=128)
     parser.add_argument("--decoder_num_res_blocks", type=int, default=1)
     parser.add_argument("--norm_type", default="layer", choices=("group", "batch", "layer", "rms", "no"))
+    parser.add_argument("--activation_type", default="swish", choices=("swish", "relu", "none", "sigmoid", "gelu", "hard_swish"))
     parser.add_argument("--decoder_type", default="symmetric", choices=("linear", "symmetric", "asymmetric"))
     parser.add_argument("--recon_loss_type", default="mse")
     parser.add_argument("--quantizer_type", default="BSQ")
@@ -258,17 +259,17 @@ def validate_residual_from_base_args(args: argparse.Namespace, *, provided: set)
     if args.output_dir and os.path.abspath(str(args.output_dir)) == os.path.abspath(str(args.base_vae_checkpoint)):
         raise ValueError("--output_dir must not equal --base_vae_checkpoint.")
     if _metric_requires_activation(metric):
-        if not str(args.wa_mse_calib_dataset).strip():
+        if not str(args.activation_calib_dataset).strip():
             raise ValueError(
-                f"{metric} requires online activation stats; set --wa_mse_calib_dataset."
+                f"{metric} requires online activation stats; set --activation_calib_dataset."
             )
-        if int(args.wa_mse_calib_nsamples) <= 0:
+        if int(args.activation_calib_nsamples) <= 0:
             raise ValueError(
-                f"{metric} requires --wa_mse_calib_nsamples > 0, got {args.wa_mse_calib_nsamples}."
+                f"{metric} requires --activation_calib_nsamples > 0, got {args.activation_calib_nsamples}."
             )
-        if int(args.wa_mse_calib_seqlen) <= 0:
+        if int(args.activation_calib_seqlen) <= 0:
             raise ValueError(
-                f"{metric} requires --wa_mse_calib_seqlen > 0, got {args.wa_mse_calib_seqlen}."
+                f"{metric} requires --activation_calib_seqlen > 0, got {args.activation_calib_seqlen}."
             )
 
     channel_args = {
@@ -422,15 +423,15 @@ def _collect_online_activation_stats(
     if not linear_items:
         raise ValueError("[activation_stats] no target linears found for activation stats collection.")
 
-    dataset = str(args.wa_mse_calib_dataset).strip()
-    device = str(args.wa_mse_calib_device).strip() or str(args.train_device)
+    dataset = str(args.activation_calib_dataset).strip()
+    device = str(args.activation_calib_device).strip() or str(args.train_device)
     logger.info(
         "[activation_stats] collecting activation stats for residual-from-base "
         "dataset=%s nsamples=%d seqlen=%d seed=%d target_linears=%d",
         dataset,
-        int(args.wa_mse_calib_nsamples),
-        int(args.wa_mse_calib_seqlen),
-        int(args.wa_mse_calib_seed),
+        int(args.activation_calib_nsamples),
+        int(args.activation_calib_seqlen),
+        int(args.activation_calib_seed),
         int(len(linear_items)),
     )
     stats_by_linear, _cache = collect_activation_stats_for_linears(
@@ -439,12 +440,12 @@ def _collect_online_activation_stats(
         model_path=str(args.model_path),
         access_token=args.access_token,
         dataset=dataset,
-        nsamples=int(args.wa_mse_calib_nsamples),
-        seqlen=int(args.wa_mse_calib_seqlen),
-        seed=int(args.wa_mse_calib_seed),
+        nsamples=int(args.activation_calib_nsamples),
+        seqlen=int(args.activation_calib_seqlen),
+        seed=int(args.activation_calib_seed),
         device=device,
         cache=None,
-        log_every=int(args.wa_mse_calib_log_every),
+        log_every=int(args.activation_calib_log_every),
         logger=logger,
     )
 
@@ -874,6 +875,7 @@ def _build_runtime_cfg(category: str, args: argparse.Namespace, *, inferred_code
             int(args.decoder_num_res_blocks) if args.decoder_num_res_blocks is not None else None
         ),
         norm_type=str(args.norm_type).strip().lower(),
+        activation_type=str(args.activation_type).strip().lower(),
         decoder_type=str(args.decoder_type).strip().lower(),
     )
 

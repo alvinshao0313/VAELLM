@@ -5,6 +5,7 @@ from typing import Optional, Sequence
 
 
 _AUTOENCODER_NORM_CHOICES = ("group", "batch", "layer", "rms", "no")
+_AUTOENCODER_ACTIVATION_CHOICES = ("swish", "relu", "none", "sigmoid", "gelu", "hard_swish")
 _AUTOENCODER_DECODER_CHOICES = ("linear", "symmetric", "asymmetric")
 _DYNAMIC_ARCH_FIELDS = (
     "base_ch",
@@ -25,6 +26,7 @@ class AutoEncoderArchSpec:
     decoder_num_res_blocks: int
     decoder_type: str
     norm_type: str
+    activation_type: str
     use_checkpoint: bool
 
 
@@ -236,6 +238,15 @@ def add_autoencoder_model_args(parent_parser: argparse.ArgumentParser) -> argpar
         default="group",
     )
     parser.add_argument(
+        "--activation_type",
+        type=lambda v: _parse_choice_or_stage_list(
+            v,
+            arg_name="--activation_type",
+            choices=_AUTOENCODER_ACTIVATION_CHOICES,
+        ),
+        default="swish",
+    )
+    parser.add_argument(
         "--decoder_type",
         type=lambda v: _parse_choice_or_stage_list(
             v,
@@ -278,6 +289,11 @@ def resolve_autoencoder_arch_spec(args) -> AutoEncoderArchSpec:
         arg_name="--norm_type",
         choices=_AUTOENCODER_NORM_CHOICES,
     )
+    activation_type = _parse_choice_like(
+        getattr(args, "activation_type", "swish"),
+        arg_name="--activation_type",
+        choices=_AUTOENCODER_ACTIVATION_CHOICES,
+    )
     if decoder_type == "asymmetric":
         decoder_hidden_dim = _resolve_positive_int(
             getattr(args, "decoder_base_ch", None),
@@ -304,6 +320,7 @@ def resolve_autoencoder_arch_spec(args) -> AutoEncoderArchSpec:
         decoder_num_res_blocks=int(decoder_num_res_blocks),
         decoder_type=str(decoder_type),
         norm_type=str(norm_type),
+        activation_type=str(activation_type),
         use_checkpoint=bool(getattr(args, "vae_decoder_checkpoint", False)),
     )
 
@@ -323,6 +340,7 @@ def apply_autoencoder_arch_defaults(args):
     setattr(args, "decoder_num_res_blocks", int(spec.decoder_num_res_blocks))
     setattr(args, "decoder_type", str(spec.decoder_type))
     setattr(args, "norm_type", str(spec.norm_type))
+    setattr(args, "activation_type", str(spec.activation_type))
     return args
 
 

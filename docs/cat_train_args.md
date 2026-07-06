@@ -49,6 +49,7 @@
 - `decoder_num_res_blocks`
 - `recon_loss_type`
 - `norm_type`
+- `activation_type`
 - `decoder_type`
 
 写法：
@@ -149,6 +150,8 @@
 | `--outlier_channel_scope` | `layer` | channel 计数范围 | `layer` 为每层独立 top-N；`category` 为同类所有层全局排序，总预算为 `N * 有效 linear 数` |
 | `--outlier_residual_top_p` | `default=0.0` | `residual_sparse` 模式下保留最终重构残差 top-p 比例元素 | 类别 override；`residual_sparse` 要求 `0 < p <= 1` |
 | `--outlier_rank_metric` | `sparse_residual_abs` | 离群选择排序指标 | `residual_sparse` 只允许 `sparse_*`；`channel_residual_vae` 只允许 `channel_*`；`channel` 实际保护通道时只允许 `channel_weight_*`；`actmax` 使用激活绝对值最大值，`actmean` 使用激活绝对值均值 |
+| `--outlier_mlp_rank_metric` | `none` | MLP gate/up/down 专用选道指标 | `none` 时 MLP 仍走 `--outlier_rank_metric`；`mlp_intermediate_aligned_actrms` / `actmean_abs` / `actrms_abs` 时按 SwiGLU intermediate path 共享保护通道 |
+| `--outlier_mlp_fuse_weights` | `1,1,1` | MLP aligned 选道的 up/gate/down 融合权重 | 格式 `alpha_up,alpha_gate,alpha_down`；对所有 aligned MLP metric 生效 |
 | `--outlier_residual_min_abs` | `1e-6` | `residual_sparse` 模式下 residual 的最小绝对值门槛 | 全局单值；若 `|original-reconstructed| < threshold`，该位置会从 top-p 中剔除，并继续往后补 |
 | `--outlier_residual_codec` | `coo_fp16` | `residual_sparse` 的存储格式 | `coo_fp16` / `blocked_quantized` |
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
@@ -159,12 +162,20 @@
 | `--outlier_residual_vae_batch_multiplier` | `1` | protected residual VAE batch 放大倍数 | 只影响 protected residual VAE，不影响 base VAE stage1/stage2；category shared residual VAE 推荐 `32`，实际 batch 会被 residual block 总数限制 |
 | `--outlier_residual_vae_steps` | `0` | protected residual VAE 独立训练步数 | `0` 表示继承 base VAE residual stage steps；category shared residual VAE 推荐 `1000~1500` |
 | `--outlier_residual_vae_lr` | `0.0` | protected residual VAE 独立学习率 | `0` 表示继承 base VAE lr；category shared residual VAE 推荐 `0.001~0.003`，当前建议 `0.002` |
-| `--wa_mse_calib_dataset` | `""` | 动态采集时的校准混合数据集 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用；启用动态校准时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5` |
-| `--wa_mse_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
-| `--wa_mse_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
-| `--wa_mse_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / channel outlier protect / residual_sparse(activation-weighted score)` 共用 |
-| `--wa_mse_calib_device` | `""` | 动态采集设备 | 为空时回退 `train_device` |
-| `--wa_mse_calib_log_every` | `0` | 动态采集日志间隔 | `0` 表示关闭 |
+| `--activation_calib_dataset` | `""` | 动态采集时的校准混合数据集 | 供 `wa_mse / channel outlier protect / MLP aligned outlier protect / residual_sparse(activation-weighted score)` 共用；启用动态校准时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5` |
+| `--activation_calib_nsamples` | `512` | 动态采集样本数 | 供 `wa_mse / channel outlier protect / MLP aligned outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--activation_calib_seqlen` | `512` | 动态采集序列长度 | 供 `wa_mse / channel outlier protect / MLP aligned outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--activation_calib_seed` | `0` | 动态采集随机种子 | 供 `wa_mse / channel outlier protect / MLP aligned outlier protect / residual_sparse(activation-weighted score)` 共用 |
+| `--activation_calib_device` | `""` | 动态采集设备 | 为空时回退 `train_device` |
+| `--activation_calib_log_every` | `0` | 动态采集日志间隔 | `0` 表示关闭 |
+
+`--activation_calib_*` 语义：
+
+- 校准 forward **全 run 只执行一次**，在首个 category 开始 VAE 优化前，对全部 target linears 挂 hook 并跑一遍校准数据。
+- 统计来源是**尚未被 VAE 替换的基座 Linear** 输入激活；hook 内以 float32 累积 `max` / `abs_mean` / `sq_mean`。
+- 后续 category / group 只做 lookup 复用，不再重复跑校准 forward。
+- 供 `wa_mse` / `amse` 损失加权、通道重要性判定、`residual_sparse` activation-weighted 打分等共用同一份统计。
+
 | `--eval_ppl` | `true` | 是否在类别后评估阶段运行 PPL | 现在和 `convert` 解耦；`false` 时不跑 PPL |
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
@@ -183,7 +194,7 @@
 | `--distill_loss_alpha` | `default=0.5` | LoRA 蒸馏混合权重 | after-category override |
 | `--distill_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
 | `--distill_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
-| `--distill_hidden_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权，`linear_depth` 让后层权重线性增大并归一到平均权重为 1 |
+| `--distill_hidden_alignment_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权全层；`linear_depth` 后层权重线性增大并归一到平均权重为 1；`adaptive` 默认选 cosine 最低的 3 层；`adaptive_top_<K>` 仅对 teacher 相邻层变化最大的 K 层计算对齐损失 |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 `remaining_lora` 支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
 | `--distill_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 `--distill_after_category=remaining_lora` 支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
 | `--distill_use_post_norm_head_linear` | `false` | 每类后 LoRA 蒸馏是否训练 post-norm head linear | 仅 `--distill_after_category=remaining_lora` 支持；最终保存前会融合回 `lm_head` |
@@ -219,6 +230,7 @@
 | `--decoder_num_res_blocks` | `default=none` | asymmetric decoder 残差块数；`none` 回退到 `num_res_blocks` |
 | `--recon_loss_type` | `default=mse` | 重建损失类型 |
 | `--norm_type` | `default=group` | `group/batch/layer/rms/no`；`rms` 为 RMSNorm |
+| `--activation_type` | `default=swish` | `swish/relu/none/sigmoid/gelu/hard_swish`；控制 encoder/decoder/res block 内激活 |
 | `--decoder_type` | `default=linear` | `linear/symmetric/asymmetric` |
 
 重要语义：
@@ -240,6 +252,7 @@
     - `decoder_base_ch`
     - `decoder_num_res_blocks`
     - `norm_type`
+    - `activation_type`
     - `decoder_type`
   - joint decoder 联合优化代码已关闭；全部 stage 训练完后直接进入保存/替换流程
 - `decoder_type=linear` 或 `decoder_type=symmetric` 时，decoder 的 hidden dim / residual blocks 会强制对齐 encoder。
@@ -411,6 +424,39 @@
 - `outlier_residual_vae_batch_multiplier` 只放大 protected residual VAE 的训练 batch；默认 `1` 保持旧行为，`category` shared residual VAE 建议 `32`。
 - `outlier_residual_vae_steps/outlier_residual_vae_lr` 只控制 protected residual VAE；默认 `0` 分别继承 base VAE 的 steps/lr。
 
+#### MLP aligned channel selection（`--outlier_mlp_rank_metric`）
+
+v1 仅支持 `outlier_protect_mode=channel` 且 `outlier_channel_scope=layer`。
+
+- 仅作用于 `gate_proj` / `up_proj` / `down_proj`；attention 类别仍使用 `--outlier_rank_metric` 的 per-linear 逻辑。
+- 同一层 MLP 共享一组 intermediate channel indices：`gate_proj`/`up_proj` 保护 output row，`down_proj` 保护 input column。
+- `--outlier_protect_count` 在 MLP 三类上必须相同，表示每层 intermediate channel 保护数 `k`。
+- `--outlier_protect_axis` 在 MLP aligned 模式下被忽略，由框架按 category 自动映射。
+- 一次 MLP block 校准同时采集 `abs_mean` / `sq_mean`（in 与 mid），三种 metric 共用，不重复跑 forward。
+- 运行目录会写出 `mlp_channel_selection_summary.json`（含 `rank_metric`）。
+
+三种 `--outlier_mlp_rank_metric` 公式（up/gate 用 MLP 输入 `x` 统计，down 用 SwiGLU 中间态 `z` 统计）：
+
+| 值 | 对齐 per-linear | up/gate（row i） | down（col i） |
+|----|-----------------|------------------|---------------|
+| `mlp_intermediate_aligned_actrms` | 文档原算法 | `mean_j(\|W_{ij}\| · RMS(x_j))` | `mean_r(\|W_{ri}\| · RMS(z_i))` |
+| `mlp_intermediate_aligned_actmean_abs` | `channel_weight_actmean_abs` | `\|W_{i,:} ⊙ mean(\|x\|)\|_2` | `\|W_{:,i} ⊙ mean(\|z\|)\|_2` |
+| `mlp_intermediate_aligned_actrms_abs` | `channel_residual_actrms_abs` 权重公式 | `\sum_j W_{ij}^2 · E[x_j^2]` | `\sum_r W_{ri}^2 · E[z_i^2]` |
+
+注意：`actrms` 是 **RMS 标量乘子 + L1 mean**；`actrms_abs` 是 **E[x²] 乘子 + W² 求和**，二者不同。
+
+示例（仅 metric 行不同）：
+
+```bash
+--outlier_protect_mode channel \
+--outlier_channel_scope layer \
+--outlier_rank_metric channel_weight_actmean_abs \
+--outlier_mlp_rank_metric mlp_intermediate_aligned_actmean_abs \
+--outlier_mlp_fuse_weights 1,1,1 \
+--outlier_protect_count "default=32,cat:gate_proj=32,cat:up_proj=32,cat:down_proj=32" \
+--activation_calib_dataset "alpaca=1"
+```
+
 `residual_sparse` 的约束：
 
 - `outlier_protect_count` 必须为 `0`。
@@ -561,9 +607,9 @@ python tools/cat_train.py \
   --model_path meta-llama/Llama-2-7b-hf \
   --convert \
   --recon_loss_type default=wa_mse \
-  --wa_mse_calib_dataset wiki=1.0 \
-  --wa_mse_calib_nsamples 512 \
-  --wa_mse_calib_seqlen 512 \
+  --activation_calib_dataset wiki=1.0 \
+  --activation_calib_nsamples 512 \
+  --activation_calib_seqlen 512 \
   --train_device cuda
 ```
 
@@ -595,7 +641,7 @@ python tools/cat_train.py \
   --lora_rank default=8,after:q_proj=16 \
   --distill_steps default=50,after:q_proj=200 \
   --distill_hidden_loss_weight default=0.01 \
-  --distill_hidden_layer_weighting linear_depth \
+  --distill_hidden_alignment_layer_weighting adaptive_top_3 \
   --eval_ppl true \
   --eval_tasks boolq,rte,piqa \
   --distill_hif4_act false \
@@ -614,7 +660,7 @@ python tools/cat_train.py \
   --lora_rank default=8,after:q_proj=16 \
   --distill_steps default=50,after:q_proj=200 \
   --distill_hidden_loss_weight default=0.01 \
-  --distill_hidden_layer_weighting linear_depth \
+  --distill_hidden_alignment_layer_weighting adaptive_top_3 \
   --eval_ppl true \
   --eval_tasks boolq,rte,piqa \
   --distill_hif4_act false \

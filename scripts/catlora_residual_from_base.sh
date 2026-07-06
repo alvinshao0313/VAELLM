@@ -67,12 +67,12 @@ python tools/cat_residual_from_base.py \
   --outlier_residual_vae_codebook_bits "128" \
   --outlier_residual_vae_codebook_dim "32" \
   --base_batch_size "8192" \
-  --wa_mse_calib_dataset "alpaca=1" \
-  --wa_mse_calib_nsamples "128" \
-  --wa_mse_calib_seqlen "8192" \
-  --wa_mse_calib_seed "31" \
-  --wa_mse_calib_device "" \
-  --wa_mse_calib_log_every "0" \
+  --activation_calib_dataset "alpaca=1" \
+  --activation_calib_nsamples "128" \
+  --activation_calib_seqlen "8192" \
+  --activation_calib_seed "31" \
+  --activation_calib_device "" \
+  --activation_calib_log_every "0" \
   --seed "31" \
   --deterministic "true" \
   --train_device "cuda" \

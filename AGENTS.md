@@ -84,14 +84,14 @@ python xxx.py
 SEED="${SEED:-42}"
 
 python train.py \
-  --wa_mse_calib_seed "${SEED}"
+  --activation_calib_seed "${SEED}"
 ```
 
 应该写成：
 
 ```bash
 python train.py \
-  --wa_mse_calib_seed 42
+  --activation_calib_seed 42
 ```
 
 只有下面几类情况允许使用 shell 变量：

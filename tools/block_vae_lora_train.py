@@ -101,6 +101,7 @@ def _build_internal_vae_namespace(args: BlockVaeLoraArgs, training_args) -> argp
         decoder_base_ch=args.decoder_base_ch,
         decoder_num_res_blocks=args.decoder_num_res_blocks,
         norm_type=args.norm_type,
+        activation_type=args.activation_type,
         decoder_type=args.decoder_type,
         recon_loss_type=args.recon_loss_type,
         quantizer_type=str(args.quantizer_type),

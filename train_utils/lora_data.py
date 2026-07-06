@@ -50,11 +50,11 @@ def _split_lora_mix_targets(total_rows: int, weights: List[float]) -> List[int]:
 
 def _split_calibration_mix_targets(total_blocks: int, weights: List[float]) -> List[int]:
     if int(total_blocks) < 0:
-        raise ValueError(f"--wa_mse_calib_nsamples must be >= 0, got {total_blocks}.")
+        raise ValueError(f"--activation_calib_nsamples must be >= 0, got {total_blocks}.")
     if int(total_blocks) == 0:
         return [0 for _weight in weights]
     if not weights:
-        raise ValueError("--wa_mse_calib_dataset cannot be empty.")
+        raise ValueError("--activation_calib_dataset cannot be empty.")
     targets: List[int] = []
     allocated = 0
     for idx, weight in enumerate(weights):
@@ -65,7 +65,7 @@ def _split_calibration_mix_targets(total_blocks: int, weights: List[float]) -> L
             allocated += int(blocks)
         if blocks < 1:
             raise ValueError(
-                "--wa_mse_calib_nsamples is too small for the requested --wa_mse_calib_dataset mix; "
+                "--activation_calib_nsamples is too small for the requested --activation_calib_dataset mix; "
                 f"source index {idx} got target_blocks={blocks}."
             )
         targets.append(int(blocks))
@@ -251,19 +251,19 @@ def build_calibration_input_ids(
     block_size = int(seqlen)
     dataset_mix_spec = str(dataset_name or "").strip()
     if not dataset_mix_spec:
-        raise ValueError("--wa_mse_calib_dataset must be set when dynamic calibration is enabled.")
+        raise ValueError("--activation_calib_dataset must be set when dynamic calibration is enabled.")
     if "=" not in dataset_mix_spec:
         raise ValueError(
-            "--wa_mse_calib_dataset only accepts ratio-style dataset specs, for example "
+            "--activation_calib_dataset only accepts ratio-style dataset specs, for example "
             "'wiki=1.0', 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
         )
     from e2e_common.data import normalize_dataset_mix_spec
 
     sources, weights, _normalized_spec = normalize_dataset_mix_spec(dataset_mix_spec)
     if target_blocks < 0:
-        raise ValueError(f"--wa_mse_calib_nsamples must be >= 0, got {target_blocks}.")
+        raise ValueError(f"--activation_calib_nsamples must be >= 0, got {target_blocks}.")
     if block_size <= 0:
-        raise ValueError(f"--wa_mse_calib_seqlen must be > 0, got {block_size}.")
+        raise ValueError(f"--activation_calib_seqlen must be > 0, got {block_size}.")
     if target_blocks == 0:
         return []
 

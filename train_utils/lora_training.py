@@ -29,7 +29,60 @@ except ImportError:
     SFTTrainer = None
 
 
-_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+_DISTILL_HIDDEN_LAYER_WEIGHTING_STATIC_CHOICES = ("uniform", "linear_depth")
+_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES = (
+    "uniform",
+    "linear_depth",
+    "adaptive",
+    "adaptive_top_<K>",
+)
+_DEFAULT_ADAPTIVE_TOPK = 3
+
+
+def parse_distill_hidden_alignment_layer_weighting(raw: str) -> str:
+    mode = str(raw).strip().lower()
+    if mode in _DISTILL_HIDDEN_LAYER_WEIGHTING_STATIC_CHOICES:
+        return mode
+    if mode == "adaptive":
+        return mode
+    if mode.startswith("adaptive_top"):
+        suffix = mode[len("adaptive_top") :]
+        if suffix.startswith("_"):
+            suffix = suffix[1:]
+        if not suffix.isdigit() or int(suffix) < 1:
+            raise ValueError(
+                f"Invalid --distill_hidden_alignment_layer_weighting: {raw!r}. "
+                "adaptive_top suffix must be a positive integer, e.g. adaptive_top_3."
+            )
+        return mode
+    raise ValueError(
+        f"Invalid --distill_hidden_alignment_layer_weighting: {raw!r}. "
+        "Supported: uniform, linear_depth, adaptive, adaptive_top_<K>."
+    )
+
+
+def is_adaptive_hidden_alignment_layer_weighting(layer_weighting: str) -> bool:
+    mode = str(layer_weighting).strip().lower()
+    return mode == "adaptive" or mode.startswith("adaptive_top")
+
+
+def parse_adaptive_hidden_alignment_topk(layer_weighting: str, default_k: int = _DEFAULT_ADAPTIVE_TOPK) -> int:
+    mode = str(layer_weighting).strip().lower()
+    if not is_adaptive_hidden_alignment_layer_weighting(mode):
+        raise ValueError(
+            f"parse_adaptive_hidden_alignment_topk expects adaptive layer weighting, got {layer_weighting!r}."
+        )
+    if mode == "adaptive":
+        return max(1, int(default_k))
+    suffix = mode[len("adaptive_top") :]
+    if suffix.startswith("_"):
+        suffix = suffix[1:]
+    if not suffix:
+        raise ValueError(
+            f"Invalid adaptive layer weighting: {layer_weighting!r}. "
+            "Use adaptive or adaptive_top_<K> with a positive integer K."
+        )
+    return max(1, int(suffix))
 
 
 def build_distill_hidden_layer_weights(
@@ -43,6 +96,11 @@ def build_distill_hidden_layer_weights(
     if num_layers <= 0:
         raise ValueError(f"num_layers must be > 0, got {num_layers}.")
     mode = str(layer_weighting).strip().lower()
+    if is_adaptive_hidden_alignment_layer_weighting(mode):
+        raise ValueError(
+            "adaptive layer weighting must not use build_distill_hidden_layer_weights; "
+            "use _aggregate_hidden_alignment_layer_losses instead."
+        )
     if mode == "uniform":
         return torch.ones(num_layers, device=device, dtype=dtype)
     if mode == "linear_depth":
@@ -51,8 +109,82 @@ def build_distill_hidden_layer_weights(
         return raw / raw.mean()
     raise ValueError(
         f"Unsupported distill hidden layer weighting: {layer_weighting}. "
-        f"Supported: {', '.join(_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
+        f"Supported: {', '.join(_DISTILL_HIDDEN_LAYER_WEIGHTING_STATIC_CHOICES)}."
     )
+
+
+def _masked_mean_cosine_similarity(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    a = a.float().detach()
+    b = b.float().detach()
+    cos = F.cosine_similarity(a, b, dim=-1)
+    if attention_mask is None:
+        return cos.mean()
+    mask = attention_mask.to(device=cos.device, dtype=cos.dtype)
+    while mask.ndim < cos.ndim:
+        mask = mask.unsqueeze(-1)
+    mask = mask.expand_as(cos)
+    count = mask.sum().clamp_min(1.0)
+    return (cos * mask).sum() / count
+
+
+def _select_adaptive_hidden_layer_indices(
+    teacher_sequence: Sequence[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    topk: int,
+    *,
+    reference_hidden: Optional[torch.Tensor] = None,
+) -> List[int]:
+    num_layers = len(teacher_sequence)
+    if num_layers <= 0:
+        raise ValueError("teacher_sequence must be non-empty for adaptive layer selection.")
+    topk = min(max(1, int(topk)), num_layers)
+
+    scores: List[Tuple[int, float]] = []
+    for layer_idx in range(num_layers):
+        hidden = teacher_sequence[layer_idx]
+        if layer_idx == 0:
+            if reference_hidden is None:
+                raise ValueError("reference_hidden is required for adaptive selection at layer 0.")
+            previous = reference_hidden
+        else:
+            previous = teacher_sequence[layer_idx - 1]
+        cosine = _masked_mean_cosine_similarity(hidden, previous, attention_mask)
+        scores.append((layer_idx, float(cosine.item())))
+
+    selected = sorted(scores, key=lambda item: item[1])[:topk]
+    return [layer_idx for layer_idx, _ in selected]
+
+
+def _aggregate_hidden_alignment_layer_losses(
+    layer_losses: List[torch.Tensor],
+    layer_weighting: str,
+    *,
+    teacher_sequence_for_selection: Sequence[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    reference_hidden: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    stacked = torch.stack(layer_losses)
+    if is_adaptive_hidden_alignment_layer_weighting(layer_weighting):
+        topk = parse_adaptive_hidden_alignment_topk(layer_weighting)
+        selected = _select_adaptive_hidden_layer_indices(
+            teacher_sequence_for_selection,
+            attention_mask,
+            topk,
+            reference_hidden=reference_hidden,
+        )
+        return stacked[selected].mean()
+
+    weights = build_distill_hidden_layer_weights(
+        num_layers=len(layer_losses),
+        layer_weighting=layer_weighting,
+        device=stacked.device,
+        dtype=stacked.dtype,
+    )
+    return (stacked * weights).mean()
 
 
 def _masked_mean_square(value: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -101,14 +233,14 @@ def compute_distill_hidden_alignment_loss(
         denominator = _masked_mean_square(teacher_hidden, attention_mask)
         layer_losses.append(numerator / (denominator + float(eps)))
 
-    stacked = torch.stack(layer_losses)
-    weights = build_distill_hidden_layer_weights(
-        num_layers=len(layer_losses),
-        layer_weighting=layer_weighting,
-        device=stacked.device,
-        dtype=stacked.dtype,
+    teacher_block_hiddens = [hidden.detach() for hidden in teacher_hidden_states[1:]]
+    return _aggregate_hidden_alignment_layer_losses(
+        layer_losses,
+        layer_weighting,
+        teacher_sequence_for_selection=teacher_block_hiddens,
+        attention_mask=attention_mask,
+        reference_hidden=teacher_hidden_states[0].detach(),
     )
-    return (stacked * weights).mean()
 
 
 def compute_distill_pre_mlp_hidden_alignment_loss(
@@ -117,6 +249,7 @@ def compute_distill_pre_mlp_hidden_alignment_loss(
     student_pre_mlp_hiddens: Sequence[torch.Tensor],
     attention_mask: Optional[torch.Tensor],
     layer_weighting: str,
+    teacher_reference_hidden: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     if teacher_pre_mlp_hiddens is None or student_pre_mlp_hiddens is None:
@@ -128,6 +261,10 @@ def compute_distill_pre_mlp_hidden_alignment_loss(
         )
     if len(teacher_pre_mlp_hiddens) == 0:
         raise ValueError("Pre-MLP hidden states must include at least one transformer block.")
+    if is_adaptive_hidden_alignment_layer_weighting(layer_weighting) and teacher_reference_hidden is None:
+        raise ValueError(
+            "teacher_reference_hidden is required for adaptive pre-MLP hidden alignment layer weighting."
+        )
 
     layer_losses: List[torch.Tensor] = []
     for layer_idx, (teacher_hidden, student_hidden) in enumerate(
@@ -144,14 +281,19 @@ def compute_distill_pre_mlp_hidden_alignment_loss(
         denominator = _masked_mean_square(teacher_hidden, attention_mask)
         layer_losses.append(numerator / (denominator + float(eps)))
 
-    stacked = torch.stack(layer_losses)
-    weights = build_distill_hidden_layer_weights(
-        num_layers=len(layer_losses),
-        layer_weighting=layer_weighting,
-        device=stacked.device,
-        dtype=stacked.dtype,
+    teacher_sequence = [hidden.detach() for hidden in teacher_pre_mlp_hiddens]
+    reference_hidden = (
+        teacher_reference_hidden.detach()
+        if teacher_reference_hidden is not None
+        else None
     )
-    return (stacked * weights).mean()
+    return _aggregate_hidden_alignment_layer_losses(
+        layer_losses,
+        layer_weighting,
+        teacher_sequence_for_selection=teacher_sequence,
+        attention_mask=attention_mask,
+        reference_hidden=reference_hidden,
+    )
 
 
 @contextmanager
@@ -264,12 +406,9 @@ else:
                 raise ValueError(
                     f"pre_mlp_hidden_loss_weight must be >= 0, got {self.pre_mlp_hidden_loss_weight}."
                 )
-            self.hidden_alignment_layer_weighting = str(hidden_alignment_layer_weighting).strip().lower()
-            if self.hidden_alignment_layer_weighting not in _DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES:
-                raise ValueError(
-                    f"Unsupported hidden_alignment_layer_weighting: {hidden_alignment_layer_weighting}. "
-                    f"Supported: {', '.join(_DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
-                )
+            self.hidden_alignment_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
+                hidden_alignment_layer_weighting
+            )
             self.distill_hif4_act_controller = distill_hif4_act_controller
             self.teacher_param_snapshots = list(teacher_param_snapshots or [])
 
@@ -397,6 +536,7 @@ else:
                         student_pre_mlp_hiddens=student_pre_mlp_hiddens,
                         attention_mask=full_inputs.get("attention_mask"),
                         layer_weighting=self.hidden_alignment_layer_weighting,
+                        teacher_reference_hidden=teacher_outputs.hidden_states[0],
                     )
                     loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
                 return loss

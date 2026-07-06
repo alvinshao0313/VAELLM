@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=1
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -43,7 +43,7 @@ export HF_DATASETS_OFFLINE=1
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
-# --wa_mse_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
+# --activation_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
 # CAT_DISTILL_DATASET_NUM_PROC=16          # 蒸馏/校准数据 format 预处理并行进程数，位置在 lora_data.py
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
@@ -66,12 +66,12 @@ python tools/cat_train.py \
   --linear_group_size "36" \
   --steps_per_category "default=10000" \
   --batch_size "8192" \
-  --wa_mse_calib_dataset "alpaca=1" \
-  --wa_mse_calib_nsamples "128" \
-  --wa_mse_calib_seqlen "8192" \
-  --wa_mse_calib_seed "31" \
-  --wa_mse_calib_device "" \
-  --wa_mse_calib_log_every "0" \
+  --activation_calib_dataset "alpaca=1" \
+  --activation_calib_nsamples "128" \
+  --activation_calib_seqlen "8192" \
+  --activation_calib_seed "31" \
+  --activation_calib_device "" \
+  --activation_calib_log_every "0" \
   --codebook_bits "default=32" \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
@@ -79,8 +79,9 @@ python tools/cat_train.py \
   --num_res_blocks "default=0" \
   --decoder_base_ch "default=128" \
   --decoder_num_res_blocks "default=1" \
-  --norm_type "default=layer" \
-  --decoder_type "default=linear" \
+  --norm_type "default=rms" \
+  --activation_type "default=relu" \
+  --decoder_type "default=symmetric" \
   --recon_loss_type "default=mse" \
   --quantizer_type "BSQ" \
   --gamma0 "1.0" \
@@ -109,6 +110,8 @@ python tools/cat_train.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --outlier_protect_mode "channel" \
+  --outlier_mlp_rank_metric "none" \
+  --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
   --outlier_protect_channel_quant "none" \
   --outlier_residual_vae_decoder_share_scope "none" \

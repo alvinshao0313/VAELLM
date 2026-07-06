@@ -41,7 +41,7 @@ output_dir/
 - `--outlier_rank_metric sparse_residual_abs|sparse_residual_actmax_abs|sparse_residual_actmean_abs|sparse_weight_abs|sparse_weight_actmax_abs|sparse_weight_actmean_abs`
 - `--sparse_residual_ratio`
 
-如果 metric 带 `actmax` 或 `actmean`，会根据 `wa_mse_calib_*` 参数现场采集 activation stats。
+如果 metric 带 `actmax` 或 `actmean`，会根据 `activation_calib_*` 参数现场采集 activation stats。
 
 `--outlier_protect_mode channel_residual_vae`
 
@@ -56,7 +56,7 @@ output_dir/
 - `--outlier_residual_vae_steps`
 - `--outlier_residual_vae_lr`
 
-如果 metric 带 `actmax`、`actmean` 或 `actrms`，会根据 `wa_mse_calib_*` 参数现场采集 activation stats。
+如果 metric 带 `actmax`、`actmean` 或 `actrms`，会根据 `activation_calib_*` 参数现场采集 activation stats。
 
 ## Activation Stats
 
@@ -64,12 +64,12 @@ output_dir/
 
 如果 `--outlier_rank_metric` 需要 activation，例如带 `actmax`、`actmean` 或 `actrms` 的 metric，每次运行都会按下面这些参数重新采集目标 linear 的 activation max / abs mean / second moment / RMS：
 
-- `--wa_mse_calib_dataset`
-- `--wa_mse_calib_nsamples`
-- `--wa_mse_calib_seqlen`
-- `--wa_mse_calib_seed`
-- `--wa_mse_calib_device`
-- `--wa_mse_calib_log_every`
+- `--activation_calib_dataset`
+- `--activation_calib_nsamples`
+- `--activation_calib_seqlen`
+- `--activation_calib_seed`
+- `--activation_calib_device`
+- `--activation_calib_log_every`
 
 示例：
 
@@ -77,12 +77,12 @@ output_dir/
 python tools/cat_residual_from_base.py \
   ... \
   --outlier_rank_metric "channel_residual_actrms_abs" \
-  --wa_mse_calib_dataset "alpaca=1" \
-  --wa_mse_calib_nsamples "128" \
-  --wa_mse_calib_seqlen "8192" \
-  --wa_mse_calib_seed "31" \
-  --wa_mse_calib_device "" \
-  --wa_mse_calib_log_every "0"
+  --activation_calib_dataset "alpaca=1" \
+  --activation_calib_nsamples "128" \
+  --activation_calib_seqlen "8192" \
+  --activation_calib_seed "31" \
+  --activation_calib_device "" \
+  --activation_calib_log_every "0"
 ```
 
 ## 示例

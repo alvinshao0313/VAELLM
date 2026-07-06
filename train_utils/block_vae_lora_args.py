@@ -21,6 +21,7 @@ from train_utils.cat_train_args import ResolvedCategoryRuntimeConfig, parse_skip
 _CATEGORY_SELECTORS = ("default", "cat")
 _RECON_LOSS_TYPE_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse")
 _NORM_TYPE_CHOICES = ("group", "batch", "layer", "rms", "no")
+_ACTIVATION_TYPE_CHOICES = ("swish", "relu", "none", "sigmoid", "gelu", "hard_swish")
 _DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OPTIMIZER_CHOICES = ("adam", "adamw", "sgd", "rmsprop")
 _LR_SCHEDULER_CHOICES = ("none", "linear", "cosine", "constant", "constant_with_warmup")
@@ -84,6 +85,7 @@ class BlockVaeLoraArgs:
     decoder_base_ch: OverrideTable[Optional[int]]
     decoder_num_res_blocks: OverrideTable[Optional[int]]
     norm_type: OverrideTable[str]
+    activation_type: OverrideTable[str]
     decoder_type: OverrideTable[str]
     recon_loss_type: OverrideTable[str]
     quantizer_type: str
@@ -161,6 +163,7 @@ class BlockVaeRuntimeConfig:
     decoder_base_ch: Optional[int]
     decoder_num_res_blocks: Optional[int]
     norm_type: str
+    activation_type: str
     decoder_type: str
     joint_decoder_steps: int = 0
     joint_decoder_lr: float = 0.0
@@ -231,6 +234,11 @@ _DECODER_NUM_RES_BLOCKS_SPEC = _make_optional_int_override_spec(
     example="default=1,cat:q_proj=0",
 )
 _NORM_TYPE_SPEC = _make_choice_override_spec("--norm_type", choices=_NORM_TYPE_CHOICES, example="default=layer")
+_ACTIVATION_TYPE_SPEC = _make_choice_override_spec(
+    "--activation_type",
+    choices=_ACTIVATION_TYPE_CHOICES,
+    example="default=swish",
+)
 _DECODER_TYPE_SPEC = _make_choice_override_spec("--decoder_type", choices=_DECODER_TYPE_CHOICES, example="default=symmetric")
 _RECON_LOSS_TYPE_SPEC = _make_choice_override_spec("--recon_loss_type", choices=_RECON_LOSS_TYPE_CHOICES, example="default=mse")
 
@@ -436,6 +444,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder_base_ch", type=str, default="default=128", help=f"Category override. Example: {_DECODER_BASE_CH_SPEC.example}")
     parser.add_argument("--decoder_num_res_blocks", type=str, default="default=1", help=f"Category override. Example: {_DECODER_NUM_RES_BLOCKS_SPEC.example}")
     parser.add_argument("--norm_type", type=str, default="default=layer", help=f"Category override. Example: {_NORM_TYPE_SPEC.example}")
+    parser.add_argument(
+        "--activation_type",
+        type=str,
+        default="default=swish",
+        help=f"Category override. Example: {_ACTIVATION_TYPE_SPEC.example}",
+    )
     parser.add_argument("--decoder_type", type=str, default="default=symmetric", help=f"Category override. Example: {_DECODER_TYPE_SPEC.example}")
     parser.add_argument("--recon_loss_type", type=str, default="default=mse", help=f"Category override. Example: {_RECON_LOSS_TYPE_SPEC.example}")
 
@@ -591,6 +605,7 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         decoder_base_ch=parse_override_table(str(raw_args.decoder_base_ch), spec=_DECODER_BASE_CH_SPEC),
         decoder_num_res_blocks=parse_override_table(str(raw_args.decoder_num_res_blocks), spec=_DECODER_NUM_RES_BLOCKS_SPEC),
         norm_type=parse_override_table(str(raw_args.norm_type), spec=_NORM_TYPE_SPEC),
+        activation_type=parse_override_table(str(raw_args.activation_type), spec=_ACTIVATION_TYPE_SPEC),
         decoder_type=parse_override_table(str(raw_args.decoder_type), spec=_DECODER_TYPE_SPEC),
         recon_loss_type=parse_override_table(str(raw_args.recon_loss_type), spec=_RECON_LOSS_TYPE_SPEC),
         quantizer_type=str(raw_args.quantizer_type),
@@ -804,6 +819,7 @@ def resolve_block_runtime_configs(
         (args.decoder_base_ch, "--decoder_base_ch"),
         (args.decoder_num_res_blocks, "--decoder_num_res_blocks"),
         (args.norm_type, "--norm_type"),
+        (args.activation_type, "--activation_type"),
         (args.decoder_type, "--decoder_type"),
         (args.recon_loss_type, "--recon_loss_type"),
     )
@@ -831,6 +847,7 @@ def resolve_block_runtime_configs(
             decoder_base_ch=resolve_category_value(args.decoder_base_ch, category),
             decoder_num_res_blocks=resolve_category_value(args.decoder_num_res_blocks, category),
             norm_type=str(resolve_category_value(args.norm_type, category)),
+            activation_type=str(resolve_category_value(args.activation_type, category)),
             decoder_type=str(resolve_category_value(args.decoder_type, category)),
         )
     return resolved

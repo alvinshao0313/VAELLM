@@ -530,6 +530,41 @@ def _split_protected_channel_payload(
     return None, qvalues, scales
 
 
+def _activation_weighted_channel_scores(
+    source: torch.Tensor,
+    *,
+    axis: str,
+    act_max: Optional[torch.Tensor] = None,
+    act_mean: Optional[torch.Tensor] = None,
+    act_sq_mean: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    resolved_axis = str(axis).strip().lower()
+    if resolved_axis not in {"input", "output"}:
+        raise ValueError(f"Unsupported outlier_protect_axis={axis}. Expected input or output.")
+    reduce_dim = 0 if resolved_axis == "input" else 1
+
+    if act_sq_mean is not None:
+        act_sq = act_sq_mean.to(device=source.device, dtype=source.dtype, non_blocking=True)
+        return (
+            source.pow(2) * act_sq.clamp_min(0.0).view(1, -1)
+        ).sum(dim=reduce_dim).contiguous()
+
+    channel_source = source
+    if act_max is not None:
+        channel_source = channel_source * act_max.to(
+            device=source.device,
+            dtype=source.dtype,
+            non_blocking=True,
+        ).view(1, -1)
+    if act_mean is not None:
+        channel_source = channel_source * act_mean.to(
+            device=source.device,
+            dtype=source.dtype,
+            non_blocking=True,
+        ).view(1, -1)
+    return torch.norm(channel_source, p=2, dim=reduce_dim).contiguous()
+
+
 def _prepare_linear_weight_for_outlier_protection(
     *,
     weight: torch.Tensor,
@@ -622,15 +657,19 @@ def _prepare_linear_weight_for_outlier_protection(
     weight_device = weight.device
     act_dev = None if act_cpu is None else act_cpu.to(device=weight_device, dtype=torch.float32, non_blocking=True)
     weight_f = weight.detach().to(device=weight_device, dtype=torch.float32).contiguous()
+    if protected_idx is None:
+        scores = _activation_weighted_channel_scores(
+            weight_f,
+            axis=axis,
+            act_max=act_dev,
+        )
+        protected_idx = torch.topk(scores, k=protect_count, largest=True).indices
+        protected_idx = torch.sort(protected_idx).values.contiguous().to(device=weight_device)
+    else:
+        protected_idx = protected_idx.to(device=weight_device, dtype=torch.long, non_blocking=True)
+
     if axis == "input":
         weight_in_major = weight_f.t().contiguous()  # [in, out]
-        if protected_idx is None:
-            weighted_rows = weight_in_major * act_dev.view(-1, 1)
-            channel_norm = torch.norm(weighted_rows, p=2, dim=1)
-            protected_idx = torch.topk(channel_norm, k=protect_count, largest=True).indices
-            protected_idx = torch.sort(protected_idx).values.contiguous().to(device=weight_device)
-        else:
-            protected_idx = protected_idx.to(device=weight_device, dtype=torch.long, non_blocking=True)
 
         keep_mask = torch.ones(original_in_features, dtype=torch.bool, device=weight_device)
         keep_mask[protected_idx] = False
@@ -659,14 +698,6 @@ def _prepare_linear_weight_for_outlier_protection(
             protected_output_indices=None,
             protected_output_weight=None,
         )
-
-    if protected_idx is None:
-        weighted_weight = weight_f * act_dev.view(1, -1)
-        channel_norm = torch.norm(weighted_weight, p=2, dim=1)
-        protected_idx = torch.topk(channel_norm, k=protect_count, largest=True).indices
-        protected_idx = torch.sort(protected_idx).values.contiguous()
-    else:
-        protected_idx = protected_idx.to(device=weight_device, dtype=torch.long, non_blocking=True)
 
     keep_mask = torch.ones(original_out_features, dtype=torch.bool, device=weight_device)
     keep_mask[protected_idx] = False
@@ -811,37 +842,21 @@ def compute_channel_rank_score(
                 f"got={int(act_sq_vec.numel())}, expected in_features={in_features}."
             )
 
-    if resolved_axis == "input":
-        if act_sq_vec is not None:
-            score = source.pow(2).sum(dim=0) * act_sq_vec.clamp_min(0.0)
-        else:
-            score = torch.norm(source, p=2, dim=0)
-            if act_max_vec is not None:
-                score = score * act_max_vec
-            if act_mean_vec is not None:
-                score = score * act_mean_vec
-        if int(score.numel()) != in_features:
-            raise ValueError(
-                f"{linear_name}: input channel score shape mismatch for {resolved_metric}, "
-                f"got={tuple(score.shape)}, expected=({in_features},)."
-            )
-        return score.contiguous()
-
-    if act_sq_vec is not None:
-        score = (source.pow(2) * act_sq_vec.clamp_min(0.0).view(1, -1)).sum(dim=1)
-    else:
-        channel_source = source
-        if act_max_vec is not None:
-            channel_source = channel_source * act_max_vec.view(1, -1)
-        if act_mean_vec is not None:
-            channel_source = channel_source * act_mean_vec.view(1, -1)
-        score = torch.norm(channel_source, p=2, dim=1)
-    if int(score.numel()) != out_features:
+    score = _activation_weighted_channel_scores(
+        source,
+        axis=resolved_axis,
+        act_max=act_max_vec,
+        act_mean=act_mean_vec,
+        act_sq_mean=act_sq_vec,
+    )
+    expected_channels = in_features if resolved_axis == "input" else out_features
+    if int(score.numel()) != expected_channels:
+        axis_label = "input" if resolved_axis == "input" else "output"
         raise ValueError(
-            f"{linear_name}: output channel score shape mismatch for {resolved_metric}, "
-            f"got={tuple(score.shape)}, expected=({out_features},)."
+            f"{linear_name}: {axis_label} channel score shape mismatch for {resolved_metric}, "
+            f"got={tuple(score.shape)}, expected=({expected_channels},)."
         )
-    return score.contiguous()
+    return score
 
 
 def build_outlier_channel_index_plan(

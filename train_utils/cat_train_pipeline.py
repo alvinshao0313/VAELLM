@@ -46,7 +46,17 @@ from train_utils.cat_data_prep import (
 )
 from train_utils.activation_utils import (
     ActivationCalibrationCache,
+    activation_stats_to_views,
     collect_activation_stats_for_linears,
+    collect_mlp_block_activation_stats,
+    subset_activation_stats,
+)
+from train_utils.mlp_channel_selection import (
+    MLP_CATEGORIES,
+    build_mlp_aligned_plans_all_layers,
+    is_mlp_aligned_rank_metric,
+    mlp_protect_axis_for_category,
+    write_mlp_channel_selection_summary,
 )
 from train_utils.cat_arg_overrides import validate_category_keys
 from train_utils.cat_train_data import (
@@ -901,6 +911,7 @@ def _train_protected_residual_vae_payload(
         base_ch=int(runtime_cfg.base_ch),
         num_res_blocks=int(runtime_cfg.num_res_blocks),
         norm_type=str(runtime_cfg.norm_type),
+        activation_type=str(runtime_cfg.activation_type),
         decoder_type=str(runtime_cfg.decoder_type),
         decoder_base_ch=(
             None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch)
@@ -1203,6 +1214,7 @@ def train_group_vae_payload(
     stage_base_ch = int(runtime_cfg.base_ch)
     stage_num_res_blocks = int(runtime_cfg.num_res_blocks)
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
+    stage_activation_type = str(runtime_cfg.activation_type).strip().lower()
     stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
     protected_residual_vae_steps = (
         int(requested_residual_vae_steps)
@@ -1307,45 +1319,21 @@ def train_group_vae_payload(
             raise ValueError(
                 f"[{group_tag}] dynamic activation runtime is required for wa_mse/amse or outlier protection."
             )
-        calib_device = str(activation_runtime.get("device") or train_device)
-        linear_items = [(r.name, r.module) for r in group_refs]
-        dynamic_act_stats, new_cache = collect_activation_stats_for_linears(
-            model=model,
-            linear_items=linear_items,
-            model_path=str(activation_runtime["model_path"]),
-            access_token=activation_runtime.get("access_token"),
-            dataset=str(activation_runtime.get("dataset", "")),
-            nsamples=int(activation_runtime.get("nsamples", 512)),
-            seqlen=int(activation_runtime.get("seqlen", 512)),
-            seed=int(activation_runtime.get("seed", 0)),
-            device=calib_device,
-            cache=activation_runtime.get("cache"),  # type: ignore[arg-type]
-            log_every=int(activation_runtime.get("log_every", 0)),
-            logger=log,
-        )
-        activation_runtime["cache"] = new_cache
-        effective_activation_weight = {
-            name: stats["max"]
-            for name, stats in dynamic_act_stats.items()
-            if isinstance(stats.get("max"), torch.Tensor)
-        }
-        effective_activation_abs_mean = {
-            name: stats["abs_mean"]
-            for name, stats in dynamic_act_stats.items()
-            if isinstance(stats.get("abs_mean"), torch.Tensor)
-        }
-        effective_activation_sq_mean = {
-            name: stats["sq_mean"]
-            for name, stats in dynamic_act_stats.items()
-            if isinstance(stats.get("sq_mean"), torch.Tensor)
-        }
+        stats_by_linear = activation_runtime.get("stats_by_linear")
+        if not isinstance(stats_by_linear, dict):
+            raise ValueError(
+                f"[{group_tag}] precomputed activation stats are required but missing from activation_runtime."
+            )
+        subset_stats = subset_activation_stats(stats_by_linear, [r.name for r in group_refs])
+        (
+            effective_activation_weight,
+            effective_activation_abs_mean,
+            effective_activation_sq_mean,
+        ) = activation_stats_to_views(subset_stats)
         log.info(
-            "[%s] refreshed dynamic activation stats (linears=%d, dataset=%s, nsamples=%d, seqlen=%d).",
+            "[%s] using precomputed activation stats (linears=%d).",
             group_tag,
-            len(dynamic_act_stats),
-            str(activation_runtime.get("dataset", "")),
-            int(activation_runtime.get("nsamples", 512)),
-            int(activation_runtime.get("seqlen", 512)),
+            len(subset_stats),
         )
 
     prep_refs = [
@@ -1463,6 +1451,7 @@ def train_group_vae_payload(
         base_ch=int(stage_base_ch),
         num_res_blocks=int(stage_num_res_blocks),
         norm_type=str(stage_norm_type),
+        activation_type=str(stage_activation_type),
         decoder_type=str(stage_decoder_type),
         decoder_base_ch=(
             None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch)
@@ -1606,7 +1595,7 @@ def train_group_vae_payload(
             )
 
         log.info(
-            "[%s] start (residual_rms=%.6e, steps=%d, blocks=%d, bits=%d, dim=%d, recon_loss=%s, base_ch=%d, num_res_blocks=%d, norm_type=%s, decoder_type=%s, stage_norm=%s)",
+            "[%s] start (residual_rms=%.6e, steps=%d, blocks=%d, bits=%d, dim=%d, recon_loss=%s, base_ch=%d, num_res_blocks=%d, norm_type=%s, activation_type=%s, decoder_type=%s, stage_norm=%s)",
             stage_tag,
             residual_rms_before,
             int(stage_steps),
@@ -1617,6 +1606,7 @@ def train_group_vae_payload(
             int(stage_base_ch),
             int(stage_num_res_blocks),
             stage_norm_type,
+            stage_activation_type,
             stage_decoder_type,
             "on" if use_stage_norm else "off",
         )
@@ -2480,7 +2470,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     resolved_category_cfgs = resolve_category_runtime_configs(cat_args, vae_args, active_categories)
     resolved_outlier_mode = str(getattr(cat_args, "outlier_protect_mode", "channel")).strip().lower()
     resolved_outlier_rank_metric = str(getattr(cat_args, "outlier_rank_metric", "sparse_residual_abs")).strip().lower()
-    log.info("outlier_mode=%s outlier_rank_metric=%s", resolved_outlier_mode, resolved_outlier_rank_metric)
+    resolved_outlier_mlp_rank_metric = str(getattr(cat_args, "outlier_mlp_rank_metric", "none")).strip().lower()
+    log.info(
+        "outlier_mode=%s outlier_rank_metric=%s outlier_mlp_rank_metric=%s",
+        resolved_outlier_mode,
+        resolved_outlier_rank_metric,
+        resolved_outlier_mlp_rank_metric,
+    )
     if resolved_outlier_mode == "residual_sparse":
         nonzero_counts = {
             cat: int(cfg.outlier_protect_count)
@@ -2571,6 +2567,15 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         }
         and any_outlier_protect
     )
+    mlp_channel_protect_needs_activation = (
+        is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
+        and resolved_outlier_mode == "channel"
+        and any(
+            int(category_outlier_protect_count.get(cat, 0)) > 0
+            for cat in MLP_CATEGORIES
+            if cat in active_categories
+        )
+    )
     residual_sparse_needs_activation = (
         resolved_outlier_mode == "residual_sparse"
         and (
@@ -2579,22 +2584,28 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         )
     )
     sort_needs_act = False  # 排序代码，已关闭。
-    if any_channel_weight_loss or channel_protect_needs_activation or sort_needs_act or residual_sparse_needs_activation:
-        activation_dataset = str(getattr(cat_args, "wa_mse_calib_dataset", "")).strip()
+    if (
+        any_channel_weight_loss
+        or channel_protect_needs_activation
+        or mlp_channel_protect_needs_activation
+        or sort_needs_act
+        or residual_sparse_needs_activation
+    ):
+        activation_dataset = str(cat_args.activation_calib_dataset).strip()
         if not activation_dataset:
             raise ValueError(
-                "--wa_mse_calib_dataset must be set when dynamic activation calibration is enabled. "
+                "--activation_calib_dataset must be set when dynamic activation calibration is enabled. "
                 "Use ratio-style dataset specs such as 'openorca=1.0' or 'openorca=0.5,fineweb_edu=0.5'."
             )
         activation_cache: Optional[ActivationCalibrationCache] = None
         activation_runtime = {
             "cache": activation_cache,
             "dataset": activation_dataset,
-            "nsamples": int(getattr(cat_args, "wa_mse_calib_nsamples", 512)),
-            "seqlen": int(getattr(cat_args, "wa_mse_calib_seqlen", 512)),
-            "seed": int(getattr(cat_args, "wa_mse_calib_seed", 0)),
-            "device": str(getattr(cat_args, "wa_mse_calib_device", "")).strip() or str(cat_args.train_device),
-            "log_every": int(getattr(cat_args, "wa_mse_calib_log_every", 0)),
+            "nsamples": int(cat_args.activation_calib_nsamples),
+            "seqlen": int(cat_args.activation_calib_seqlen),
+            "seed": int(cat_args.activation_calib_seed),
+            "device": str(cat_args.activation_calib_device).strip() or str(cat_args.train_device),
+            "log_every": int(cat_args.activation_calib_log_every),
             "model_path": str(vae_args.model_path),
             "access_token": hf_args.access_token,
         }
@@ -2605,10 +2616,12 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             enabled_features.append("amse")
         if channel_protect_needs_activation:
             enabled_features.append("outlier_protect")
+        if mlp_channel_protect_needs_activation:
+            enabled_features.append("mlp_outlier_protect")
         if residual_sparse_needs_activation:
             enabled_features.append("residual_sparse_score")
         log.info(
-            "Dynamic activation recalibration enabled for %s: dataset=%s nsamples=%d seqlen=%d seed=%d device=%s",
+            "Dynamic activation calibration enabled for %s: dataset=%s nsamples=%d seqlen=%d seed=%d device=%s",
             ",".join(enabled_features),
             str(activation_runtime["dataset"]),
             int(activation_runtime["nsamples"]),
@@ -2616,6 +2629,95 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             int(activation_runtime["seed"]),
             str(activation_runtime["device"]),
         )
+        linear_items = [(r.name, r.module) for r in all_linears]
+        stats_by_linear, new_cache = collect_activation_stats_for_linears(
+            model=model,
+            linear_items=linear_items,
+            model_path=str(activation_runtime["model_path"]),
+            access_token=activation_runtime.get("access_token"),
+            dataset=str(activation_runtime.get("dataset", "")),
+            nsamples=int(activation_runtime["nsamples"]),
+            seqlen=int(activation_runtime["seqlen"]),
+            seed=int(activation_runtime["seed"]),
+            device=str(activation_runtime["device"]),
+            cache=activation_runtime.get("cache"),  # type: ignore[arg-type]
+            log_every=int(activation_runtime["log_every"]),
+            logger=log,
+        )
+        activation_runtime["cache"] = new_cache
+        activation_runtime["stats_by_linear"] = stats_by_linear
+        log.info(
+            "Prefilled activation stats for %d linears (one-shot, dataset=%s nsamples=%d seqlen=%d seed=%d device=%s).",
+            len(stats_by_linear),
+            str(activation_runtime["dataset"]),
+            int(activation_runtime["nsamples"]),
+            int(activation_runtime["seqlen"]),
+            int(activation_runtime["seed"]),
+            str(activation_runtime["device"]),
+        )
+
+    mlp_channel_plan_by_linear: Optional[Dict[str, torch.Tensor]] = None
+    if (
+        is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
+        and resolved_outlier_mode == "channel"
+    ):
+        mlp_protect_count = int(category_outlier_protect_count.get("gate_proj", 0))
+        if mlp_protect_count > 0:
+            if activation_runtime is None:
+                raise ValueError(
+                    "MLP aligned channel selection requires activation_runtime, "
+                    "but dynamic activation calibration was not initialized."
+                )
+            mlp_layer_indices = sorted(
+                {
+                    int(layer_idx)
+                    for ref in all_linears
+                    if ref.category in MLP_CATEGORIES
+                    for layer_idx in [_extract_layer_idx(ref.name)]
+                    if layer_idx is not None
+                }
+            )
+            stats_by_mlp_block, mlp_cache = collect_mlp_block_activation_stats(
+                model=model,
+                layer_indices=mlp_layer_indices,
+                model_path=str(activation_runtime["model_path"]),
+                access_token=activation_runtime.get("access_token"),
+                dataset=str(activation_runtime.get("dataset", "")),
+                nsamples=int(activation_runtime["nsamples"]),
+                seqlen=int(activation_runtime["seqlen"]),
+                seed=int(activation_runtime["seed"]),
+                device=str(activation_runtime["device"]),
+                cache=activation_runtime.get("cache"),  # type: ignore[arg-type]
+                skip_layer_keys=skip_layer_keys,
+                log_every=int(activation_runtime["log_every"]),
+                logger=log,
+            )
+            activation_runtime["cache"] = mlp_cache
+            activation_runtime["stats_by_mlp_block"] = stats_by_mlp_block
+            mlp_channel_plan_by_linear, mlp_summary_by_layer = build_mlp_aligned_plans_all_layers(
+                model=model,
+                stats_by_mlp_block=stats_by_mlp_block,
+                protect_count=int(mlp_protect_count),
+                fuse_weights=cat_args.outlier_mlp_fuse_weights,
+                rank_metric=resolved_outlier_mlp_rank_metric,
+                skip_layer_keys=skip_layer_keys,
+            )
+            activation_runtime["mlp_channel_plan_by_linear"] = mlp_channel_plan_by_linear
+            summary_path = os.path.join(run_output_dir, "mlp_channel_selection_summary.json")
+            write_mlp_channel_selection_summary(
+                summary_path,
+                summary_by_layer=mlp_summary_by_layer,
+                protect_count=int(mlp_protect_count),
+                fuse_weights=cat_args.outlier_mlp_fuse_weights,
+                rank_metric=resolved_outlier_mlp_rank_metric,
+            )
+            log.info(
+                "MLP aligned channel plan ready: layers=%d linears=%d protect_count=%d summary=%s",
+                len(mlp_summary_by_layer),
+                len(mlp_channel_plan_by_linear),
+                int(mlp_protect_count),
+                summary_path,
+            )
 
     if any_outlier_protect:
         enabled_counts = ",".join(
@@ -2765,70 +2867,83 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             else:
                 eligible_plan_refs = planned_refs
 
+            category_protect_axis = outlier_protect_axis
+            if (
+                is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
+                and cat in MLP_CATEGORIES
+            ):
+                category_protect_axis = mlp_protect_axis_for_category(cat)
+
             outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None
             if resolved_outlier_mode == "channel" and int(cat_cfg.outlier_protect_count) > 0:
-                plan_activation_weight: Optional[Dict[str, torch.Tensor]] = None
-                plan_activation_abs_mean: Optional[Dict[str, torch.Tensor]] = None
-                if resolved_outlier_rank_metric in {"channel_weight_actmax_abs", "channel_weight_actmean_abs"}:
-                    if activation_runtime is None:
-                        raise ValueError(
-                            f"[{cat}] dynamic activation runtime is required for activation-weighted outlier channel scoring."
+                if (
+                    is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
+                    and cat in MLP_CATEGORIES
+                    and mlp_channel_plan_by_linear is not None
+                ):
+                    outlier_channel_plan = {}
+                    for ref in eligible_plan_refs:
+                        outlier_channel_plan[ref.name] = mlp_channel_plan_by_linear.get(
+                            ref.name,
+                            torch.empty(0, dtype=torch.long),
+                        ).detach().to(device="cpu", dtype=torch.long).contiguous()
+                    for ref in planned_refs:
+                        outlier_channel_plan.setdefault(ref.name, torch.empty(0, dtype=torch.long))
+                    log.info(
+                        "[%s] MLP aligned outlier channel plan: eligible_linears=%d total_channels=%d axis=%s",
+                        cat,
+                        len(eligible_plan_refs),
+                        sum(int(v.numel()) for v in outlier_channel_plan.values()),
+                        category_protect_axis,
+                    )
+                else:
+                    plan_activation_weight: Optional[Dict[str, torch.Tensor]] = None
+                    plan_activation_abs_mean: Optional[Dict[str, torch.Tensor]] = None
+                    if resolved_outlier_rank_metric in {"channel_weight_actmax_abs", "channel_weight_actmean_abs"}:
+                        if activation_runtime is None:
+                            raise ValueError(
+                                f"[{cat}] dynamic activation runtime is required for activation-weighted outlier channel scoring."
+                            )
+                        stats_by_linear = activation_runtime.get("stats_by_linear")
+                        if not isinstance(stats_by_linear, dict):
+                            raise ValueError(
+                                f"[{cat}] precomputed activation stats are required but missing from activation_runtime."
+                            )
+                        subset_stats = subset_activation_stats(
+                            stats_by_linear,
+                            [r.name for r in eligible_plan_refs],
                         )
-                    dynamic_act_stats, new_cache = collect_activation_stats_for_linears(
-                        model=model,
-                        linear_items=[(r.name, r.module) for r in eligible_plan_refs],
-                        model_path=str(activation_runtime["model_path"]),
-                        access_token=activation_runtime.get("access_token"),
-                        dataset=str(activation_runtime.get("dataset", "")),
-                        nsamples=int(activation_runtime.get("nsamples", 512)),
-                        seqlen=int(activation_runtime.get("seqlen", 512)),
-                        seed=int(activation_runtime.get("seed", 0)),
-                        device=str(activation_runtime.get("device") or cat_args.train_device),
-                        cache=activation_runtime.get("cache"),  # type: ignore[arg-type]
-                        log_every=int(activation_runtime.get("log_every", 0)),
-                        logger=log,
+                        plan_activation_weight, plan_activation_abs_mean, _ = activation_stats_to_views(subset_stats)
+                    plan_refs = [
+                        LinearPrepRef(
+                            name=r.name,
+                            weight=r.module.weight,
+                            in_features=int(r.module.in_features),
+                            out_features=int(r.module.out_features),
+                            transpose=bool(r.transpose),
+                        )
+                        for r in eligible_plan_refs
+                    ]
+                    outlier_channel_plan = build_outlier_channel_index_plan(
+                        group_refs=plan_refs,
+                        activation_weight_by_linear=plan_activation_weight,
+                        activation_abs_mean_by_linear=plan_activation_abs_mean,
+                        outlier_protect_count=int(cat_cfg.outlier_protect_count),
+                        outlier_protect_axis=category_protect_axis,
+                        outlier_channel_scope=str(cat_args.outlier_channel_scope),
+                        outlier_rank_metric=resolved_outlier_rank_metric,
+                        outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
                     )
-                    activation_runtime["cache"] = new_cache
-                    plan_activation_weight = {
-                        name: stats["max"]
-                        for name, stats in dynamic_act_stats.items()
-                        if isinstance(stats.get("max"), torch.Tensor)
-                    }
-                    plan_activation_abs_mean = {
-                        name: stats["abs_mean"]
-                        for name, stats in dynamic_act_stats.items()
-                        if isinstance(stats.get("abs_mean"), torch.Tensor)
-                    }
-                plan_refs = [
-                    LinearPrepRef(
-                        name=r.name,
-                        weight=r.module.weight,
-                        in_features=int(r.module.in_features),
-                        out_features=int(r.module.out_features),
-                        transpose=bool(r.transpose),
+                    for ref in planned_refs:
+                        outlier_channel_plan.setdefault(ref.name, torch.empty(0, dtype=torch.long))
+                    log.info(
+                        "[%s] outlier channel plan: mode=%s scope=%s eligible_linears=%d total_channels=%d",
+                        cat,
+                        resolved_outlier_mode,
+                        str(cat_args.outlier_channel_scope),
+                        len(plan_refs),
+                        sum(int(v.numel()) for v in outlier_channel_plan.values()),
                     )
-                    for r in eligible_plan_refs
-                ]
-                outlier_channel_plan = build_outlier_channel_index_plan(
-                    group_refs=plan_refs,
-                    activation_weight_by_linear=plan_activation_weight,
-                    activation_abs_mean_by_linear=plan_activation_abs_mean,
-                    outlier_protect_count=int(cat_cfg.outlier_protect_count),
-                    outlier_protect_axis=outlier_protect_axis,
-                    outlier_channel_scope=str(cat_args.outlier_channel_scope),
-                    outlier_rank_metric=resolved_outlier_rank_metric,
-                    outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
-                )
-                for ref in planned_refs:
-                    outlier_channel_plan.setdefault(ref.name, torch.empty(0, dtype=torch.long))
-                log.info(
-                    "[%s] outlier channel plan: mode=%s scope=%s eligible_linears=%d total_channels=%d",
-                    cat,
-                    resolved_outlier_mode,
-                    str(cat_args.outlier_channel_scope),
-                    len(plan_refs),
-                    sum(int(v.numel()) for v in outlier_channel_plan.values()),
-                )
 
             for start in range(0, len(ordered_refs), linear_group_size):
                 group_refs = ordered_refs[start:start + linear_group_size]
@@ -2865,7 +2980,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     outlier_channel_scope=str(cat_args.outlier_channel_scope),
                     outlier_rank_metric=resolved_outlier_rank_metric,
                     outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
-                    outlier_protect_axis=outlier_protect_axis,
+                    outlier_protect_axis=category_protect_axis,
                     outlier_protect_channel_quant=outlier_protect_channel_quant,
                     outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
                     outlier_residual_codec=cat_args.outlier_residual_codec,

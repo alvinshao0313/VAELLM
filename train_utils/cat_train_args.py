@@ -18,6 +18,7 @@ from litebsq.sparse_residual import (
     get_default_block_shape_for_index_bits,
     validate_sparse_residual_block_shape,
 )
+from train_utils.lora_training import parse_distill_hidden_alignment_layer_weighting
 from train_utils.cat_data_prep import normalize_intra_part_sort_mode
 from train_utils.cat_arg_overrides import (
     OverrideSpec,
@@ -38,6 +39,7 @@ from train_utils.train_args import (
     _parse_bool_like,
     _parse_distill_loss_type,
 )
+from train_utils.mlp_channel_selection import is_mlp_aligned_rank_metric
 from train_utils.utils import split_csv
 
 
@@ -68,6 +70,8 @@ class NormalizedCatArgs:
     outlier_channel_scope: str
     outlier_residual_top_p: OverrideTable[float]
     outlier_rank_metric: str
+    outlier_mlp_rank_metric: str
+    outlier_mlp_fuse_weights: Tuple[float, float, float]
     outlier_residual_min_abs: float
     outlier_residual_codec: str
     outlier_residual_index_bits: int
@@ -82,12 +86,12 @@ class NormalizedCatArgs:
     outlier_residual_vae_lr: float
     outlier_residual_vae_codebook_bits: OverrideTable[int]
     outlier_residual_vae_codebook_dim: OverrideTable[int]
-    wa_mse_calib_dataset: str
-    wa_mse_calib_nsamples: int
-    wa_mse_calib_seqlen: int
-    wa_mse_calib_seed: int
-    wa_mse_calib_device: str
-    wa_mse_calib_log_every: int
+    activation_calib_dataset: str
+    activation_calib_nsamples: int
+    activation_calib_seqlen: int
+    activation_calib_seed: int
+    activation_calib_device: str
+    activation_calib_log_every: int
     eval_ppl: bool
     eval_tasks: str
     ppl_limit: int
@@ -175,6 +179,7 @@ class ResolvedCategoryRuntimeConfig:
     decoder_base_ch: Optional[int]
     decoder_num_res_blocks: Optional[int]
     norm_type: str
+    activation_type: str
     decoder_type: str
 
 
@@ -203,11 +208,15 @@ _CATEGORY_OVERRIDE_SELECTORS = ("default", "cat")
 _AFTER_CATEGORY_OVERRIDE_SELECTORS = ("default", "after")
 _CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse", "amse")
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "rms", "no")
+_CAT_ACTIVATION_TYPE_CHOICES = ("swish", "relu", "none", "sigmoid", "gelu", "hard_swish")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
 _OUTLIER_PROTECT_MODE_CHOICES = ("none", "channel", "channel_residual_vae", "residual_sparse")
 _OUTLIER_CHANNEL_SCOPE_CHOICES = ("layer", "category")
 _OUTLIER_RESIDUAL_VAE_DECODER_SHARE_SCOPE_CHOICES = ("none", "category")
-_DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+_DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_HELP = (
+    "LoRA hidden alignment 层权重模式：uniform | linear_depth | adaptive | adaptive_top_<K>。"
+    " adaptive 默认 K=3，仅对 teacher 相邻层 cosine 最低的 K 层计算 hidden 对齐损失。"
+)
 _DISTILL_AFTER_CATEGORY_CHOICES = ("none", "remaining_lora", "compressed_lora", "decoder", "both")
 _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES = {"compressed_lora", "both"}
 _OUTLIER_RANK_METRIC_CHOICES = (
@@ -263,6 +272,13 @@ _OUTLIER_RANK_METRICS_NEED_ACT_SQ_MEAN = (
     "channel_residual_actrms_abs",
 )
 _OUTLIER_CHANNEL_MODES = ("channel", "channel_residual_vae")
+_OUTLIER_MLP_RANK_METRIC_CHOICES = (
+    "none",
+    "mlp_intermediate_aligned_actrms",
+    "mlp_intermediate_aligned_actmean_abs",
+    "mlp_intermediate_aligned_actrms_abs",
+)
+_MLP_PROTECT_CATEGORIES = ("gate_proj", "up_proj", "down_proj")
 
 
 def _normalize_target_categories(value: Optional[str]) -> str:
@@ -360,7 +376,7 @@ def _normalize_distill_dataset_arg(raw: str, *, distill_after_category: str) -> 
     return _parse_distill_dataset_mix_text(value, arg_name="--distill_dataset")
 
 
-def _parse_wa_mse_calib_dataset_text(raw: str, *, arg_name: str) -> str:
+def _parse_activation_calib_dataset_text(raw: str, *, arg_name: str) -> str:
     value = str(raw or "").strip()
     if not value:
         return ""
@@ -560,6 +576,12 @@ _NORM_TYPE_SPEC = _make_choice_override_spec(
     example="default=group,cat:q_proj=layer",
     choices=_CAT_NORM_TYPE_CHOICES,
 )
+_ACTIVATION_TYPE_SPEC = _make_choice_override_spec(
+    arg_name="--activation_type",
+    allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=swish,cat:q_proj=relu",
+    choices=_CAT_ACTIVATION_TYPE_CHOICES,
+)
 _DECODER_TYPE_SPEC = _make_choice_override_spec(
     arg_name="--decoder_type",
     allowed_selectors=_CATEGORY_OVERRIDE_SELECTORS,
@@ -691,6 +713,7 @@ def _build_cat_train_vae_parser() -> argparse.ArgumentParser:
     parser.add_argument("--zeta", type=float, default=1.0)
     parser.add_argument("--inv_temperature", type=float, default=100.0)
     parser.add_argument("--norm_type", type=str, default="default=group", help=f"Category overrides. Example: {_NORM_TYPE_SPEC.example}")
+    parser.add_argument("--activation_type", type=str, default="default=swish", help=f"Category overrides. Example: {_ACTIVATION_TYPE_SPEC.example}")
     parser.add_argument("--decoder_type", type=str, default="default=linear", help=f"Category overrides. Example: {_DECODER_TYPE_SPEC.example}")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -752,6 +775,11 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_channel_scope=str(raw_args.outlier_channel_scope).strip().lower(),
         outlier_residual_top_p=_parse_cat_override(raw_args.outlier_residual_top_p, spec=_OUTLIER_RESIDUAL_TOP_P_SPEC),
         outlier_rank_metric=str(raw_args.outlier_rank_metric).strip().lower(),
+        outlier_mlp_rank_metric=str(raw_args.outlier_mlp_rank_metric).strip().lower(),
+        outlier_mlp_fuse_weights=_parse_outlier_mlp_fuse_weights_text(
+            raw_args.outlier_mlp_fuse_weights,
+            arg_name="--outlier_mlp_fuse_weights",
+        ),
         outlier_residual_min_abs=float(raw_args.outlier_residual_min_abs),
         outlier_residual_codec=str(raw_args.outlier_residual_codec).strip().lower(),
         outlier_residual_index_bits=resolved_index_bits,
@@ -775,15 +803,15 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         outlier_residual_vae_batch_multiplier=int(raw_args.outlier_residual_vae_batch_multiplier),
         outlier_residual_vae_steps=int(raw_args.outlier_residual_vae_steps),
         outlier_residual_vae_lr=float(raw_args.outlier_residual_vae_lr),
-        wa_mse_calib_dataset=_parse_wa_mse_calib_dataset_text(
-            raw_args.wa_mse_calib_dataset,
-            arg_name="--wa_mse_calib_dataset",
+        activation_calib_dataset=_parse_activation_calib_dataset_text(
+            raw_args.activation_calib_dataset,
+            arg_name="--activation_calib_dataset",
         ),
-        wa_mse_calib_nsamples=int(raw_args.wa_mse_calib_nsamples),
-        wa_mse_calib_seqlen=int(raw_args.wa_mse_calib_seqlen),
-        wa_mse_calib_seed=int(raw_args.wa_mse_calib_seed),
-        wa_mse_calib_device=str(raw_args.wa_mse_calib_device),
-        wa_mse_calib_log_every=int(raw_args.wa_mse_calib_log_every),
+        activation_calib_nsamples=int(raw_args.activation_calib_nsamples),
+        activation_calib_seqlen=int(raw_args.activation_calib_seqlen),
+        activation_calib_seed=int(raw_args.activation_calib_seed),
+        activation_calib_device=str(raw_args.activation_calib_device),
+        activation_calib_log_every=int(raw_args.activation_calib_log_every),
         eval_ppl=bool(raw_args.eval_ppl),
         eval_tasks=str(raw_args.eval_tasks),
         ppl_limit=int(raw_args.ppl_limit),
@@ -810,10 +838,9 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
             raw_args.distill_pre_mlp_hidden_loss_weight,
             spec=_DISTILL_PRE_MLP_HIDDEN_LOSS_WEIGHT_SPEC,
         ),
-        distill_hidden_alignment_layer_weighting=make_choice_parser(
-            arg_name="--distill_hidden_alignment_layer_weighting",
-            choices=_DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_CHOICES,
-        )(raw_args.distill_hidden_alignment_layer_weighting),
+        distill_hidden_alignment_layer_weighting=parse_distill_hidden_alignment_layer_weighting(
+            raw_args.distill_hidden_alignment_layer_weighting
+        ),
         lora_use_dora=_parse_cat_override(raw_args.lora_use_dora, spec=_LORA_USE_DORA_SPEC),
         distill_tune_final_norm=bool(raw_args.distill_tune_final_norm),
         distill_use_post_norm_head_linear=bool(raw_args.distill_use_post_norm_head_linear),
@@ -844,6 +871,66 @@ def _override_table_contains(table: OverrideTable[object], predicate) -> bool:
     return any(bool(predicate(value)) for _selector, value in _iter_override_entries(table))
 
 
+def _parse_outlier_mlp_fuse_weights_text(value: str, *, arg_name: str) -> Tuple[float, float, float]:
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"{arg_name} must contain exactly 3 comma-separated floats, got {value!r}.")
+    parsed = tuple(float(part) for part in parts)
+    if any(weight <= 0.0 for weight in parsed):
+        raise ValueError(f"{arg_name} entries must be > 0, got {value!r}.")
+    return parsed  # type: ignore[return-value]
+
+
+def _mlp_aligned_rank_metric_enabled(cat_args: NormalizedCatArgs) -> bool:
+    return is_mlp_aligned_rank_metric(cat_args.outlier_mlp_rank_metric)
+
+
+def _validate_outlier_mlp_args(cat_args: NormalizedCatArgs) -> None:
+    metric = str(cat_args.outlier_mlp_rank_metric).strip().lower()
+    if metric not in _OUTLIER_MLP_RANK_METRIC_CHOICES:
+        raise ValueError(
+            f"Unsupported --outlier_mlp_rank_metric={cat_args.outlier_mlp_rank_metric!r}. "
+            f"Expected one of: {', '.join(_OUTLIER_MLP_RANK_METRIC_CHOICES)}."
+        )
+    if metric == "none":
+        return
+
+    mode = str(cat_args.outlier_protect_mode).strip().lower()
+    if mode != "channel":
+        raise ValueError(
+            f"--outlier_mlp_rank_metric={metric!r} is only valid when --outlier_protect_mode=channel."
+        )
+    if str(cat_args.outlier_channel_scope).strip().lower() != "layer":
+        raise ValueError(
+            f"--outlier_mlp_rank_metric={metric!r} is only valid when --outlier_channel_scope=layer."
+        )
+    if not str(cat_args.activation_calib_dataset).strip():
+        raise ValueError(
+            f"--outlier_mlp_rank_metric={metric!r} requires --activation_calib_dataset."
+        )
+
+    categories = split_csv(cat_args.target_categories)
+    missing = [cat for cat in _MLP_PROTECT_CATEGORIES if cat not in categories]
+    if missing:
+        raise ValueError(
+            f"--outlier_mlp_rank_metric={metric!r} requires target_categories to include "
+            + ",".join(_MLP_PROTECT_CATEGORIES)
+            + f", missing: {','.join(missing)}."
+        )
+
+    counts = {
+        cat: int(resolve_category_value(cat_args.outlier_protect_count, cat))
+        for cat in _MLP_PROTECT_CATEGORIES
+    }
+    unique_counts = sorted(set(counts.values()))
+    if len(unique_counts) != 1:
+        raise ValueError(
+            "--outlier_mlp_rank_metric requires equal --outlier_protect_count for "
+            "gate_proj, up_proj, and down_proj. Got: "
+            + ",".join(f"{cat}={counts[cat]}" for cat in _MLP_PROTECT_CATEGORIES)
+        )
+
+
 def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) -> None:
     channel_needs_activation = (
         str(cat_args.outlier_protect_mode).strip().lower() in _OUTLIER_CHANNEL_MODES
@@ -854,12 +941,22 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
         )
         and _override_table_contains(cat_args.outlier_protect_count, lambda value: int(value) > 0)
     )
+    mlp_channel_needs_activation = (
+        _mlp_aligned_rank_metric_enabled(cat_args)
+        and str(cat_args.outlier_protect_mode).strip().lower() == "channel"
+        and any(
+            int(resolve_category_value(cat_args.outlier_protect_count, cat)) > 0
+            for cat in _MLP_PROTECT_CATEGORIES
+            if cat in split_csv(cat_args.target_categories)
+        )
+    )
     dynamic_calib_enabled = (
         _override_table_contains(
             vae_args.recon_loss_type,
             lambda value: str(value).strip().lower() == "wa_mse",
         )
         or channel_needs_activation
+        or mlp_channel_needs_activation
         or (
             str(cat_args.outlier_protect_mode).strip().lower() == "residual_sparse"
             and (
@@ -868,9 +965,9 @@ def _validate_dynamic_calib_dataset_args(cat_args: NormalizedCatArgs, vae_args) 
             )
         )
     )
-    if dynamic_calib_enabled and not str(cat_args.wa_mse_calib_dataset).strip():
+    if dynamic_calib_enabled and not str(cat_args.activation_calib_dataset).strip():
         raise ValueError(
-            "--wa_mse_calib_dataset must be set when dynamic activation calibration is enabled. "
+            "--activation_calib_dataset must be set when dynamic activation calibration is enabled. "
             "Use ratio-style dataset specs such as 'wiki=1.0', 'openorca=1.0' or "
             "'openorca=0.5,fineweb_edu=0.5'."
         )
@@ -1074,6 +1171,7 @@ def _normalize_cat_train_vae_args(raw_args):
     args.decoder_num_res_blocks = _parse_cat_override(raw_args.decoder_num_res_blocks, spec=_DECODER_NUM_RES_BLOCKS_SPEC)
     args.recon_loss_type = _parse_cat_override(raw_args.recon_loss_type, spec=_RECON_LOSS_TYPE_SPEC)
     args.norm_type = _parse_cat_override(raw_args.norm_type, spec=_NORM_TYPE_SPEC)
+    args.activation_type = _parse_cat_override(raw_args.activation_type, spec=_ACTIVATION_TYPE_SPEC)
     args.decoder_type = _parse_cat_override(raw_args.decoder_type, spec=_DECODER_TYPE_SPEC)
     return args
 
@@ -1102,6 +1200,7 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
         (vae_args.decoder_num_res_blocks, "--decoder_num_res_blocks"),
         (vae_args.recon_loss_type, "--recon_loss_type"),
         (vae_args.norm_type, "--norm_type"),
+        (vae_args.activation_type, "--activation_type"),
         (vae_args.decoder_type, "--decoder_type"),
     )
     for table, arg_name in tables:
@@ -1180,6 +1279,7 @@ def resolve_category_runtime_configs(cat_args: NormalizedCatArgs, vae_args, acti
             decoder_base_ch=resolve_category_value(vae_args.decoder_base_ch, category),
             decoder_num_res_blocks=resolve_category_value(vae_args.decoder_num_res_blocks, category),
             norm_type=str(resolve_category_value(vae_args.norm_type, category)).strip().lower(),
+            activation_type=str(resolve_category_value(vae_args.activation_type, category)).strip().lower(),
             decoder_type=str(resolve_category_value(vae_args.decoder_type, category)).strip().lower(),
         )
     return resolved
@@ -1276,6 +1376,22 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--outlier_mlp_rank_metric",
+        type=str,
+        choices=list(_OUTLIER_MLP_RANK_METRIC_CHOICES),
+        default="none",
+        help=(
+            "MLP gate/up/down 专用选道指标。none 表示 MLP 仍走 --outlier_rank_metric 的 per-linear 逻辑；"
+            "mlp_intermediate_aligned_actrms / actmean_abs / actrms_abs 表示按 SwiGLU intermediate path 共享保护通道。"
+        ),
+    )
+    parser.add_argument(
+        "--outlier_mlp_fuse_weights",
+        type=str,
+        default="1,1,1",
+        help="MLP aligned 选道融合权重。格式：alpha_up,alpha_gate,alpha_down。",
+    )
+    parser.add_argument(
         "--outlier_residual_min_abs",
         type=lambda v: _parse_nonnegative_float_text(v, arg_name="--outlier_residual_min_abs"),
         default=1e-6,
@@ -1357,18 +1473,18 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="Learning rate for protected residual VAE. If 0, reuse the base VAE learning rate.",
     )
     parser.add_argument(
-        "--wa_mse_calib_dataset",
-        type=lambda raw: _parse_wa_mse_calib_dataset_text(raw, arg_name="--wa_mse_calib_dataset"),
+        "--activation_calib_dataset",
+        type=lambda raw: _parse_activation_calib_dataset_text(raw, arg_name="--activation_calib_dataset"),
         default="",
-        help="Calibration dataset used for wa_mse dynamic act-max recomputation. "
+        help="Calibration dataset for dynamic activation stats collection. "
         "Required when dynamic calibration is enabled. Format: alias=weight,alias=weight. "
         "For example: wiki=1.0, openorca=1.0, or openorca=0.5,fineweb_edu=0.5.",
     )
-    parser.add_argument("--wa_mse_calib_nsamples", type=int, default=512, help="Calibration sample count used for wa_mse dynamic act-max recomputation.")
-    parser.add_argument("--wa_mse_calib_seqlen", type=int, default=512, help="Calibration sequence length used for wa_mse dynamic act-max recomputation.")
-    parser.add_argument("--wa_mse_calib_seed", type=int, default=0, help="Calibration sampling seed used for wa_mse dynamic act-max recomputation.")
-    parser.add_argument("--wa_mse_calib_device", type=str, default="", help="Device for wa_mse dynamic act-max recomputation. Empty means use --train_device.")
-    parser.add_argument("--wa_mse_calib_log_every", type=int, default=0, help="Log interval for wa_mse dynamic act-max recomputation progress (0 to disable).")
+    parser.add_argument("--activation_calib_nsamples", type=int, default=512, help="Calibration sample count for dynamic activation stats collection.")
+    parser.add_argument("--activation_calib_seqlen", type=int, default=512, help="Calibration sequence length for dynamic activation stats collection.")
+    parser.add_argument("--activation_calib_seed", type=int, default=0, help="Calibration sampling seed for dynamic activation stats collection.")
+    parser.add_argument("--activation_calib_device", type=str, default="", help="Device for dynamic activation stats collection. Empty means use --train_device.")
+    parser.add_argument("--activation_calib_log_every", type=int, default=0, help="Log interval for dynamic activation stats collection progress (0 to disable).")
     parser.add_argument(
         "--eval_ppl",
         type=lambda v: _parse_bool_like(v, arg_name="--eval_ppl"),
@@ -1429,9 +1545,9 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--distill_hidden_alignment_layer_weighting",
-        type=str,
+        type=parse_distill_hidden_alignment_layer_weighting,
         default="uniform",
-        help="LoRA hidden alignment 辅助损失的层权重模式：uniform 或 linear_depth。",
+        help=_DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_HELP,
     )
     parser.add_argument("--lora_use_dora", type=str, default="default=true", help=f"after_category 覆盖参数。示例：{_LORA_USE_DORA_SPEC.example}")
     parser.add_argument(
@@ -1479,6 +1595,7 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
     raw_script_args, remaining = script_parser.parse_known_args(list(argv))
     cat_args = _normalize_cat_train_script_args(raw_script_args)
     _validate_outlier_protect_mode_args(cat_args)
+    _validate_outlier_mlp_args(cat_args)
     _validate_distill_after_category_args(cat_args)
 
     vae_parser = _build_cat_train_vae_parser()

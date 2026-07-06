@@ -62,6 +62,7 @@ def _module_shape_key(ref: LinearRef, runtime_cfg) -> Tuple[object, ...]:
         None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch),
         None if runtime_cfg.decoder_num_res_blocks is None else int(runtime_cfg.decoder_num_res_blocks),
         str(runtime_cfg.norm_type),
+        str(runtime_cfg.activation_type),
         str(runtime_cfg.decoder_type),
     )
 
@@ -182,6 +183,7 @@ def _runtime_cfg_manifest(runtime_cfg) -> Dict[str, Any]:
         if runtime_cfg.decoder_num_res_blocks is None
         else int(runtime_cfg.decoder_num_res_blocks),
         "norm_type": str(runtime_cfg.norm_type),
+        "activation_type": str(runtime_cfg.activation_type),
         "decoder_type": str(runtime_cfg.decoder_type),
     }
 

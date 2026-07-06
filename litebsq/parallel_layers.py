@@ -2,11 +2,37 @@ from typing import Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
+
+_ACTIVATION_CHOICES = ("swish", "relu", "none", "sigmoid", "gelu", "hard_swish")
 
 
 def swish(x: Tensor) -> Tensor:
     return x * torch.sigmoid(x)
+
+
+def hard_swish(x: Tensor) -> Tensor:
+    return x * F.relu6(x + 3.0) / 6.0
+
+
+def apply_activation(x: Tensor, activation_type: str) -> Tensor:
+    kind = str(activation_type).strip().lower()
+    if kind == "swish":
+        return swish(x)
+    if kind == "relu":
+        return F.relu(x)
+    if kind == "none":
+        return x
+    if kind == "sigmoid":
+        return torch.sigmoid(x)
+    if kind == "gelu":
+        return F.gelu(x)
+    if kind == "hard_swish":
+        return hard_swish(x)
+    raise ValueError(
+        f"Unsupported activation_type={activation_type!r}. Expected one of: {', '.join(_ACTIVATION_CHOICES)}."
+    )
 
 
 def _validate_model_index(model_idx: int, *, num_models: int) -> None:
@@ -404,11 +430,19 @@ def pack_normalizes(norms: Sequence["Normalize"]) -> "Normalize":
 
 
 class ResnetBlock1D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, norm_type: str = "group", num_models: int = 1):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        norm_type: str = "group",
+        activation_type: str = "swish",
+        num_models: int = 1,
+    ):
         super().__init__()
         self.in_channels = int(in_channels)
         self.out_channels = self.in_channels if out_channels is None else int(out_channels)
         self.num_models = int(num_models)
+        self.activation_type = str(activation_type).strip().lower()
 
         self.norm1 = Normalize(self.in_channels, norm_type, num_models=self.num_models)
         self.linear1 = ParallelLinear(self.in_channels, self.out_channels, num_models=self.num_models)
@@ -419,7 +453,7 @@ class ResnetBlock1D(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.norm1(x)
-        h = swish(h)
+        h = apply_activation(h, self.activation_type)
         h = self.linear1(h)
         x = self.nin_shortcut(x)
         return x + h
@@ -430,6 +464,7 @@ class ResnetBlock1D(nn.Module):
             in_channels=self.in_channels,
             out_channels=self.out_channels,
             norm_type=self.norm1.norm_type,
+            activation_type=self.activation_type,
             num_models=1,
         )
         block.norm1 = self.norm1.extract_single(model_idx)
@@ -457,6 +492,7 @@ def pack_resnet_blocks(blocks: Sequence["ResnetBlock1D"]) -> "ResnetBlock1D":
     in_channels = int(first.in_channels)
     out_channels = int(first.out_channels)
     norm_type = str(first.norm1.norm_type)
+    activation_type = str(first.activation_type)
     training = bool(first.training)
     first_linear = _resolve_single_linear(first.linear1)
     device = first_linear.weight.device
@@ -474,11 +510,13 @@ def pack_resnet_blocks(blocks: Sequence["ResnetBlock1D"]) -> "ResnetBlock1D":
             int(block.in_channels) != in_channels
             or int(block.out_channels) != out_channels
             or str(block.norm1.norm_type) != norm_type
+            or str(block.activation_type) != activation_type
         ):
             raise ValueError(
                 f"pack_resnet_blocks config mismatch at idx={idx}: "
-                f"in={int(block.in_channels)}, out={int(block.out_channels)}, norm={str(block.norm1.norm_type)} "
-                f"vs ({in_channels}, {out_channels}, {norm_type})."
+                f"in={int(block.in_channels)}, out={int(block.out_channels)}, norm={str(block.norm1.norm_type)}, "
+                f"activation={str(block.activation_type)} "
+                f"vs ({in_channels}, {out_channels}, {norm_type}, {activation_type})."
             )
         if bool(block.training) != training:
             raise ValueError("pack_resnet_blocks requires all blocks to share the same training mode.")
@@ -496,6 +534,7 @@ def pack_resnet_blocks(blocks: Sequence["ResnetBlock1D"]) -> "ResnetBlock1D":
         in_channels=in_channels,
         out_channels=out_channels,
         norm_type=norm_type,
+        activation_type=activation_type,
         num_models=len(blocks),
     ).to(device=device, dtype=dtype)
     packed.requires_grad_(False)
@@ -513,8 +552,10 @@ __all__ = [
     "Normalize",
     "ParallelLinear",
     "ResnetBlock1D",
+    "apply_activation",
     "pack_normalizes",
     "pack_parallel_linears",
     "pack_resnet_blocks",
+    "hard_swish",
     "swish",
 ]

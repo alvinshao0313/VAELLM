@@ -15,10 +15,10 @@ from litebsq.parallel_layers import (
     Normalize,
     ParallelLinear,
     ResnetBlock1D,
+    apply_activation,
     pack_normalizes,
     pack_parallel_linears,
     pack_resnet_blocks,
-    swish,
 )
 from litebsq.vae_args import add_autoencoder_model_args, resolve_autoencoder_arch_spec
 
@@ -39,6 +39,7 @@ class Encoder(nn.Module):
         num_res_blocks: int,
         out_dim: int,
         norm_type: str = "group",
+        activation_type: str = "swish",
         use_checkpoint: bool = False,
         num_models: int = 1,
     ):
@@ -47,6 +48,7 @@ class Encoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.num_res_blocks = int(num_res_blocks)
         self.out_dim = int(out_dim)
+        self.activation_type = str(activation_type).strip().lower()
         self.use_checkpoint = bool(use_checkpoint)
         self.num_models = int(num_models)
 
@@ -57,6 +59,7 @@ class Encoder(nn.Module):
                     in_channels=self.hidden_dim,
                     out_channels=self.hidden_dim,
                     norm_type=norm_type,
+                    activation_type=self.activation_type,
                     num_models=self.num_models,
                 )
                 for _ in range(self.num_res_blocks)
@@ -75,7 +78,7 @@ class Encoder(nn.Module):
         for block in self.blocks:
             h = block(h)
         h = self.norm_out(h)
-        h = swish(h)
+        h = apply_activation(h, self.activation_type)
         return self.linear_out(h)
 
 
@@ -88,6 +91,7 @@ class Decoder(nn.Module):
         hidden_dim: int = 128,
         num_res_blocks: int = 2,
         norm_type: str = "group",
+        activation_type: str = "swish",
         decoder_type: str = "linear",
         use_checkpoint: bool = False,
         num_models: int = 1,
@@ -98,6 +102,7 @@ class Decoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.num_res_blocks = int(num_res_blocks)
         self.norm_type = str(norm_type).strip().lower()
+        self.activation_type = str(activation_type).strip().lower()
         self.decoder_type = str(decoder_type).strip().lower()
         self.use_checkpoint = bool(use_checkpoint)
         self.num_models = int(num_models)
@@ -113,6 +118,7 @@ class Decoder(nn.Module):
                         in_channels=self.hidden_dim,
                         out_channels=self.hidden_dim,
                         norm_type=self.norm_type,
+                        activation_type=self.activation_type,
                         num_models=self.num_models,
                     )
                     for _ in range(self.num_res_blocks)
@@ -136,7 +142,7 @@ class Decoder(nn.Module):
         for block in self.blocks:
             h = block(h)
         h = self.norm_out(h)
-        h = swish(h)
+        h = apply_activation(h, self.activation_type)
         return self.linear_out(h)
 
     @torch.no_grad()
@@ -179,6 +185,7 @@ class Decoder(nn.Module):
             hidden_dim=self.hidden_dim,
             num_res_blocks=self.num_res_blocks,
             norm_type=self.norm_type,
+            activation_type=self.activation_type,
             decoder_type=self.decoder_type,
             use_checkpoint=self.use_checkpoint,
             num_models=1,
@@ -236,6 +243,7 @@ def pack_decoders(decoders: Sequence[Decoder]) -> Decoder:
             or int(decoder.hidden_dim) != int(first.hidden_dim)
             or int(decoder.num_res_blocks) != int(first.num_res_blocks)
             or str(decoder.norm_type) != str(first.norm_type)
+            or str(decoder.activation_type) != str(first.activation_type)
             or str(decoder.decoder_type) != str(first.decoder_type)
             or bool(decoder.use_checkpoint) != bool(first.use_checkpoint)
         ):
@@ -243,6 +251,7 @@ def pack_decoders(decoders: Sequence[Decoder]) -> Decoder:
                 f"pack_decoders config mismatch at idx={idx}: "
                 f"got in={int(decoder.in_dim)}, out={int(decoder.out_dim)}, hidden={int(decoder.hidden_dim)}, "
                 f"blocks={int(decoder.num_res_blocks)}, norm={str(decoder.norm_type)}, "
+                f"activation={str(decoder.activation_type)}, "
                 f"type={str(decoder.decoder_type)}, ckpt={bool(decoder.use_checkpoint)} "
                 f"vs first decoder."
             )
@@ -269,6 +278,7 @@ def pack_decoders(decoders: Sequence[Decoder]) -> Decoder:
         hidden_dim=first.hidden_dim,
         num_res_blocks=first.num_res_blocks,
         norm_type=first.norm_type,
+        activation_type=first.activation_type,
         decoder_type=first.decoder_type,
         use_checkpoint=first.use_checkpoint,
         num_models=len(decoders),
@@ -309,6 +319,7 @@ class AutoEncoder(nn.Module):
             num_res_blocks=self.arch_spec.encoder_num_res_blocks,
             out_dim=self.latent_dim,
             norm_type=self.arch_spec.norm_type,
+            activation_type=self.arch_spec.activation_type,
             use_checkpoint=self.arch_spec.use_checkpoint,
             num_models=self.num_models,
         )
@@ -318,6 +329,7 @@ class AutoEncoder(nn.Module):
             hidden_dim=self.arch_spec.decoder_hidden_dim,
             num_res_blocks=self.arch_spec.decoder_num_res_blocks,
             norm_type=self.arch_spec.norm_type,
+            activation_type=self.arch_spec.activation_type,
             decoder_type=self.arch_spec.decoder_type,
             use_checkpoint=self.arch_spec.use_checkpoint,
             num_models=self.num_models,

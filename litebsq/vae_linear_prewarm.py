@@ -51,6 +51,7 @@ class _DecoderPackSignature:
     hidden_dim: int
     num_res_blocks: int
     norm_type: str
+    activation_type: str
     use_checkpoint: bool
     param_dtype: torch.dtype
 
@@ -202,6 +203,7 @@ def _resolve_decoder_pack_signature(decoder: nn.Module) -> _DecoderPackSignature
         hidden_dim=int(decoder.hidden_dim),
         num_res_blocks=int(decoder.num_res_blocks),
         norm_type=str(decoder.norm_type),
+        activation_type=str(getattr(decoder, "activation_type", "swish")),
         use_checkpoint=bool(decoder.use_checkpoint),
         param_dtype=_resolve_decoder_param_dtype(decoder),
     )
