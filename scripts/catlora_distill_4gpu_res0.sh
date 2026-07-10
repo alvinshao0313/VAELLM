@@ -5,25 +5,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/edgerazor_model_env.sh
 source "${SCRIPT_DIR}/lib/edgerazor_model_env.sh"
 
+RESUME_CKPT=".result/catlora/res0-bf16-protect-channel-vae/final_model"
+OUTPUT_DIR="./.result/catlora_distill/res0-bf16-protect-channel-vae"
+
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
-export CAT_DISTILL_DATASET_NUM_PROC="${CAT_DISTILL_DATASET_NUM_PROC:-16}"
+export CAT_DISTILL_DATASET_NUM_PROC="${CAT_DISTILL_DATASET_NUM_PROC:-32}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-# 多卡蒸馏（DDP）：只改启动方式，CLI 参数与下方 python 命令一致。
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
-# torchrun --standalone --nproc_per_node=4 python tools/cat_distill_from_vae_checkpoint.py \
-#   ... # 与下方相同参数
-
-python tools/cat_distill_from_vae_checkpoint.py \
+torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.py \
   --model_path "${MODEL_PATH}" \
-  --resume_from_checkpoint ".result/catlora/no_outlier_protect_vae_only_Qwen_Qwen3-8B_20260618_075940" \
-  --output_dir "./.result/catlora_distill" \
+  --resume_from_checkpoint "${RESUME_CKPT}" \
+  --output_dir "${OUTPUT_DIR}" \
   --seed "31" \
   --deterministic "true" \
   --train_device "cuda" \
@@ -36,18 +34,18 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
   --skip_layers "" \
   --eval_ppl "false" \
-  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
+  --eval_tasks "" \
   --ppl_limit "-1" \
   --outlier_protect_mode "none" \
   --distill_after_category "compressed_lora" \
   --distill_dataset "${VAELLM_EDGERAZOR_DATASET_MIX}" \
   --lora_rank "default=4" \
-  --lora_alpha "default=4,after:k_proj=256" \
+  --lora_alpha "default=4" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=5000,after:q_proj=5000,after:k_proj=8000,after:v_proj=8000,after:o_proj=3000,after:gate_proj=3000,after:up_proj=3000,after:down_proj=3000" \
+  --distill_steps "default=2000" \
   --distill_batch_size "default=1" \
-  --distill_nsamples "default=11000000" \
-  --distill_lr "default=1e-4" \
+  --distill_nsamples "default=8730040" \
+  --distill_lr "default=2e-5" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
   --distill_post_attn "false" \
@@ -56,20 +54,20 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --distill_loss_type "default=eakld" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
-  --distill_hidden_loss_weight "default=0.01" \
+  --distill_hidden_loss_weight "default=0.5" \
   --distill_pre_mlp_hidden_loss_weight "default=0.0" \
-  --distill_hidden_alignment_layer_weighting "linear_depth" \
+  --distill_hidden_alignment_layer_weighting "adaptive_top_3" \
   --lora_use_dora "default=false" \
   --distill_tune_final_norm "false" \
   --distill_use_post_norm_head_linear "false" \
   --distill_hif4_act "false" \
   --eval_hif4_act "false" \
-  --distill_gradient_accumulation_steps "1" \
+  --distill_gradient_accumulation_steps "256" \
   --distill_gradient_checkpointing "true" \
   --distill_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --distill_optim "adamw_torch" \
   --distill_max_grad_norm "1.3" \
-  --distill_warmup_ratio "0.1" \
+  --distill_warmup_ratio "0.05" \
   --distill_group_by_length "true" \
   --distill_lr_scheduler_type "constant" \
   --distill_model_max_length "${DISTILL_MODEL_MAX_LENGTH}" \

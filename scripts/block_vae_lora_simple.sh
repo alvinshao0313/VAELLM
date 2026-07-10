@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/edgerazor_model_env.sh
+source "${SCRIPT_DIR}/lib/edgerazor_model_env.sh"
+
 export PYTHONPATH="${PYTHONPATH:-.}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-5}"
@@ -23,7 +27,7 @@ fi
 # --vae_pretrained_checkpoint、--block_init_checkpoint、--block_resume_from_checkpoint 三者只能选一个。
 
 python tools/block_vae_lora_train.py \
-  --model_path "Qwen/Qwen3-8B" \
+  --model_path "${MODEL_PATH}" \
   --output_dir ".result" \
   --seed "${SEED}" \
   --deterministic "${FULL_DETERMINISM:-false}" \
@@ -73,7 +77,7 @@ python tools/block_vae_lora_train.py \
   --diversity_gamma "1.0" \
   --normalize_weight \
   --new_quant \
-  --block_distill_dataset "openorca=0.24,fineweb_edu=0.18,race=0.24,sciq=0.03,alpaca=0.11,longalpaca=0.10,longalign=0.10" \
+  --block_distill_dataset "${VAELLM_EDGERAZOR_DATASET_MIX}" \
   --block_distill_steps "5000" \
   --block_distill_nsamples "5000" \
   --block_distill_seqlen "4096" \
@@ -96,6 +100,8 @@ python tools/block_vae_lora_train.py \
   --block_adalora_orth_reg_weight "0.5" \
   --block_loss_alpha "0." \
   --block_loss_beta "0.05" \
+  --block_distill_entropy_aware_kl "true" \
+  --block_distill_eakld_confidence_k "16" \
   --block_attn_query_chunk_size "4096" \
   --block_distill_log_every "10" \
   --block_decode_group_size "8" \

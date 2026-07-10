@@ -19,9 +19,16 @@ from train_utils.cat_after_category_distill import run_after_category_distill
 from train_utils.cat_train_args import resolve_category_runtime_configs
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.cat_train_runtime import save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot
+from train_utils.lora_utils import (
+    distill_distributed_barrier,
+    ensure_distill_process_group_initialized,
+    is_distill_distributed,
+    is_distill_main_process,
+    resolve_distill_train_device,
+)
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
-    _build_run_output_dir,
+    _build_distributed_run_output_dir,
     load_model_checkpoint,
     resolve_checkpoint_dir,
     save_model_checkpoint,
@@ -345,14 +352,23 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
 
     configure_deterministic_mode(bool(getattr(cat_args, "deterministic", False)))
     set_seed(cat_args.seed)
+    ensure_distill_process_group_initialized()
+    if not is_distill_main_process():
+        os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 
     os.makedirs(cat_args.output_dir, exist_ok=True)
-    run_output_dir = _build_run_output_dir(cat_args.output_dir, vae_args.model_path)
+    run_output_dir = _build_distributed_run_output_dir(cat_args.output_dir, vae_args.model_path)
     os.environ["LOG_FILE"] = os.path.join(run_output_dir, "linear_by_category.log")
     logger = get_logger("linear_by_category")
     cat_args.output_dir = run_output_dir
 
     logger.info("Run output directory: %s", run_output_dir)
+    if is_distill_distributed():
+        logger.info(
+            "Checkpoint distill distributed mode: world_size=%d local_rank=%s",
+            int(os.environ.get("WORLD_SIZE", "1")),
+            str(os.environ.get("LOCAL_RANK", "0")),
+        )
     if bool(getattr(cat_args, "deterministic", False)):
         logger.info("Deterministic mode enabled: torch deterministic algorithms on, TF32 disabled.")
     logger.info(
@@ -394,7 +410,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     logger.info("Saved normalized parameter snapshot: %s", snapshot_path)
 
     eval_tokenizer = None
-    if run_task_eval:
+    if run_task_eval and is_distill_main_process():
         from transformers import AutoTokenizer
 
         logger.info("加载类别后下游任务评估 tokenizer: %s", vae_args.model_path)
@@ -407,6 +423,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     residency = _CheckpointDistillResidency()
     lora_round_idx = 0
     active_categories: List[str] = []
+    distill_device = resolve_distill_train_device(str(cat_args.train_device))
     for category in target_categories:
         active_categories.append(str(category))
         _apply_checkpoint_distill_residency(
@@ -425,7 +442,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 prewarm_targets,
                 clear_existing=True,
                 group_size=8,
-                compute_device=str(cat_args.train_device),
+                compute_device=distill_device,
                 logger=logger,
             )
             logger.info(
@@ -438,7 +455,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 int(prewarm_stats.get("failed", 0)),
             )
 
-        if run_category_eval:
+        if run_category_eval and is_distill_main_process():
             logger.info("每类后蒸馏前评估...")
             _eval_after_category(
                 model=model,
@@ -468,7 +485,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         model = distill_result.model
         lora_round_idx = int(distill_result.next_lora_round_idx)
 
-        if run_category_eval:
+        if run_category_eval and is_distill_main_process():
             logger.info("每类后蒸馏后评估...")
             _eval_after_category(
                 model=model,
@@ -483,7 +500,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 tokenizer=eval_tokenizer,
             )
 
-    if run_category_eval:
+    if run_category_eval and is_distill_main_process():
         logger.info("所有类别蒸馏完成后最终评估...")
         _eval_after_category(
             model=model,
@@ -497,7 +514,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             eval_tasks=eval_tasks_text,
             tokenizer=eval_tokenizer,
         )
-    if cat_args.save_model:
+    if cat_args.save_model and is_distill_main_process():
         _restore_checkpoint_distill_residency(model=model, residency=residency, logger=logger)
         _save_final_model(
             model=model,
@@ -508,4 +525,5 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             logger=logger,
         )
 
+    distill_distributed_barrier()
     logger.info("Done.")

@@ -192,7 +192,8 @@
 | `--distill_log_every` | `default=1` | LoRA 日志间隔 | after-category override |
 | `--distill_temperature` | `default=1.0` | LoRA 蒸馏温度 | after-category override |
 | `--distill_loss_alpha` | `default=0.5` | LoRA 蒸馏混合权重 | after-category override |
-| `--distill_loss_type` | `default=sft` | LoRA loss 类型 | after-category override |
+| `--distill_loss_type` | `default=eakld` | LoRA loss 类型（含 `eakld` / `eakld_kd` / `kd_top_*` 等） | after-category override |
+| `--distill_eakld_confidence_k` | `16` | EAKLD 熵归一化 K（非 vocab top-k） | 全局 |
 | `--distill_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
 | `--distill_hidden_alignment_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权全层；`linear_depth` 后层权重线性增大并归一到平均权重为 1；`adaptive` 默认选 cosine 最低的 3 层；`adaptive_top_<K>` 仅对 teacher 相邻层变化最大的 K 层计算对齐损失 |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 `remaining_lora` 支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
@@ -310,6 +311,7 @@
 | `--distill_group_by_length` | LoRA `TrainingArguments` | LoRA 按长度分组 |
 | `--distill_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型 |
 | `--distill_model_max_length` | LoRA trainer | LoRA 样本最大长度 |
+| `--distill_teacher_logits_cpu_staging` | LoRA trainer | teacher forward 后把 logits 暂存 CPU（bf16），算 KL 前搬回 GPU；默认 `true` |
 | `--distill_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |
 | `--eval_hif4_act` | cat_train eval | 是否在内部类别后评估时启用 HiFloat4 激活伪量化；默认 `false` |
 

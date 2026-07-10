@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from itertools import chain
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -7,6 +8,12 @@ import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets, interleave_datasets, load_dataset
 from transformers import AutoTokenizer
 from transformers.trainer_utils import IntervalStrategy
+
+from e2e_common.chat_template_utils import (
+    infer_assistant_response_template,
+    infer_user_instruction_template,
+    render_messages,
+)
 
 
 @dataclass(frozen=True)
@@ -138,8 +145,67 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         text_field="question_stem",
         text_format="openbookqa_mcqa",
     ),
+    "edgerazor_ii_7m": DatasetMixSourcePreset(
+        alias="edgerazor_ii_7m",
+        path="data/edgerazor_qwen3/ii_7M_instruct.jsonl",
+        config=None,
+        train_split="train",
+        eval_split=None,
+        text_field="messages",
+        text_format="edgerazor_messages",
+    ),
+    "edgerazor_ii_gen": DatasetMixSourcePreset(
+        alias="edgerazor_ii_gen",
+        path="data/edgerazor_qwen3/ii_gen_1.4M_instruct.jsonl",
+        config=None,
+        train_split="train",
+        eval_split=None,
+        text_field="messages",
+        text_format="edgerazor_messages",
+    ),
+    "edgerazor_tulu": DatasetMixSourcePreset(
+        alias="edgerazor_tulu",
+        path="data/edgerazor_qwen3/tulu_0.6M_instruct.jsonl",
+        config=None,
+        train_split="train",
+        eval_split=None,
+        text_field="messages",
+        text_format="edgerazor_messages",
+    ),
+    "edgerazor_am": DatasetMixSourcePreset(
+        alias="edgerazor_am",
+        path="data/edgerazor_qwen3/am_1.4M_instruct.jsonl",
+        config=None,
+        train_split="train",
+        eval_split=None,
+        text_field="messages",
+        text_format="edgerazor_messages",
+    ),
+    "vaellm_eval_task": DatasetMixSourcePreset(
+        alias="vaellm_eval_task",
+        path="data/edgerazor_qwen3/task_vaellm_eval_instruct.jsonl",
+        config=None,
+        train_split="train",
+        eval_split=None,
+        text_field="messages",
+        text_format="edgerazor_messages",
+    ),
 }
 
+
+VAELLM_EDGERAZOR_DATA_DIR = "data/edgerazor_qwen3"
+VAELLM_EDGERAZOR_DATASET_MIX = (
+    "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,"
+    "edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009"
+)
+VAELLM_EDGERAZOR_TOTAL_SAMPLES = 11_000_000
+VAELLM_EDGERAZOR_SFT_ALIASES = {
+    "edgerazor_ii_7m",
+    "edgerazor_ii_gen",
+    "edgerazor_tulu",
+    "edgerazor_am",
+    "vaellm_eval_task",
+}
 
 MCQA_DATASET_MIX_ALIASES = {"mmlu", "race", "sciq", "arc", "openbookqa"}
 _MCQA_CONTINUATIONS = [" A", " B", " C", " D"]
@@ -682,6 +748,117 @@ def _sft_race_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bo
     return [(prompt, False), (options[answer_idx], True)]
 
 
+def _resolve_dataset_path(path: str) -> str:
+    path_str = str(path).strip()
+    if not path_str.lower().endswith((".jsonl", ".json")):
+        return path_str
+    candidate = path_str
+    if not os.path.isabs(candidate):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(project_root, candidate)
+    if not os.path.isfile(candidate):
+        raise FileNotFoundError(f"Local dataset file not found: {candidate}")
+    return candidate
+
+
+def _normalize_edgerazor_messages(record: Dict[str, object]) -> Optional[List[Dict[str, str]]]:
+    messages = record.get("messages")
+    if not isinstance(messages, list) or len(messages) < 1:
+        return None
+    normalized: List[Dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            return None
+        role = str(message.get("role", "")).strip().lower()
+        content = str(message.get("content", "")).strip()
+        if role not in {"system", "user", "assistant"} or not content:
+            return None
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _format_edgerazor_messages_record(record: Dict[str, object]) -> Optional[str]:
+    messages = _normalize_edgerazor_messages(record)
+    if messages is None:
+        return None
+    parts: List[str] = []
+    for message in messages:
+        role = str(message["role"])
+        content = str(message["content"])
+        if role == "system":
+            parts.append(f"### System:\n{content}")
+        elif role == "user":
+            parts.append(f"### User:\n{content}")
+        else:
+            parts.append(f"### Assistant:\n{content}")
+    return "\n\n".join(parts)
+
+
+def _encode_edgerazor_messages_sft(
+    record: Dict[str, object],
+    tokenizer,
+    *,
+    block_size: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    messages = _normalize_edgerazor_messages(record)
+    if messages is None:
+        raise ValueError("edgerazor_messages SFT record is missing a valid messages field.")
+
+    try:
+        from trl.trainer.utils import DataCollatorForCompletionOnlyLM
+    except ImportError as exc:
+        raise ImportError("未安装 trl。edgerazor_messages SFT 需要 DataCollatorForCompletionOnlyLM。") from exc
+
+    full_text = render_messages(messages, tokenizer, add_generation_prompt=False)
+    encoded = tokenizer(
+        full_text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    input_ids = [int(token_id) for token_id in encoded.get("input_ids", [])]
+    attention_mask = [1] * len(input_ids)
+    collator = DataCollatorForCompletionOnlyLM(
+        infer_assistant_response_template(tokenizer),
+        instruction_template=infer_user_instruction_template(tokenizer),
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+    batch = collator(
+        [
+            {
+                "input_ids": list(input_ids),
+                "attention_mask": list(attention_mask),
+            }
+        ]
+    )
+    labels = [int(value) for value in batch["labels"][0].tolist()]
+    has_trainable_token = any(int(value) != -100 for value in labels)
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        input_ids.append(int(eos_token_id))
+        labels.append(int(eos_token_id))
+        attention_mask.append(1)
+        has_trainable_token = True
+
+    if not has_trainable_token:
+        raise ValueError("edgerazor_messages SFT sample has no trainable response tokens.")
+    if len(input_ids) > int(block_size):
+        raise ValueError(
+            f"edgerazor_messages SFT sample length {len(input_ids)} exceeds --model_max_length={int(block_size)}. "
+            "Increase --model_max_length or remove this over-length sample."
+        )
+    return input_ids, attention_mask, labels
+
+
+def _sft_edgerazor_messages_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bool]]]:
+    raise ValueError(
+        "edgerazor_messages SFT encoding requires tokenizer.apply_chat_template. "
+        "Use _encode_edgerazor_messages_sft instead of segment-based encoding."
+    )
+
+
 def _sft_sciq_segments(record: Dict[str, object]) -> Optional[List[Tuple[str, bool]]]:
     support = _stringify_text(record.get("support"))
     question = _stringify_text(record.get("question"))
@@ -712,9 +889,11 @@ def _record_to_sft_segments(
         return _sft_race_segments(record)
     if normalized_text_format == "sciq_qa":
         return _sft_sciq_segments(record)
+    if normalized_text_format == "edgerazor_messages":
+        return _sft_edgerazor_messages_segments(record)
     raise ValueError(
         f"SFT dataset_task does not support text_format={text_format!r}. "
-        "Supported formats: openorca, alpaca, longalign_chat, race_mcqa, sciq_qa."
+        "Supported formats: openorca, alpaca, longalign_chat, race_mcqa, sciq_qa, edgerazor_messages."
     )
 
 
@@ -737,6 +916,8 @@ def _record_to_text(
         return _format_race_record(record)
     if normalized_text_format == "sciq_qa":
         return _format_sciq_record(record)
+    if normalized_text_format == "edgerazor_messages":
+        return _format_edgerazor_messages_record(record)
     if normalized_text_format != "auto":
         raise ValueError(f"Unsupported dataset text format: {text_format}")
 
@@ -814,6 +995,32 @@ def _records_to_text_batch(
         record = {key: examples[key][idx] for key in keys}
         out.append(_record_to_text(record, text_field=text_field, text_format=text_format))
     return {"text": out}
+
+
+def _prepare_edgerazor_messages_dataset(
+    dataset: Dataset,
+    *,
+    num_proc: int = 1,
+) -> Dataset:
+    def _records_to_messages_batch(examples: Dict[str, Sequence[object]]) -> Dict[str, List[Optional[List[Dict[str, str]]]]]:
+        if not examples:
+            return {"messages": []}
+        keys = list(examples.keys())
+        batch_size = len(examples[keys[0]])
+        out: List[Optional[List[Dict[str, str]]]] = []
+        for idx in range(batch_size):
+            record = {key: examples[key][idx] for key in keys}
+            out.append(_normalize_edgerazor_messages(record))
+        return {"messages": out}
+
+    prepared = dataset.map(
+        _records_to_messages_batch,
+        batched=True,
+        remove_columns=list(dataset.column_names),
+        num_proc=None if int(num_proc) == 1 else int(num_proc),
+    )
+    prepared = prepared.filter(lambda rec: rec["messages"] is not None)
+    return prepared
 
 
 def _prepare_text_dataset(
@@ -969,14 +1176,24 @@ def _records_to_sft_blocks_batch(
 
     for idx in range(batch_size):
         record = {key: examples[key][idx] for key in keys}
-        segments = _record_to_sft_segments(record, text_format=text_format)
-        if segments is None:
-            continue
-        input_ids, attention_mask, labels = _encode_sft_segments(
-            segments,
-            tokenizer,
-            block_size=block,
-        )
+        if str(text_format).strip().lower() == "edgerazor_messages":
+            try:
+                input_ids, attention_mask, labels = _encode_edgerazor_messages_sft(
+                    record,
+                    tokenizer,
+                    block_size=block,
+                )
+            except ValueError:
+                continue
+        else:
+            segments = _record_to_sft_segments(record, text_format=text_format)
+            if segments is None:
+                continue
+            input_ids, attention_mask, labels = _encode_sft_segments(
+                segments,
+                tokenizer,
+                block_size=block,
+            )
         buffered_input_ids.extend(input_ids)
         buffered_attention_mask.extend(attention_mask)
         buffered_labels.extend(labels)
@@ -1383,6 +1600,14 @@ def _sample_and_pack_mcqa_source(
 
 
 def _load_preset_raw_datasets(preset: DatasetMixSourcePreset) -> Tuple[Dataset, Optional[Dataset]]:
+    resolved_path = _resolve_dataset_path(str(preset.path))
+    if resolved_path.lower().endswith((".jsonl", ".json")):
+        dataset = load_dataset("json", data_files={"train": resolved_path})
+        if isinstance(dataset, DatasetDict):
+            if str(preset.train_split) not in dataset:
+                raise ValueError(f"Missing train split '{preset.train_split}' in local dataset {resolved_path}.")
+            return dataset[str(preset.train_split)], None
+        return dataset, None
     if str(preset.alias) == "mmlu":
         train_parts: List[Dataset] = []
         for subject in _MMLU_NO_TRAIN_SUBJECTS:

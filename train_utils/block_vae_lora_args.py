@@ -135,6 +135,8 @@ class BlockVaeLoraArgs:
     block_distill_log_every: int
     block_decode_group_size: int
     block_hidden_advance_batch_size: int
+    block_distill_entropy_aware_kl: bool
+    block_distill_eakld_confidence_k: int
     transpose_modules: str
     skip_layers: str
     block_layers: str
@@ -523,6 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block_decode_group_size", type=int, default=8)
     parser.add_argument("--block_hidden_advance_batch_size", type=int, default=1)
     parser.add_argument(
+        "--block_distill_entropy_aware_kl",
+        type=lambda v: _parse_bool_like(v, arg_name="--block_distill_entropy_aware_kl"),
+        default=True,
+        help="Use entropy-aware forward/reverse KL for block attention map distillation.",
+    )
+    parser.add_argument(
+        "--block_distill_eakld_confidence_k",
+        type=int,
+        default=16,
+        help="Entropy normalization K for block attention EAKLD (not vocab top-k).",
+    )
+    parser.add_argument(
         "--transpose_modules",
         type=str,
         default=_DEFAULT_TRANSPOSE_MODULES,
@@ -655,6 +669,8 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         block_distill_log_every=int(raw_args.block_distill_log_every),
         block_decode_group_size=int(raw_args.block_decode_group_size),
         block_hidden_advance_batch_size=int(raw_args.block_hidden_advance_batch_size),
+        block_distill_entropy_aware_kl=bool(raw_args.block_distill_entropy_aware_kl),
+        block_distill_eakld_confidence_k=int(raw_args.block_distill_eakld_confidence_k),
         transpose_modules=str(raw_args.transpose_modules),
         skip_layers=str(raw_args.skip_layers),
         block_layers=str(raw_args.block_layers),
@@ -757,6 +773,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: BlockVaeLoraArgs, trai
         parser.error("--block_loss_beta must be >= 0.")
     if float(args.block_loss_alpha) + float(args.block_loss_beta) > 1.0:
         parser.error("--block_loss_alpha + --block_loss_beta must be <= 1.")
+    if int(args.block_distill_eakld_confidence_k) < 2:
+        parser.error("--block_distill_eakld_confidence_k must be >= 2.")
     if int(args.block_attn_query_chunk_size) <= 0:
         parser.error("--block_attn_query_chunk_size must be > 0.")
     if int(args.block_distill_log_every) <= 0:

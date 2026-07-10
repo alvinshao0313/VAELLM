@@ -16,6 +16,15 @@ except ImportError:
     TrainerCallback = None
     TrainingArguments = None
 
+from e2e_common.chat_template_utils import (
+    infer_assistant_response_template,
+    infer_user_instruction_template,
+    render_messages,
+)
+from e2e_common.data import (
+    VAELLM_EDGERAZOR_SFT_ALIASES,
+    normalize_dataset_mix_spec,
+)
 from e2e_common.post_norm_head import ensure_post_norm_head_linear, resolve_post_norm_linear
 from rotation.model_utils import get_model_type, get_pre_head_layernorm
 from train_utils.cat_train_args import resolve_distill_runtime_config
@@ -27,6 +36,7 @@ from train_utils.hif4_act import (
 from train_utils.lora_data import ensure_distill_dataset_stack_available, prepare_distill_datasets
 from train_utils.lora_training import (
     CustomSFTTrainer,
+    DataCollatorForCompletionOnlyLM,
     SFTTrainer,
     create_lora_adapters,
     ensure_lora_training_stack_available,
@@ -55,6 +65,7 @@ class _ResolvedDistillStageConfig:
     hidden_loss_weight: float
     pre_mlp_hidden_loss_weight: float
     hidden_alignment_layer_weighting: str
+    eakld_confidence_k: int
     dataset: str
     use_dora: bool
     use_distill_hif4_act: bool
@@ -146,6 +157,49 @@ def _ensure_lora_stack_available() -> None:
         raise ImportError("未安装 transformers。请先安装：pip install transformers")
 
 
+def distill_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def is_distill_distributed() -> bool:
+    return distill_world_size() > 1
+
+
+def resolve_distill_train_device(fallback: str) -> str:
+    device = str(fallback).strip()
+    if not is_distill_distributed():
+        return device
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if device.startswith("cuda") and torch.cuda.is_available():
+        return f"cuda:{local_rank}"
+    return device
+
+
+def is_distill_main_process() -> bool:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank()) == 0
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def distill_distributed_barrier() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def ensure_distill_process_group_initialized() -> None:
+    if not is_distill_distributed():
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return
+    if not torch.distributed.is_available():
+        raise RuntimeError("torch.distributed is unavailable but WORLD_SIZE > 1.")
+    backend = "nccl" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "gloo"
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if backend == "nccl":
+        torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(backend=backend)
+
+
 def _enum_to_value(value, default: str) -> str:
     raw = value if value is not None else default
     if hasattr(raw, "value"):
@@ -170,7 +224,7 @@ def _resolve_distill_stage_config(
     runtime_cfg = resolve_distill_runtime_config(cat_args, after_category)
     base_seed = int(getattr(cat_args, "seed", 0))
     return _ResolvedDistillStageConfig(
-        device=str(getattr(cat_args, "train_device", "cuda")),
+        device=resolve_distill_train_device(str(getattr(cat_args, "train_device", "cuda"))),
         base_seed=base_seed,
         round_idx=round_idx,
         seed=int(base_seed + round_idx),
@@ -189,6 +243,7 @@ def _resolve_distill_stage_config(
         hidden_loss_weight=float(runtime_cfg.hidden_loss_weight),
         pre_mlp_hidden_loss_weight=float(runtime_cfg.pre_mlp_hidden_loss_weight),
         hidden_alignment_layer_weighting=str(runtime_cfg.hidden_alignment_layer_weighting),
+        eakld_confidence_k=int(runtime_cfg.eakld_confidence_k),
         dataset=str(getattr(cat_args, "distill_dataset", "")).strip().lower(),
         use_dora=bool(runtime_cfg.use_dora),
         use_distill_hif4_act=bool(getattr(training_args, "distill_hif4_act", False)),
@@ -362,7 +417,7 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
         if not isinstance(gradient_checkpointing_kwargs, dict):
             raise ValueError("--distill_gradient_checkpointing_kwargs must be a JSON object.")
 
-    return TrainingArguments(
+    training_kwargs = dict(
         output_dir=os.path.join(str(getattr(cat_args, "output_dir", ".result")), "lora_trainer_state"),
         per_device_train_batch_size=int(cfg.batch_size),
         gradient_accumulation_steps=int(getattr(training_args, "distill_gradient_accumulation_steps", 1)),
@@ -382,12 +437,24 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
         group_by_length=bool(getattr(training_args, "distill_group_by_length", True)),
         lr_scheduler_type=_enum_to_value(getattr(training_args, "distill_lr_scheduler_type", "linear"), "linear"),
         report_to=[],
-        disable_tqdm=False,
+        disable_tqdm=not is_distill_main_process(),
+        log_level="info" if is_distill_main_process() else "error",
+        log_level_replica="error",
         save_strategy="no",
         seed=int(cfg.seed),
         data_seed=int(cfg.seed),
         full_determinism=bool(getattr(cat_args, "deterministic", False)),
     )
+    if is_distill_distributed():
+        training_kwargs["ddp_find_unused_parameters"] = True
+    return TrainingArguments(**training_kwargs)
+
+
+def _distill_dataset_uses_edgerazor_messages(dataset_mix_spec: str) -> bool:
+    if "=" not in str(dataset_mix_spec):
+        return False
+    sources, _, _ = normalize_dataset_mix_spec(str(dataset_mix_spec))
+    return any(str(alias) in VAELLM_EDGERAZOR_SFT_ALIASES for alias in sources)
 
 
 def _build_lora_trainer(
@@ -402,16 +469,31 @@ def _build_lora_trainer(
     cfg: _ResolvedDistillStageConfig,
     hif4_act_controller,
     teacher_param_snapshots,
+    tokenizer=None,
 ):
     trainer_kwargs = dict(
         model=model,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         args=sft_args,
-        dataset_text_field="text",
         max_seq_length=int(getattr(training_args, "distill_model_max_length", 2048)),
         callbacks=[_LoraTrainerLogCallback(logger=logger)],
     )
+    if tokenizer is not None and _distill_dataset_uses_edgerazor_messages(cfg.dataset):
+        if DataCollatorForCompletionOnlyLM is None:
+            raise ImportError("未安装 trl。EdgeRazor messages 蒸馏需要 DataCollatorForCompletionOnlyLM。")
+        response_template = infer_assistant_response_template(tokenizer)
+        instruction_template = infer_user_instruction_template(tokenizer)
+        trainer_kwargs["processing_class"] = tokenizer
+        trainer_kwargs["formatting_func"] = lambda example: render_messages(example["messages"], tokenizer)
+        trainer_kwargs["data_collator"] = DataCollatorForCompletionOnlyLM(
+            response_template,
+            instruction_template=instruction_template,
+            tokenizer=tokenizer,
+            mlm=False,
+        )
+    else:
+        trainer_kwargs["dataset_text_field"] = "text"
     if lora_config is not None:
         trainer_kwargs["peft_config"] = lora_config
 
@@ -428,6 +510,10 @@ def _build_lora_trainer(
             hidden_loss_weight=float(cfg.hidden_loss_weight),
             pre_mlp_hidden_loss_weight=float(cfg.pre_mlp_hidden_loss_weight),
             hidden_alignment_layer_weighting=str(cfg.hidden_alignment_layer_weighting),
+            eakld_confidence_k=int(cfg.eakld_confidence_k),
+            teacher_logits_cpu_staging=bool(
+                getattr(training_args, "distill_teacher_logits_cpu_staging", False)
+            ),
             distill_hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
         )
@@ -463,10 +549,15 @@ def _train_and_merge_lora_model(
             hif4_act_controller.enabled = False
         remove_hif4_act_hooks(hif4_act_handles)
 
+    distill_distributed_barrier()
     model, merged_count = merge_all_lora(trainer.model)
+    if is_distill_main_process():
+        logger.info("LoRA: 微调完成并融合，融合模块数量=%d", merged_count)
+    if is_distill_distributed():
+        distill_distributed_barrier()
+        return model
     model.to("cpu")
     torch.cuda.empty_cache()
-    logger.info("LoRA: 微调完成并融合，融合模块数量=%d", merged_count)
     return model
 
 
@@ -538,6 +629,7 @@ def lora_finetune_remaining_categories(
             cfg.dataset,
             nsamples=cfg.nsamples,
             seed=cfg.seed,
+            cache_dir=str(getattr(cat_args, "output_dir", "") or ""),
         )
         logger.info(
             "LoRA: 补偿训练混合数据集=%s nsamples=%d eval_dataset=none",
@@ -565,6 +657,7 @@ def lora_finetune_remaining_categories(
         _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
         sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
         hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
+        tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
         trainer = _build_lora_trainer(
             model=model,
             train_ds=train_ds,
@@ -576,6 +669,7 @@ def lora_finetune_remaining_categories(
             cfg=cfg,
             hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
+            tokenizer=tokenizer,
         )
         model = _train_and_merge_lora_model(
             trainer=trainer,

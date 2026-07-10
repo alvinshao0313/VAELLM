@@ -171,6 +171,18 @@ def cleanup_memory(verbos=True) -> None:
             )
 
 
+def _is_rank_zero_for_logging() -> bool:
+    rank = os.environ.get("RANK")
+    if rank is not None and str(rank).strip() != "":
+        return int(rank) == 0
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None and str(local_rank).strip() != "":
+        return int(local_rank) == 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank()) == 0
+    return True
+
+
 # Define a utility method for setting the logging parameters of a logger
 def get_logger(logger_name: Optional[str]) -> logging.Logger:
     logger = logging.getLogger(logger_name)
@@ -179,6 +191,10 @@ def get_logger(logger_name: Optional[str]) -> logging.Logger:
 
     if logger.handlers:
         logger.handlers.clear()
+
+    if not _is_rank_zero_for_logging():
+        logger.addHandler(logging.NullHandler())
+        return logger
 
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 

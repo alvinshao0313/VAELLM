@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=7
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -47,7 +46,7 @@ export HF_DATASETS_OFFLINE=1
 # CAT_DISTILL_DATASET_NUM_PROC=16          # 蒸馏/校准数据 format 预处理并行进程数，位置在 lora_data.py
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
-# --distill_after_category "none|remaining_lora|compressed_lora|decoder|both"
+# 蒸馏数据：先运行 bash scripts/prepare_vaellm_edgerazor_data.sh，见 docs/edgerazor_dataset.md
   # --unload_vae_original_weights_on_final_save \
 
 python tools/cat_train.py \
@@ -80,7 +79,7 @@ python tools/cat_train.py \
   --decoder_base_ch "default=128" \
   --decoder_num_res_blocks "default=1" \
   --norm_type "default=rms" \
-  --activation_type "default=relu" \
+  --activation_type "default=swish" \
   --decoder_type "default=symmetric" \
   --recon_loss_type "default=mse" \
   --quantizer_type "BSQ" \
@@ -110,7 +109,7 @@ python tools/cat_train.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --outlier_protect_mode "channel" \
-  --outlier_mlp_rank_metric "none" \
+  --outlier_mlp_rank_metric "mlp_intermediate_aligned_actmean_abs" \
   --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
   --outlier_protect_channel_quant "none" \
@@ -121,7 +120,7 @@ python tools/cat_train.py \
   --outlier_residual_vae_stages "default=1" \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=32,cat:o_proj=32,cat:gate_proj=32,cat:up_proj=32,cat:down_proj=128" \
+  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=32,cat:o_proj=32,cat:gate_proj=128,cat:up_proj=128,cat:down_proj=128" \
   --outlier_protect_min_per_layer 1 \
   --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.0" \
@@ -131,20 +130,22 @@ python tools/cat_train.py \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
   --distill_after_category "none" \
-  --distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1" \
+  --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --lora_rank "default=128" \
   --lora_alpha "default=128" \
   --lora_dropout "default=0.03" \
   --distill_steps "default=5000" \
   --distill_batch_size "default=1" \
-  --distill_nsamples "default=20000" \
+  --distill_nsamples "default=11000000" \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
   --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
-  --distill_loss_type "default=kd_top_1000" \
+  --distill_loss_type "default=eakld" \
+  --distill_eakld_confidence_k "16" \
+  --distill_teacher_logits_cpu_staging "true" \
   --distill_hidden_loss_weight "default=0.01" \
   --distill_pre_mlp_hidden_loss_weight "default=0.0" \
   --distill_hidden_alignment_layer_weighting "linear_depth" \

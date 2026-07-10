@@ -29,7 +29,7 @@ from train_utils.block_distill import (
     validate_block_distill_targets_available,
     validate_block_categories,
     validate_final_block_checkpoint,
-    validate_qwen3_model,
+    validate_block_distill_model,
 )
 from train_utils.block_vae_lora_args import (
     BlockVaeLoraArgs,
@@ -392,7 +392,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             str(resume_load_meta.get("adapter_module_count")),
         )
     setattr(model, "_e2e_vae_lora_tune_bias", str(args.block_lora_bias) == "lora_only")
-    validate_qwen3_model(model)
+    validate_block_distill_model(model)
 
     transpose_modules = parse_transpose_modules(str(args.transpose_modules))
     configured_categories = list(args.block_vae_categories)
@@ -597,6 +597,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         train_mode=str(args.block_distill_train_mode),
         decode_group_size=int(args.block_decode_group_size),
         hidden_advance_batch_size=int(args.block_hidden_advance_batch_size),
+        entropy_aware_kl=bool(args.block_distill_entropy_aware_kl),
+        eakld_confidence_k=int(args.block_distill_eakld_confidence_k),
     )
 
     for layer_idx in range(num_layers):

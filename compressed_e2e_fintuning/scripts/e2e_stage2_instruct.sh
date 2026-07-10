@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=../../scripts/lib/edgerazor_model_env.sh
+source "${REPO_ROOT}/scripts/lib/edgerazor_model_env.sh"
+
 export PYTHONPATH="${PYTHONPATH:-.}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -14,7 +18,7 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 MAX_STEPS="${MAX_STEPS:-500}"
 : "${STUDENT_CKPT:?Set STUDENT_CKPT to the stage1 final_model directory.}"
-INSTRUCT_DATASET_MIX="${INSTRUCT_DATASET_MIX:-openorca=0.50,alpaca=0.20,longalpaca=0.15,longalign=0.15}"
+INSTRUCT_DATASET_MIX="${INSTRUCT_DATASET_MIX:-${VAELLM_EDGERAZOR_DATASET_MIX}}"
 EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
@@ -41,7 +45,7 @@ python -m compressed_e2e_fintuning.main \
   --distill_temperature 1.0 \
   --distill_alpha 0.5 \
   --post_attn false \
-  --model_max_length "${MODEL_MAX_LENGTH:-8192}" \
+  --model_max_length "${MODEL_MAX_LENGTH}" \
   --decoder_layers "${DECODER_LAYERS:-0-35}" \
   --target_modules all \
   --layer_device_map auto \

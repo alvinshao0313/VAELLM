@@ -8,6 +8,7 @@ from train_utils.distill_losses import (
     compute_dual_kl_topk_loss,
     compute_dual_rkl_loss,
     compute_dual_rkl_topk_loss,
+    compute_entropy_aware_kl_loss,
 )
 
 
@@ -40,6 +41,7 @@ def compute_dense_loss_from_logits(
     temperature: float = 1.0,
     alpha: float = 0.5,
     post_attn: bool = False,
+    eakld_confidence_k: int = 16,
 ) -> torch.Tensor:
     norm = str(loss_type or "").strip().lower()
     if norm in {"sft", "origin"}:
@@ -125,6 +127,26 @@ def compute_dense_loss_from_logits(
                 reduction="batchmean",
             )
         return ce_loss * (1.0 - float(alpha)) + kd_loss * (float(alpha) * temperature * temperature)
+    if norm == "eakld":
+        return compute_entropy_aware_kl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+            temperature=float(temperature),
+            confidence_k=int(eakld_confidence_k),
+        )
+    if norm == "eakld_kd":
+        if ce_loss is None:
+            raise ValueError("loss_type=eakld_kd requires ce_loss.")
+        temperature = float(temperature)
+        eakld_loss = compute_entropy_aware_kl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+            temperature=temperature,
+            confidence_k=int(eakld_confidence_k),
+        )
+        return ce_loss * (1.0 - float(alpha)) + eakld_loss * (float(alpha) * temperature * temperature)
     if norm.startswith("dual_kl_top"):
         k = parse_topk(norm, prefix="dual_kl_top", default_k=1000)
         return compute_dual_kl_topk_loss(
@@ -170,6 +192,6 @@ def compute_dense_loss_from_logits(
 
     raise ValueError(
         f"Unsupported dense loss type: {loss_type}. "
-        "Supported: sft/origin, kl, rkl, dual_rkl, mse, kd, kd_top[_K], dual_kd_top[_K], "
+        "Supported: sft/origin, kl, rkl, dual_rkl, mse, kd, kd_top[_K], eakld, eakld_kd, dual_kd_top[_K], "
         "dual_kl, dual_kd, kl_top[_K], r_kl_top[_K], dual_r_kl_top[_K], dual_kl_top[_K]."
     )

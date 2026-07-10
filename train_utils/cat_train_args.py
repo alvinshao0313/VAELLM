@@ -113,6 +113,7 @@ class NormalizedCatArgs:
     distill_hidden_loss_weight: OverrideTable[float]
     distill_pre_mlp_hidden_loss_weight: OverrideTable[float]
     distill_hidden_alignment_layer_weighting: str
+    distill_eakld_confidence_k: int
     lora_use_dora: OverrideTable[bool]
     distill_tune_final_norm: bool
     distill_use_post_norm_head_linear: bool
@@ -150,6 +151,12 @@ class CatTrainHFTrainingArguments:
     distill_hif4_act: bool = field(
         default=False,
         metadata={"help": "Enable HiFloat4 activation pseudo-quantization for student linear inputs during the after-category distill stage."},
+    )
+    distill_teacher_logits_cpu_staging: bool = field(
+        default=True,
+        metadata={
+            "help": "After teacher forward, move teacher logits to CPU (bf16/fp16) until loss computation to reduce GPU peak memory."
+        },
     )
     fp16: bool = field(default=False)
     bf16: bool = field(default=False)
@@ -200,6 +207,7 @@ class ResolvedDistillRuntimeConfig:
     hidden_loss_weight: float
     pre_mlp_hidden_loss_weight: float
     hidden_alignment_layer_weighting: str
+    eakld_confidence_k: int
     use_dora: bool
 
 
@@ -841,6 +849,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         distill_hidden_alignment_layer_weighting=parse_distill_hidden_alignment_layer_weighting(
             raw_args.distill_hidden_alignment_layer_weighting
         ),
+        distill_eakld_confidence_k=int(raw_args.distill_eakld_confidence_k),
         lora_use_dora=_parse_cat_override(raw_args.lora_use_dora, spec=_LORA_USE_DORA_SPEC),
         distill_tune_final_norm=bool(raw_args.distill_tune_final_norm),
         distill_use_post_norm_head_linear=bool(raw_args.distill_use_post_norm_head_linear),
@@ -1304,6 +1313,7 @@ def resolve_distill_runtime_config(cat_args: NormalizedCatArgs, after_category: 
             resolve_after_category_value(cat_args.distill_pre_mlp_hidden_loss_weight, after_category)
         ),
         hidden_alignment_layer_weighting=str(cat_args.distill_hidden_alignment_layer_weighting),
+        eakld_confidence_k=int(cat_args.distill_eakld_confidence_k),
         use_dora=bool(resolve_after_category_value(cat_args.lora_use_dora, after_category)),
     )
 
@@ -1535,7 +1545,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_log_every", type=str, default="default=1", help=f"after_category 覆盖参数。示例：{_DISTILL_LOG_EVERY_SPEC.example}")
     parser.add_argument("--distill_temperature", type=str, default="default=1.0", help=f"after_category 覆盖参数。示例：{_DISTILL_TEMPERATURE_SPEC.example}")
     parser.add_argument("--distill_loss_alpha", type=str, default="default=0.5", help=f"after_category 覆盖参数。示例：{_DISTILL_LOSS_ALPHA_SPEC.example}")
-    parser.add_argument("--distill_loss_type", type=str, default="default=sft", help=f"after_category 覆盖参数。示例：{_DISTILL_LOSS_TYPE_SPEC.example}")
+    parser.add_argument("--distill_loss_type", type=str, default="default=eakld", help=f"after_category 覆盖参数。示例：{_DISTILL_LOSS_TYPE_SPEC.example}")
     parser.add_argument("--distill_hidden_loss_weight", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_DISTILL_HIDDEN_LOSS_WEIGHT_SPEC.example}")
     parser.add_argument(
         "--distill_pre_mlp_hidden_loss_weight",
@@ -1548,6 +1558,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         type=parse_distill_hidden_alignment_layer_weighting,
         default="uniform",
         help=_DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_HELP,
+    )
+    parser.add_argument(
+        "--distill_eakld_confidence_k",
+        type=int,
+        default=16,
+        help="EAKLD 熵归一化常数 K（非 vocab top-k）。用于 eakld / eakld_kd。",
     )
     parser.add_argument("--lora_use_dora", type=str, default="default=true", help=f"after_category 覆盖参数。示例：{_LORA_USE_DORA_SPEC.example}")
     parser.add_argument(

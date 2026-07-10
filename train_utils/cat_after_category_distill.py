@@ -30,6 +30,9 @@ from train_utils.lora_utils import (
     _log_lora_stage_start,
     _resolve_distill_stage_config,
     _restore_model_use_cache,
+    distill_distributed_barrier,
+    is_distill_distributed,
+    is_distill_main_process,
     lora_finetune_remaining_categories,
 )
 from train_utils.utils import collect_linears as _collect_linears
@@ -251,9 +254,12 @@ def _train_without_merging_peft_adapters(
             hif4_act_controller.enabled = False
         remove_hif4_act_hooks(hif4_act_handles)
 
+    distill_distributed_barrier()
     model = trainer.model
-    model.to("cpu")
-    torch.cuda.empty_cache()
+    if not is_distill_distributed():
+        model.to("cpu")
+        torch.cuda.empty_cache()
+    distill_distributed_barrier()
     return model
 
 
@@ -301,6 +307,7 @@ def _run_compressed_category_distill(
         cfg.dataset,
         nsamples=cfg.nsamples,
         seed=cfg.seed,
+        cache_dir=str(cat_args.output_dir),
     )
     _log_distill_dataset(logger, dataset_mix_spec, source_stats, cfg.nsamples)
     if len(train_ds) == 0:
@@ -382,6 +389,7 @@ def _run_compressed_category_distill(
         _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
         sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
         hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
+        tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
         trainer = _build_lora_trainer(
             model=model,
             train_ds=train_ds,
@@ -393,6 +401,7 @@ def _run_compressed_category_distill(
             cfg=cfg,
             hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=[],
+            tokenizer=tokenizer,
         )
         model = _train_without_merging_peft_adapters(
             trainer=trainer,

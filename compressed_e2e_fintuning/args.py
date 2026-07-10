@@ -7,14 +7,14 @@ from typing import List, Optional, Sequence, Tuple
 
 from transformers import HfArgumentParser
 
-from e2e_common.data import MCQA_DATASET_MIX_ALIASES, normalize_dataset_mix_spec
+from e2e_common.data import MCQA_DATASET_MIX_ALIASES, VAELLM_EDGERAZOR_SFT_ALIASES, normalize_dataset_mix_spec
 from e2e_common.e2e_args import parse_decoder_layers, parse_target_modules
 from train_utils.model_checkpoint_io import resolve_checkpoint_dir
 from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_like, _parse_lora_loss_type
 
 
 _DEFAULT_RUN_ROOT = ".result/compressed_e2e_fintuning"
-_SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"}
+_SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"} | VAELLM_EDGERAZOR_SFT_ALIASES
 _MCQA_LOSS_TYPES = {"choice_kd", "choice_kd_ce"}
 _VALID_FINETUNE_MODES = {"decoder", "lora", "both"}
 _MODE_TO_VAE_TRAIN_MODE = {
@@ -55,6 +55,7 @@ class VAEDecoderE2EArguments:
     distill_alpha: float = 0.5
     post_attn: bool = False
     hidden_loss_weight: float = 0.0
+    eakld_confidence_k: int = 16
     hidden_layer_weighting: str = "uniform"
     decoder_layers: str = "all"
     target_modules: str = "all"
@@ -123,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_alpha", type=float, default=0.5)
     parser.add_argument("--post_attn", type=lambda v: _parse_bool_like(v, arg_name="--post_attn"), default=False)
     parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
+    parser.add_argument("--eakld_confidence_k", type=int, default=16)
     parser.add_argument("--hidden_layer_weighting", type=str, default="uniform")
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
@@ -272,6 +274,8 @@ def validate_args(
         parser.error("--distill_alpha must satisfy 0 <= alpha <= 1.")
     if float(args.hidden_loss_weight) < 0.0:
         parser.error("--hidden_loss_weight must be >= 0.")
+    if int(args.eakld_confidence_k) < 2:
+        parser.error("--eakld_confidence_k must be >= 2.")
     hidden_layer_weighting = str(args.hidden_layer_weighting or "").strip().lower()
     if hidden_layer_weighting not in _VALID_HIDDEN_LAYER_WEIGHTING:
         parser.error("--hidden_layer_weighting must be one of: uniform | linear_depth.")

@@ -701,6 +701,7 @@ def run(args, hf_args, training_args):
         post_attn=bool(args.post_attn),
         hidden_loss_weight=float(args.hidden_loss_weight),
         hidden_layer_weighting=str(args.hidden_layer_weighting),
+        eakld_confidence_k=int(args.eakld_confidence_k),
         saved_tensor_offload=saved_tensor_offload,
         streaming_offload_manager=streaming_manager,
     )

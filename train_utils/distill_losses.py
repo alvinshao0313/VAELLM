@@ -1,5 +1,7 @@
 from typing import Optional
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -65,6 +67,101 @@ def _masked_token_kl_mean(
     mask_fp32 = mask.to(device=token_kl.device, dtype=token_kl.dtype)
     denom = mask_fp32.sum().clamp_min(1.0)
     return (token_kl * mask_fp32).sum() / denom
+
+
+def _resolve_distill_temperature(temperature: float) -> float:
+    return max(float(temperature), 0.1)
+
+
+def compute_teacher_entropy_gamma(
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    *,
+    confidence_k: int = 16,
+) -> torch.Tensor:
+    resolved_k = int(confidence_k)
+    if resolved_k < 2:
+        raise ValueError(f"confidence_k must be >= 2, got {resolved_k}.")
+
+    teacher_probs = F.softmax(teacher_logits.detach().float(), dim=-1)
+    entropy = -(teacher_probs * torch.log(teacher_probs.clamp_min(1e-8))).sum(dim=-1)
+    max_entropy = math.log(float(resolved_k))
+
+    if mask is not None:
+        mask_bool = mask.to(device=entropy.device, dtype=torch.bool)
+        entropy = entropy.masked_fill(~mask_bool, 0.0)
+        valid_lengths = mask.to(device=entropy.device, dtype=torch.float32).sum(dim=-1).clamp_min(1.0)
+        sample_avg_entropy = entropy.sum(dim=-1) / valid_lengths
+    else:
+        sample_avg_entropy = entropy.mean(dim=-1)
+
+    normalized_entropy = sample_avg_entropy / float(max_entropy)
+    gamma = 1.0 - normalized_entropy.mean()
+    return gamma.clamp(0.0, 1.0)
+
+
+def compute_forward_kl_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    temp = _resolve_distill_temperature(temperature)
+    student_scaled = student_logits.float() / temp
+    teacher_scaled = teacher_logits.detach().float() / temp
+    kl = _masked_token_kl_mean(
+        student_log_prob=F.log_softmax(student_scaled, dim=-1),
+        teacher_prob=F.softmax(teacher_scaled, dim=-1),
+        mask=mask,
+    )
+    return kl * (temp * temp)
+
+
+def compute_reverse_kl_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    temp = _resolve_distill_temperature(temperature)
+    student_scaled = student_logits.float() / temp
+    teacher_scaled = teacher_logits.detach().float() / temp
+    kl = _masked_token_kl_mean(
+        student_log_prob=F.log_softmax(teacher_scaled, dim=-1),
+        teacher_prob=F.softmax(student_scaled, dim=-1),
+        mask=mask,
+    )
+    return kl * (temp * temp)
+
+
+def compute_entropy_aware_kl_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    temperature: float = 1.0,
+    confidence_k: int = 16,
+) -> torch.Tensor:
+    gamma = compute_teacher_entropy_gamma(
+        teacher_logits,
+        mask,
+        confidence_k=int(confidence_k),
+    )
+    reverse_kl = compute_reverse_kl_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        mask=mask,
+        temperature=float(temperature),
+    )
+    forward_kl = compute_forward_kl_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        mask=mask,
+        temperature=float(temperature),
+    )
+    return gamma * reverse_kl + (1.0 - gamma) * forward_kl
 
 
 def compute_dual_kl_loss(

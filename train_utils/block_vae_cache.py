@@ -10,7 +10,7 @@ from torch import nn
 
 from train_utils import cat_train_pipeline as cat_train_impl
 from e2e_common.checkpoint_io import load_e2e_model_checkpoint, save_e2e_model_checkpoint
-from train_utils.block_distill import validate_qwen3_model
+from train_utils.block_distill import validate_block_distill_model
 from train_utils.block_vae_lora_args import BlockVaeLoraArgs, format_skip_layers
 from train_utils.cat_train_runtime import load_model_for_cat_train
 from train_utils.utils import LinearRef, configure_deterministic_mode, get_logger, set_seed
@@ -355,7 +355,7 @@ def _run_category_pretrain_worker(
     local_cat_args.convert_device = str(device)
     configure_deterministic_mode(bool(args.deterministic))
     model = load_model_for_cat_train(cat_args=local_cat_args, hf_args=hf_args, vae_args=vae_args)
-    validate_qwen3_model(model)
+    validate_block_distill_model(model)
     payloads = _train_category_tasks_on_loaded_model(
         model=model,
         tasks=tasks,

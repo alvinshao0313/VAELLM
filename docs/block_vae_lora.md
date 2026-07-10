@@ -181,6 +181,8 @@ cat:<当前类别> > default
 | `--block_lora_bias` | `none` | `none` | LoRA bias 模式 |
 | `--block_loss_alpha` | `0.1` | `0.5` | attention KL 权重 |
 | `--block_loss_beta` | `0.2` | `0.2` | linear relative MSE 权重 |
+| `--block_distill_entropy_aware_kl` | `true` | `true` | attention KL 使用熵感知 forward/reverse 混合（EAKLD 类比） |
+| `--block_distill_eakld_confidence_k` | `16` | `16` | attention 熵归一化 K（非 vocab top-k） |
 | `--block_attn_query_chunk_size` | `128` | `4096` | attention KL query chunk |
 | `--block_decode_group_size` | `8` | `8` | PEFT proxy decode group size |
 | `--block_hidden_advance_batch_size` | `1` | `8` | 推进 teacher/student hidden states 时的小 batch 大小；用于 resume prefix、skipped layer 和每层蒸馏结束后的 hidden 更新，不改变蒸馏训练 step 的 sample 粒度 |

@@ -1,5 +1,6 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+import math
 import re
 from typing import Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -30,7 +31,7 @@ from litebsq.vae_linear_prewarm import (
 from train_utils.hif4_act import applied_hif4_act
 
 
-QWEN3_BLOCK_CATEGORIES = (
+BLOCK_DISTILL_CATEGORIES = (
     "q_proj",
     "k_proj",
     "v_proj",
@@ -40,12 +41,14 @@ QWEN3_BLOCK_CATEGORIES = (
     "down_proj",
 )
 
+QWEN3_BLOCK_CATEGORIES = BLOCK_DISTILL_CATEGORIES
+
 
 def _normalize_target_categories(target_categories: Optional[Sequence[str]]) -> Tuple[str, ...]:
     if target_categories is None:
-        return tuple(QWEN3_BLOCK_CATEGORIES)
+        return tuple(BLOCK_DISTILL_CATEGORIES)
     seen = set()
-    allowed = set(QWEN3_BLOCK_CATEGORIES)
+    allowed = set(BLOCK_DISTILL_CATEGORIES)
     for item in target_categories:
         category = str(item)
         if category not in allowed:
@@ -88,6 +91,8 @@ class BlockDistillConfig:
     decode_group_size: int = 8
     hidden_advance_batch_size: int = 1
     eps: float = 1e-6
+    entropy_aware_kl: bool = True
+    eakld_confidence_k: int = 16
 
 
 def get_module_by_name(model: nn.Module, module_name: str) -> nn.Module:
@@ -347,14 +352,27 @@ def block_student_weight_scope(
                 module.set_temporary(bool(old_temporary))
 
 
-def validate_qwen3_model(model: nn.Module) -> None:
+def _block_distill_model_type(model: nn.Module) -> str:
     config = getattr(model, "config", None)
     model_type = str(getattr(config, "model_type", "")).lower()
-    if model_type != "qwen3":
-        raise ValueError(f"block_vae_lora_train only supports Qwen3 in v1, got model_type={model_type!r}.")
+    if model_type in {"qwen3", "qwen2"}:
+        return "qwen"
+    if model_type == "llama":
+        return "llama"
+    raise ValueError(
+        f"block distill only supports Qwen3/Qwen2 and Llama decoder models, got model_type={model_type!r}."
+    )
+
+
+def validate_block_distill_model(model: nn.Module) -> None:
+    _block_distill_model_type(model)
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None or len(layers) < 1:
-        raise ValueError("Qwen3 model must expose model.layers.")
+        raise ValueError("Block distill model must expose model.layers.")
+
+
+def validate_qwen3_model(model: nn.Module) -> None:
+    validate_block_distill_model(model)
 
 
 def validate_block_categories(model: nn.Module, layer_idx: int) -> Dict[str, str]:
@@ -622,7 +640,10 @@ def relative_mse(student: torch.Tensor, teacher: torch.Tensor, *, eps: float = 1
     return (student_f - teacher_f).pow(2).mean() / (teacher_f.pow(2).mean() + float(eps))
 
 
-def _build_causal_inputs(model: nn.Module, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+def _build_qwen_causal_inputs(
+    model: nn.Module,
+    hidden_states: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     qwen_model = model.model
     batch, seqlen = int(hidden_states.shape[0]), int(hidden_states.shape[1])
     cache_position = torch.arange(seqlen, device=hidden_states.device, dtype=torch.long)
@@ -636,6 +657,24 @@ def _build_causal_inputs(model: nn.Module, hidden_states: torch.Tensor) -> Tuple
     )
     position_embeddings = qwen_model.rotary_emb(hidden_states, position_ids)
     return causal_mask, position_ids, position_embeddings
+
+
+def _build_llama_causal_inputs(
+    model: nn.Module,
+    hidden_states: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    llama_model = model.model
+    batch, seqlen = int(hidden_states.shape[0]), int(hidden_states.shape[1])
+    cache_position = torch.arange(seqlen, device=hidden_states.device, dtype=torch.long)
+    position_ids = cache_position.unsqueeze(0).expand(batch, -1)
+    causal_mask = llama_model._update_causal_mask(
+        None,
+        hidden_states,
+        cache_position,
+        None,
+        False,
+    )
+    return causal_mask, position_ids
 
 
 def _materialized_causal_mask(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -656,7 +695,7 @@ def run_qwen3_block(
     output_attentions: bool = False,
 ) -> torch.Tensor:
     layer = model.model.layers[int(layer_idx)]
-    causal_mask, position_ids, position_embeddings = _build_causal_inputs(model, hidden_states)
+    causal_mask, position_ids, position_embeddings = _build_qwen_causal_inputs(model, hidden_states)
     outputs = layer(
         hidden_states,
         attention_mask=causal_mask,
@@ -668,6 +707,51 @@ def run_qwen3_block(
         position_embeddings=position_embeddings,
     )
     return outputs[0]
+
+
+def run_llama_block(
+    model: nn.Module,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    *,
+    output_attentions: bool = False,
+) -> torch.Tensor:
+    layer = model.model.layers[int(layer_idx)]
+    causal_mask, position_ids = _build_llama_causal_inputs(model, hidden_states)
+    outputs = layer(
+        hidden_states,
+        attention_mask=causal_mask,
+        position_ids=position_ids,
+        past_key_value=None,
+        output_attentions=bool(output_attentions),
+        use_cache=False,
+    )
+    return outputs[0]
+
+
+def run_decoder_block(
+    model: nn.Module,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    *,
+    output_attentions: bool = False,
+) -> torch.Tensor:
+    model_family = _block_distill_model_type(model)
+    if model_family == "qwen":
+        return run_qwen3_block(
+            model,
+            int(layer_idx),
+            hidden_states,
+            output_attentions=bool(output_attentions),
+        )
+    if model_family == "llama":
+        return run_llama_block(
+            model,
+            int(layer_idx),
+            hidden_states,
+            output_attentions=bool(output_attentions),
+        )
+    raise ValueError(f"Unsupported block distill model family: {model_family!r}.")
 
 
 @contextmanager
@@ -789,6 +873,147 @@ def attention_map_kl_loss(
         kl_sum = kl_sum + kl_per_query.masked_select(valid_query).sum()
         valid_count = valid_count + valid_query.sum().to(device=kl_sum.device, dtype=kl_sum.dtype)
     return kl_sum / valid_count.clamp_min(1.0)
+
+
+def _attention_map_kl_chunk_losses(
+    teacher_attn: torch.Tensor,
+    student_attn: torch.Tensor,
+    *,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    teacher_attn_f = teacher_attn.float()
+    student_attn_f = student_attn.float()
+    valid = teacher_attn_f > 0
+    teacher_prob = teacher_attn_f.clamp_min(float(eps))
+    student_prob = student_attn_f.clamp_min(float(eps))
+    reverse_kl = teacher_prob * (teacher_prob.log() - student_prob.log())
+    forward_kl = student_prob * (student_prob.log() - teacher_prob.log())
+    kl_per_query_reverse = reverse_kl.masked_fill(~valid, 0.0).sum(dim=-1)
+    kl_per_query_forward = forward_kl.masked_fill(~valid, 0.0).sum(dim=-1)
+    entropy_per_query = -(teacher_prob * teacher_prob.log()).sum(dim=-1)
+    valid_query = valid.any(dim=-1)
+    return kl_per_query_reverse, kl_per_query_forward, entropy_per_query, valid_query
+
+
+def entropy_aware_attention_map_kl_loss(
+    model: nn.Module,
+    layer_idx: int,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    *,
+    query_chunk_size: int,
+    confidence_k: int = 16,
+    eps: float = 1e-6,
+    hif4_controller=None,
+    active_block_targets: Optional[Collection[Tuple[int, str]]] = None,
+    layer_temporary_modules: Optional[Sequence[Tuple[str, nn.Module]]] = None,
+    active_layer_categories: Optional[Collection[str]] = None,
+    student_scope_already_active: bool = False,
+) -> torch.Tensor:
+    if int(confidence_k) < 2:
+        raise ValueError(f"confidence_k must be >= 2, got {confidence_k}.")
+    if int(query_chunk_size) < 1:
+        raise ValueError(f"query_chunk_size must be >= 1, got {query_chunk_size}.")
+    previous_hif4_enabled = None if hif4_controller is None else bool(getattr(hif4_controller, "enabled", False))
+    try:
+        if hif4_controller is not None:
+            hif4_controller.enabled = False
+        teacher_scope = (
+            block_layer_student_weight_scope(layer_temporary_modules, set())
+            if layer_temporary_modules is not None
+            else block_student_weight_scope(model, set())
+        )
+        with torch.no_grad(), teacher_scope:
+            teacher_q, teacher_k, teacher_mask = _qk_states_for_attention(model, layer_idx, teacher_hidden)
+        if bool(student_scope_already_active):
+            student_scope = nullcontext()
+        elif layer_temporary_modules is not None and active_layer_categories is not None:
+            student_scope = block_layer_student_weight_scope(layer_temporary_modules, active_layer_categories)
+        elif active_block_targets is not None:
+            student_scope = block_student_weight_scope(model, active_block_targets)
+        else:
+            student_scope = nullcontext()
+        if hif4_controller is not None:
+            hif4_controller.enabled = True
+        with student_scope:
+            student_q, student_k, student_mask = _qk_states_for_attention(model, layer_idx, student_hidden)
+    finally:
+        if hif4_controller is not None:
+            hif4_controller.enabled = bool(previous_hif4_enabled)
+
+    scaling = float(model.model.layers[int(layer_idx)].self_attn.scaling)
+    seqlen = int(student_q.shape[-2])
+    reverse_sum = student_q.new_zeros(())
+    forward_sum = student_q.new_zeros(())
+    entropy_sum = student_q.new_zeros(())
+    valid_count = student_q.new_zeros(())
+    max_entropy = math.log(float(confidence_k))
+
+    for start in range(0, seqlen, int(query_chunk_size)):
+        end = min(start + int(query_chunk_size), seqlen)
+        teacher_logits = torch.matmul(
+            teacher_q[:, :, start:end, :],
+            teacher_k.transpose(2, 3),
+        ) * scaling
+        teacher_logits = teacher_logits + teacher_mask[:, :, start:end, : teacher_k.shape[-2]]
+        teacher_attn = F.softmax(teacher_logits, dim=-1, dtype=torch.float32).to(dtype=student_q.dtype)
+        student_logits = torch.matmul(
+            student_q[:, :, start:end, :],
+            student_k.transpose(2, 3),
+        ) * scaling
+        student_logits = student_logits + student_mask[:, :, start:end, : student_k.shape[-2]]
+        student_attn = F.softmax(student_logits, dim=-1, dtype=torch.float32).to(dtype=student_q.dtype)
+        reverse_kl, forward_kl, entropy, valid_query = _attention_map_kl_chunk_losses(
+            teacher_attn,
+            student_attn,
+            eps=float(eps),
+        )
+        reverse_sum = reverse_sum + reverse_kl.masked_select(valid_query).sum()
+        forward_sum = forward_sum + forward_kl.masked_select(valid_query).sum()
+        entropy_sum = entropy_sum + entropy.masked_select(valid_query).sum()
+        valid_count = valid_count + valid_query.sum().to(device=reverse_sum.device, dtype=reverse_sum.dtype)
+
+    denom = valid_count.clamp_min(1.0)
+    sample_avg_entropy = entropy_sum / denom
+    normalized_entropy = (sample_avg_entropy / float(max_entropy)).clamp(max=1.0)
+    gamma = (1.0 - normalized_entropy).clamp(0.0, 1.0)
+    reverse_mean = reverse_sum / denom
+    forward_mean = forward_sum / denom
+    return gamma * reverse_mean + (1.0 - gamma) * forward_mean
+
+
+def _resolve_block_attention_kl_loss(
+    *,
+    config: BlockDistillConfig,
+    model: nn.Module,
+    layer_idx: int,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    hif4_controller,
+    active_block_targets: Optional[Collection[Tuple[int, str]]],
+    layer_temporary_modules: Optional[Sequence[Tuple[str, nn.Module]]],
+    active_layer_categories: Optional[Collection[str]],
+    student_scope_already_active: bool,
+) -> torch.Tensor:
+    common_kwargs = dict(
+        model=model,
+        layer_idx=int(layer_idx),
+        student_hidden=student_hidden,
+        teacher_hidden=teacher_hidden,
+        query_chunk_size=int(config.attn_query_chunk_size),
+        eps=float(config.eps),
+        hif4_controller=hif4_controller,
+        active_block_targets=active_block_targets,
+        layer_temporary_modules=layer_temporary_modules,
+        active_layer_categories=active_layer_categories,
+        student_scope_already_active=bool(student_scope_already_active),
+    )
+    if bool(config.entropy_aware_kl):
+        return entropy_aware_attention_map_kl_loss(
+            **common_kwargs,
+            confidence_k=int(config.eakld_confidence_k),
+        )
+    return attention_map_kl_loss(**common_kwargs)
 
 
 def _resolve_proxy_base_linear(module_name: str, proxy: PeftVAELinearProxy) -> nn.Linear:
@@ -1246,11 +1471,11 @@ def advance_block_hidden_states_in_place(
             if hif4_controller is not None:
                 hif4_controller.enabled = False
             with block_layer_student_weight_scope(layer_temporary_modules, set()):
-                teacher_next = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False)
+                teacher_next = run_decoder_block(model, int(layer_idx), teacher_in, output_attentions=False)
             if hif4_controller is not None:
                 hif4_controller.enabled = True
             with block_layer_student_weight_scope(layer_temporary_modules, active_layer_categories):
-                student_next = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
+                student_next = run_decoder_block(model, int(layer_idx), student_in, output_attentions=False)
             teacher_next_cpu = teacher_next.detach().to(device="cpu", dtype=torch.bfloat16)
             student_next_cpu = student_next.detach().to(device="cpu", dtype=torch.bfloat16)
             for offset, tensor in enumerate(torch.split(teacher_next_cpu, teacher_batch_sizes, dim=0)):
@@ -1345,14 +1570,14 @@ def train_block_lora_distill(
         with block_layer_student_weight_scope(layer_temporary_modules, set()):
             if linear_weight > 0.0:
                 with torch.no_grad(), capture_linear_io(module_by_name) as teacher_io:
-                    teacher_out = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
+                    teacher_out = run_decoder_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
                 if len(teacher_io) != len(module_names):
                     missing = sorted(set(module_names) - set(teacher_io.keys()))
                     raise RuntimeError(f"Layer {layer_idx}: missing teacher linear captures: {missing}")
             elif needs_teacher_block:
                 teacher_io = {}
                 with torch.no_grad():
-                    teacher_out = run_qwen3_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
+                    teacher_out = run_decoder_block(model, int(layer_idx), teacher_in, output_attentions=False).detach()
             else:
                 teacher_io = {}
                 teacher_out = None
@@ -1385,19 +1610,18 @@ def train_block_lora_distill(
                 if hidden_weight > 0.0:
                     if teacher_out is None:
                         raise RuntimeError("hidden loss requires teacher block output.")
-                    student_out = run_qwen3_block(model, int(layer_idx), student_in, output_attentions=False)
+                    student_out = run_decoder_block(model, int(layer_idx), student_in, output_attentions=False)
                     hidden_loss = relative_mse(student_out, teacher_out, eps=config.eps)
                 else:
                     student_out = None
                     hidden_loss = student_in.new_zeros(())
                 if attn_weight > 0.0:
-                    attn_loss = attention_map_kl_loss(
-                        model,
-                        int(layer_idx),
-                        student_in,
-                        teacher_in,
-                        query_chunk_size=int(config.attn_query_chunk_size),
-                        eps=config.eps,
+                    attn_loss = _resolve_block_attention_kl_loss(
+                        config=config,
+                        model=model,
+                        layer_idx=int(layer_idx),
+                        student_hidden=student_in,
+                        teacher_hidden=teacher_in,
                         hif4_controller=hif4_controller,
                         active_block_targets=active_block_targets,
                         layer_temporary_modules=layer_temporary_modules,

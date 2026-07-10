@@ -11,6 +11,7 @@ from train_utils.distill_losses import (
     compute_dual_kl_topk_loss,
     compute_dual_rkl_loss,
     compute_dual_rkl_topk_loss,
+    compute_entropy_aware_kl_loss,
 )
 from train_utils.hif4_act import Hif4ActController
 
@@ -390,6 +391,8 @@ else:
             hidden_loss_weight: float = 0.0,
             pre_mlp_hidden_loss_weight: float = 0.0,
             hidden_alignment_layer_weighting: str = "uniform",
+            eakld_confidence_k: int = 16,
+            teacher_logits_cpu_staging: bool = False,
             distill_hif4_act_controller: Optional[Hif4ActController] = None,
             teacher_param_snapshots: Optional[Sequence[Tuple[nn.Parameter, torch.Tensor]]] = None,
             **kwargs,
@@ -409,8 +412,36 @@ else:
             self.hidden_alignment_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
                 hidden_alignment_layer_weighting
             )
+            self.eakld_confidence_k = int(eakld_confidence_k)
+            if self.eakld_confidence_k < 2:
+                raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
+            self.teacher_logits_cpu_staging = bool(teacher_logits_cpu_staging)
             self.distill_hif4_act_controller = distill_hif4_act_controller
             self.teacher_param_snapshots = list(teacher_param_snapshots or [])
+
+        def _teacher_logits_staging_dtype(self) -> torch.dtype:
+            if bool(getattr(self.args, "bf16", False)):
+                return torch.bfloat16
+            if bool(getattr(self.args, "fp16", False)):
+                return torch.float16
+            return torch.float32
+
+        def _stage_teacher_logits(self, logits: torch.Tensor) -> torch.Tensor:
+            if not bool(getattr(self, "teacher_logits_cpu_staging", False)):
+                return logits
+            return logits.detach().to(
+                device=torch.device("cpu"),
+                dtype=self._teacher_logits_staging_dtype(),
+            )
+
+        def _teacher_logits_for_loss(
+            self,
+            staged_logits: torch.Tensor,
+            student_logits: torch.Tensor,
+        ) -> torch.Tensor:
+            if staged_logits.device.type == "cpu":
+                return staged_logits.to(device=student_logits.device, non_blocking=True)
+            return staged_logits
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
             args = self.args
@@ -423,6 +454,7 @@ else:
             uses_ce_loss = (
                 loss_type == "kd"
                 or loss_type == "dual_kd"
+                or loss_type == "eakld_kd"
                 or loss_type.startswith("kd_top")
                 or loss_type.startswith("dual_kd_top")
             )
@@ -567,12 +599,13 @@ else:
 
                 if loss_type == "rkl":
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     loss = F.kl_div(
-                        F.log_softmax(ori_logits.flatten(0, -2), dim=-1),
+                        F.log_softmax(teacher_logits.flatten(0, -2), dim=-1),
                         F.softmax(logits, dim=-1).flatten(0, -2),
                         reduction="batchmean",
                     )
@@ -581,10 +614,11 @@ else:
 
                 if loss_type == "dual_rkl":
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
                         attention_mask=full_inputs.get("attention_mask"),
@@ -592,7 +626,7 @@ else:
                     )
                     loss = compute_dual_rkl_loss(
                         student_logits=logits,
-                        teacher_logits=ori_logits,
+                        teacher_logits=teacher_logits,
                         mask=token_mask,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
@@ -600,13 +634,14 @@ else:
 
                 if loss_type == "kl":
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     loss = F.kl_div(
                         F.log_softmax(logits.flatten(0, -2), dim=-1),
-                        F.softmax(ori_logits, dim=-1).flatten(0, -2),
+                        F.softmax(teacher_logits, dim=-1).flatten(0, -2),
                         reduction="batchmean",
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
@@ -615,13 +650,14 @@ else:
                 if loss_type.startswith("r_kl_top"):
                     k = parse_k("r_kl_top", default_k=1000)
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     k = min(k, int(logits.shape[-1]))
                     top_logits, indices = logits.topk(k, dim=-1, sorted=False)
-                    top_ori_logits = ori_logits.gather(-1, indices)
+                    top_ori_logits = teacher_logits.gather(-1, indices)
                     loss = F.kl_div(
                         F.log_softmax(top_ori_logits.flatten(0, -2), dim=-1),
                         F.softmax(top_logits.flatten(0, -2), dim=-1),
@@ -633,10 +669,11 @@ else:
                 if loss_type.startswith("dual_r_kl_top"):
                     k = parse_k("dual_r_kl_top", default_k=1000)
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
                         attention_mask=full_inputs.get("attention_mask"),
@@ -644,7 +681,7 @@ else:
                     )
                     loss = compute_dual_rkl_topk_loss(
                         student_logits=logits,
-                        teacher_logits=ori_logits,
+                        teacher_logits=teacher_logits,
                         mask=token_mask,
                         k=k,
                         post_attn=use_post_attn(),
@@ -655,14 +692,15 @@ else:
                 if loss_type.startswith("kl_top"):
                     k = parse_k("kl_top", default_k=1000)
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
-                    k = min(k, int(ori_logits.shape[-1]))
-                    top_ori_logits, indices = ori_logits.topk(k, dim=-1, sorted=False)
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
+                    k = min(k, int(teacher_logits.shape[-1]))
+                    top_ori_logits, indices = teacher_logits.topk(k, dim=-1, sorted=False)
                     if use_post_attn():
-                        ref = F.softmax(ori_logits, dim=-1).gather(-1, indices).flatten(0, -2)
+                        ref = F.softmax(teacher_logits, dim=-1).gather(-1, indices).flatten(0, -2)
                         can = F.log_softmax(logits, dim=-1).gather(-1, indices).flatten(0, -2)
                         loss = F.kl_div(can, ref, reduction="batchmean")
                     else:
@@ -678,16 +716,17 @@ else:
                 if loss_type.startswith("kd_top"):
                     k = parse_k("kd_top", default_k=1000)
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
-                    k = min(k, int(ori_logits.shape[-1]))
-                    top_ori_logits, indices = ori_logits.topk(k, dim=-1, sorted=False)
+                    k = min(k, int(teacher_logits.shape[-1]))
+                    top_ori_logits, indices = teacher_logits.topk(k, dim=-1, sorted=False)
                     if use_post_attn():
-                        ref = F.softmax(ori_logits / T, dim=-1).gather(-1, indices).flatten(0, -2)
+                        ref = F.softmax(teacher_logits / T, dim=-1).gather(-1, indices).flatten(0, -2)
                         can = F.log_softmax(logits / T, dim=-1).gather(-1, indices).flatten(0, -2)
                         distill_loss = F.kl_div(can, ref, reduction="batchmean")
                     else:
@@ -703,27 +742,29 @@ else:
 
                 if loss_type == "mse":
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
-                    loss = F.mse_loss(logits, ori_logits)
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
+                    loss = F.mse_loss(logits, teacher_logits)
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "kd":
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
                     logits = logits.view(-1, logits.size(-1))
-                    ori_logits = ori_logits.view(-1, ori_logits.size(-1))
+                    teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
                     distill_loss = F.kl_div(
                         F.log_softmax(logits / T, dim=-1).flatten(0, -2),
-                        F.softmax(ori_logits / T, dim=-1).flatten(0, -2),
+                        F.softmax(teacher_logits / T, dim=-1).flatten(0, -2),
                         reduction="batchmean",
                     )
                     loss = ori_loss * (1 - alpha) + distill_loss * (alpha * T * T)
@@ -732,10 +773,11 @@ else:
 
                 if loss_type == "dual_kl":
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
                         attention_mask=full_inputs.get("attention_mask"),
@@ -743,7 +785,7 @@ else:
                     )
                     loss = compute_dual_kl_loss(
                         student_logits=logits,
-                        teacher_logits=ori_logits,
+                        teacher_logits=teacher_logits,
                         mask=token_mask,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
@@ -752,10 +794,11 @@ else:
                 if loss_type.startswith("dual_kl_top"):
                     k = parse_k("dual_kl_top", default_k=1000)
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
                         attention_mask=full_inputs.get("attention_mask"),
@@ -763,7 +806,7 @@ else:
                     )
                     loss = compute_dual_kl_topk_loss(
                         student_logits=logits,
-                        teacher_logits=ori_logits,
+                        teacher_logits=teacher_logits,
                         mask=token_mask,
                         k=k,
                         post_attn=use_post_attn(),
@@ -774,10 +817,11 @@ else:
                 if loss_type.startswith("dual_kd_top"):
                     k = parse_k("dual_kd_top", default_k=1000)
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     ori_loss = outputs["loss"]
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
@@ -786,7 +830,7 @@ else:
                     )
                     distill_loss = compute_dual_kl_topk_loss(
                         student_logits=logits,
-                        teacher_logits=ori_logits,
+                        teacher_logits=teacher_logits,
                         mask=token_mask,
                         k=k,
                         post_attn=use_post_attn(),
@@ -798,10 +842,11 @@ else:
 
                 if loss_type == "dual_kd":
                     teacher_outputs = get_ori_outputs()
-                    ori_logits = teacher_outputs.logits
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     ori_loss = outputs["loss"]
                     token_mask = build_distill_token_mask(
                         labels=full_inputs.get("labels"),
@@ -810,7 +855,7 @@ else:
                     )
                     distill_loss = compute_dual_kl_loss(
                         student_logits=logits,
-                        teacher_logits=ori_logits,
+                        teacher_logits=teacher_logits,
                         mask=token_mask,
                     )
                     alpha = self.loss_alpha
@@ -818,10 +863,57 @@ else:
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
+                if loss_type == "eakld":
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    prepare_student_path()
+                    outputs = student_forward(student_inputs)
+                    logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
+                    token_mask = build_distill_token_mask(
+                        labels=full_inputs.get("labels"),
+                        attention_mask=full_inputs.get("attention_mask"),
+                        reference_logits=logits,
+                    )
+                    loss = compute_entropy_aware_kl_loss(
+                        student_logits=logits,
+                        teacher_logits=teacher_logits,
+                        mask=token_mask,
+                        temperature=float(self.temperature),
+                        confidence_k=int(self.eakld_confidence_k),
+                    )
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    return (loss, outputs) if return_outputs else loss
+
+                if loss_type == "eakld_kd":
+                    teacher_outputs = get_ori_outputs()
+                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    prepare_student_path()
+                    outputs = student_forward(full_inputs)
+                    logits = outputs.logits
+                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
+                    T, alpha = self.temperature, self.loss_alpha
+                    ori_loss = outputs["loss"]
+                    token_mask = build_distill_token_mask(
+                        labels=full_inputs.get("labels"),
+                        attention_mask=full_inputs.get("attention_mask"),
+                        reference_logits=logits,
+                    )
+                    distill_loss = compute_entropy_aware_kl_loss(
+                        student_logits=logits,
+                        teacher_logits=teacher_logits,
+                        mask=token_mask,
+                        temperature=float(T),
+                        confidence_k=int(self.eakld_confidence_k),
+                    )
+                    loss = ori_loss * (1 - alpha) + distill_loss * (alpha * T * T)
+                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    return (loss, outputs) if return_outputs else loss
+
                 raise ValueError(
                     f"Unsupported lora loss type: {loss_type}. "
                     f"Supported: sft/origin, rkl, dual_rkl, kl, r_kl_top[_K], dual_r_kl_top[_K], "
-                    f"kl_top[_K], kd_top[_K], dual_kl, dual_kd, dual_kl_top[_K], dual_kd_top[_K], mse, kd."
+                    f"kl_top[_K], kd_top[_K], eakld, eakld_kd, dual_kl, dual_kd, dual_kl_top[_K], dual_kd_top[_K], mse, kd."
                 )
             finally:
                 restore_temporary()

@@ -173,6 +173,7 @@ class VAEDecoderE2ETrainer(Trainer):
         distill_alpha: float = 0.5,
         post_attn: bool = False,
         hidden_loss_weight: float = 0.0,
+        eakld_confidence_k: int = 16,
         hidden_layer_weighting: str = "uniform",
         saved_tensor_offload=None,
         streaming_offload_manager=None,
@@ -186,6 +187,9 @@ class VAEDecoderE2ETrainer(Trainer):
         self.hidden_loss_weight = float(hidden_loss_weight)
         if self.hidden_loss_weight < 0.0:
             raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
+        self.eakld_confidence_k = int(eakld_confidence_k)
+        if self.eakld_confidence_k < 2:
+            raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
         self.hidden_layer_weighting = str(hidden_layer_weighting).strip().lower()
         if self.hidden_layer_weighting not in _HIDDEN_LAYER_WEIGHTING_CHOICES:
             raise ValueError(
@@ -321,6 +325,7 @@ class VAEDecoderE2ETrainer(Trainer):
             temperature=self.distill_temperature,
             alpha=self.distill_alpha,
             post_attn=self.post_attn,
+            eakld_confidence_k=int(self.eakld_confidence_k),
         )
         loss = self._add_hidden_alignment_loss(loss, teacher_outputs, outputs, inputs)
         return (loss, outputs) if return_outputs else loss
