@@ -76,7 +76,6 @@
 - `lora_dropout`
 - `distill_steps`
 - `distill_batch_size`
-- `distill_nsamples`
 - `distill_lr`
 - `distill_weight_decay`
 - `distill_log_every`
@@ -186,7 +185,6 @@
 | `--lora_dropout` | `default=0.0` | LoRA dropout | after-category override |
 | `--distill_steps` | `default=50` | LoRA 最大步数 | `0` 表示跳过该轮 LoRA |
 | `--distill_batch_size` | `default=2` | LoRA 每卡 batch size | after-category override |
-| `--distill_nsamples` | `default=128` | LoRA 训练样本数 | 从 `--distill_dataset` 指定的数据集采样 |
 | `--distill_lr` | `default=1e-4` | LoRA 学习率 | after-category override |
 | `--distill_weight_decay` | `default=0.0` | LoRA 权重衰减 | after-category override |
 | `--distill_log_every` | `default=1` | LoRA 日志间隔 | after-category override |

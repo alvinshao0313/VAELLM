@@ -1762,8 +1762,35 @@ def _build_mixed_datasets(args, training_args, tokenizer):
 
 
 def build_datasets(args, training_args, tokenizer):
+    from e2e_common.lazy_datasets import (
+        build_mixed_lazy_dataset,
+        build_single_file_lazy_dataset,
+        dataset_length_or_none,
+        is_iterable_training_dataset,
+    )
+
+    block_size = int(training_args.model_max_length)
     if getattr(args, "dataset_mix_spec", None):
-        return _build_mixed_datasets(args, training_args, tokenizer)
+        dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
+        normalized_spec, source_stats, train_dataset, train_is_iterable = build_mixed_lazy_dataset(
+            str(args.dataset_mix_spec),
+            task=dataset_task,
+            tokenizer=tokenizer,
+            max_seq_len=int(block_size),
+            seed=int(getattr(training_args, "seed", 0)),
+        )
+        eval_dataset = None
+        return train_dataset, eval_dataset, {
+            "dataset_mode": "mix",
+            "dataset_task": str(dataset_task),
+            "block_size": int(block_size),
+            "dataset_mix_spec": str(normalized_spec),
+            "dataset_mix_sources": [str(item["alias"]) for item in source_stats],
+            "dataset_mix_weights": [float(item["weight"]) for item in source_stats],
+            "lazy_iterable": bool(train_is_iterable),
+            "dataset_length": dataset_length_or_none(train_dataset),
+            "source_stats": source_stats,
+        }
 
     dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
     if dataset_task in {"sft", "mcqa"}:
@@ -1771,30 +1798,21 @@ def build_datasets(args, training_args, tokenizer):
     if dataset_task != "lm":
         raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm', 'sft', or 'mcqa'.")
 
-    block_size = int(training_args.model_max_length)
-    dataset_num_proc = _resolve_dataset_num_proc(args)
-    prepare_eval = _should_prepare_eval_dataset(training_args)
-
-    train_raw, eval_raw = _load_raw_datasets(args)
-    train_raw = _apply_sample_limit(train_raw, args.max_train_samples)
-    eval_raw = _apply_sample_limit(eval_raw, args.max_eval_samples)
-
-    train_text = _prepare_text_dataset(train_raw, text_field=str(args.text_field), num_proc=dataset_num_proc)
-    eval_text = (
-        _prepare_text_dataset(eval_raw, text_field=str(args.text_field), num_proc=dataset_num_proc)
-        if prepare_eval and eval_raw is not None
-        else None
+    train_dataset = build_single_file_lazy_dataset(
+        train_file=str(args.train_file),
+        task="lm",
+        tokenizer=tokenizer,
+        max_seq_len=int(block_size),
+        text_field=str(args.text_field),
+        text_format="auto",
+        max_train_samples=getattr(args, "max_train_samples", None),
     )
-
-    train_dataset = _tokenize_and_pack(train_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
-    eval_dataset = (
-        _tokenize_and_pack(eval_text, tokenizer, block_size=block_size, num_proc=dataset_num_proc)
-        if eval_text is not None
-        else None
-    )
+    eval_dataset = None
     return train_dataset, eval_dataset, {
         "dataset_mode": "single",
         "dataset_task": str(dataset_task),
         "block_size": int(block_size),
+        "lazy_iterable": is_iterable_training_dataset(train_dataset),
+        "dataset_length": dataset_length_or_none(train_dataset),
         "source_stats": [],
     }

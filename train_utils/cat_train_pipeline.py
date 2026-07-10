@@ -2504,7 +2504,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         (cat_args.lora_dropout, "--lora_dropout"),
         (cat_args.distill_steps, "--distill_steps"),
         (cat_args.distill_batch_size, "--distill_batch_size"),
-        (cat_args.distill_nsamples, "--distill_nsamples"),
         (cat_args.distill_lr, "--distill_lr"),
         (cat_args.distill_weight_decay, "--distill_weight_decay"),
         (cat_args.distill_log_every, "--distill_log_every"),

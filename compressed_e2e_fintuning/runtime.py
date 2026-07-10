@@ -22,6 +22,7 @@ from e2e_common.low_rank_lora import (
     write_low_rank_payloads_to_compressed_model,
 )
 from e2e_common.post_norm_head import ensure_post_norm_head_linear
+from e2e_common.lazy_datasets import build_edgerazor_data_collator, dataset_length_or_none, default_dataloader_num_workers
 from e2e_common.runtime_utils import build_datasets_with_main_process_first, eval_final_ppl
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
@@ -656,15 +657,33 @@ def run(args, hf_args, training_args):
         tokenizer,
         log,
     )
-    if len(train_dataset) < 1:
-        raise ValueError("Packed training dataset is empty. Increase input text volume or lower --model_max_length.")
-    if eval_dataset is not None and len(eval_dataset) < 1:
+    train_len = dataset_length_or_none(train_dataset)
+    if train_len is not None and train_len < 1:
+        raise ValueError("Lazy training dataset is empty. Increase input text volume or lower --model_max_length.")
+    eval_len = dataset_length_or_none(eval_dataset) if eval_dataset is not None else None
+    if eval_len is not None and eval_len < 1:
         eval_dataset = None
+        eval_len = None
+    if int(getattr(training_args, "dataloader_num_workers", 0)) <= 0:
+        training_args.dataloader_num_workers = int(default_dataloader_num_workers())
+    training_args.dataloader_pin_memory = True
+    if bool(data_info.get("lazy_iterable", False)):
+        training_args.group_by_length = False
+    dataset_task = str(data_info.get("dataset_task", "lm")).strip().lower()
+    if dataset_task == "mcqa":
+        data_collator = default_data_collator
+    else:
+        data_collator = build_edgerazor_data_collator(
+            tokenizer,
+            max_seq_len=int(data_info["block_size"]),
+        )
     log.info(
-        "Prepared datasets: train=%d eval=%s block_size=%d",
-        len(train_dataset),
-        "none" if eval_dataset is None else str(len(eval_dataset)),
+        "Prepared datasets: train=%s eval=%s block_size=%d lazy_iterable=%s dataloader_num_workers=%d",
+        "unknown" if train_len is None else str(train_len),
+        "none" if eval_len is None else str(eval_len),
         int(data_info["block_size"]),
+        str(bool(data_info.get("lazy_iterable", False))).lower(),
+        int(training_args.dataloader_num_workers),
     )
 
     teacher_model, teacher_source = _load_teacher(
@@ -693,7 +712,7 @@ def run(args, hf_args, training_args):
         tokenizer=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=default_data_collator,
+        data_collator=data_collator,
         loss_type=args.loss_type,
         teacher_model=teacher_model,
         distill_temperature=args.distill_temperature,

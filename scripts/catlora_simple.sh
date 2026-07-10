@@ -6,7 +6,6 @@ export CUDA_VISIBLE_DEVICES=7
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
-export CAT_DISTILL_DATASET_NUM_PROC="${CAT_DISTILL_DATASET_NUM_PROC:-16}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
@@ -43,7 +42,7 @@ export HF_DATASETS_OFFLINE=1
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
 # --activation_calib_dataset "openorca=1.0"  # 使用 dense_e2e dataset_mix alias，格式 alias=weight,...
-# CAT_DISTILL_DATASET_NUM_PROC=16          # 蒸馏/校准数据 format 预处理并行进程数，位置在 lora_data.py
+# 数据加载：EdgeRazor lazy Dataset + dataloader_num_workers（默认 16）；不再使用 CAT_DISTILL_DATASET_NUM_PROC
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
 # 蒸馏数据：先运行 bash scripts/prepare_vaellm_edgerazor_data.sh，见 docs/edgerazor_dataset.md
@@ -109,7 +108,7 @@ python tools/cat_train.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --outlier_protect_mode "channel" \
-  --outlier_mlp_rank_metric "mlp_intermediate_aligned_actmean_abs" \
+  --outlier_mlp_rank_metric "mlp_intermediate_aligned_actrms" \
   --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
   --outlier_protect_channel_quant "none" \
@@ -121,7 +120,7 @@ python tools/cat_train.py \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
   --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=32,cat:o_proj=32,cat:gate_proj=128,cat:up_proj=128,cat:down_proj=128" \
-  --outlier_protect_min_per_layer 1 \
+  --outlier_protect_min_per_layer "0" \
   --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.0" \
   --outlier_rank_metric "channel_weight_actmean_abs" \
@@ -136,7 +135,6 @@ python tools/cat_train.py \
   --lora_dropout "default=0.03" \
   --distill_steps "default=5000" \
   --distill_batch_size "default=1" \
-  --distill_nsamples "default=11000000" \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \

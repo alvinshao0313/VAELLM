@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# shellcheck source=../../scripts/lib/edgerazor_model_env.sh
-source "${REPO_ROOT}/scripts/lib/edgerazor_model_env.sh"
-
 export PYTHONPATH="${PYTHONPATH:-.}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -54,7 +50,7 @@ python -m compressed_e2e_fintuning.main \
   --student_checkpoint_dir "${STUDENT_CKPT}" \
   --run_root_dir .result/compressed_e2e_fintuning \
   --finetune_mode decoder \
-  --dataset_mix "${VAELLM_EDGERAZOR_DATASET_MIX}" \
+  --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --dataset_task sft \
   --dataset_num_proc 64 \
   --loss_type eakld_kd \
@@ -64,7 +60,7 @@ python -m compressed_e2e_fintuning.main \
   --post_attn false \
   --hidden_loss_weight 0.0 \
   --hidden_layer_weighting linear_depth \
-  --model_max_length "${MODEL_MAX_LENGTH}" \
+  --model_max_length "8192" \
   --decoder_layers 0-35 \
   --target_modules all \
   --layer_device_map auto \

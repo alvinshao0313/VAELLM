@@ -103,7 +103,6 @@ class NormalizedCatArgs:
     lora_dropout: OverrideTable[float]
     distill_steps: OverrideTable[int]
     distill_batch_size: OverrideTable[int]
-    distill_nsamples: OverrideTable[int]
     distill_lr: OverrideTable[float]
     distill_weight_decay: OverrideTable[float]
     distill_log_every: OverrideTable[int]
@@ -197,7 +196,6 @@ class ResolvedDistillRuntimeConfig:
     dropout: float
     steps: int
     batch_size: int
-    nsamples: int
     lr: float
     weight_decay: float
     log_every: int
@@ -624,11 +622,6 @@ _DISTILL_BATCH_SIZE_SPEC = _make_positive_int_override_spec(
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=2,after:q_proj=4",
 )
-_DISTILL_NSAMPLES_SPEC = _make_positive_int_override_spec(
-    arg_name="--distill_nsamples",
-    allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
-    example="default=128,after:q_proj=256",
-)
 _DISTILL_LR_SPEC = _make_override_spec(
     arg_name="--distill_lr",
     parse_value=lambda raw: parse_float_text(raw, arg_name="--distill_lr"),
@@ -834,7 +827,6 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         lora_dropout=_parse_cat_override(raw_args.lora_dropout, spec=_LORA_DROPOUT_SPEC),
         distill_steps=_parse_cat_override(raw_args.distill_steps, spec=_DISTILL_STEPS_SPEC),
         distill_batch_size=_parse_cat_override(raw_args.distill_batch_size, spec=_DISTILL_BATCH_SIZE_SPEC),
-        distill_nsamples=_parse_cat_override(raw_args.distill_nsamples, spec=_DISTILL_NSAMPLES_SPEC),
         distill_lr=_parse_cat_override(raw_args.distill_lr, spec=_DISTILL_LR_SPEC),
         distill_weight_decay=_parse_cat_override(raw_args.distill_weight_decay, spec=_DISTILL_WEIGHT_DECAY_SPEC),
         distill_log_every=_parse_cat_override(raw_args.distill_log_every, spec=_DISTILL_LOG_EVERY_SPEC),
@@ -1301,7 +1293,6 @@ def resolve_distill_runtime_config(cat_args: NormalizedCatArgs, after_category: 
         dropout=float(resolve_after_category_value(cat_args.lora_dropout, after_category)),
         steps=int(resolve_after_category_value(cat_args.distill_steps, after_category)),
         batch_size=int(resolve_after_category_value(cat_args.distill_batch_size, after_category)),
-        nsamples=int(resolve_after_category_value(cat_args.distill_nsamples, after_category)),
         lr=float(resolve_after_category_value(cat_args.distill_lr, after_category)),
         weight_decay=float(resolve_after_category_value(cat_args.distill_weight_decay, after_category)),
         log_every=int(resolve_after_category_value(cat_args.distill_log_every, after_category)),
@@ -1539,7 +1530,6 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_dropout", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_LORA_DROPOUT_SPEC.example}")
     parser.add_argument("--distill_steps", type=str, default="default=50", help=f"after_category 覆盖参数。示例：{_DISTILL_STEPS_SPEC.example}")
     parser.add_argument("--distill_batch_size", type=str, default="default=2", help=f"after_category 覆盖参数。示例：{_DISTILL_BATCH_SIZE_SPEC.example}")
-    parser.add_argument("--distill_nsamples", type=str, default="default=128", help=f"after_category 覆盖参数。示例：{_DISTILL_NSAMPLES_SPEC.example}")
     parser.add_argument("--distill_lr", type=str, default="default=1e-4", help=f"after_category 覆盖参数。示例：{_DISTILL_LR_SPEC.example}")
     parser.add_argument("--distill_weight_decay", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_DISTILL_WEIGHT_DECAY_SPEC.example}")
     parser.add_argument("--distill_log_every", type=str, default="default=1", help=f"after_category 覆盖参数。示例：{_DISTILL_LOG_EVERY_SPEC.example}")

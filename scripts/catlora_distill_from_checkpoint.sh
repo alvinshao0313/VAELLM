@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/edgerazor_model_env.sh
-source "${SCRIPT_DIR}/lib/edgerazor_model_env.sh"
-
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=1
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
-export CAT_DISTILL_DATASET_NUM_PROC="${CAT_DISTILL_DATASET_NUM_PROC:-16}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
@@ -21,7 +16,7 @@ export HF_DATASETS_OFFLINE=1
 #   ... # 与下方相同参数
 
 python tools/cat_distill_from_vae_checkpoint.py \
-  --model_path "${MODEL_PATH}" \
+  --model_path "Qwen/Qwen3-8B" \
   --resume_from_checkpoint ".result/catlora/no_outlier_protect_vae_only_Qwen_Qwen3-8B_20260618_075940" \
   --output_dir "./.result/catlora_distill" \
   --seed "31" \
@@ -40,13 +35,12 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --ppl_limit "-1" \
   --outlier_protect_mode "none" \
   --distill_after_category "compressed_lora" \
-  --distill_dataset "${VAELLM_EDGERAZOR_DATASET_MIX}" \
+  --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --lora_rank "default=4" \
   --lora_alpha "default=4,after:k_proj=256" \
   --lora_dropout "default=0.03" \
   --distill_steps "default=5000,after:q_proj=5000,after:k_proj=8000,after:v_proj=8000,after:o_proj=3000,after:gate_proj=3000,after:up_proj=3000,after:down_proj=3000" \
   --distill_batch_size "default=1" \
-  --distill_nsamples "default=11000000" \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
@@ -72,7 +66,7 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --distill_warmup_ratio "0.1" \
   --distill_group_by_length "true" \
   --distill_lr_scheduler_type "constant" \
-  --distill_model_max_length "${DISTILL_MODEL_MAX_LENGTH}" \
+  --distill_model_max_length "8192" \
   --fp16 "false" \
   --bf16 "true" \
   "$@"

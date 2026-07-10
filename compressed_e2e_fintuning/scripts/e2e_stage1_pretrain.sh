@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# shellcheck source=../../scripts/lib/edgerazor_model_env.sh
-source "${REPO_ROOT}/scripts/lib/edgerazor_model_env.sh"
-
 export PYTHONPATH="${PYTHONPATH:-.}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -18,7 +14,6 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 MAX_STEPS="${MAX_STEPS:-500}"
 STUDENT_CKPT="${STUDENT_CKPT:-.result/final_model}"
-PRETRAIN_DATASET_MIX="${PRETRAIN_DATASET_MIX:-${VAELLM_EDGERAZOR_DATASET_MIX}}"
 EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
@@ -39,14 +34,14 @@ python -m compressed_e2e_fintuning.main \
   --run_root_dir .result/compressed_e2e_fintuning_stage1_pretrain \
   --finetune_mode decoder \
   --dataset_task sft \
-  --dataset_mix "${PRETRAIN_DATASET_MIX}" \
+  --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --dataset_num_proc "${DATASET_NUM_PROC:-64}" \
   --loss_type eakld_kd \
   --eakld_confidence_k 16 \
   --distill_temperature 1.0 \
   --distill_alpha 0.5 \
   --post_attn false \
-  --model_max_length "${MODEL_MAX_LENGTH}" \
+  --model_max_length "8192" \
   --decoder_layers "${DECODER_LAYERS:-0-35}" \
   --target_modules all \
   --layer_device_map auto \

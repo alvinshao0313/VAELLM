@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -20,6 +20,7 @@ from train_utils.hif4_act import (
     register_hif4_act_hooks,
     remove_hif4_act_hooks,
 )
+from e2e_common.lazy_datasets import dataset_length_or_none, is_iterable_training_dataset
 from train_utils.lora_data import prepare_distill_datasets
 from train_utils.lora_utils import (
     _build_lora_trainer,
@@ -77,24 +78,23 @@ def _logger_warning(logger, message: str, *args) -> None:
         info(message, *args)
 
 
-def _log_distill_dataset(logger, dataset_mix_spec, source_stats, nsamples: int) -> None:
+def _log_distill_dataset(logger, dataset_mix_spec, source_stats, train_len: Optional[int], train_is_iterable: bool) -> None:
     logger.info(
-        "After-category distill: 训练混合数据集=%s nsamples=%d eval_dataset=none",
+        "After-category distill: 训练混合数据集=%s lazy_iterable=%s dataset_len=%s eval_dataset=none",
         str(dataset_mix_spec),
-        int(nsamples),
+        str(train_is_iterable).lower(),
+        "unknown" if train_len is None else str(train_len),
     )
     for source_info in source_stats:
         logger.info(
-            "After-category distill: 混合数据源 alias=%s weight=%.6f target_rows=%d actual_rows=%d raw_rows=%d text_rows=%d hf=%s config=%s train_split=%s",
+            "After-category distill: 混合数据源 alias=%s weight=%.6f raw_rows=%d hf=%s config=%s train_split=%s lazy_iterable=%s",
             str(source_info["alias"]),
             float(source_info["weight"]),
-            int(source_info["target_rows"]),
-            int(source_info["actual_rows"]),
             int(source_info["raw_rows"]),
-            int(source_info["text_rows"]),
             str(source_info["path"]),
             "none" if source_info["config"] is None else str(source_info["config"]),
             str(source_info["train_split"]),
+            str(source_info.get("is_iterable", train_is_iterable)).lower(),
         )
 
 
@@ -303,14 +303,18 @@ def _run_compressed_category_distill(
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
     _ensure_lora_stack_available()
+    _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
+    tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
     dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
         cfg.dataset,
-        nsamples=cfg.nsamples,
         seed=cfg.seed,
-        cache_dir=str(cat_args.output_dir),
+        tokenizer=tokenizer,
+        max_seq_len=int(getattr(training_args, "distill_model_max_length", 2048)),
     )
-    _log_distill_dataset(logger, dataset_mix_spec, source_stats, cfg.nsamples)
-    if len(train_ds) == 0:
+    train_is_iterable = is_iterable_training_dataset(train_ds)
+    train_len = dataset_length_or_none(train_ds)
+    _log_distill_dataset(logger, dataset_mix_spec, source_stats, train_len, train_is_iterable)
+    if train_len == 0:
         _logger_warning(logger, "After-category distill: 数据集为空，跳过。")
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
@@ -387,7 +391,12 @@ def _run_compressed_category_distill(
             use_custom_trainer=use_custom_trainer,
         )
         _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
-        sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
+        sft_args = _build_sft_args(
+            cat_args=cat_args,
+            training_args=training_args,
+            cfg=cfg,
+            train_is_iterable=train_is_iterable,
+        )
         hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
         tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
         trainer = _build_lora_trainer(
@@ -402,6 +411,8 @@ def _run_compressed_category_distill(
             hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=[],
             tokenizer=tokenizer,
+            train_is_iterable=train_is_iterable,
+            use_lazy_tokenized_dataset=True,
         )
         model = _train_without_merging_peft_adapters(
             trainer=trainer,

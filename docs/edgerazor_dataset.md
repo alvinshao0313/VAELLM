@@ -25,24 +25,23 @@ Python 常量见 `e2e_common/data.py` 中的 `VAELLM_EDGERAZOR_DATASET_MIX`。
 
 ## Qwen / Llama 切换
 
-六条训练脚本统一 `source scripts/lib/edgerazor_model_env.sh`。只改 `MODEL_PATH` 即可切换模型家族，chat template 与 response mask 由 tokenizer 自动推断：
+各训练脚本在 `python` 命令里直接写 `--model_path`；改对应脚本中的该行即可切换模型家族，chat template 与 response mask 由 tokenizer 自动推断：
 
 ```bash
-# Qwen（默认）
-MODEL_PATH=Qwen/Qwen3-8B bash scripts/catlora_simple.sh
-
-# Llama 3.1 Instruct
-MODEL_PATH=meta-llama/Llama-3.1-8B-Instruct bash scripts/catlora_simple.sh
+# 例如在 scripts/catlora_simple.sh 里把
+#   --model_path "Qwen/Qwen3-8B"
+# 改成
+#   --model_path "meta-llama/Llama-3.1-8B-Instruct"
 ```
 
-相关环境变量（见 `scripts/lib/edgerazor_model_env.sh`）：
+常用 CLI（默认值见各 `.sh` 里的 python 命令）：
 
-| 变量 | 默认 | 用途 |
+| CLI | 典型默认 | 用途 |
 |---|---|---|
-| `MODEL_PATH` | `Qwen/Qwen3-8B` | Cat / Block 蒸馏基座模型 |
-| `DISTILL_MODEL_MAX_LENGTH` | `8192` | Cat 蒸馏 `--distill_model_max_length` |
-| `MODEL_MAX_LENGTH` | `1024` | E2E `--model_max_length` |
-| `VAELLM_EDGERAZOR_DATASET_MIX` | 见上 | 三条链路数据集 mix |
+| `--model_path` | `Qwen/Qwen3-8B` | Cat / Block 蒸馏基座模型 |
+| `--distill_model_max_length` | `8192` | Cat 蒸馏序列长度 |
+| `--model_max_length` | `8192` | E2E 序列长度 |
+| `--distill_dataset` / `--dataset_mix` | 见上 mix 串 | 蒸馏 / E2E 数据配方 |
 
 Llama gated 模型需自行配置 `HF_TOKEN` 或训练 CLI 的 `--access_token`。
 
@@ -50,14 +49,9 @@ Block 蒸馏现已支持 Qwen3/Qwen2 与 Llama decoder（`train_utils/block_dist
 
 ## 序列长度
 
-EdgeRazor 论文（Appendix D.1）对所有已验证模型统一 **truncate 到 1024**。Qwen3-8B / Llama-3.1-8B 属于未在论文中验证的外推；Cat 蒸馏默认 **8192**（`DISTILL_MODEL_MAX_LENGTH`），E2E 仍默认 1024。
+EdgeRazor 论文（Appendix D.1）对所有已验证模型统一 **truncate 到 1024**。Qwen3-8B / Llama-3.1-8B 属于未在论文中验证的外推；当前脚本默认 **8192**（Cat 用 `--distill_model_max_length`，E2E 用 `--model_max_length`）。
 
-覆盖示例：
-
-```bash
-DISTILL_MODEL_MAX_LENGTH=1024 MODEL_PATH=Qwen/Qwen3-8B bash scripts/catlora_simple.sh
-MODEL_MAX_LENGTH=2048 bash compressed_e2e_fintuning/scripts/e2e_stage1_pretrain.sh
-```
+覆盖示例：直接改脚本里对应 CLI 行，例如 `--distill_model_max_length "1024"` 或 `--model_max_length "2048"`。
 
 ## Cat 多卡蒸馏（DDP）
 
@@ -72,6 +66,8 @@ torchrun --standalone --nproc_per_node=4 python tools/cat_distill_from_vae_check
 
 - `--distill_batch_size` 为**每卡** batch；global batch = `batch_size × GPU 数 × distill_gradient_accumulation_steps`
 - VAE 训练 / activation calib 仍单卡；推荐仅 checkpoint 蒸馏脚本使用 `torchrun`
+- **数据加载**：EdgeRazor 式 lazy Dataset（`load_dataset` 读 jsonl，`__getitem__` 内 tokenize）；`interleave_datasets` 按 mix 权重采样；并行靠 `dataloader_num_workers`（默认 16），无 rank-0 预处理 cache
+- **训练量**：由 `--distill_steps` 控制
 
 ## 蒸馏损失（EAKLD）
 
@@ -144,7 +140,7 @@ MAX_SAMPLES=100 MAX_SAMPLES_PER_TASK=10 bash scripts/download_distill_dataset.sh
 - Block 蒸馏：`scripts/block_vae_lora_simple.sh`
 - E2E：`compressed_e2e_fintuning/scripts/e2e_stage1_pretrain.sh`、`e2e_stage2_instruct.sh`、`e2e_decoder.sh`
 
-默认全量 `--distill_nsamples=11000000`，Cat 蒸馏序列长度默认 8192。
+Cat 蒸馏序列长度由 `--distill_model_max_length` 控制（脚本中常见 4096 或 8192）。
 
 ## LongBench 说明
 

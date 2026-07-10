@@ -93,6 +93,5 @@ fi
 
 echo "============================================"
 echo " 蒸馏数据已就绪: ${OUTPUT_DIR}"
-echo " 默认 mix（见 scripts/lib/edgerazor_model_env.sh）:"
-echo "   edgerazor_ii_7m, edgerazor_ii_gen, edgerazor_tulu, edgerazor_am, vaellm_eval_task"
+echo " 默认 mix: edgerazor_ii_7m, edgerazor_ii_gen, edgerazor_tulu, edgerazor_am, vaellm_eval_task"
 echo "============================================"

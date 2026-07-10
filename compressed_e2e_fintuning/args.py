@@ -319,7 +319,7 @@ def validate_args(
     if int(args.eval_prewarm_group_size) < 1:
         parser.error("--eval_prewarm_group_size must be >= 1.")
     if int(args.dataset_num_proc) < 1:
-        parser.error("--dataset_num_proc must be >= 1.")
+        parser.error("--dataset_num_proc is deprecated and must be >= 1 when provided.")
     if args.max_train_samples is not None and int(args.max_train_samples) < 1:
         parser.error("--max_train_samples must be >= 1 when provided.")
     if args.max_eval_samples is not None and int(args.max_eval_samples) < 1:

@@ -33,6 +33,12 @@ from train_utils.hif4_act import (
     register_hif4_act_hooks,
     remove_hif4_act_hooks,
 )
+from e2e_common.lazy_datasets import (
+    build_edgerazor_data_collator,
+    dataset_length_or_none,
+    default_dataloader_num_workers,
+    is_iterable_training_dataset,
+)
 from train_utils.lora_data import ensure_distill_dataset_stack_available, prepare_distill_datasets
 from train_utils.lora_training import (
     CustomSFTTrainer,
@@ -55,7 +61,6 @@ class _ResolvedDistillStageConfig:
     dropout: float
     steps: int
     batch_size: int
-    nsamples: int
     lr: float
     weight_decay: float
     log_every: int
@@ -233,7 +238,6 @@ def _resolve_distill_stage_config(
         dropout=float(runtime_cfg.dropout),
         steps=int(runtime_cfg.steps),
         batch_size=int(runtime_cfg.batch_size),
-        nsamples=int(runtime_cfg.nsamples),
         lr=float(runtime_cfg.lr),
         weight_decay=float(runtime_cfg.weight_decay),
         log_every=int(runtime_cfg.log_every),
@@ -409,7 +413,17 @@ def _ensure_lora_tokenizer_ready(*, vae_args, model: nn.Module) -> None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
 
-def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig):
+def _resolve_distill_dataloader_num_workers(training_args) -> int:
+    raw = getattr(training_args, "distill_dataloader_num_workers", None)
+    if raw is None:
+        return int(default_dataloader_num_workers())
+    workers = int(raw)
+    if workers < 0:
+        raise ValueError(f"distill_dataloader_num_workers must be >= 0, got {workers}.")
+    return workers
+
+
+def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig, train_is_iterable: bool = False):
     gradient_checkpointing_kwargs = None
     raw_gc_kwargs = getattr(training_args, "distill_gradient_checkpointing_kwargs", None)
     if raw_gc_kwargs is not None and str(raw_gc_kwargs).strip():
@@ -444,7 +458,11 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
         seed=int(cfg.seed),
         data_seed=int(cfg.seed),
         full_determinism=bool(getattr(cat_args, "deterministic", False)),
+        dataloader_num_workers=_resolve_distill_dataloader_num_workers(training_args),
+        dataloader_pin_memory=True,
     )
+    if train_is_iterable:
+        training_kwargs["group_by_length"] = False
     if is_distill_distributed():
         training_kwargs["ddp_find_unused_parameters"] = True
     return TrainingArguments(**training_kwargs)
@@ -470,16 +488,26 @@ def _build_lora_trainer(
     hif4_act_controller,
     teacher_param_snapshots,
     tokenizer=None,
+    train_is_iterable: bool = False,
+    use_lazy_tokenized_dataset: bool = False,
 ):
+    max_seq_len = int(getattr(training_args, "distill_model_max_length", 2048))
     trainer_kwargs = dict(
         model=model,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         args=sft_args,
-        max_seq_length=int(getattr(training_args, "distill_model_max_length", 2048)),
         callbacks=[_LoraTrainerLogCallback(logger=logger)],
     )
-    if tokenizer is not None and _distill_dataset_uses_edgerazor_messages(cfg.dataset):
+    if use_lazy_tokenized_dataset:
+        if tokenizer is None:
+            raise ValueError("Lazy tokenized distill dataset requires tokenizer.")
+        trainer_kwargs["processing_class"] = tokenizer
+        trainer_kwargs["data_collator"] = build_edgerazor_data_collator(
+            tokenizer,
+            max_seq_len=max_seq_len,
+        )
+    elif tokenizer is not None and _distill_dataset_uses_edgerazor_messages(cfg.dataset):
         if DataCollatorForCompletionOnlyLM is None:
             raise ImportError("未安装 trl。EdgeRazor messages 蒸馏需要 DataCollatorForCompletionOnlyLM。")
         response_template = infer_assistant_response_template(tokenizer)
@@ -492,8 +520,11 @@ def _build_lora_trainer(
             tokenizer=tokenizer,
             mlm=False,
         )
+        trainer_kwargs["max_seq_length"] = max_seq_len
     else:
         trainer_kwargs["dataset_text_field"] = "text"
+        trainer_kwargs["max_seq_length"] = max_seq_len
+    del train_is_iterable
     if lora_config is not None:
         trainer_kwargs["peft_config"] = lora_config
 
@@ -625,39 +656,45 @@ def lora_finetune_remaining_categories(
             use_custom_trainer=use_custom_trainer,
         )
 
+        _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
+        tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
         dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
             cfg.dataset,
-            nsamples=cfg.nsamples,
             seed=cfg.seed,
-            cache_dir=str(getattr(cat_args, "output_dir", "") or ""),
+            tokenizer=tokenizer,
+            max_seq_len=int(getattr(training_args, "distill_model_max_length", 2048)),
         )
+        train_is_iterable = is_iterable_training_dataset(train_ds)
+        train_len = dataset_length_or_none(train_ds)
         logger.info(
-            "LoRA: 补偿训练混合数据集=%s nsamples=%d eval_dataset=none",
+            "LoRA: 补偿训练混合数据集=%s lazy_iterable=%s dataset_len=%s eval_dataset=none",
             str(dataset_mix_spec),
-            int(cfg.nsamples),
+            str(train_is_iterable).lower(),
+            "unknown" if train_len is None else str(train_len),
         )
         for source_info in source_stats:
             logger.info(
-                "LoRA: 混合数据源 alias=%s weight=%.6f target_rows=%d actual_rows=%d raw_rows=%d text_rows=%d hf=%s config=%s train_split=%s",
+                "LoRA: 混合数据源 alias=%s weight=%.6f raw_rows=%d hf=%s config=%s train_split=%s lazy_iterable=%s",
                 str(source_info["alias"]),
                 float(source_info["weight"]),
-                int(source_info["target_rows"]),
-                int(source_info["actual_rows"]),
                 int(source_info["raw_rows"]),
-                int(source_info["text_rows"]),
                 str(source_info["path"]),
                 "none" if source_info["config"] is None else str(source_info["config"]),
                 str(source_info["train_split"]),
+                str(source_info.get("is_iterable", train_is_iterable)).lower(),
             )
-        if len(train_ds) == 0:
+        if train_len == 0:
             logger.warning("LoRA: 数据集为空，跳过。")
             model, _merged_count = merge_all_lora(model)
             return model
 
-        _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
-        sft_args = _build_sft_args(cat_args=cat_args, training_args=training_args, cfg=cfg)
+        sft_args = _build_sft_args(
+            cat_args=cat_args,
+            training_args=training_args,
+            cfg=cfg,
+            train_is_iterable=train_is_iterable,
+        )
         hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
-        tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
         trainer = _build_lora_trainer(
             model=model,
             train_ds=train_ds,
@@ -670,6 +707,8 @@ def lora_finetune_remaining_categories(
             hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
             tokenizer=tokenizer,
+            train_is_iterable=train_is_iterable,
+            use_lazy_tokenized_dataset=True,
         )
         model = _train_and_merge_lora_model(
             trainer=trainer,

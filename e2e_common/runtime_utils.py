@@ -21,14 +21,11 @@ def build_datasets_with_main_process_first(args, training_args, tokenizer, log):
     eval_strategy = normalized_eval_strategy(training_args)
     skip_eval_preprocessing = eval_strategy == "no"
     log.info(
-        "Dataset preprocess config: dataset_num_proc=%d eval_strategy=%s skip_eval_preprocessing=%s main_process_first=%s",
-        int(getattr(args, "dataset_num_proc", 1)),
+        "Dataset preprocess config: lazy_loading=true eval_strategy=%s skip_eval_preprocessing=%s",
         eval_strategy,
         str(skip_eval_preprocessing).lower(),
-        "true",
     )
-    with training_args.main_process_first(local=False, desc="dataset preprocessing"):
-        return build_datasets(args, training_args, tokenizer)
+    return build_datasets(args, training_args, tokenizer)
 
 
 def eval_final_ppl(*, model, args, model_path: str, output_dir: str, log):
