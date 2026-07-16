@@ -16,13 +16,8 @@ from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_l
 _DEFAULT_RUN_ROOT = ".result/compressed_e2e_fintuning"
 _SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"} | VAELLM_EDGERAZOR_SFT_ALIASES
 _MCQA_LOSS_TYPES = {"choice_kd", "choice_kd_ce"}
-_VALID_FINETUNE_MODES = {"decoder", "lora", "both"}
-_MODE_TO_VAE_TRAIN_MODE = {
-    "decoder": "decoder",
-    "lora": "low_rank",
-    "both": "both",
-}
-_VALID_VAE_TRAIN_MODES = {"decoder", "low_rank", "both"}
+_VALID_FINETUNE_MODES = {"decoder", "compressed_lora", "both"}
+_VALID_VAE_TRAIN_MODES = {"decoder", "compressed_lora", "both"}
 _VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
 _VALID_HIDDEN_LAYER_WEIGHTING = {"uniform", "linear_depth"}
 _DISALLOWED_DENSE_LORA_FLAGS = {
@@ -282,26 +277,25 @@ def validate_args(
     args.hidden_layer_weighting = hidden_layer_weighting
     finetune_mode = str(args.finetune_mode or "").strip().lower()
     if finetune_mode not in _VALID_FINETUNE_MODES:
-        parser.error("--finetune_mode must be one of: decoder | lora | both.")
+        parser.error("--finetune_mode must be one of: decoder | compressed_lora | both.")
     args.finetune_mode = finetune_mode
-    train_mode = _MODE_TO_VAE_TRAIN_MODE[finetune_mode]
-    if train_mode not in _VALID_VAE_TRAIN_MODES:
-        parser.error("Internal error: mapped --finetune_mode to invalid train mode.")
-    args.vae_train_mode = train_mode
-    args.internal_vae_train_mode = train_mode
+    if finetune_mode not in _VALID_VAE_TRAIN_MODES:
+        parser.error("Internal error: invalid --finetune_mode.")
+    args.vae_train_mode = finetune_mode
+    args.internal_vae_train_mode = finetune_mode
     decode_device = str(args.decode_device or "").strip().lower()
     if not _VALID_DECODE_DEVICE_PATTERN.fullmatch(decode_device):
         parser.error("--decode_device only supports: auto | cpu | cuda | cuda:<index>.")
     args.decode_device = decode_device
     if int(args.decode_group_size) < 1:
         parser.error("--decode_group_size must be >= 1.")
-    if train_mode == "low_rank":
+    if finetune_mode == "compressed_lora":
         if bool(args.vae_tune_bias):
-            parser.error("--finetune_mode lora does not support --vae_tune_bias=true.")
+            parser.error("--finetune_mode compressed_lora does not support --vae_tune_bias=true.")
         if bool(args.tune_final_norm):
-            parser.error("--finetune_mode lora does not support --tune_final_norm=true.")
+            parser.error("--finetune_mode compressed_lora does not support --tune_final_norm=true.")
         if bool(args.use_post_norm_head_linear):
-            parser.error("--finetune_mode lora does not support --use_post_norm_head_linear=true.")
+            parser.error("--finetune_mode compressed_lora does not support --use_post_norm_head_linear=true.")
     if int(args.ppl_seqlen) < 1:
         parser.error("--ppl_seqlen must be >= 1.")
     if int(args.ppl_limit) == 0 or int(args.ppl_limit) < -1:

@@ -33,7 +33,6 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --eval_ppl "false" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
-  --outlier_protect_mode "none" \
   --distill_after_category "compressed_lora" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --lora_rank "default=4" \
@@ -64,8 +63,8 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --distill_optim "adamw_torch" \
   --distill_max_grad_norm "1.3" \
   --distill_warmup_ratio "0.1" \
-  --distill_group_by_length "true" \
-  --distill_lr_scheduler_type "constant" \
+  --distill_group_by_length "false" \
+  --distill_lr_scheduler_type "constant_with_warmup" \
   --distill_model_max_length "8192" \
   --fp16 "false" \
   --bf16 "true" \

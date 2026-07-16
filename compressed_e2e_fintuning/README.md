@@ -6,7 +6,7 @@
 
 ```bash
 --finetune_mode decoder   # 默认
---finetune_mode lora
+--finetune_mode compressed_lora
 --finetune_mode both
 ```
 
@@ -62,7 +62,7 @@ bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
 - 仍是压缩 checkpoint
 - 不产生 PEFT adapter
 
-## 2. `lora`
+## 2. `compressed_lora`
 
 只训练已有低秩分支，不训练 decoder。
 
@@ -70,7 +70,7 @@ bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
 
 ```bash
 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
-  --finetune_mode lora \
+  --finetune_mode compressed_lora \
   --decode_device auto \
   --decode_group_size 8 \
   --tune_final_norm false \
@@ -139,7 +139,7 @@ bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
 适合场景：
 
 - 低秩补偿和 decoder 都需要一起调整
-- 能接受比 `low_rank` 更重的训练成本
+- 能接受比 `compressed_lora` 更重的训练成本
 
 输出：
 

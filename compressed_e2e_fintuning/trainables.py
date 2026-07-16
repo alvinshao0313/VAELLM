@@ -133,7 +133,7 @@ def validate_selected_low_rank_payloads(
     if not unique_ranks:
         raise ValueError("No selected VAELinear modules found for low-rank training.")
     if bool(require_uniform_rank) and len(unique_ranks) != 1:
-        raise ValueError(f"--finetune_mode lora requires uniform low-rank rank, got {unique_ranks}.")
+        raise ValueError(f"--finetune_mode compressed_lora requires uniform low-rank rank, got {unique_ranks}.")
     return int(unique_ranks[0])
 
 
@@ -156,7 +156,7 @@ def select_vae_decoder_trainables(
 ) -> VAEDecoderTrainableSelection:
     _freeze_all(model)
     train_mode = str(train_mode or "decoder").strip().lower()
-    if train_mode not in {"decoder", "low_rank", "both"}:
+    if train_mode not in {"decoder", "compressed_lora", "both"}:
         raise ValueError(f"Invalid train_mode={train_mode!r}.")
 
     selected_modules, target_module_suffixes = collect_selected_vae_linears(
@@ -174,8 +174,8 @@ def select_vae_decoder_trainables(
         if bool(vae_tune_bias) and module.bias is not None:
             module.bias.requires_grad = True
             bias_modules.append(name)
-        if train_mode in {"low_rank", "both"}:
-            if train_mode == "low_rank":
+        if train_mode in {"compressed_lora", "both"}:
+            if train_mode == "compressed_lora":
                 module.trainable_decode = True
                 module.cache_decoded_weight = False
                 module.clear_decoded_weight_cache()

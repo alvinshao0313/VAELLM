@@ -307,7 +307,7 @@
 | `--distill_max_grad_norm` | LoRA `TrainingArguments` | LoRA 梯度裁剪 |
 | `--distill_warmup_ratio` | LoRA `TrainingArguments` | LoRA warmup 比例 |
 | `--distill_group_by_length` | LoRA `TrainingArguments` | LoRA 按长度分组 |
-| `--distill_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型 |
+| `--distill_lr_scheduler_type` | LoRA `TrainingArguments` | LoRA 学习率调度器类型；`constant` 且 `distill_warmup_ratio>0` 会直接报错，需改用 `constant_with_warmup` |
 | `--distill_model_max_length` | LoRA trainer | LoRA 样本最大长度 |
 | `--distill_teacher_logits_cpu_staging` | LoRA trainer | teacher forward 后把 logits 暂存 CPU（bf16），算 KL 前搬回 GPU；默认 `true` |
 | `--distill_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |

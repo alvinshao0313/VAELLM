@@ -2802,6 +2802,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         )
         log.info("Saved normalized parameter snapshot: %s", snapshot_path)
         lora_round_idx = 0
+        completed_distill_categories: List[str] = []
         any_distill_after_overrides = any(table.is_override_enabled() for table, _ in distill_tables)
         if any_distill_after_overrides:
             log.info(
@@ -3037,6 +3038,48 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 )
                 model = distill_result.model
                 lora_round_idx = int(distill_result.next_lora_round_idx)
+                if int(distill_result.trained_target_count) > 0 and bool(cat_args.save_model):
+                    if str(cat) not in completed_distill_categories:
+                        completed_distill_categories.append(str(cat))
+                    from transformers import AutoTokenizer
+                    from e2e_common.post_norm_head import fuse_post_norm_head_linear
+                    from e2e_common.peft_proxy import iter_named_peft_vae_proxies
+                    from litebsq.vae_linear import clear_model_vae_linear_cache
+
+                    after_dir = os.path.join(run_output_dir, f"after_{cat}")
+                    tok = AutoTokenizer.from_pretrained(
+                        vae_args.model_path, use_fast=True, token=hf_args.access_token
+                    )
+                    fused_post_norm_head = fuse_post_norm_head_linear(model)
+                    if fused_post_norm_head:
+                        log.info("After-category save: fused post_norm_linear into lm_head.weight.")
+                    leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
+                    if leftover_proxies:
+                        raise RuntimeError(
+                            "After-category save found unexported PeftVAELinearProxy modules: "
+                            + ", ".join(leftover_proxies)
+                        )
+                    cleared = clear_model_vae_linear_cache(model)
+                    log.info(
+                        "After-category save [%s]: cleared decoded cache for %d VAELinear modules.",
+                        cat,
+                        cleared,
+                    )
+                    save_paths = save_model_checkpoint(
+                        model,
+                        after_dir,
+                        base_model_path=vae_args.model_path,
+                        tokenizer=tok,
+                        save_config=True,
+                        extra_meta={
+                            "stage": "after_category",
+                            "category": str(cat),
+                            "completed_categories": list(completed_distill_categories),
+                            "distill_after_category": str(distill_after_category),
+                        },
+                        unload_vae_original_weights=False,
+                    )
+                    log.info("Saved after-category model to %s", save_paths["output_dir"])
 
             if run_category_eval and distill_after_category != "none":
                 log.info("每类后蒸馏后评估...")

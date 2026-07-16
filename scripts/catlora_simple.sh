@@ -159,7 +159,7 @@ python tools/cat_train.py \
   --distill_max_grad_norm "1.3" \
   --distill_warmup_ratio "0.1" \
   --distill_group_by_length "true" \
-  --distill_lr_scheduler_type "constant" \
+  --distill_lr_scheduler_type "constant_with_warmup" \
   --distill_model_max_length "8192" \
   --fp16 "false" \
   --bf16 "true" \

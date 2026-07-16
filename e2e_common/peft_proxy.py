@@ -162,10 +162,21 @@ class PeftVAELinearProxy(nn.Module):
         peft_linear = self.per_decoded_linear
         if not is_peft_proxy_adapter_linear(peft_linear):
             raise RuntimeError("PeftVAELinearProxy decoder+adapter training requires a PEFT adapter linear.")
-        dense_base = peft_linear.get_base_layer()
+        if is_peft_adalora_linear(peft_linear):
+            raise RuntimeError("PeftVAELinearProxy decoder+adapter training does not support AdaLoRA.")
+        if _adapter_uses_dora(peft_linear, _get_default_adapter_name(peft_linear)):
+            raise RuntimeError("PeftVAELinearProxy decoder+adapter training does not support DoRA.")
         decoder_out = self.base_layer(x)
-        adapter_delta = peft_linear(x) - dense_base(x)
+        adapter_delta = _compute_plain_lora_delta(peft_linear, x)
         return decoder_out + adapter_delta
+
+
+def _compute_plain_lora_delta(peft_linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Compute LoRA delta as scaling * B(A(dropout(x))) without a dense base subtract."""
+    adapter_name = _get_default_adapter_name(peft_linear)
+    dropped = peft_linear.lora_dropout[adapter_name](x)
+    delta = peft_linear.lora_B[adapter_name](peft_linear.lora_A[adapter_name](dropped))
+    return delta * float(peft_linear.scaling[adapter_name])
 
 
 def ensure_peft_vae_linear_proxy(
@@ -231,6 +242,23 @@ def _restore_base_layer_cache_policy_from_proxy(proxy: PeftVAELinearProxy) -> No
         )
     elif hasattr(base_layer, "_skip_global_cache_prewarm"):
         delattr(base_layer, "_skip_global_cache_prewarm")
+
+
+def unwrap_peft_vae_proxies(
+    model: nn.Module,
+    *,
+    module_names: Optional[Sequence[str]] = None,
+) -> int:
+    """Remove PeftVAELinearProxy wrappers and restore bare VAELinear modules without exporting LoRA."""
+    proxy_refs = _select_peft_proxy_refs(model, module_names)
+    restored = 0
+    for module_name, proxy in proxy_refs:
+        base_layer = proxy.base_layer
+        _restore_base_layer_cache_policy_from_proxy(proxy)
+        base_layer.clear_decoded_weight_cache()
+        set_module_by_name(model, module_name, base_layer)
+        restored += 1
+    return int(restored)
 
 
 def _adapter_uses_dora(peft_linear: PeftLoraLinear, adapter_name: str) -> bool:
@@ -807,6 +835,10 @@ def ensure_peft_vae_proxy_adapter(
     variant = _normalize_variant(variant)
     bias_mode = _normalize_bias_mode(bias_mode)
     init_mode = str(init_mode).strip().lower()
+    if init_mode not in {"gaussian", "peft_default", "zero"}:
+        raise ValueError(
+            f"Unsupported init_mode={init_mode!r}. Expected one of: gaussian, peft_default, zero."
+        )
     proxy_refs = list(iter_named_peft_vae_proxies(model))
     if not proxy_refs:
         return 0

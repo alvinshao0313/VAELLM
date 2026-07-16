@@ -993,6 +993,17 @@ def _validate_distill_after_category_args(cat_args: NormalizedCatArgs) -> None:
                 )
 
 
+def _validate_distill_lr_scheduler_args(training_args) -> None:
+    scheduler = str(getattr(training_args, "distill_lr_scheduler_type", "linear") or "linear").strip().lower()
+    warmup_ratio = float(getattr(training_args, "distill_warmup_ratio", 0.0) or 0.0)
+    if scheduler == "constant" and warmup_ratio > 0.0:
+        raise ValueError(
+            "--distill_lr_scheduler_type=constant ignores warmup. "
+            "Use --distill_lr_scheduler_type=constant_with_warmup when "
+            f"--distill_warmup_ratio={warmup_ratio} > 0, or set --distill_warmup_ratio 0."
+        )
+
+
 def validate_outlier_rank_metric(
     outlier_mode: str,
     outlier_rank_metric: str,
@@ -1611,6 +1622,7 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
 
     hf_parser = transformers.HfArgumentParser((HFArguments, CatTrainHFTrainingArguments))
     hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=unknown_args)
+    _validate_distill_lr_scheduler_args(training_args)
     use_bf16 = bool(training_args.bf16)
     vae_args.vae_weight_dtype = "bf16" if use_bf16 else "fp32"
     vae_args.vae_autocast_dtype = "bf16" if use_bf16 else "fp32"

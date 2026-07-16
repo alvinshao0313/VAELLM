@@ -13,9 +13,12 @@ from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import (
     NamedVAELinearTarget,
     clear_model_vae_linear_cache,
-    prime_named_vae_linear_cache,
 )
-from train_utils.cat_after_category_distill import run_after_category_distill
+from train_utils.cat_after_category_distill import (
+    category_targets_have_low_rank,
+    collect_compressed_category_targets,
+    run_after_category_distill,
+)
 from train_utils.cat_train_args import resolve_category_runtime_configs
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.cat_train_runtime import save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot
@@ -24,7 +27,6 @@ from train_utils.lora_utils import (
     ensure_distill_process_group_initialized,
     is_distill_distributed,
     is_distill_main_process,
-    resolve_distill_train_device,
 )
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
@@ -109,9 +111,16 @@ def _iter_vae_decoder_checkpoint_targets(base_layer: VAELinear):
         yield decoder
 
 
-def _apply_vae_decoder_checkpoint_override(*, model: nn.Module, vae_args, logger) -> int:
+def _apply_vae_decoder_checkpoint_override(*, model: nn.Module, vae_args, logger, mode: str) -> int:
     override = getattr(vae_args, "vae_decoder_checkpoint", None)
     if override is None:
+        return 0
+
+    resolved_mode = str(mode).strip().lower()
+    if resolved_mode == "compressed_lora":
+        logger.info(
+            "Checkpoint distill: mode=compressed_lora，忽略 --vae_decoder_checkpoint（前向不跑 decoder）。"
+        )
         return 0
 
     enabled = bool(override)
@@ -306,35 +315,133 @@ def _load_checkpoint_for_distill(*, cat_args, hf_args, vae_args, logger) -> nn.M
     return model
 
 
-def _save_final_model(*, model: nn.Module, run_output_dir: str, cat_args, hf_args, vae_args, logger) -> None:
+def _load_completed_categories_from_checkpoint(checkpoint_dir: str) -> List[str]:
+    meta_path = os.path.join(checkpoint_dir, META_FILENAME)
+    if not os.path.exists(meta_path):
+        return []
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    extra_meta = meta.get("extra_meta") if isinstance(meta, dict) else None
+    if not isinstance(extra_meta, dict):
+        return []
+    raw = extra_meta.get("completed_categories")
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _save_distill_model(
+    *,
+    model: nn.Module,
+    model_out: str,
+    cat_args,
+    hf_args,
+    vae_args,
+    logger,
+    extra_meta: Optional[dict],
+    unload_vae_original_weights: bool,
+) -> None:
     if not bool(getattr(cat_args, "convert", False)):
         raise ValueError("--save_model requires --convert")
 
     from transformers import AutoTokenizer
 
-    model_out = os.path.join(run_output_dir, "final_model")
     tok = AutoTokenizer.from_pretrained(vae_args.model_path, use_fast=True, token=hf_args.access_token)
     fused_post_norm_head = fuse_post_norm_head_linear(model)
     if fused_post_norm_head:
-        logger.info("Final save: fused post_norm_linear into lm_head.weight.")
+        logger.info("Save: fused post_norm_linear into lm_head.weight.")
     leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
     if leftover_proxies:
         raise RuntimeError(
-            "Final save found unexported PeftVAELinearProxy modules: "
+            "Save found unexported PeftVAELinearProxy modules: "
             + ", ".join(leftover_proxies)
         )
     cleared = clear_model_vae_linear_cache(model)
-    logger.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
+    logger.info("Save: cleared decoded cache for %d VAELinear modules.", cleared)
     save_paths = save_model_checkpoint(
         model,
         model_out,
         base_model_path=vae_args.model_path,
         tokenizer=tok,
         save_config=True,
-        extra_meta={"stage": "final"},
+        extra_meta=extra_meta,
+        unload_vae_original_weights=bool(unload_vae_original_weights),
+    )
+    logger.info("Saved model to %s", save_paths["output_dir"])
+
+
+def _save_final_model(
+    *,
+    model: nn.Module,
+    run_output_dir: str,
+    cat_args,
+    hf_args,
+    vae_args,
+    logger,
+    completed_categories: Optional[Sequence[str]] = None,
+) -> None:
+    _save_distill_model(
+        model=model,
+        model_out=os.path.join(run_output_dir, "final_model"),
+        cat_args=cat_args,
+        hf_args=hf_args,
+        vae_args=vae_args,
+        logger=logger,
+        extra_meta={
+            "stage": "final",
+            "completed_categories": [str(item) for item in (completed_categories or [])],
+        },
         unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
     )
-    logger.info("Saved final model to %s", save_paths["output_dir"])
+
+
+def _save_after_category_checkpoint(
+    *,
+    model: nn.Module,
+    run_output_dir: str,
+    category: str,
+    completed_categories: Sequence[str],
+    mode: str,
+    active_categories: Sequence[str],
+    residency: _CheckpointDistillResidency,
+    cat_args,
+    hf_args,
+    vae_args,
+    logger,
+) -> None:
+    # All ranks restore so DDP model graphs stay aligned; only rank0 writes.
+    _restore_checkpoint_distill_residency(model=model, residency=residency, logger=logger)
+    distill_distributed_barrier()
+    try:
+        if is_distill_main_process():
+            _save_distill_model(
+                model=model,
+                model_out=os.path.join(run_output_dir, f"after_{category}"),
+                cat_args=cat_args,
+                hf_args=hf_args,
+                vae_args=vae_args,
+                logger=logger,
+                extra_meta={
+                    "stage": "after_category",
+                    "category": str(category),
+                    "completed_categories": [str(item) for item in completed_categories],
+                    "distill_after_category": str(mode),
+                },
+                unload_vae_original_weights=False,
+            )
+    finally:
+        distill_distributed_barrier()
+        _apply_checkpoint_distill_residency(
+            model=model,
+            active_categories=active_categories,
+            residency=residency,
+            logger=logger,
+        )
+        _set_active_vae_category_prefix(
+            model=model,
+            active_categories=active_categories,
+            logger=logger,
+        )
 
 
 def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) -> None:
@@ -379,7 +486,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     )
 
     model = _load_checkpoint_for_distill(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args, logger=logger)
-    _apply_vae_decoder_checkpoint_override(model=model, vae_args=vae_args, logger=logger)
+    _apply_vae_decoder_checkpoint_override(model=model, vae_args=vae_args, logger=logger, mode=mode)
     transpose_modules = _split_csv(cat_args.transpose_modules)
     target_categories = _split_csv(cat_args.target_categories)
     only_decoder_projections = not bool(cat_args.include_all_linears)
@@ -397,6 +504,14 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         raise ValueError(
             "target_categories contains categories without VAELinear in checkpoint: "
             + ",".join(missing_target_categories)
+        )
+
+    resume_checkpoint_dir = resolve_checkpoint_dir(str(cat_args.resume_from_checkpoint))
+    completed_categories = _load_completed_categories_from_checkpoint(resume_checkpoint_dir)
+    if completed_categories:
+        logger.info(
+            "Checkpoint distill resume progress: completed_categories=%s",
+            ",".join(completed_categories),
         )
 
     resolved_category_cfgs = resolve_category_runtime_configs(cat_args, vae_args, target_categories)
@@ -424,7 +539,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     residency = _CheckpointDistillResidency()
     lora_round_idx = 0
     active_categories: List[str] = []
-    distill_device = resolve_distill_train_device(str(cat_args.train_device))
+    completed_categories = list(completed_categories)
     for category in target_categories:
         active_categories.append(str(category))
         _apply_checkpoint_distill_residency(
@@ -438,23 +553,16 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             active_categories=active_categories,
             logger=logger,
         )
-        if mode == "compressed_lora":
-            prewarm_stats = prime_named_vae_linear_cache(
-                prewarm_targets,
-                clear_existing=True,
-                group_size=8,
-                compute_device=distill_device,
-                logger=logger,
-            )
+        del prewarm_targets  # outer prewarm removed (O5); inner path in after-category distill handles cache
+
+        skip_from_progress = str(category) in set(completed_categories)
+        if skip_from_progress:
             logger.info(
-                "Checkpoint distill prewarm: category=%s active_categories=%s total=%d warmed=%d skipped=%d failed=%d",
+                "Checkpoint distill: category=%s 已在 completed_categories 中，跳过蒸馏。",
                 str(category),
-                ",".join(active_categories),
-                int(prewarm_stats.get("total", 0)),
-                int(prewarm_stats.get("warmed", 0)),
-                int(prewarm_stats.get("skipped", 0)),
-                int(prewarm_stats.get("failed", 0)),
             )
+            lora_round_idx = int(lora_round_idx) + 1
+            continue
 
         if run_category_eval:
             if is_distill_main_process():
@@ -486,6 +594,32 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         )
         model = distill_result.model
         lora_round_idx = int(distill_result.next_lora_round_idx)
+
+        if int(distill_result.trained_target_count) > 0:
+            if str(category) not in completed_categories:
+                completed_categories.append(str(category))
+            if bool(cat_args.save_model):
+                _save_after_category_checkpoint(
+                    model=model,
+                    run_output_dir=run_output_dir,
+                    category=str(category),
+                    completed_categories=completed_categories,
+                    mode=mode,
+                    active_categories=active_categories,
+                    residency=residency,
+                    cat_args=cat_args,
+                    hf_args=hf_args,
+                    vae_args=vae_args,
+                    logger=logger,
+                )
+        elif mode in {"compressed_lora", "both"}:
+            if category_targets_have_low_rank(collect_compressed_category_targets(model, category)):
+                if str(category) not in completed_categories:
+                    completed_categories.append(str(category))
+                    logger.info(
+                        "Checkpoint distill: category=%s 因已有 low_rank_a/b 记入 completed_categories。",
+                        str(category),
+                    )
 
         if run_category_eval:
             if is_distill_main_process():
@@ -527,6 +661,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             hf_args=hf_args,
             vae_args=vae_args,
             logger=logger,
+            completed_categories=completed_categories,
         )
 
     distill_distributed_barrier()

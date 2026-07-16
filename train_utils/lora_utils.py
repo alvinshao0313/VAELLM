@@ -458,7 +458,7 @@ def _resolve_distill_dataloader_num_workers(training_args) -> int:
     return workers
 
 
-def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig, train_is_iterable: bool = False):
+def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig, train_is_iterable: bool = False, logger=None):
     gradient_checkpointing_kwargs = None
     raw_gc_kwargs = getattr(training_args, "distill_gradient_checkpointing_kwargs", None)
     if raw_gc_kwargs is not None and str(raw_gc_kwargs).strip():
@@ -466,6 +466,7 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
         if not isinstance(gradient_checkpointing_kwargs, dict):
             raise ValueError("--distill_gradient_checkpointing_kwargs must be a JSON object.")
 
+    requested_group_by_length = bool(getattr(training_args, "distill_group_by_length", True))
     training_kwargs = dict(
         output_dir=os.path.join(str(getattr(cat_args, "output_dir", ".result")), "lora_trainer_state"),
         per_device_train_batch_size=int(cfg.batch_size),
@@ -483,7 +484,7 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
         max_grad_norm=float(getattr(training_args, "distill_max_grad_norm", 0.3)),
         max_steps=int(cfg.steps),
         warmup_ratio=float(getattr(training_args, "distill_warmup_ratio", 0.3)),
-        group_by_length=bool(getattr(training_args, "distill_group_by_length", True)),
+        group_by_length=requested_group_by_length,
         lr_scheduler_type=_enum_to_value(getattr(training_args, "distill_lr_scheduler_type", "linear"), "linear"),
         report_to=[],
         disable_tqdm=not is_distill_main_process(),
@@ -498,8 +499,15 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
     )
     if train_is_iterable:
         training_kwargs["group_by_length"] = False
+        if requested_group_by_length and logger is not None:
+            logger.info(
+                "LoRA: dataset is iterable，已忽略 --distill_group_by_length=true。"
+            )
     if is_distill_distributed():
+        # Only current-category params are trainable; frozen params are unused in the graph.
         training_kwargs["ddp_find_unused_parameters"] = True
+        if logger is not None:
+            logger.info("LoRA: DDP find_unused_parameters=True（仅当前类参数可训）。")
     return TrainingArguments(**training_kwargs)
 
 
@@ -728,6 +736,7 @@ def lora_finetune_remaining_categories(
             training_args=training_args,
             cfg=cfg,
             train_is_iterable=train_is_iterable,
+            logger=logger,
         )
         hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
         trainer = _build_lora_trainer(

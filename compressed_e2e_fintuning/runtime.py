@@ -225,7 +225,7 @@ def _build_low_rank_peft_model(
     try:
         from peft import LoraConfig, TaskType, get_peft_model
     except ImportError as exc:  # pragma: no cover
-        raise ImportError("low_rank 训练需要 peft。请先安装：pip install peft") from exc
+        raise ImportError("compressed_lora 训练需要 peft。请先安装：pip install peft") from exc
 
     target_modules = sorted(low_rank_payloads.keys())
     peft_config = LoraConfig(
@@ -258,7 +258,7 @@ def _build_low_rank_peft_model(
         trainable_parameter_names=trainable_names,
         trainable_parameter_count=trainable_count,
         parallel_stage_decode=bool(parallel_stage_decode),
-        train_mode="low_rank",
+        train_mode="compressed_lora",
     )
     return peft_model, selection
 
@@ -529,7 +529,7 @@ def run(args, hf_args, training_args):
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(layers))
     train_mode = str(getattr(args, "vae_train_mode", "decoder")).strip().lower()
     low_rank_payloads_for_export: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
-    if train_mode == "low_rank":
+    if train_mode == "compressed_lora":
         selected_modules, target_module_suffixes = collect_selected_vae_linears(
             model,
             decoder_layer_ids=decoder_layer_ids,
@@ -600,7 +600,7 @@ def run(args, hf_args, training_args):
     )
 
     resolved_layer_device_map = resolve_layer_device_map(args.layer_device_map, len(layers))
-    device_map_model = _peft_base_model(model) if train_mode == "low_rank" else model
+    device_map_model = _peft_base_model(model) if train_mode == "compressed_lora" else model
     offload_mode = str(args.offload_mode).strip().lower()
     streaming_manager = None
     saved_tensor_offload = None
@@ -621,7 +621,7 @@ def run(args, hf_args, training_args):
         hf_device_map = {**boundary_map, **streaming_map}
     else:
         hook_handles, hf_device_map = apply_layer_device_map(device_map_model, layer_device_map=resolved_layer_device_map)
-    if train_mode == "low_rank":
+    if train_mode == "compressed_lora":
         setattr(model, "hf_device_map", hf_device_map)
         setattr(model, "is_parallelizable", True)
         setattr(model, "model_parallel", True)
@@ -742,10 +742,10 @@ def run(args, hf_args, training_args):
         handle.remove()
     if streaming_manager is not None:
         streaming_manager.offload_all(synchronize=True)
-        unwrap_target = _peft_base_model(final_model) if train_mode == "low_rank" else final_model
+        unwrap_target = _peft_base_model(final_model) if train_mode == "compressed_lora" else final_model
         unwrapped_streaming = unwrap_streaming_offload_layers(unwrap_target)
         log.info("Unwrapped %d streaming offload layers before final save.", unwrapped_streaming)
-    if train_mode == "low_rank":
+    if train_mode == "compressed_lora":
         low_rank_payloads_for_export = extract_low_rank_payloads_from_lora(
             final_model,
             selection.target_modules,

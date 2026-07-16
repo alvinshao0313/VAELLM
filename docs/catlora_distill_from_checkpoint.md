@@ -2,7 +2,7 @@
 
 这个脚本用于从已经完成 VAE 压缩的 cat checkpoint 继续做逐类别蒸馏。
 
-它不会重新训练 VAE，也不会重新把 `nn.Linear` 替换成 `VAELinear`。它会读取 checkpoint 里已有的 `VAELinear`，按 `--target_categories` 顺序重放 `catlora_simple.sh` 里“每类刚压缩完后”的蒸馏步骤。
+它不会重新训练 VAE，也不会重新把 `nn.Linear` 替换成 `VAELinear`。它会读取 checkpoint 里已有的 `VAELinear`，按 `--target_categories` 顺序重放“每类刚压缩完后”的蒸馏步骤。
 
 ## 入口链路
 
@@ -13,21 +13,22 @@ scripts/catlora_distill_from_checkpoint.sh
   -> train_utils/cat_after_category_distill.run_after_category_distill(...)
 ```
 
-脚本仍然复用 `cat_train` 的参数解析，因此 `--target_categories`、`--distill_after_category`、`--distill_steps`、`--lora_rank` 等参数含义和 `scripts/catlora_simple.sh` 保持一致。
+脚本复用 `cat_train` 的参数解析，因此 `--target_categories`、`--distill_after_category`、`--distill_steps`、`--lora_rank` 等参数含义和 `scripts/catlora_simple.sh` 保持一致。
 
 ## 适用场景
 
-适合这种流程：
+适合：
 
 1. 已经用 `scripts/catlora_simple.sh` 或同等入口完成目标类别的 VAE 压缩。
 2. 保存出来的 checkpoint 里已经有目标类别的 `VAELinear`。
-3. 之前没有做蒸馏，或者想从这个全 VAE checkpoint 重新开始逐类别蒸馏。
+3. 之前没有做蒸馏，或者想从这个全 VAE checkpoint 开始逐类别蒸馏。
+4. 从中途 `after_<category>/` checkpoint 继续后续类别。
 
-不适合这种流程：
+不适合：
 
 - 输入 checkpoint 里还没有目标类别的 `VAELinear`。
-- 想继续没压缩完的 `cat_train` run。这种情况仍然用 `tools/cat_train.py --resume_from_checkpoint`。
-- 想做 compressed e2e 全模型微调。这种情况使用 `compressed_e2e_fintuning/scripts/e2e_decoder.sh`。
+- 想继续没压缩完的 `cat_train` run（用 `tools/cat_train.py --resume_from_checkpoint`）。
+- 想做 compressed e2e 全模型微调（用 `compressed_e2e_fintuning/scripts/e2e_decoder.sh`）。
 
 ## 运行方式
 
@@ -37,187 +38,128 @@ scripts/catlora_distill_from_checkpoint.sh
 conda activate bitvae
 ```
 
-然后传入要继续蒸馏的 VAE checkpoint：
+编辑脚本里的 `--resume_from_checkpoint`，指向 VAE 压缩结果，然后运行：
 
 ```bash
-VAE_CKPT=.result/catlora/<run>/final_model \
 bash scripts/catlora_distill_from_checkpoint.sh
 ```
 
-`VAE_CKPT` 可以是：
+也可以在命令行覆盖：
+
+```bash
+bash scripts/catlora_distill_from_checkpoint.sh \
+  --resume_from_checkpoint .result/catlora/<run>/final_model
+```
+
+`--resume_from_checkpoint` 可以是：
 
 - run 目录，例如 `.result/catlora/Qwen_Qwen3-8B_20260618_xxxxxx`
 - run 下的 `final_model/`
-- 直接指向 `checkpoint_meta.json`
+- 中途保存的 `after_<category>/`
+- 直接指向含 `checkpoint_meta.json` 的目录
 
-脚本默认输出到：
-
-```text
-.result/catlora_distill/<model_name>_<timestamp>/final_model
-```
-
-运行日志在新 run 目录下：
+输出目录：
 
 ```text
-linear_by_category.log
+.result/catlora_distill/<model_name>_<timestamp>/
+  after_q_proj/
+  after_k_proj/
+  ...
+  final_model/
+  linear_by_category.log
 ```
+
+每个类别蒸馏成功后会立刻落盘到 `after_<category>/`（不卸载 `original_weight`，便于续跑）。全部完成后写 `final_model/`。
 
 ## 当前脚本默认配置
 
-当前脚本默认只蒸馏这三个类别：
-
 ```bash
---target_categories "q_proj,k_proj,v_proj"
-```
-
-默认蒸馏模式是：
-
-```bash
+--target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
 --distill_after_category "compressed_lora"
 ```
 
-这表示每个类别会训练当前类别 `VAELinear` 上的 proxy LoRA，训练后导出到 `VAELinear.low_rank_a/b`，最终 checkpoint 不保存 PEFT adapter。
+`compressed_lora`：训练当前类别 `VAELinear` 上的 proxy LoRA，训练后导出为 `VAELinear.low_rank_a/b`，最终不保留 PEFT adapter。
 
-如果要换 GPU，直接改脚本里的：
+改 GPU：
 
 ```bash
 export CUDA_VISIBLE_DEVICES=4
 ```
 
-如果要换输入类别顺序，直接改：
-
-```bash
---target_categories "q_proj,k_proj,v_proj"
-```
-
-如果要改蒸馏步数、数据或 LoRA rank，直接改脚本里的对应 CLI 参数，例如：
+改步数 / 数据 / rank：直接改脚本里的对应 CLI，例如：
 
 ```bash
 --distill_steps "default=5000"
---distill_dataset "openorca=0.2,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.1,longalign=0.1"
---lora_rank "default=128"
+--distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009"
+--lora_rank "default=4"
 ```
 
-按类别覆盖仍然使用 `after:<category>`：
+学习率调度：若设置了 `--distill_warmup_ratio > 0`，必须用 `constant_with_warmup`（或其它支持 warmup 的 scheduler）。`constant` 会忽略 warmup，启动时会直接报错。
 
-```bash
---distill_steps "default=5000,after:k_proj=3000"
---lora_rank "default=128,after:v_proj=64"
+## 自动跳过与续跑
+
+### 1. 已有 `low_rank_a/b` 自动跳过
+
+对 `compressed_lora` / `both`：若当前类别全部目标 `VAELinear` 已有完整 `low_rank_a/b`，会自动跳过，不必再手写 `after:xxx=0`。
+
+### 2. 从 `after_<category>/` 续跑
+
+中途 checkpoint 的 `checkpoint_meta.json` 里会写入：
+
+```json
+{
+  "extra_meta": {
+    "stage": "after_category",
+    "category": "q_proj",
+    "completed_categories": ["q_proj"],
+    "distill_after_category": "compressed_lora"
+  }
+}
 ```
 
-## 推理路径切换顺序
-
-假设：
+续跑时把 `--resume_from_checkpoint` 指到该 `after_<category>/`，并保持完整 `target_categories` 前缀：
 
 ```bash
---target_categories "q_proj,k_proj,v_proj"
-```
-
-运行时会按下面顺序切换 `VAELinear` 的推理路径：
-
-1. 蒸馏 `q_proj` 时：`q_proj` 走 VAE 压缩路径，`k_proj/v_proj` 走原始权重路径。
-2. 蒸馏 `k_proj` 时：`q_proj/k_proj` 走 VAE 压缩路径，`v_proj` 走原始权重路径。
-3. 蒸馏 `v_proj` 时：`q_proj/k_proj/v_proj` 都走 VAE 压缩路径。
-
-在 `compressed_lora` 模式下，每个类别蒸馏前会预热当前 active prefix 的 decoded weight cache。`decoder` / `both` 模式会训练 decoder 参数，因此不会做这个预热。
-
-## 从已蒸馏前缀 checkpoint 继续后续类别
-
-如果已经从全 VAE checkpoint 蒸馏好了 `q_proj,k_proj,v_proj`，并保存了一个新的 `final_model`，可以用这个 checkpoint 继续蒸馏后续类别。
-
-关键点是：已经完成蒸馏的类别仍然要放在 `--target_categories` 前缀里，但要把它们的 `distill_steps` 设成 `0`，避免重新训练和覆盖已有 `low_rank_a/b`。
-
-例如：从已经蒸馏好 qkv 的 checkpoint 继续蒸馏 `o_proj`：
-
-```bash
-VAE_CKPT=.result/catlora_distill/<qkv_run>/final_model \
 bash scripts/catlora_distill_from_checkpoint.sh \
-  --target_categories "q_proj,k_proj,v_proj,o_proj" \
-  --distill_steps "default=5000,after:q_proj=0,after:k_proj=0,after:v_proj=0"
+  --resume_from_checkpoint .result/catlora_distill/<run>/after_q_proj \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
 ```
 
-这样运行时的实际效果是：
+行为：
 
-1. `q_proj`：打开 `q_proj` 压缩路径，但 `after:q_proj=0`，不重新蒸馏。
-2. `k_proj`：打开 `q_proj,k_proj` 压缩路径，但 `after:k_proj=0`，不重新蒸馏。
-3. `v_proj`：打开 `q_proj,k_proj,v_proj` 压缩路径，但 `after:v_proj=0`，不重新蒸馏。
-4. `o_proj`：打开 `q_proj,k_proj,v_proj,o_proj` 压缩路径，并按 `default=5000` 真正蒸馏。
+1. 读取 `completed_categories`，跳过已完成类别的蒸馏。
+2. 已完成类别仍进入 active 压缩前缀（progressive 状态正确）。
+3. 从未完成类别继续训练，并继续写新的 `after_*` / 最终 `final_model`。
 
-如果要继续蒸馏多个后续类别，也同样把已完成前缀设为 0：
+### 3. 不要只写后续类别
 
-```bash
-VAE_CKPT=.result/catlora_distill/<qkv_run>/final_model \
-bash scripts/catlora_distill_from_checkpoint.sh \
-  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
-  --distill_steps "default=5000,after:q_proj=0,after:k_proj=0,after:v_proj=0"
-```
-
-不要只写后续类别：
+不要：
 
 ```bash
 --target_categories "o_proj,gate_proj,up_proj,down_proj"
 ```
 
-这样会让已经蒸馏好的 `q_proj,k_proj,v_proj` 不在 active prefix 里，运行时会被切回原始权重路径。
+这样会把前面已压缩类别 stash 成 original dense，训练期 progressive 状态错误。
 
-也不要把已经蒸馏好的前缀保留在 `--target_categories` 里却不给它们设 `distill_steps=0`。否则脚本会尝试重新蒸馏这些类别；如果 checkpoint 里已有 `low_rank_a/b`，`compressed_lora` 导出时会拒绝覆盖。
+应始终保留完整前缀；已完成类别靠自动跳过或 `completed_categories` 处理。
 
-前提：输入 checkpoint 里必须已经包含所有要写进 `--target_categories` 的 `VAELinear`。这个脚本不会把新的 dense `nn.Linear` 压缩成 `VAELinear`。
+## 模式说明
 
-## 输入 checkpoint 的原始权重
+| `--distill_after_category` | 含义 |
+|---|---|
+| `compressed_lora` | 只训 proxy LoRA，导出 `low_rank_a/b` |
+| `decoder` | 只训 decoder |
+| `both` | 同时训 decoder + LoRA |
 
-如果 checkpoint 里保存了 `VAELinear.original_weight`，运行时会使用 checkpoint 中的原始权重。
+checkpoint distill **不支持** `remaining_lora` / `none`。
 
-如果 checkpoint 因为 `--unload_vae_original_weights_on_final_save` 没有保存 `original_weight`，加载时会从 base model 权重补回。这个逻辑要求 checkpoint metadata 或脚本参数能确定 base model 路径。
+## 评估
 
-如果目标类别在 checkpoint 中没有对应 `VAELinear`，启动时会直接报错，例如：
+- `--eval_ppl false` 且 `--eval_tasks ""`：跳过类别后评估。
+- `--eval_tasks` 非空：即使 `eval_ppl=false` 也会跑下游任务评估。
 
-```text
-target_categories contains categories without VAELinear in checkpoint: v_proj
-```
+## 相关文档
 
-## 常见问题
-
-### `VAE_CKPT` 没设置
-
-脚本会直接报错：
-
-```text
-set VAE_CKPT to cat VAE checkpoint
-```
-
-按下面方式传入：
-
-```bash
-VAE_CKPT=.result/catlora/<run>/final_model bash scripts/catlora_distill_from_checkpoint.sh
-```
-
-### 想只跑某些类别
-
-直接改脚本里的：
-
-```bash
---target_categories "q_proj,k_proj,v_proj"
-```
-
-注意：这里的顺序就是逐类别蒸馏顺序，也决定 active prefix 的打开顺序。
-
-### 想关闭类别后评估
-
-当前脚本已经设置：
-
-```bash
---eval_ppl "false"
-```
-
-但仍然保留了：
-
-```bash
---eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"
-```
-
-如果完全不跑类别后下游任务评估，把它改成空串：
-
-```bash
---eval_tasks ""
-```
+- 优化清单：`docs/cat_distill_optimization.md`
+- 参数说明：`docs/cat_train_args.md`
+- 蒸馏数据：`docs/edgerazor_dataset.md`

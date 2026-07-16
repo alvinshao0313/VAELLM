@@ -12,9 +12,10 @@ from e2e_common.peft_proxy import (
     is_peft_proxy_adapter_linear,
     iter_named_peft_vae_proxies,
     materialize_peft_proxy_decoded_linears,
+    unwrap_peft_vae_proxies,
 )
 from litebsq.vae_linear import VAELinear
-from litebsq.vae_linear_prewarm import prime_model_vae_linear_cache
+from litebsq.vae_linear_prewarm import NamedVAELinearTarget, prime_model_vae_linear_cache, prime_named_vae_linear_cache
 from train_utils.hif4_act import (
     build_hif4_act_controller,
     register_hif4_act_hooks,
@@ -157,6 +158,12 @@ def collect_compressed_category_targets(
     return targets
 
 
+def category_targets_have_low_rank(targets: Sequence[Tuple[str, VAELinear]]) -> bool:
+    if not targets:
+        return False
+    return all(base_layer.has_low_rank_residual() for _name, base_layer in targets)
+
+
 def _wrap_targets_as_peft_proxies(
     model: nn.Module,
     targets: Sequence[Tuple[str, VAELinear]],
@@ -185,6 +192,10 @@ def _enable_only_decoder_params(base_layer: VAELinear) -> List[nn.Parameter]:
         if bool(param.requires_grad):
             trainable.append(param)
     return trainable
+
+
+def _unwrap_peft_proxies_without_export(model: nn.Module, module_names: Sequence[str]) -> int:
+    return unwrap_peft_vae_proxies(model, module_names=module_names)
 
 
 def _enable_compressed_trainable_params(
@@ -288,6 +299,14 @@ def _run_compressed_category_distill(
         )
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
+    if mode in {"compressed_lora", "both"} and category_targets_have_low_rank(targets):
+        logger.info(
+            "After-category distill: mode=%s category=%s 已有 low_rank_a/b，自动跳过。",
+            str(mode),
+            str(category),
+        )
+        return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
+
     cfg = _resolve_distill_stage_config(
         cat_args=cat_args,
         training_args=training_args,
@@ -308,12 +327,38 @@ def _run_compressed_category_distill(
     _ensure_lora_stack_available()
     _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
     tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
-    dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
-        cfg.dataset,
-        seed=cfg.seed,
-        tokenizer=tokenizer,
-        max_seq_len=int(getattr(training_args, "distill_model_max_length", 2048)),
-    )
+    max_seq_len = int(getattr(training_args, "distill_model_max_length", 2048))
+    # Reuse the same lazy mix across categories; trainer seed still varies by round.
+    dataset_cache = getattr(vae_args, "_cached_distill_datasets", None)
+    if not isinstance(dataset_cache, dict):
+        dataset_cache = {}
+        setattr(vae_args, "_cached_distill_datasets", dataset_cache)
+    dataset_cache_key = (str(cfg.dataset), int(max_seq_len), int(cfg.base_seed), id(tokenizer))
+    cached_dataset = dataset_cache.get(dataset_cache_key)
+    if cached_dataset is None:
+        dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
+            cfg.dataset,
+            seed=int(cfg.base_seed),
+            tokenizer=tokenizer,
+            max_seq_len=max_seq_len,
+        )
+        dataset_cache[dataset_cache_key] = (
+            dataset_mix_spec,
+            source_stats,
+            train_ds,
+            eval_ds,
+            _eval_split,
+        )
+        logger.info(
+            "After-category distill: prepared distill dataset cache key=%s",
+            str(dataset_cache_key[:3]),
+        )
+    else:
+        dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = cached_dataset
+        logger.info(
+            "After-category distill: reused distill dataset cache key=%s",
+            str(dataset_cache_key[:3]),
+        )
     train_is_iterable = is_iterable_training_dataset(train_ds)
     train_len = dataset_length_or_none(train_ds)
     _log_distill_dataset(logger, dataset_mix_spec, source_stats, train_len, train_is_iterable)
@@ -338,7 +383,7 @@ def _run_compressed_category_distill(
             rank=cfg.rank,
             alpha=cfg.alpha,
             dropout=cfg.dropout,
-            init_mode="zero",
+            init_mode="peft_default",
             materialize_before_inject=False,
         )
         if int(injected) != int(len(module_names)):
@@ -353,19 +398,50 @@ def _run_compressed_category_distill(
             logger,
             prefix=f"After-category distill {category}: before prewarm",
         )
-        prewarm_stats = prime_model_vae_linear_cache(
-            model,
-            dtype=torch.bfloat16 if bool(getattr(training_args, "bf16", False)) else None,
-            clear_existing=False,
-            group_size=8,
-            compute_device=cfg.device,
-            logger=logger,
-        )
-        logger.info(
-            "After-category distill %s: prewarmed VAELinear cache stats=%s",
-            str(category),
-            str(prewarm_stats),
-        )
+        # decoder/both: current-category modules will clear cache under trainable_decode;
+        # only prewarm other VAELinear that still use cache (e.g. completed prefix).
+        # compressed_lora: proxies skip prewarm via _skip_global_cache_prewarm; warm the rest.
+        if use_decoder:
+            skip_names = set(module_names)
+            prewarm_targets = []
+            for name, module in model.named_modules():
+                if not isinstance(module, VAELinear):
+                    continue
+                if str(name) in skip_names:
+                    continue
+                if any(str(name) == p or str(name).startswith(f"{p}.") for p in skip_names):
+                    continue
+                prewarm_targets.append(NamedVAELinearTarget(name=str(name), base_layer=module))
+            if prewarm_targets:
+                prewarm_stats = prime_named_vae_linear_cache(
+                    prewarm_targets,
+                    dtype=torch.bfloat16 if bool(getattr(training_args, "bf16", False)) else None,
+                    clear_existing=False,
+                    group_size=8,
+                    compute_device=cfg.device,
+                    logger=logger,
+                )
+            else:
+                prewarm_stats = {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
+            logger.info(
+                "After-category distill %s: decoder/both prefix prewarm stats=%s (skipped current category)",
+                str(category),
+                str(prewarm_stats),
+            )
+        else:
+            prewarm_stats = prime_model_vae_linear_cache(
+                model,
+                dtype=torch.bfloat16 if bool(getattr(training_args, "bf16", False)) else None,
+                clear_existing=False,
+                group_size=8,
+                compute_device=cfg.device,
+                logger=logger,
+            )
+            logger.info(
+                "After-category distill %s: prewarmed VAELinear cache stats=%s",
+                str(category),
+                str(prewarm_stats),
+            )
         _log_vae_linear_cache_status(
             model,
             logger,
@@ -375,7 +451,20 @@ def _run_compressed_category_distill(
         _set_proxy_decoder_adapter_mode(model, module_names, enabled=mode == "both")
         trainable = _enable_compressed_trainable_params(model, module_names, mode=mode)
         if not trainable:
-            logger.info("After-category distill: 没有可训练参数，跳过。")
+            if use_lora:
+                restored = _unwrap_peft_proxies_without_export(model, module_names)
+                logger.info(
+                    "After-category distill: 没有可训练参数，已拆掉 proxy=%d，跳过。",
+                    int(restored),
+                )
+            if use_decoder:
+                finalized = _finalize_decoder_trainables(model, module_names)
+                logger.info(
+                    "After-category distill: 没有可训练参数，已 finalize decoder modules=%d，跳过。",
+                    int(finalized),
+                )
+            if not use_lora and not use_decoder:
+                logger.info("After-category distill: 没有可训练参数，跳过。")
             return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
         resolved_lora_loss = str(cfg.loss_type).strip().lower()
@@ -399,6 +488,7 @@ def _run_compressed_category_distill(
             training_args=training_args,
             cfg=cfg,
             train_is_iterable=train_is_iterable,
+            logger=logger,
         )
         hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
         tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
