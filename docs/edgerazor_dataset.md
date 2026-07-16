@@ -68,6 +68,7 @@ torchrun --standalone --nproc_per_node=4 python tools/cat_distill_from_vae_check
 - VAE 训练 / activation calib 仍单卡；推荐仅 checkpoint 蒸馏脚本使用 `torchrun`
 - **数据加载**：EdgeRazor 式 lazy Dataset（`load_dataset` 读 jsonl，`__getitem__` 内 tokenize）；`interleave_datasets` 按 mix 权重采样；并行靠 `dataloader_num_workers`（默认 16），无 rank-0 预处理 cache
 - **训练量**：由 `--distill_steps` 控制
+- **类别后 eval**：多卡 checkpoint 蒸馏下若设置 `--eval_tasks`，lm_eval 会按 rank 切分任务并行评测，rank0 汇总指标；所有 rank 在 eval 阶段同步，避免 NCCL 超时
 
 ## 蒸馏损失（EAKLD）
 

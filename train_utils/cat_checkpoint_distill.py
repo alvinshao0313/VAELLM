@@ -410,10 +410,11 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     logger.info("Saved normalized parameter snapshot: %s", snapshot_path)
 
     eval_tokenizer = None
-    if run_task_eval and is_distill_main_process():
+    if run_task_eval:
         from transformers import AutoTokenizer
 
-        logger.info("加载类别后下游任务评估 tokenizer: %s", vae_args.model_path)
+        if is_distill_main_process():
+            logger.info("加载类别后下游任务评估 tokenizer: %s", vae_args.model_path)
         eval_tokenizer = AutoTokenizer.from_pretrained(
             vae_args.model_path,
             use_fast=True,
@@ -455,8 +456,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 int(prewarm_stats.get("failed", 0)),
             )
 
-        if run_category_eval and is_distill_main_process():
-            logger.info("每类后蒸馏前评估...")
+        if run_category_eval:
+            if is_distill_main_process():
+                logger.info("每类后蒸馏前评估...")
             _eval_after_category(
                 model=model,
                 vae_args=vae_args,
@@ -485,8 +487,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         model = distill_result.model
         lora_round_idx = int(distill_result.next_lora_round_idx)
 
-        if run_category_eval and is_distill_main_process():
-            logger.info("每类后蒸馏后评估...")
+        if run_category_eval:
+            if is_distill_main_process():
+                logger.info("每类后蒸馏后评估...")
             _eval_after_category(
                 model=model,
                 vae_args=vae_args,
@@ -500,8 +503,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 tokenizer=eval_tokenizer,
             )
 
-    if run_category_eval and is_distill_main_process():
-        logger.info("所有类别蒸馏完成后最终评估...")
+    if run_category_eval:
+        if is_distill_main_process():
+            logger.info("所有类别蒸馏完成后最终评估...")
         _eval_after_category(
             model=model,
             vae_args=vae_args,

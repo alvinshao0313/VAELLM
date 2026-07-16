@@ -205,6 +205,41 @@ def ensure_distill_process_group_initialized() -> None:
     torch.distributed.init_process_group(backend=backend)
 
 
+def distill_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_distill_local_device(*, fallback: str = "cuda") -> str:
+    return resolve_distill_train_device(str(fallback))
+
+
+def unwrap_distill_model(model: nn.Module) -> nn.Module:
+    current = model
+    while hasattr(current, "module"):
+        inner = getattr(current, "module")
+        if inner is current:
+            break
+        current = inner
+    return current
+
+
+def split_tasks_for_distill_rank(
+    task_names: Sequence[str],
+    *,
+    rank: int,
+    world_size: int,
+) -> List[str]:
+    world = int(world_size)
+    if world <= 0:
+        raise ValueError(f"world_size must be > 0, got {world_size}.")
+    current_rank = int(rank)
+    if current_rank < 0 or current_rank >= world:
+        raise ValueError(f"rank must be in [0, {world}), got {rank}.")
+    return [str(name) for idx, name in enumerate(task_names) if idx % world == current_rank]
+
+
 def _enum_to_value(value, default: str) -> str:
     raw = value if value is not None else default
     if hasattr(raw, "value"):

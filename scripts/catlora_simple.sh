@@ -77,7 +77,7 @@ python tools/cat_train.py \
   --num_res_blocks "default=0" \
   --decoder_base_ch "default=128" \
   --decoder_num_res_blocks "default=1" \
-  --norm_type "default=rms" \
+  --norm_type "default=layer" \
   --activation_type "default=swish" \
   --decoder_type "default=symmetric" \
   --recon_loss_type "default=mse" \
@@ -108,7 +108,7 @@ python tools/cat_train.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --outlier_protect_mode "channel" \
-  --outlier_mlp_rank_metric "mlp_intermediate_aligned_actrms" \
+  --outlier_mlp_rank_metric "none" \
   --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
   --outlier_protect_channel_quant "none" \
@@ -119,7 +119,7 @@ python tools/cat_train.py \
   --outlier_residual_vae_stages "default=1" \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=32,cat:o_proj=32,cat:gate_proj=128,cat:up_proj=128,cat:down_proj=128" \
+  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=32,cat:o_proj=32,cat:gate_proj=32,cat:up_proj=32,cat:down_proj=128" \
   --outlier_protect_min_per_layer "0" \
   --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.0" \

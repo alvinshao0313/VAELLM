@@ -35,17 +35,17 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --lora_alpha "default=4" \
   --lora_dropout "default=0.03" \
   --distill_steps "default=2000" \
-  --distill_batch_size "default=1" \
+  --distill_batch_size "default=8" \
   --distill_lr "default=2e-5" \
   --distill_weight_decay "default=0.001" \
-  --distill_log_every "default=100" \
+  --distill_log_every "default=10" \
   --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
-  --distill_loss_type "default=eakld" \
+  --distill_loss_type "default=kd_top_1000" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
-  --distill_hidden_loss_weight "default=0.5" \
+  --distill_hidden_loss_weight "default=0.1" \
   --distill_pre_mlp_hidden_loss_weight "default=0.0" \
   --distill_hidden_alignment_layer_weighting "adaptive_top_3" \
   --lora_use_dora "default=false" \
@@ -61,7 +61,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_warmup_ratio "0.05" \
   --distill_group_by_length "true" \
   --distill_lr_scheduler_type "constant" \
-  --distill_model_max_length "4096" \
+  --distill_model_max_length "1024" \
   --fp16 "false" \
   --bf16 "true" \
   "$@"

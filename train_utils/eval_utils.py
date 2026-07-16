@@ -141,7 +141,71 @@ def _build_lm_eval_summary_rows(
     return rows
 
 
-def set_seed(seed):
+def merge_lm_eval_results(
+    partial_results: List[Optional[Dict[str, Any]]],
+    task_names: List[str],
+) -> Dict[str, Any]:
+    merged_metrics: Dict[str, Optional[float]] = {}
+    merged_metric_keys: Dict[str, str] = {}
+    merged_raw_results: Dict[str, Dict[str, Any]] = {}
+    merged_group_results: Dict[str, Dict[str, Any]] = {}
+
+    for partial in partial_results:
+        if not partial:
+            continue
+        for task_name, metric in (partial.get("task_metrics") or {}).items():
+            merged_metrics[str(task_name)] = metric
+        for task_name, metric_key in (partial.get("task_metric_keys") or {}).items():
+            merged_metric_keys[str(task_name)] = str(metric_key)
+        raw_results = partial.get("raw_results")
+        if isinstance(raw_results, dict):
+            merged_raw_results.update(raw_results)
+        group_results = partial.get("group_results")
+        if isinstance(group_results, dict):
+            merged_group_results.update(group_results)
+
+    missing_tasks = [
+        str(task_name)
+        for task_name in task_names
+        if merged_metrics.get(str(task_name)) is None
+    ]
+    if missing_tasks:
+        raise ValueError(
+            "Distributed lm_eval merge missing task metrics for: "
+            + ",".join(missing_tasks)
+        )
+
+    summary_rows = _build_lm_eval_summary_rows(
+        task_names=[str(task_name) for task_name in task_names],
+        results=merged_raw_results,
+        groups=merged_group_results,
+    )
+    for row in summary_rows:
+        task_name = str(row["task"])
+        metric_val = row.get("metric")
+        if metric_val is not None:
+            merged_metrics[task_name] = float(metric_val)
+        merged_metric_keys[task_name] = str(row.get("metric_key", merged_metric_keys.get(task_name, "n/a")))
+
+    table_headers = ["Task", "Metric", "Score(%)"]
+    table_rows = [
+        [str(row["task"]), str(row["metric_key"]), str(row["score_percent"])]
+        for row in summary_rows
+    ]
+    summary_table = _format_markdown_table(table_headers, table_rows)
+
+    return {
+        "tasks": [str(task_name) for task_name in task_names],
+        "task_metrics": {str(task_name): merged_metrics[str(task_name)] for task_name in task_names},
+        "task_metric_keys": {
+            str(task_name): merged_metric_keys.get(str(task_name), "n/a")
+            for task_name in task_names
+        },
+        "summary_rows": summary_rows,
+        "summary_table": summary_table,
+        "raw_results": merged_raw_results,
+        "group_results": merged_group_results,
+    }
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
