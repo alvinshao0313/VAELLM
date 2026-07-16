@@ -64,10 +64,14 @@ class ParallelLinear(nn.Module):
                 return self.linear(x.squeeze(1)).unsqueeze(1)
             return self.linear(x)
 
-        batch_size = int(x.shape[0])
-        x = x.reshape(batch_size, self.num_models * self.in_features, 1)
-        out = self.conv(x)
-        return out.reshape(batch_size, self.num_models, self.out_features)
+        # Keep conv weight storage for checkpoint compatibility, but compute with
+        # batched GEMM. Grouped Conv1d(k=1) is much slower for shapes like 32->128.
+        # x: [B, M, In] -> out: [B, M, Out]
+        weight = self.conv.weight[:, :, 0].view(
+            self.num_models, self.out_features, self.in_features
+        )
+        bias = self.conv.bias.view(self.num_models, self.out_features)
+        return torch.einsum("bmi,moi->bmo", x, weight) + bias
 
     def extract_single(self, model_idx: int) -> nn.Linear:
         _validate_model_index(model_idx, num_models=self.num_models)

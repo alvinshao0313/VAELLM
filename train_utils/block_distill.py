@@ -1408,8 +1408,11 @@ def _finalize_block_decoder_trainables(model: nn.Module, module_names: Iterable[
     for name in module_names:
         module = get_module_by_name(model, str(name))
         base_layer = _resolve_block_base_layer(str(name), module)
-        base_layer.unpack_parallel_stage_decoder_()
+        packed = getattr(base_layer, "_parallel_stage_decoder", None)
+        if packed is not None:
+            packed.requires_grad_(False)
         base_layer.disable_trainable_decode()
+        base_layer.clear_decoded_weight_cache()
         finalized += 1
     return int(finalized)
 
@@ -1560,6 +1563,9 @@ def train_block_lora_distill(
     if active_layer_categories is None:
         raise ValueError("active_block_targets must be provided for block distill training.")
 
+    if use_decoder:
+        VAELinear.reset_fuse_stats()
+
     for step in range(int(config.steps)):
         sample_idx = int(step) % int(num_samples)
         teacher_in = teacher_hiddens_cpu[sample_idx].to(device=device, non_blocking=True)
@@ -1654,6 +1660,23 @@ def train_block_lora_distill(
 
         del teacher_in, student_in, teacher_out, student_out, loss, linear_loss, attn_loss, hidden_loss
 
+    if use_decoder:
+        fuse_stats = VAELinear.get_fuse_stats()
+        if logger is not None:
+            logger.info(
+                "[block %d] fuse_stats hit=%d miss=%d miss_reasons=%s",
+                int(layer_idx),
+                int(fuse_stats["hit"]),
+                int(fuse_stats["miss"]),
+                str(fuse_stats["miss_reasons"]),
+            )
+            if int(fuse_stats["miss"]) > 0:
+                logger.warning(
+                    "[block %d] fused decode missed %d times; reasons=%s",
+                    int(layer_idx),
+                    int(fuse_stats["miss"]),
+                    str(fuse_stats["miss_reasons"]),
+                )
     if logger is not None:
         if use_lora:
             logger.info("[block %d] kept PEFT proxy adapters for final checkpoint: %d", int(layer_idx), int(len(module_names)))

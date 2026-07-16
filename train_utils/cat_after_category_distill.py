@@ -221,8 +221,11 @@ def _finalize_decoder_trainables(model: nn.Module, module_names: Sequence[str]) 
     for name in module_names:
         module = _get_module_by_name(model, str(name))
         base_layer = _resolve_base_layer(str(name), module)
-        base_layer.unpack_parallel_stage_decoder_()
+        packed = getattr(base_layer, "_parallel_stage_decoder", None)
+        if packed is not None:
+            packed.requires_grad_(False)
         base_layer.disable_trainable_decode()
+        base_layer.clear_decoded_weight_cache()
         finalized += 1
     return int(finalized)
 
@@ -414,12 +417,29 @@ def _run_compressed_category_distill(
             train_is_iterable=train_is_iterable,
             use_lazy_tokenized_dataset=True,
         )
+        if use_decoder:
+            VAELinear.reset_fuse_stats()
         model = _train_without_merging_peft_adapters(
             trainer=trainer,
             hif4_act_controller=hif4_act_controller,
             logger=logger,
         )
         if use_decoder:
+            fuse_stats = VAELinear.get_fuse_stats()
+            logger.info(
+                "After-category distill %s: fuse_stats hit=%d miss=%d miss_reasons=%s",
+                str(category),
+                int(fuse_stats["hit"]),
+                int(fuse_stats["miss"]),
+                str(fuse_stats["miss_reasons"]),
+            )
+            if int(fuse_stats["miss"]) > 0:
+                logger.warning(
+                    "After-category distill %s: fused decode missed %d times; reasons=%s",
+                    str(category),
+                    int(fuse_stats["miss"]),
+                    str(fuse_stats["miss_reasons"]),
+                )
             finalized = _finalize_decoder_trainables(model, module_names)
             logger.info("After-category distill: finalized trainable decoder modules=%d.", int(finalized))
         if use_lora:

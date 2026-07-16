@@ -1,3 +1,4 @@
+from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -11,7 +12,11 @@ from litebsq.bitpack import (
     unpack_uint8_tensor_to_bool,
     validate_bitpack_u8_spec,
 )
-
+from litebsq.fused_multistage_decoder import (
+    _TRITON_AVAILABLE,
+    fused_decode_packed_symmetric_decoder,
+    packed_symmetric_decoder_supports_fuse,
+)
 from litebsq.protected_channel_quant import (
     PROTECTED_CHANNEL_QUANT_NONE,
     decode_protected_channel_weight,
@@ -35,6 +40,33 @@ class VAELinear(nn.Module):
     不传 `vq_storage_specs` / `stage_vq_storage_specs` 时，默认把逻辑 bool bits 打包成 uint8 存储。
     `decoder` 可以是单个 decoder（单分块）或 decoder 列表（多分块）。
     """
+
+    _fuse_stats_hit: int = 0
+    _fuse_stats_miss: int = 0
+    _fuse_stats_miss_reasons: Counter = Counter()
+
+    @classmethod
+    def reset_fuse_stats(cls) -> None:
+        cls._fuse_stats_hit = 0
+        cls._fuse_stats_miss = 0
+        cls._fuse_stats_miss_reasons = Counter()
+
+    @classmethod
+    def get_fuse_stats(cls) -> Dict[str, Any]:
+        return {
+            "hit": int(cls._fuse_stats_hit),
+            "miss": int(cls._fuse_stats_miss),
+            "miss_reasons": dict(cls._fuse_stats_miss_reasons),
+        }
+
+    @classmethod
+    def _record_fuse_hit(cls) -> None:
+        cls._fuse_stats_hit = int(cls._fuse_stats_hit) + 1
+
+    @classmethod
+    def _record_fuse_miss(cls, reason: str) -> None:
+        cls._fuse_stats_miss = int(cls._fuse_stats_miss) + 1
+        cls._fuse_stats_miss_reasons[str(reason)] += 1
 
     def __init__(
         self,
@@ -1614,9 +1646,14 @@ class VAELinear(nn.Module):
 
     def disable_trainable_decode(self) -> None:
         self.trainable_decode = False
-        self.parallel_stage_decode = False
         self.cache_decoded_weight = True
         self.clear_decoded_weight_cache()
+        # Keep parallel_stage_decode enabled whenever a packed decoder remains so
+        # callers do not fall into serial extract_single copy paths by accident.
+        if getattr(self, "_parallel_stage_decoder", None) is not None:
+            self.parallel_stage_decode = True
+        else:
+            self.parallel_stage_decode = False
 
     def pack_parallel_stage_decoder_(self, *, trainable: bool = False) -> bool:
         packed_decoder = getattr(self, "_parallel_stage_decoder", None)
@@ -1970,6 +2007,50 @@ class VAELinear(nn.Module):
             return restored_stages[0].contiguous()
         return torch.stack(restored_stages, dim=0).sum(dim=0).contiguous()
 
+    def _try_fused_parallel_stage_decode(
+        self,
+        packed_decoder: nn.Module,
+        grouped_vq: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        decode_device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Return fused split-weight when supported; otherwise None and record miss reason."""
+        if packed_decoder is None:
+            self._record_fuse_miss("no_packed_decoder")
+            return None
+        if int(self.parallel_parts) != 1:
+            self._record_fuse_miss("parts_gt_1")
+            return None
+        if not bool(getattr(self, "_parallel_stage_layout_is_stage_major", False)):
+            self._record_fuse_miss("not_stage_major")
+            return None
+        if not bool(getattr(self, "_parallel_stage_restore_identity", False)):
+            self._record_fuse_miss("restore_not_identity")
+            return None
+        if not packed_symmetric_decoder_supports_fuse(packed_decoder):
+            self._record_fuse_miss("not_symmetric")
+            return None
+        if torch.device(decode_device).type != "cuda":
+            self._record_fuse_miss("no_cuda")
+            return None
+        if not bool(_TRITON_AVAILABLE):
+            self._record_fuse_miss("no_triton")
+            return None
+
+        fused_blocks = fused_decode_packed_symmetric_decoder(packed_decoder, grouped_vq)
+        split_rows = self.compressed_in_features if self.transpose else self.compressed_out_features
+        split_cols = self.compressed_out_features if self.transpose else self.compressed_in_features
+        expected_flat = int(split_rows) * int(split_cols)
+        fused_flat = fused_blocks.reshape(-1)
+        if int(fused_flat.numel()) != expected_flat:
+            raise RuntimeError(
+                f"fused parallel decode flat numel {int(fused_flat.numel())} != expected {expected_flat}."
+            )
+
+        self._record_fuse_hit()
+        return fused_flat.view(int(split_rows), int(split_cols)).contiguous().to(dtype=dtype)
+
     def _decode_split_weight_parallel_stages(self, dtype: torch.dtype) -> torch.Tensor:
         packed_decoder = getattr(self, "_parallel_stage_decoder", None)
         if packed_decoder is None:
@@ -1983,6 +2064,17 @@ class VAELinear(nn.Module):
         decode_device = param.device if param is not None else torch.device("cpu")
         decode_dtype = param.dtype if param is not None else dtype
         grouped_vq = self._get_parallel_stage_grouped_vq(dtype=decode_dtype, device=decode_device)
+
+        # Training and inference share the fused Triton path when config matches.
+        fused = self._try_fused_parallel_stage_decode(
+            packed_decoder,
+            grouped_vq,
+            dtype=dtype,
+            decode_device=decode_device,
+        )
+        if fused is not None:
+            return fused
+
         stage_out = packed_decoder(grouped_vq)
         if tuple(int(v) for v in stage_out.shape[:2]) != (int(grouped_vq.shape[0]), expected_models):
             raise RuntimeError(

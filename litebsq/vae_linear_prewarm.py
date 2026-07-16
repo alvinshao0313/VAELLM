@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from litebsq.autoencoder import Decoder, pack_decoders
+from litebsq.autoencoder import Decoder
 
 if TYPE_CHECKING:
     from litebsq.vae_linear import VAELinear
@@ -192,10 +192,6 @@ def _resolve_base_layer_device(base_layer: "VAELinear") -> torch.device:
 def _resolve_decoder_pack_signature(decoder: nn.Module) -> _DecoderPackSignature:
     if not isinstance(decoder, Decoder):
         raise TypeError(f"Grouped prewarm only supports Decoder stage payloads, got {type(decoder)}.")
-    if int(decoder.num_models) != 1:
-        raise ValueError(
-            f"Grouped prewarm expects single-model Decoder payload, got num_models={decoder.num_models}."
-        )
     return _DecoderPackSignature(
         decoder_type=str(decoder.decoder_type),
         in_dim=int(decoder.in_dim),
@@ -217,6 +213,7 @@ def _build_vae_linear_prewarm_signature(
 ) -> _VAELinearPrewarmSignature:
     stage_vq_shapes: List[Tuple[Tuple[int, int], ...]] = []
     stage_decoder_signatures: List[Tuple[_DecoderPackSignature, ...]] = []
+    packed_decoder = getattr(base_layer, "_parallel_stage_decoder", None)
     for stage_idx in range(int(base_layer.residual_stages)):
         one_stage_vq_shapes = []
         one_stage_decoder_sigs = []
@@ -228,9 +225,14 @@ def _build_vae_linear_prewarm_signature(
                     f"got {tuple(vq_weight.shape)} for '{name}' stage={stage_idx} part={part_idx}."
                 )
             one_stage_vq_shapes.append((int(vq_weight.shape[0]), int(vq_weight.shape[-1])))
-            one_stage_decoder_sigs.append(
-                _resolve_decoder_pack_signature(base_layer.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx))
-            )
+            if packed_decoder is not None:
+                one_stage_decoder_sigs.append(_resolve_decoder_pack_signature(packed_decoder))
+            else:
+                one_stage_decoder_sigs.append(
+                    _resolve_decoder_pack_signature(
+                        base_layer.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+                    )
+                )
         stage_vq_shapes.append(tuple(one_stage_vq_shapes))
         stage_decoder_signatures.append(tuple(one_stage_decoder_sigs))
     return _VAELinearPrewarmSignature(
@@ -265,80 +267,125 @@ def _decode_named_vae_linear_weights_chunk(
     if not chunk_targets:
         raise ValueError("_decode_named_vae_linear_weights_chunk expects a non-empty chunk.")
 
+    from litebsq.fused_multistage_decoder import (
+        fused_decode_batched_same_shape_decoders,
+        packed_symmetric_decoder_supports_fuse,
+    )
+
     first = chunk_targets[0].base_layer
     parts_per_linear = int(first.parallel_parts)
-    residual_stages = int(first.residual_stages)
     chunk_num_models = int(len(chunk_targets)) * parts_per_linear
     resolved_compute_device: Optional[torch.device] = None
-    target_dtypes = [
-        _resolve_cache_dtype_for_layer(target.base_layer, target.target_dtype)
-        for target in chunk_targets
-    ]
-    accumulated_compressed_weights: List[Optional[torch.Tensor]] = [None for _ in chunk_targets]
+    decoded_results: List[DecodedVAELinearWeight] = []
 
-    for stage_idx in range(residual_stages):
-        stage_decoders: List[Decoder] = []
-        stage_vq_weights: List[torch.Tensor] = []
-        for target in chunk_targets:
-            base_layer = target.base_layer
-            for part_idx in range(parts_per_linear):
-                stage_decoders.append(base_layer.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx))
-                stage_vq_weights.append(base_layer.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx))
+    prepared: List[Tuple[NamedVAELinearDecodeTarget, torch.dtype, torch.device]] = []
+    for target in chunk_targets:
+        base_layer = target.base_layer
+        target_dtype = _resolve_cache_dtype_for_layer(target.base_layer, target.target_dtype)
 
-        grouped_decoder = pack_decoders(stage_decoders)
-        grouped_vq = torch.cat(stage_vq_weights, dim=1).contiguous()
-        decode_dtype = _resolve_decoder_param_dtype(grouped_decoder)
-        decode_device = _resolve_decoder_param_device(grouped_decoder) if compute_device is None else torch.device(compute_device)
-        grouped_decoder = grouped_decoder.to(device=decode_device, dtype=decode_dtype)
-        stage_out = grouped_decoder(grouped_vq.to(device=decode_device, dtype=decode_dtype, non_blocking=True))
-        stage_flat = stage_out.permute(1, 0, 2).contiguous().view(chunk_num_models, -1)
-        for linear_idx, target in enumerate(chunk_targets):
-            base_layer = target.base_layer
-            start = linear_idx * parts_per_linear
-            end = start + parts_per_linear
-            part_flats = stage_flat[start:end]
-            stage_compressed_weight = base_layer._decode_compressed_weight_from_part_flats(
-                part_flats,
-                dtype=target_dtypes[linear_idx],
-                stage_idx=stage_idx,
-            )
-            previous_weight = accumulated_compressed_weights[linear_idx]
-            if previous_weight is None:
-                accumulated_compressed_weights[linear_idx] = stage_compressed_weight
+        # Persistently pack once on the module. Never temporary pack_decoders / extract copies.
+        if getattr(base_layer, "_parallel_stage_decoder", None) is None:
+            if int(base_layer.residual_stages) * int(base_layer.parallel_parts) > 1:
+                base_layer.pack_parallel_stage_decoder_(trainable=False)
+        if getattr(base_layer, "_parallel_stage_decoder", None) is not None:
+            base_layer.parallel_stage_decode = True
+            if getattr(base_layer, "_parallel_stage_grouped_vq_weight", None) is None:
+                base_layer._build_parallel_stage_decode_plan()
+
+        packed_decoder = getattr(base_layer, "_parallel_stage_decoder", None)
+        if packed_decoder is not None and compute_device is not None:
+            packed_decoder.to(device=torch.device(compute_device))
+            resolved_compute_device = torch.device(compute_device)
+        elif packed_decoder is not None:
+            resolved_compute_device = _resolve_decoder_param_device(packed_decoder)
+        else:
+            if compute_device is not None:
+                base_layer.to(device=torch.device(compute_device))
+                resolved_compute_device = torch.device(compute_device)
             else:
-                if tuple(previous_weight.shape) != tuple(stage_compressed_weight.shape):
-                    raise ValueError(
-                        f"Grouped prewarm compressed weight shape mismatch for '{target.name}': "
-                        f"prev={tuple(previous_weight.shape)} vs stage={tuple(stage_compressed_weight.shape)}."
-                    )
-                accumulated_compressed_weights[linear_idx] = previous_weight + stage_compressed_weight
-        del grouped_decoder, grouped_vq, stage_out, stage_flat
-        resolved_compute_device = decode_device
+                resolved_compute_device = _resolve_base_layer_device(base_layer)
+        prepared.append(
+            (
+                target,
+                target_dtype,
+                resolved_compute_device if resolved_compute_device is not None else torch.device("cpu"),
+            )
+        )
+
+    can_batch_fuse = (
+        len(prepared) > 1
+        and all(
+            getattr(item[0].base_layer, "_parallel_stage_decoder", None) is not None
+            and packed_symmetric_decoder_supports_fuse(item[0].base_layer._parallel_stage_decoder)
+            and int(item[0].base_layer.parallel_parts) == 1
+            and bool(getattr(item[0].base_layer, "_parallel_stage_layout_is_stage_major", False))
+            and bool(getattr(item[0].base_layer, "_parallel_stage_restore_identity", False))
+            and item[2].type == "cuda"
+            for item in prepared
+        )
+    )
+
+    if can_batch_fuse:
+        decoders = []
+        grouped_vqs = []
+        for target, target_dtype, layer_device in prepared:
+            base_layer = target.base_layer
+            packed_decoder = base_layer._parallel_stage_decoder
+            param = next(packed_decoder.parameters())
+            grouped_vqs.append(
+                base_layer._get_parallel_stage_grouped_vq(dtype=param.dtype, device=param.device)
+            )
+            decoders.append(packed_decoder)
+        fused_blocks_list = fused_decode_batched_same_shape_decoders(decoders, grouped_vqs)
+        for (target, target_dtype, layer_device), fused_blocks in zip(prepared, fused_blocks_list):
+            base_layer = target.base_layer
+            split_rows = (
+                base_layer.compressed_in_features if base_layer.transpose else base_layer.compressed_out_features
+            )
+            split_cols = (
+                base_layer.compressed_out_features if base_layer.transpose else base_layer.compressed_in_features
+            )
+            compressed = fused_blocks.view(int(split_rows), int(split_cols)).to(dtype=target_dtype)
+            if base_layer.transpose:
+                compressed = compressed.t().contiguous()
+            else:
+                compressed = compressed.contiguous()
+            decoded_weight = base_layer._finalize_decoded_weight_from_compressed(
+                compressed,
+                dtype=target_dtype,
+                include_low_rank=bool(target.include_low_rank),
+            ).detach()
+            decoded_results.append(
+                DecodedVAELinearWeight(
+                    name=str(target.name),
+                    base_layer=base_layer,
+                    decoded_weight=decoded_weight,
+                    target_dtype=target_dtype,
+                    compute_device=layer_device,
+                )
+            )
+            base_layer._record_fuse_hit()
+    else:
+        for target, target_dtype, layer_device in prepared:
+            base_layer = target.base_layer
+            compressed_weight = base_layer._decode_compressed_weight(dtype=target_dtype)
+            decoded_weight = base_layer._finalize_decoded_weight_from_compressed(
+                compressed_weight,
+                dtype=target_dtype,
+                include_low_rank=bool(target.include_low_rank),
+            ).detach()
+            decoded_results.append(
+                DecodedVAELinearWeight(
+                    name=str(target.name),
+                    base_layer=base_layer,
+                    decoded_weight=decoded_weight,
+                    target_dtype=target_dtype,
+                    compute_device=layer_device,
+                )
+            )
 
     if resolved_compute_device is None:
         resolved_compute_device = torch.device("cpu")
-
-    decoded_results: List[DecodedVAELinearWeight] = []
-    for linear_idx, target in enumerate(chunk_targets):
-        base_layer = target.base_layer
-        compressed_weight = accumulated_compressed_weights[linear_idx]
-        if compressed_weight is None:
-            raise RuntimeError(f"Grouped prewarm produced no compressed weight for '{target.name}'.")
-        target_dtype = target_dtypes[linear_idx]
-        decoded_weight = base_layer._finalize_decoded_weight_from_compressed(
-            compressed_weight,
-            dtype=target_dtype,
-            include_low_rank=bool(target.include_low_rank),
-        ).detach()
-        decoded_results.append(
-            DecodedVAELinearWeight(
-                name=str(target.name),
-                base_layer=base_layer,
-                decoded_weight=decoded_weight,
-                target_dtype=target_dtype,
-                compute_device=resolved_compute_device,
-            )
-        )
     return decoded_results, chunk_num_models
 
 
