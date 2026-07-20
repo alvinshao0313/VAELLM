@@ -819,7 +819,16 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
 
     resume_checkpoint_dir = resolve_checkpoint_dir(str(cat_args.resume_from_checkpoint))
     completed_categories = _load_completed_categories_from_checkpoint(resume_checkpoint_dir)
-    if completed_categories:
+    if bool(getattr(cat_args, "distill_reset_completed", False)):
+        if completed_categories:
+            logger.info(
+                "Checkpoint distill: --distill_reset_completed=true，忽略 resume ckpt 中的 completed_categories=%s",
+                ",".join(completed_categories),
+            )
+        else:
+            logger.info("Checkpoint distill: --distill_reset_completed=true，resume ckpt 无 completed_categories。")
+        completed_categories = []
+    elif completed_categories:
         logger.info(
             "Checkpoint distill resume progress: completed_categories=%s",
             ",".join(completed_categories),

@@ -125,6 +125,7 @@ class NormalizedCatArgs:
     convert_device: str
     save_model: bool
     unload_vae_original_weights_on_final_save: bool
+    distill_reset_completed: bool
     output_dir: str
     allow_tail_group: bool
 
@@ -854,6 +855,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         convert_device=str(raw_args.convert_device),
         save_model=bool(raw_args.save_model),
         unload_vae_original_weights_on_final_save=bool(raw_args.unload_vae_original_weights_on_final_save),
+        distill_reset_completed=bool(raw_args.distill_reset_completed),
         output_dir=str(raw_args.output_dir),
         allow_tail_group=bool(raw_args.allow_tail_group),
     )
@@ -1598,6 +1600,15 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--convert_device", type=str, default="cuda")
     parser.add_argument("--save_model", action="store_true", help="保存最终模型 state_dict/config/tokenizer（需要 --convert）。")
     parser.add_argument("--unload_vae_original_weights_on_final_save", action="store_true", default=False, help="最终保存前卸载 VAELinear 中缓存的原始 Linear 权重，减小保存体积。")
+    parser.add_argument(
+        "--distill_reset_completed",
+        type=lambda v: _parse_bool_like(v, arg_name="--distill_reset_completed"),
+        default=False,
+        help=(
+            "checkpoint distill 时忽略 resume ckpt 中的 completed_categories，对 target_categories "
+            "全量再跑一轮类别蒸馏（在已有压缩/蒸馏权重上继续）。默认 false，不影响正常续跑跳过。"
+        ),
+    )
     parser.add_argument("--output_dir", type=str, default="./output_linear_by_category")
     parser.add_argument("--allow_tail_group", type=lambda v: _parse_bool_like(v, arg_name="--allow_tail_group"), default=True, help="是否允许处理最后一个不足分组大小的尾部分组（true/false）。")
     return parser

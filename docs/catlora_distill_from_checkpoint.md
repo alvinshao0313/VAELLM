@@ -133,6 +133,14 @@ bash scripts/catlora_distill_from_checkpoint.sh \
 4. 从未完成类别继续训练，并继续写新的 `after_*` / 最终 `final_model`。
 5. `after_*` 保存前仍会全量 restore 为完整 `VAELinear` 图，ckpt 格式与续跑所需的 `original_weight` 不变。
 
+若要对**已经蒸完**的 ckpt 再跑一轮类别蒸馏（在已有权重上继续，而不是跳过），加：
+
+```bash
+--distill_reset_completed true
+```
+
+默认 `false`：按 `completed_categories` 正常跳过已完成类。开启后只影响本次运行的进度跳过逻辑，不改盘上旧 meta。
+
 训练期 residency（显存）三分态：
 
 | 状态 | 模型里 | stash |

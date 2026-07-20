@@ -15,6 +15,7 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 
 # 续训：指向 after_k_proj（completed=q_proj,k_proj，从 v_proj 继续）。
 # 从头蒸馏：改回 ".result/catlora/res0-bf16-protect-channel-vae/final_model"
+# --distill_reset_completed false：按 completed_categories 跳过；true：在已有权重上再蒸一轮全部分类
 torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.py \
   --model_path "Qwen/Qwen3-8B" \
   --resume_from_checkpoint ".result/catlora_distill/res0-bf16-protect-channel-vae/Qwen_Qwen3-8B_20260717_032410/after_k_proj" \
@@ -34,6 +35,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --distill_after_category "decoder" \
+  --distill_reset_completed "false" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --lora_rank "default=4" \
   --lora_alpha "default=4" \
