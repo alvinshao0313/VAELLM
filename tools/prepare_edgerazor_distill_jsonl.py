@@ -23,8 +23,6 @@ GENERAL_JSONL_NAMES = (
     "am_1.4M_instruct.jsonl",
 )
 
-from contextlib import contextmanager
-
 _INFINITY_REPO = "BAAI/Infinity-Instruct"
 _INFINITY_ROLE_MAP = {"human": "user", "gpt": "assistant"}
 _AM_REPO = "a-m-team/AM-DeepSeek-R1-Distilled-1.4M"
@@ -40,20 +38,21 @@ def _resolve_hf_token() -> Optional[str]:
     return None
 
 
-@contextmanager
-def _official_hf_hub_endpoint():
-    saved_endpoint = os.environ.pop("HF_ENDPOINT", None)
-    try:
-        yield
-    finally:
-        if saved_endpoint is not None:
-            os.environ["HF_ENDPOINT"] = saved_endpoint
+def _root_exception(exc: BaseException) -> BaseException:
+    cur: BaseException = exc
+    seen = set()
+    while True:
+        nxt = cur.__cause__ or cur.__context__
+        if nxt is None or id(nxt) in seen:
+            return cur
+        seen.add(id(cur))
+        cur = nxt
 
 
 def _infinity_access_error(config_name: Optional[str], exc: Exception) -> RuntimeError:
     from huggingface_hub.errors import GatedRepoError
 
-    if isinstance(exc, GatedRepoError):
+    if isinstance(exc, GatedRepoError) or isinstance(_root_exception(exc), GatedRepoError):
         return RuntimeError(
             f"无法访问 gated 数据集 {_INFINITY_REPO}（config={config_name}）。\n"
             f"HF token 可能无效，或该账号尚未获批访问权限。\n"
@@ -62,10 +61,11 @@ def _infinity_access_error(config_name: Optional[str], exc: Exception) -> Runtim
             f"2) 若 token 无效，在 https://huggingface.co/settings/tokens 重新生成，"
             f"并更新 scripts/download_distill_dataset.sh 中的 HF_TOKEN。"
         )
+    root = _root_exception(exc)
     return RuntimeError(
-        f"无法加载 gated 数据集 {_INFINITY_REPO}（config={config_name}）。\n"
-        f"1) 在 https://huggingface.co/datasets/{_INFINITY_REPO} 申请访问；\n"
-        f"2) 配置有效 HF token 并更新 scripts/download_distill_dataset.sh。"
+        f"加载 {_INFINITY_REPO}（config={config_name}）失败：{type(root).__name__}: {root}\n"
+        f"若为 parquet 损坏，可删除 "
+        f"~/.cache/huggingface/hub/datasets--BAAI--Infinity-Instruct 后重试。"
     )
 
 
@@ -84,28 +84,27 @@ def _ensure_infinity_access() -> None:
             f"配置有效 HF_TOKEN，并在 https://huggingface.co/datasets/{_INFINITY_REPO} 申请访问。"
         )
 
-    with _official_hf_hub_endpoint():
-        api = HfApi()
-        try:
-            api.whoami(token=token)
-        except Exception as exc:
-            raise RuntimeError(
-                "HF_TOKEN 无效或已过期。请在 https://huggingface.co/settings/tokens "
-                "重新生成 token，并更新 scripts/download_distill_dataset.sh。"
-            ) from exc
-        try:
-            hf_hub_download(
-                _INFINITY_REPO,
-                "7M/train-00000-of-00075.parquet",
-                repo_type="dataset",
-                token=token,
-            )
-        except GatedRepoError as exc:
-            raise RuntimeError(
-                f"HF token 有效，但账号尚未获得 {_INFINITY_REPO} 的访问权限。\n"
-                f"请用同一账号打开 https://huggingface.co/datasets/{_INFINITY_REPO} "
-                f"填写申请表单，等待审批通过后再重试。"
-            ) from exc
+    api = HfApi()
+    try:
+        api.whoami(token=token)
+    except Exception as exc:
+        raise RuntimeError(
+            "HF_TOKEN 无效或已过期。请在 https://huggingface.co/settings/tokens "
+            "重新生成 token，并更新 scripts/download_distill_dataset.sh。"
+        ) from exc
+    try:
+        hf_hub_download(
+            _INFINITY_REPO,
+            "7M/train-00000-of-00075.parquet",
+            repo_type="dataset",
+            token=token,
+        )
+    except GatedRepoError as exc:
+        raise RuntimeError(
+            f"HF token 有效，但账号尚未获得 {_INFINITY_REPO} 的访问权限。\n"
+            f"请用同一账号打开 https://huggingface.co/datasets/{_INFINITY_REPO} "
+            f"填写申请表单，等待审批通过后再重试。"
+        ) from exc
 
     _INFINITY_ACCESS_CHECKED = True
 
@@ -127,11 +126,10 @@ def _load_infinity_dataset(config_name: str, *, split: str = "train"):
 
     _ensure_infinity_access()
     token = _resolve_hf_token()
-    with _official_hf_hub_endpoint():
-        try:
-            return load_dataset(_INFINITY_REPO, config_name, split=split, token=token)
-        except Exception as exc:
-            raise _infinity_access_error(config_name, exc) from exc
+    try:
+        return load_dataset(_INFINITY_REPO, config_name, split=split, token=token)
+    except Exception as exc:
+        raise _infinity_access_error(config_name, exc) from exc
 
 
 def _convert_infinity_conversations(conversations: object) -> Optional[List[Dict[str, str]]]:

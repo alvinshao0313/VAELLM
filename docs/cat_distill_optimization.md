@@ -22,6 +22,7 @@
 | O13 | 已做：重写 `docs/catlora_distill_from_checkpoint.md` |
 | O14 | 已做：e2e `--finetune_mode compressed_lora`，无 `lora`/`low_rank` mode 兼容 |
 | O15 | 已做：`compressed_lora` 忽略 `vae_decoder_checkpoint` |
+| O16 | 已做：completed 物化为 `TemporarySwitchLinear` + 共享 original bank，VAE CPU stash |
 
 回归测试见 `docs/cat_distill_test.md`。
 

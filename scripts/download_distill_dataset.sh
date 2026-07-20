@@ -16,6 +16,7 @@
 #
 # 可选环境变量：
 #   OUTPUT_DIR             默认 <repo>/data/edgerazor_qwen3
+#   HF_ENDPOINT            默认 https://hf-mirror.com
 #   HF_TOKEN               BAAI/Infinity-Instruct 为 gated 数据集，需有效 token
 #   MAX_SAMPLES            非空时每个 general jsonl 只取 N 条（smoke）
 #   MAX_SAMPLES_PER_TASK   非空时 task jsonl 每任务只取 N 条（smoke）
@@ -34,9 +35,12 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/data/edgerazor_qwen3}"
 
 export PYTHONPATH="${PROJECT_ROOT}"
-unset HF_ENDPOINT
+# 默认走 hf-mirror；可用环境变量 HF_ENDPOINT 覆盖。
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+# 不走本机/环境代理。
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 # BAAI/Infinity-Instruct 为 gated 数据集；将 hf_xxx 替换为你的 token。
-export HF_TOKEN="${HF_TOKEN:-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}"
+export HF_TOKEN="${HF_TOKEN:-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}"
 unset HF_HUB_OFFLINE HF_DATASETS_OFFLINE TRANSFORMERS_OFFLINE
 
 REQUIRED_FILES=(
@@ -50,7 +54,7 @@ REQUIRED_FILES=(
 echo "============================================"
 echo " VAELLM 蒸馏数据集下载"
 echo " 输出目录: ${OUTPUT_DIR}"
-echo " HF Hub: https://huggingface.co"
+echo " HF Hub: ${HF_ENDPOINT}"
 if [[ -n "${HF_TOKEN}" && "${HF_TOKEN}" != "hf_xxx" ]]; then
   echo " HF_TOKEN: 已配置"
 else
@@ -72,11 +76,8 @@ TASK_ARGS=(--output_dir "${OUTPUT_DIR}")
 if [[ -n "${MAX_SAMPLES_PER_TASK:-}" ]]; then
   TASK_ARGS+=(--max_samples_per_task "${MAX_SAMPLES_PER_TASK}")
 fi
-if [[ -f "${OUTPUT_DIR}/task_vaellm_eval_instruct.jsonl" && -z "${MAX_SAMPLES_PER_TASK:-}" ]]; then
-  echo "已存在，跳过: task_vaellm_eval_instruct.jsonl"
-else
-  python tools/prepare_vaellm_task_mix.py "${TASK_ARGS[@]}"
-fi
+# task 文件可能因中途失败留下半成品；始终重生成（体积小）。
+python tools/prepare_vaellm_task_mix.py "${TASK_ARGS[@]}"
 
 missing=0
 for dataset_name in "${REQUIRED_FILES[@]}"; do

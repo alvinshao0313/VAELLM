@@ -128,8 +128,20 @@ bash scripts/catlora_distill_from_checkpoint.sh \
 行为：
 
 1. 读取 `completed_categories`，跳过已完成类别的蒸馏。
-2. 已完成类别仍进入 active 压缩前缀（progressive 状态正确）。
-3. 从未完成类别继续训练，并继续写新的 `after_*` / 最终 `final_model`。
+2. 已完成且已进入 active 前缀的类别会物化为 `TemporarySwitchLinear`（student=decoded，teacher=共享 original bank）；完整 `VAELinear` 卸到 CPU，仅存盘前 restore。
+3. 当前未完成类别保留 GPU 上的 `VAELinear` 供蒸馏。
+4. 从未完成类别继续训练，并继续写新的 `after_*` / 最终 `final_model`。
+5. `after_*` 保存前仍会全量 restore 为完整 `VAELinear` 图，ckpt 格式与续跑所需的 `original_weight` 不变。
+
+训练期 residency（显存）三分态：
+
+| 状态 | 模型里 | stash |
+|---|---|---|
+| 已完成 ∩ active | `TemporarySwitchLinear` | 完整 `VAELinear` 在 CPU |
+| active 且未完成 | `VAELinear`（可训） | 无 |
+| 未进入 active | 冻结 `nn.Linear`（weight 引用 original bank） | 完整 `VAELinear` 在 CPU |
+
+全层 `original_weight` 只保留一份（`original_weight_bank`），teacher/student 仍通过 `set_temporary` 切换，不改变 KD 语义。
 
 ### 3. 不要只写后续类别
 

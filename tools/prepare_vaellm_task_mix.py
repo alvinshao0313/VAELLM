@@ -214,16 +214,23 @@ KEEP_TASK_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _load_hf_dataset(path: str, name: Optional[str] = None, *, split: Optional[str] = None):
+    # datasets>=2.14 对脚本式仓库需要显式信任；非交互环境不能等 stdin 确认。
+    kwargs: Dict[str, Any] = {"trust_remote_code": True}
+    if split is not None:
+        kwargs["split"] = split
+    if name:
+        return load_dataset(path, name, **kwargs)
+    return load_dataset(path, **kwargs)
+
+
 def _iter_task_config_records(
     task_name: str,
     config: Dict[str, Any],
     *,
     max_samples: Optional[int] = None,
 ) -> Iterable[Dict[str, List[Dict[str, str]]]]:
-    if config["dataset_name"]:
-        dataset = load_dataset(config["dataset_path"], config["dataset_name"])
-    else:
-        dataset = load_dataset(config["dataset_path"])
+    dataset = _load_hf_dataset(config["dataset_path"], config["dataset_name"])
 
     split_name = str(config["training_split"])
     if split_name not in dataset:
@@ -244,7 +251,7 @@ def _iter_task_config_records(
 def _iter_mmlu_records(*, max_samples: Optional[int] = None) -> Iterable[Dict[str, List[Dict[str, str]]]]:
     produced = 0
     for subject in _MMLU_NO_TRAIN_SUBJECTS:
-        dataset = load_dataset("hails/mmlu_no_train", name=str(subject))
+        dataset = _load_hf_dataset("hails/mmlu_no_train", str(subject))
         for split_name in ("dev", "validation"):
             if split_name not in dataset:
                 continue
@@ -268,30 +275,49 @@ def _iter_mmlu_records(*, max_samples: Optional[int] = None) -> Iterable[Dict[st
 
 
 def _iter_longbench_records(*, max_samples: Optional[int] = None) -> Iterable[Dict[str, List[Dict[str, str]]]]:
+    import zipfile
+
+    from huggingface_hub import hf_hub_download
+
+    # THUDM/LongBench 以 data.zip + 脚本仓库分发；datasets.load_dataset 容易长时间卡住。
+    # 直接下载 zip 后按 subset 读取本地 jsonl。
+    try:
+        zip_path = hf_hub_download("THUDM/LongBench", "data.zip", repo_type="dataset")
+    except Exception as exc:
+        print(f"Warning: skip LongBench (data.zip download failed): {exc}", flush=True)
+        return
+
     produced = 0
-    for subset in LONGBENCH_SUBSETS:
-        try:
-            dataset = load_dataset("THUDM/LongBench", str(subset), split="test")
-        except Exception as exc:
-            print(f"Warning: skip LongBench subset {subset}: {exc}")
-            continue
-        for record in dataset:
-            user_text = str(record.get("input", "")).strip()
-            answers = record.get("answers")
-            if not user_text or not answers:
+    with zipfile.ZipFile(zip_path) as zf:
+        available = set(zf.namelist())
+        for subset in LONGBENCH_SUBSETS:
+            member = f"data/{subset}.jsonl"
+            if member not in available:
+                print(f"Warning: skip LongBench subset {subset}: missing {member}", flush=True)
                 continue
-            answer_text = str(answers[0]).strip()
-            if not answer_text:
+            try:
+                with zf.open(member) as handle:
+                    for raw in handle:
+                        record = json.loads(raw)
+                        user_text = str(record.get("input", "")).strip()
+                        answers = record.get("answers")
+                        if not user_text or not answers:
+                            continue
+                        answer_text = str(answers[0]).strip()
+                        if not answer_text:
+                            continue
+                        yield {
+                            "messages": [
+                                {"role": "user", "content": user_text},
+                                {"role": "assistant", "content": " " + answer_text},
+                            ]
+                        }
+                        produced += 1
+                        if max_samples is not None and produced >= int(max_samples):
+                            return
+            except Exception as exc:
+                print(f"Warning: skip LongBench subset {subset}: {exc}", flush=True)
                 continue
-            yield {
-                "messages": [
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": " " + answer_text},
-                ]
-            }
-            produced += 1
-            if max_samples is not None and produced >= int(max_samples):
-                return
 
 
 def _write_task_jsonl(

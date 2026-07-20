@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -191,6 +192,21 @@ def distill_distributed_barrier() -> None:
         torch.distributed.barrier()
 
 
+def _resolve_distill_process_group_timeout_sec() -> int:
+    # 分布式 lm_eval 按 task 分片时，mmlu 等长任务会让先完成的 rank 在 gather 上久等。
+    # 默认 3 小时；可用 DISTILL_NCCL_TIMEOUT_SEC 覆盖。
+    raw = str(os.environ.get("DISTILL_NCCL_TIMEOUT_SEC", "10800")).strip()
+    try:
+        timeout_sec = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"DISTILL_NCCL_TIMEOUT_SEC must be an integer number of seconds, got {raw!r}."
+        ) from exc
+    if timeout_sec <= 0:
+        raise ValueError(f"DISTILL_NCCL_TIMEOUT_SEC must be > 0, got {timeout_sec}.")
+    return int(timeout_sec)
+
+
 def ensure_distill_process_group_initialized() -> None:
     if not is_distill_distributed():
         return
@@ -202,7 +218,8 @@ def ensure_distill_process_group_initialized() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if backend == "nccl":
         torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend=backend)
+    timeout_sec = _resolve_distill_process_group_timeout_sec()
+    torch.distributed.init_process_group(backend=backend, timeout=timedelta(seconds=timeout_sec))
 
 
 def distill_rank() -> int:
