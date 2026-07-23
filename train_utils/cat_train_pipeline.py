@@ -990,6 +990,14 @@ def _train_protected_residual_vae_payload(
                 )
                 start = time.time()
 
+        # 训完立刻释放 Adam 状态，降低随后全量重构的显存尖峰。
+        del optimizer
+        optimizer = None
+        if lr_scheduler is not None:
+            del lr_scheduler
+            lr_scheduler = None
+        torch.cuda.empty_cache()
+
         vae.eval()
         recon_chunks: List[torch.Tensor] = []
         bit_chunks: List[torch.Tensor] = []
@@ -1024,9 +1032,7 @@ def _train_protected_residual_vae_payload(
             )
         dec.to("cpu")
         stage_decoders.append(dec)
-        del vae, train_loader, eval_loader, optimizer
-        if lr_scheduler is not None:
-            del lr_scheduler
+        del vae, train_loader, eval_loader
         torch.cuda.empty_cache()
 
     return {
@@ -1768,6 +1774,19 @@ def train_group_vae_payload(
                 )
                 vae.train()
 
+        # 训完立刻释放 Adam 状态，降低随后全量重构的显存尖峰（不影响重构数值）。
+        del optimizer
+        optimizer = None
+        if lr_scheduler is not None:
+            del lr_scheduler
+            lr_scheduler = None
+        # all_batch_gpu_cache 路径下 x_all 仅服务训练取 batch；重构走 eval_loader。
+        # gpu_resident + batch_size=all 时 x_all 与 gpu_stage_train_data 是同一引用，不能在这里删。
+        if x_all is not None and x_all is not gpu_stage_train_data:
+            del x_all
+            x_all = None
+        torch.cuda.empty_cache()
+
         # 3) 对当前 stage 的 residual 生成重构，更新下一阶段 residual。
         vae.eval()
         stage_recon_chunks: List[torch.Tensor] = []
@@ -1850,9 +1869,8 @@ def train_group_vae_payload(
 
         if x_all is not None:
             del x_all
-        del vae, train_loader, eval_loader, optimizer, common_stage_result, stage_result
-        if lr_scheduler is not None:
-            del lr_scheduler
+            x_all = None
+        del vae, train_loader, eval_loader, common_stage_result, stage_result
         torch.cuda.empty_cache()
 
     if residual_stages > 1:
