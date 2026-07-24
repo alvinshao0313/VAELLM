@@ -2417,6 +2417,11 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     cat_args.output_dir = run_output_dir
 
     log.info("Run output directory: %s", run_output_dir)
+    if bool(getattr(cat_args, "distill_independent_categories", False)):
+        log.warning(
+            "--distill_independent_categories=true 仅对 cat checkpoint distill 生效；"
+            "当前 inline cat_train 路径忽略该开关，仍按前缀累积压缩状态蒸馏。"
+        )
     if bool(getattr(cat_args, "deterministic", False)):
         log.info("Deterministic mode enabled: torch deterministic algorithms on, TF32 disabled.")
     log.info(

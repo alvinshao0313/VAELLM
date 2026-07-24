@@ -865,11 +865,21 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     lora_round_idx = 0
     active_categories: List[str] = []
     completed_categories = list(completed_categories)
+    independent_categories = bool(getattr(cat_args, "distill_independent_categories", False))
+    if independent_categories:
+        logger.info(
+            "Checkpoint distill: --distill_independent_categories=true，"
+            "每轮只激活当前类；已完成类恢复为未压缩 Linear。"
+        )
     for category in target_categories:
-        active_categories.append(str(category))
+        if independent_categories:
+            round_active_categories = [str(category)]
+        else:
+            active_categories.append(str(category))
+            round_active_categories = active_categories
         _apply_checkpoint_distill_residency(
             model=model,
-            active_categories=active_categories,
+            active_categories=round_active_categories,
             completed_categories=completed_categories,
             residency=residency,
             device=residency_device,
@@ -878,7 +888,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         )
         prewarm_targets = _set_active_vae_category_prefix(
             model=model,
-            active_categories=active_categories,
+            active_categories=round_active_categories,
             logger=logger,
         )
         del prewarm_targets  # outer prewarm removed (O5); inner path in after-category distill handles cache
@@ -929,7 +939,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             # Materialize this category to TemporarySwitchLinear before save/eval.
             _apply_checkpoint_distill_residency(
                 model=model,
-                active_categories=active_categories,
+                active_categories=round_active_categories,
                 completed_categories=completed_categories,
                 residency=residency,
                 device=residency_device,
@@ -943,7 +953,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                     category=str(category),
                     completed_categories=completed_categories,
                     mode=mode,
-                    active_categories=active_categories,
+                    active_categories=round_active_categories,
                     residency=residency,
                     cat_args=cat_args,
                     hf_args=hf_args,
@@ -961,7 +971,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                     )
                 _apply_checkpoint_distill_residency(
                     model=model,
-                    active_categories=active_categories,
+                    active_categories=round_active_categories,
                     completed_categories=completed_categories,
                     residency=residency,
                     device=residency_device,
@@ -986,6 +996,25 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             )
 
     if run_category_eval:
+        if independent_categories and completed_categories:
+            logger.info(
+                "Checkpoint distill independent: 最终评估前激活全部 completed_categories=%s",
+                ",".join(completed_categories),
+            )
+            _apply_checkpoint_distill_residency(
+                model=model,
+                active_categories=list(completed_categories),
+                completed_categories=completed_categories,
+                residency=residency,
+                device=residency_device,
+                dtype=residency_dtype,
+                logger=logger,
+            )
+            _set_active_vae_category_prefix(
+                model=model,
+                active_categories=list(completed_categories),
+                logger=logger,
+            )
         if is_distill_main_process():
             logger.info("所有类别蒸馏完成后最终评估...")
         _eval_after_category(

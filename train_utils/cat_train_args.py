@@ -126,6 +126,7 @@ class NormalizedCatArgs:
     save_model: bool
     unload_vae_original_weights_on_final_save: bool
     distill_reset_completed: bool
+    distill_independent_categories: bool
     output_dir: str
     allow_tail_group: bool
 
@@ -856,6 +857,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         save_model=bool(raw_args.save_model),
         unload_vae_original_weights_on_final_save=bool(raw_args.unload_vae_original_weights_on_final_save),
         distill_reset_completed=bool(raw_args.distill_reset_completed),
+        distill_independent_categories=bool(raw_args.distill_independent_categories),
         output_dir=str(raw_args.output_dir),
         allow_tail_group=bool(raw_args.allow_tail_group),
     )
@@ -1607,6 +1609,16 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help=(
             "checkpoint distill 时忽略 resume ckpt 中的 completed_categories，对 target_categories "
             "全量再跑一轮类别蒸馏（在已有压缩/蒸馏权重上继续）。默认 false，不影响正常续跑跳过。"
+        ),
+    )
+    parser.add_argument(
+        "--distill_independent_categories",
+        type=lambda v: _parse_bool_like(v, arg_name="--distill_independent_categories"),
+        default=False,
+        help=(
+            "checkpoint distill 时每类独立蒸馏：训当前类前把已完成类恢复为未压缩 Linear，"
+            "不累积前缀压缩状态；全部类结束后再一次性激活已完成类做最终评估/保存。"
+            "默认 false（前缀累积）。仅对 cat checkpoint distill 生效。"
         ),
     )
     parser.add_argument("--output_dir", type=str, default="./output_linear_by_category")

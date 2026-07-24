@@ -179,6 +179,8 @@
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
 | `--distill_after_category` | `none` | 每训练完一个类别后的蒸馏模式 | `none` / `remaining_lora` / `compressed_lora` / `decoder` / `both`；非 `none` 要求开启 `--convert` |
+| `--distill_reset_completed` | `false` | checkpoint distill 是否忽略 resume 中的 `completed_categories` 全量重蒸 | 仅 checkpoint distill |
+| `--distill_independent_categories` | `false` | checkpoint distill 是否每类独立蒸馏（不累积前缀压缩状态） | `true` 时每轮只激活当前类，已完成类恢复为未压缩 Linear；全部类结束后再一次性激活已完成类做最终评估/保存。仅对 cat checkpoint distill 生效；inline `cat_train` 会 warning 并忽略 |
 | `--distill_dataset` | `""` | 每类后蒸馏训练混合数据集 | `--distill_after_category != none` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
 | `--lora_rank` | `default=8` | LoRA rank | after-category override |
 | `--lora_alpha` | `default=16.0` | LoRA alpha | after-category override |

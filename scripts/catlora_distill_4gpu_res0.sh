@@ -18,6 +18,9 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 # 续训：指向 after_k_proj（completed=q_proj,k_proj，从 v_proj 继续）。
 # 从头蒸馏：改回 ".result/catlora/res0-bf16-protect-channel-vae/final_model"
 # --distill_reset_completed false：按 completed_categories 跳过；true：在已有权重上再蒸一轮全部分类
+# --distill_independent_categories false：前缀累积压缩状态；true：每类独立（已完成类恢复未压缩）
+# edgerazor 配比：
+  # --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
 torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.py \
   --model_path "Qwen/Qwen3-8B" \
   --resume_from_checkpoint ".result/catlora/res0-bf16-protect-channel-vae/final_model" \
@@ -38,8 +41,9 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --ppl_limit "-1" \
   --distill_after_category "both" \
   --distill_reset_completed "false" \
-  --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --lora_rank "default=4" \
+  --distill_independent_categories "true" \
+  --distill_dataset "edgerazor_ii_7m=0.409,edgerazor_ii_gen=0.080,edgerazor_tulu=0.033,edgerazor_am=0.077,vaellm_eval_task=0.401" \
+  --lora_rank "default=8" \
   --lora_alpha "default=4" \
   --lora_dropout "default=0.03" \
   --distill_steps "default=2000" \
@@ -68,7 +72,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_max_grad_norm "1.3" \
   --distill_warmup_ratio "0.05" \
   --distill_group_by_length "false" \
-  --distill_lr_scheduler_type "constant_with_warmup" \
+  --distill_lr_scheduler_type "cosine_with_warmup" \
   --distill_model_max_length "1024" \
   --fp16 "false" \
   --bf16 "true" \
