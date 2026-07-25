@@ -1,14 +1,16 @@
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
 from e2e_common.peft_proxy import (
     PeftVAELinearProxy,
+    detach_and_clear_vae_low_rank_payloads,
     ensure_peft_vae_linear_proxy,
     ensure_peft_vae_proxy_adapter,
     export_peft_proxy_lora_to_low_rank,
+    initialize_peft_proxy_lora_from_low_rank,
     is_peft_proxy_adapter_linear,
     iter_named_peft_vae_proxies,
     materialize_peft_proxy_decoded_linears,
@@ -164,6 +166,31 @@ def category_targets_have_low_rank(targets: Sequence[Tuple[str, VAELinear]]) -> 
     return all(base_layer.has_low_rank_residual() for _name, base_layer in targets)
 
 
+def _category_low_rank_presence(targets: Sequence[Tuple[str, VAELinear]]) -> Tuple[int, int]:
+    present = sum(1 for _name, base_layer in targets if base_layer.has_low_rank_residual())
+    return int(present), int(len(targets))
+
+
+def _validate_low_rank_payload_ranks(
+    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    *,
+    expected_rank: int,
+    category: str,
+) -> None:
+    for name, (low_rank_a, low_rank_b) in payloads.items():
+        payload_rank = int(low_rank_a.shape[1])
+        if payload_rank != int(low_rank_b.shape[0]):
+            raise ValueError(
+                f"category={category} module={name}: low_rank inner dim mismatch "
+                f"{payload_rank} != {int(low_rank_b.shape[0])}."
+            )
+        if payload_rank != int(expected_rank):
+            raise ValueError(
+                f"category={category} module={name}: existing low_rank rank={payload_rank} "
+                f"!= --lora_rank {int(expected_rank)}; distill_reset_completed 续蒸要求秩一致。"
+            )
+
+
 def _wrap_targets_as_peft_proxies(
     model: nn.Module,
     targets: Sequence[Tuple[str, VAELinear]],
@@ -299,13 +326,33 @@ def _run_compressed_category_distill(
         )
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
 
-    if mode in {"compressed_lora", "both"} and category_targets_have_low_rank(targets):
-        logger.info(
-            "After-category distill: mode=%s category=%s 已有 low_rank_a/b，自动跳过。",
-            str(mode),
-            str(category),
-        )
-        return AfterCategoryDistillResult(model=model, next_lora_round_idx=next_round, trained_target_count=0)
+    reset_completed = bool(getattr(cat_args, "distill_reset_completed", False))
+    continue_from_low_rank = False
+    low_rank_payloads = {}
+    if mode in {"compressed_lora", "both"}:
+        low_rank_present, low_rank_total = _category_low_rank_presence(targets)
+        if low_rank_present > 0 and low_rank_present < low_rank_total:
+            raise ValueError(
+                f"category={category}: low_rank_a/b 不完整 "
+                f"({low_rank_present}/{low_rank_total})；无法决定跳过或续蒸。"
+            )
+        if low_rank_present == low_rank_total and low_rank_total > 0:
+            if not reset_completed:
+                logger.info(
+                    "After-category distill: mode=%s category=%s 已有 low_rank_a/b，自动跳过。",
+                    str(mode),
+                    str(category),
+                )
+                return AfterCategoryDistillResult(
+                    model=model, next_lora_round_idx=next_round, trained_target_count=0
+                )
+            continue_from_low_rank = True
+            logger.info(
+                "After-category distill: mode=%s category=%s distill_reset_completed=true，"
+                "从已有 low_rank_a/b 初始化 LoRA 续蒸。",
+                str(mode),
+                str(category),
+            )
 
     cfg = _resolve_distill_stage_config(
         cat_args=cat_args,
@@ -369,6 +416,18 @@ def _run_compressed_category_distill(
     use_lora = mode in {"compressed_lora", "both"}
     use_decoder = mode in {"decoder", "both"}
     if use_lora:
+        if continue_from_low_rank:
+            low_rank_payloads = detach_and_clear_vae_low_rank_payloads(targets)
+            if int(len(low_rank_payloads)) != int(len(module_names)):
+                raise RuntimeError(
+                    f"category={category}: detached low_rank payloads={len(low_rank_payloads)} "
+                    f"!= targets={len(module_names)}."
+                )
+            _validate_low_rank_payload_ranks(
+                low_rank_payloads,
+                expected_rank=int(cfg.rank),
+                category=str(category),
+            )
         module_names = _wrap_targets_as_peft_proxies(model, targets)
         materialize_peft_proxy_decoded_linears(
             model,
@@ -389,6 +448,17 @@ def _run_compressed_category_distill(
         if int(injected) != int(len(module_names)):
             raise RuntimeError(
                 f"After-category distill expected {len(module_names)} proxy adapters, injected {injected}."
+            )
+        if continue_from_low_rank:
+            initialized = initialize_peft_proxy_lora_from_low_rank(
+                model,
+                low_rank_payloads,
+                module_names=module_names,
+            )
+            logger.info(
+                "After-category distill: category=%s 已用 low_rank_a/b 初始化 LoRA adapters=%d。",
+                str(category),
+                int(initialized),
             )
 
     previous_use_cache = _freeze_model_for_lora(model, device=cfg.device, logger=logger)
@@ -533,8 +603,16 @@ def _run_compressed_category_distill(
             finalized = _finalize_decoder_trainables(model, module_names)
             logger.info("After-category distill: finalized trainable decoder modules=%d.", int(finalized))
         if use_lora:
-            exported = export_peft_proxy_lora_to_low_rank(model, module_names=module_names)
-            logger.info("After-category distill: exported compressed LoRA adapters to low_rank_a/b=%d.", int(exported))
+            exported = export_peft_proxy_lora_to_low_rank(
+                model,
+                module_names=module_names,
+                allow_overwrite=bool(continue_from_low_rank),
+            )
+            logger.info(
+                "After-category distill: exported compressed LoRA adapters to low_rank_a/b=%d allow_overwrite=%s.",
+                int(exported),
+                str(bool(continue_from_low_rank)).lower(),
+            )
             _log_vae_linear_cache_status(
                 model,
                 logger,

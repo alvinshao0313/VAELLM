@@ -269,10 +269,91 @@ def _adapter_uses_dora(peft_linear: PeftLoraLinear, adapter_name: str) -> bool:
 
 
 @torch.no_grad()
+def detach_and_clear_vae_low_rank_payloads(
+    targets: Sequence[Tuple[str, VAELinear]],
+) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    """Copy low_rank_a/b off VAELinear targets and clear them to avoid double-counting."""
+    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    for name, base_layer in targets:
+        if not isinstance(base_layer, VAELinear):
+            raise TypeError(f"{name}: expected VAELinear, got {type(base_layer)}.")
+        if not base_layer.has_low_rank_residual():
+            continue
+        low_rank_a = base_layer.low_rank_a.detach().clone().contiguous()
+        low_rank_b = base_layer.low_rank_b.detach().clone().contiguous()
+        payloads[str(name)] = (low_rank_a, low_rank_b)
+        base_layer.register_parameter("low_rank_a", None)
+        base_layer.register_parameter("low_rank_b", None)
+        base_layer.clear_decoded_weight_cache()
+    return payloads
+
+
+@torch.no_grad()
+def initialize_peft_proxy_lora_from_low_rank(
+    model: nn.Module,
+    payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    *,
+    module_names: Optional[Sequence[str]] = None,
+) -> int:
+    """Initialize proxy LoRA from VAELinear low_rank payloads.
+
+    Export convention: low_rank_a = lora_B * scaling, low_rank_b = lora_A.
+    Restore with: lora_A = low_rank_b, lora_B = low_rank_a / scaling.
+    """
+    if not payloads:
+        return 0
+    proxy_refs = _select_peft_proxy_refs(model, module_names)
+    name_to_proxy = {str(name): proxy for name, proxy in proxy_refs}
+    initialized = 0
+    for module_name, (low_rank_a, low_rank_b) in payloads.items():
+        proxy = name_to_proxy.get(str(module_name))
+        if proxy is None:
+            raise RuntimeError(f"{module_name}: missing PeftVAELinearProxy for low_rank LoRA init.")
+        peft_linear = proxy.per_decoded_linear
+        if is_peft_adalora_linear(peft_linear):
+            raise ValueError(f"{module_name}: AdaLoRA init from low_rank_a/b is not supported.")
+        if not is_peft_lora_linear(peft_linear):
+            raise TypeError(f"{module_name}: expected PEFT LoRA Linear, got {type(peft_linear)}.")
+        adapter_name = _get_default_adapter_name(peft_linear)
+        if _adapter_uses_dora(peft_linear, adapter_name):
+            raise ValueError(f"{module_name}: DoRA init from low_rank_a/b is not supported.")
+
+        lora_a = peft_linear.lora_A[adapter_name].weight
+        lora_b = peft_linear.lora_B[adapter_name].weight
+        scaling = float(peft_linear.scaling[adapter_name])
+        if scaling == 0.0:
+            raise ValueError(f"{module_name}: LoRA scaling is 0; cannot restore from low_rank_a/b.")
+        if tuple(lora_a.shape) != tuple(low_rank_b.shape):
+            raise RuntimeError(
+                f"{module_name}: lora_A shape {tuple(lora_a.shape)} != low_rank_b {tuple(low_rank_b.shape)}."
+            )
+        expected_lora_b = tuple(low_rank_a.shape)
+        if tuple(lora_b.shape) != expected_lora_b:
+            raise RuntimeError(
+                f"{module_name}: lora_B shape {tuple(lora_b.shape)} != low_rank_a {expected_lora_b}."
+            )
+        payload_rank = int(low_rank_a.shape[1])
+        if int(lora_a.shape[0]) != payload_rank:
+            raise RuntimeError(
+                f"{module_name}: LoRA rank {int(lora_a.shape[0])} != low_rank inner dim {payload_rank}."
+            )
+        lora_a.data.copy_(low_rank_b.to(device=lora_a.device, dtype=lora_a.dtype))
+        restored_b = low_rank_a.to(device=lora_b.device, dtype=torch.float32) / float(scaling)
+        lora_b.data.copy_(restored_b.to(dtype=lora_b.dtype))
+        initialized += 1
+    if int(initialized) != int(len(payloads)):
+        raise RuntimeError(
+            f"LoRA init from low_rank mismatch: initialized={initialized} expected={len(payloads)}."
+        )
+    return int(initialized)
+
+
+@torch.no_grad()
 def export_peft_proxy_lora_to_low_rank(
     model: nn.Module,
     *,
     module_names: Optional[Sequence[str]] = None,
+    allow_overwrite: bool = False,
 ) -> int:
     proxy_refs = _select_peft_proxy_refs(model, module_names)
     exported = 0
@@ -289,7 +370,7 @@ def export_peft_proxy_lora_to_low_rank(
         base_layer = proxy.base_layer
         existing_a = getattr(base_layer, "low_rank_a", None)
         existing_b = getattr(base_layer, "low_rank_b", None)
-        if existing_a is not None or existing_b is not None:
+        if (existing_a is not None or existing_b is not None) and not bool(allow_overwrite):
             raise ValueError(f"{module_name}: VAELinear already has low_rank_a/b; refusing to overwrite.")
 
         weight_a = peft_linear.lora_A[adapter_name].weight.detach()

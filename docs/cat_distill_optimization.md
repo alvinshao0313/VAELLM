@@ -123,7 +123,8 @@ scripts/catlora_distill_4gpu_res0.sh
 
 - 现有续跑约定（见 `docs/catlora_distill_from_checkpoint.md`）：已完成类别必须留在 `target_categories` 前缀，并设 `distill_steps ... after:xxx=0`。
 - 若只写后续类别，inactive 类会被 stash 成 `original_weight` 稠密 Linear，训练期 progressive 状态错误。
-- 若前缀 steps 不为 0 且已有 `low_rank_a/b`，`export_peft_proxy_lora_to_low_rank` 会拒绝覆盖。
+- 若前缀 steps 不为 0 且已有 `low_rank_a/b`，旧逻辑下 `export_peft_proxy_lora_to_low_rank` 会拒绝覆盖。
+- 现状：`--distill_reset_completed false` 时已有 `low_rank` 自动 skip；`true` 时用已有 `low_rank` 初始化 LoRA 再训并允许覆盖写回（见 `docs/catlora_distill_from_checkpoint.md`）。
 - 文档仍写 `VAE_CKPT=... bash scripts/...`；脚本实际硬编码 `--resume_from_checkpoint`。
 
 **影响**
@@ -135,6 +136,7 @@ scripts/catlora_distill_4gpu_res0.sh
 1. 代码：若某类已有完整 `low_rank_a/b`（`compressed_lora`/`both`），或已判定无需再训 decoder，则自动 skip，不必手工 `steps=0`。
 2. 脚本与文档统一使用 `--resume_from_checkpoint`；删除 `VAE_CKPT` 叙述。
 3. 与 O1 中间保存联动：支持「从 after_q_proj 继续 k_proj」。
+4. `--distill_reset_completed true`：在已有蒸馏参数上再蒸一轮（LoRA 从 `low_rank` 初始化并覆盖写回）。
 
 **优先级**：高
 

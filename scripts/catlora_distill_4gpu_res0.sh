@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1,4,5
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -15,9 +15,11 @@ export LIBRARY_PATH=/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}
 export DISTILL_NCCL_TIMEOUT_SEC=10800
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 
-# 续训：指向 after_k_proj（completed=q_proj,k_proj，从 v_proj 继续）。
+# 类别级续跑未完成类：指向 after_k_proj（completed=q_proj,k_proj，从 v_proj 继续）+ distill_reset_completed=false
 # 从头蒸馏：改回 ".result/catlora/res0-bf16-protect-channel-vae/final_model"
-# --distill_reset_completed false：按 completed_categories 跳过；true：在已有权重上再蒸一轮全部分类
+# 在已蒸馏 ckpt 上再蒸一轮（含 LoRA 续训写回）：resume 指到 final_model/after_* + distill_reset_completed=true
+# --distill_reset_completed false：按 completed_categories / 已有 low_rank 跳过
+# --distill_reset_completed true：全量再蒸；已有 low_rank 用其初始化 LoRA 继续训并覆盖写回
 # --distill_independent_categories false：前缀累积压缩状态；true：每类独立（已完成类恢复未压缩）
 # edgerazor 配比：
   # --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
@@ -72,7 +74,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_max_grad_norm "1.3" \
   --distill_warmup_ratio "0.05" \
   --distill_group_by_length "false" \
-  --distill_lr_scheduler_type "cosine_with_warmup" \
+  --distill_lr_scheduler_type "cosine" \
   --distill_model_max_length "1024" \
   --fp16 "false" \
   --bf16 "true" \

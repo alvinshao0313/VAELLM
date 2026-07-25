@@ -822,11 +822,15 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     if bool(getattr(cat_args, "distill_reset_completed", False)):
         if completed_categories:
             logger.info(
-                "Checkpoint distill: --distill_reset_completed=true，忽略 resume ckpt 中的 completed_categories=%s",
+                "Checkpoint distill: --distill_reset_completed=true，忽略 resume ckpt 中的 "
+                "completed_categories=%s；已有 low_rank_a/b 的类将用其初始化 LoRA 再蒸并覆盖写回。",
                 ",".join(completed_categories),
             )
         else:
-            logger.info("Checkpoint distill: --distill_reset_completed=true，resume ckpt 无 completed_categories。")
+            logger.info(
+                "Checkpoint distill: --distill_reset_completed=true，resume ckpt 无 completed_categories；"
+                "若类上已有 low_rank_a/b，将从其初始化 LoRA 续蒸。"
+            )
         completed_categories = []
     elif completed_categories:
         logger.info(

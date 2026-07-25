@@ -14,6 +14,10 @@ export HF_DATASETS_OFFLINE=1
 # export CUDA_VISIBLE_DEVICES=0,1,2,3
 # torchrun --standalone --nproc_per_node=4 python tools/cat_distill_from_vae_checkpoint.py \
 #   ... # 与下方相同参数
+#
+# 类别级续跑未完成类：--resume_from_checkpoint .../after_<category> + --distill_reset_completed false
+# 在已蒸馏 ckpt 上再蒸一轮（含 LoRA 续训写回）：--distill_reset_completed true
+# 详见 docs/catlora_distill_from_checkpoint.md
 
 python tools/cat_distill_from_vae_checkpoint.py \
   --model_path "Qwen/Qwen3-8B" \

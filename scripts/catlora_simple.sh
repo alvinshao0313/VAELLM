@@ -2,7 +2,7 @@
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=5
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -107,7 +107,7 @@ python tools/cat_train.py \
   --eval_ppl "false" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
-  --outlier_protect_mode "channel" \
+  --outlier_protect_mode "residual_sparse" \
   --outlier_mlp_rank_metric "none" \
   --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
@@ -119,11 +119,11 @@ python tools/cat_train.py \
   --outlier_residual_vae_stages "default=1" \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_protect_count "default=32,cat:q_proj=32,cat:k_proj=32,cat:v_proj=32,cat:o_proj=32,cat:gate_proj=32,cat:up_proj=32,cat:down_proj=128" \
+  --outlier_protect_count "default=0" \
   --outlier_protect_min_per_layer "0" \
   --outlier_protect_axis "input" \
-  --outlier_residual_top_p "default=0.0" \
-  --outlier_rank_metric "channel_weight_actmean_abs" \
+  --outlier_residual_top_p "default=0.01" \
+  --outlier_rank_metric "sparse_weight_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \

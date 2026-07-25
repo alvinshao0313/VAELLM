@@ -179,7 +179,7 @@
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
 | `--distill_after_category` | `none` | 每训练完一个类别后的蒸馏模式 | `none` / `remaining_lora` / `compressed_lora` / `decoder` / `both`；非 `none` 要求开启 `--convert` |
-| `--distill_reset_completed` | `false` | checkpoint distill 是否忽略 resume 中的 `completed_categories` 全量重蒸 | 仅 checkpoint distill |
+| `--distill_reset_completed` | `false` | checkpoint distill 是否忽略 resume 中的 `completed_categories` 全量再蒸 | `true`：已有 `low_rank_a/b` 用其初始化 LoRA 续训并覆盖写回；`false`：按 completed / 已有 low_rank 跳过（从 `after_*` 续跑未完成类）。仅 checkpoint distill |
 | `--distill_independent_categories` | `false` | checkpoint distill 是否每类独立蒸馏（不累积前缀压缩状态） | `true` 时每轮只激活当前类，已完成类恢复为未压缩 Linear；全部类结束后再一次性激活已完成类做最终评估/保存。仅对 cat checkpoint distill 生效；inline `cat_train` 会 warning 并忽略 |
 | `--distill_dataset` | `""` | 每类后蒸馏训练混合数据集 | `--distill_after_category != none` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
 | `--lora_rank` | `default=8` | LoRA rank | after-category override |
@@ -697,6 +697,38 @@ python tools/cat_train.py \
   --eval_tasks boolq,rte,piqa \
   --train_device cuda
 ```
+
+### 9.10 checkpoint distill：类别续跑与再蒸一轮
+
+从 VAE 压缩 ckpt 做逐类别蒸馏，用法见 `docs/catlora_distill_from_checkpoint.md`。
+
+类别级续跑未完成类（默认）：
+
+```bash
+python tools/cat_distill_from_vae_checkpoint.py \
+  --resume_from_checkpoint .result/catlora_distill/<run>/after_k_proj \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --distill_reset_completed false \
+  --distill_after_category both \
+  --convert \
+  --save_model
+```
+
+在已蒸馏 ckpt 上再蒸一轮（含 LoRA 从 `low_rank_a/b` 初始化并覆盖写回）：
+
+```bash
+python tools/cat_distill_from_vae_checkpoint.py \
+  --resume_from_checkpoint .result/catlora_distill/<run>/final_model \
+  --distill_reset_completed true \
+  --distill_after_category both \
+  --convert \
+  --save_model
+```
+
+说明：
+
+- `false`：按 `completed_categories` / 已有 `low_rank` 跳过，从未完成类继续
+- `true`：不跳过；已有 LoRA 分支继续训并写回；`--lora_rank` 须与已有内维一致
 
 ## 10. 评估脚本（`scripts/eval.sh`）
 

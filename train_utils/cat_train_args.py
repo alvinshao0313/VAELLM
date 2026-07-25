@@ -1608,7 +1608,9 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "checkpoint distill 时忽略 resume ckpt 中的 completed_categories，对 target_categories "
-            "全量再跑一轮类别蒸馏（在已有压缩/蒸馏权重上继续）。默认 false，不影响正常续跑跳过。"
+            "全量再跑一轮类别蒸馏。对已有 low_rank_a/b 的类：用其初始化 proxy LoRA 继续训并覆盖写回；"
+            "decoder 在已有权重上继续。默认 false：按 completed_categories / 已有 low_rank 跳过，"
+            "用于从 after_<category> 续跑未完成类。"
         ),
     )
     parser.add_argument(

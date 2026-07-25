@@ -22,13 +22,15 @@ scripts/catlora_distill_from_checkpoint.sh
 1. 已经用 `scripts/catlora_simple.sh` 或同等入口完成目标类别的 VAE 压缩。
 2. 保存出来的 checkpoint 里已经有目标类别的 `VAELinear`。
 3. 之前没有做蒸馏，或者想从这个全 VAE checkpoint 开始逐类别蒸馏。
-4. 从中途 `after_<category>/` checkpoint 继续后续类别。
+4. 从中途 `after_<category>/` checkpoint 继续后续未完成类别（`--distill_reset_completed false`）。
+5. 在已蒸馏 ckpt（含 `low_rank_a/b` / decoder）上再蒸一轮（`--distill_reset_completed true`）。
 
 不适合：
 
 - 输入 checkpoint 里还没有目标类别的 `VAELinear`。
 - 想继续没压缩完的 `cat_train` run（用 `tools/cat_train.py --resume_from_checkpoint`）。
 - 想做 compressed e2e 全模型微调（用 `compressed_e2e_fintuning/scripts/e2e_decoder.sh`）。
+- 想从某一类蒸馏的第 N 步恢复 optimizer / scheduler（当前不支持类内 step resume）。
 
 ## 运行方式
 
@@ -96,13 +98,24 @@ export CUDA_VISIBLE_DEVICES=4
 
 学习率调度：若设置了 `--distill_warmup_ratio > 0`，必须用 `constant_with_warmup`（或其它支持 warmup 的 scheduler）。`constant` 会忽略 warmup，启动时会直接报错。
 
-## 自动跳过与续跑
+## 自动跳过、类别续跑与再蒸一轮
 
-### 1. 已有 `low_rank_a/b` 自动跳过
+两种常用用法：
 
-对 `compressed_lora` / `both`：若当前类别全部目标 `VAELinear` 已有完整 `low_rank_a/b`，会自动跳过，不必再手写 `after:xxx=0`。
+| 场景 | `--resume_from_checkpoint` | `--distill_reset_completed` | 行为 |
+|---|---|---|---|
+| 从某类完成后的中间 ckpt 续跑未完成类 | `.../after_k_proj` | `false`（默认） | 跳过已完成类，从下一类继续 |
+| 在已蒸馏参数上再蒸一轮（含 LoRA） | 已蒸馏 `final_model` 或 `after_*` | `true` | 不跳过；用已有 `low_rank` 初始化 LoRA 再训并覆盖写回 |
 
-### 2. 从 `after_<category>/` 续跑
+多卡脚本示例见 `scripts/catlora_distill_4gpu_res0.sh`。
+
+### 1. 已有 `low_rank_a/b` 自动跳过（仅 `reset=false`）
+
+对 `compressed_lora` / `both`：当 `--distill_reset_completed false` 且当前类别全部目标 `VAELinear` 已有完整 `low_rank_a/b` 时，会自动跳过，不必再手写 `after:xxx=0`。
+
+若同一类别里只有部分模块有 `low_rank`，会直接报错（状态不一致，无法决定跳过或续蒸）。
+
+### 2. 从 `after_<category>/` 续跑未完成类
 
 中途 checkpoint 的 `checkpoint_meta.json` 里会写入：
 
@@ -117,12 +130,13 @@ export CUDA_VISIBLE_DEVICES=4
 }
 ```
 
-续跑时把 `--resume_from_checkpoint` 指到该 `after_<category>/`，并保持完整 `target_categories` 前缀：
+续跑时把 `--resume_from_checkpoint` 指到该 `after_<category>/`，保持完整 `target_categories` 前缀，并保持默认 `--distill_reset_completed false`：
 
 ```bash
 bash scripts/catlora_distill_from_checkpoint.sh \
   --resume_from_checkpoint .result/catlora_distill/<run>/after_q_proj \
-  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --distill_reset_completed false
 ```
 
 行为：
@@ -133,13 +147,28 @@ bash scripts/catlora_distill_from_checkpoint.sh \
 4. 从未完成类别继续训练，并继续写新的 `after_*` / 最终 `final_model`。
 5. `after_*` 保存前仍会全量 restore 为完整 `VAELinear` 图，ckpt 格式与续跑所需的 `original_weight` 不变。
 
-若要对**已经蒸完**的 ckpt 再跑一轮类别蒸馏（在已有权重上继续，而不是跳过），加：
+### 3. `--distill_reset_completed true`：在已有蒸馏参数上再蒸一轮
+
+对已经蒸完（或蒸过一部分）的 ckpt，想在已有 decoder / LoRA 参数基础上再训一轮时：
 
 ```bash
---distill_reset_completed true
+bash scripts/catlora_distill_from_checkpoint.sh \
+  --resume_from_checkpoint .result/catlora_distill/<run>/final_model \
+  --distill_reset_completed true
 ```
 
-默认 `false`：按 `completed_categories` 正常跳过已完成类。开启后只影响本次运行的进度跳过逻辑，不改盘上旧 meta。
+`true` 时：
+
+1. 忽略 resume ckpt 中的 `completed_categories`（不改盘上旧 meta）。
+2. 对已有完整 `low_rank_a/b` 的类：先摘下 residual（避免 bake 进 dense base / `both` 前向 double-count），按导出约定还原：
+   - 导出：`low_rank_a = lora_B * scaling`，`low_rank_b = lora_A`
+   - 还原：`lora_A = low_rank_b`，`lora_B = low_rank_a / scaling`（`scaling = alpha / rank`）
+   - 训完后 **覆盖写回** `low_rank_a/b`
+3. 对尚无 `low_rank` 的类：按首次蒸馏路径（`peft_default` 初始化）训练。
+4. `decoder` / `both` 在已有 decoder 权重上继续训。
+5. `--lora_rank` 必须与已有 `low_rank` 内维一致，否则直接报错。
+
+默认 `false`：按 `completed_categories` / 已有 `low_rank_a/b` 跳过，用于第 2 节的类别级续跑。
 
 训练期 residency（显存）三分态：
 
@@ -151,7 +180,7 @@ bash scripts/catlora_distill_from_checkpoint.sh \
 
 全层 `original_weight` 只保留一份（`original_weight_bank`），teacher/student 仍通过 `set_temporary` 切换，不改变 KD 语义。
 
-### 3. 不要只写后续类别
+### 4. 不要只写后续类别
 
 不要：
 

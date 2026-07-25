@@ -21,7 +21,10 @@ export PYTHONPATH=.
 - `scripts/catlora_distill_from_checkpoint.sh`
   - 入口：`tools/cat_distill_from_vae_checkpoint.py`
   - 用途：从已经完成 VAE 压缩的 cat checkpoint 继续逐类别蒸馏，不重新训练 VAE
+  - 支持从 `after_<category>/` 续跑未完成类（`--distill_reset_completed false`）
+  - 支持在已蒸馏 ckpt 上再蒸一轮，含用已有 `low_rank_a/b` 初始化 LoRA 并覆盖写回（`--distill_reset_completed true`）
   - 用法见 `docs/catlora_distill_from_checkpoint.md`
+  - 多卡示例：`scripts/catlora_distill_4gpu_res0.sh`
 - `scripts/eval.sh`
   - 入口：`tools/cat_eval.py`
   - 用途：对保存好的 checkpoint 做 PPL 和 lm-eval
