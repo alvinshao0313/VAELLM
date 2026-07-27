@@ -906,7 +906,8 @@ else:
                         temperature=float(T),
                         confidence_k=int(self.eakld_confidence_k),
                     )
-                    loss = ori_loss * (1 - alpha) + distill_loss * (alpha * T * T)
+                    # T² is already applied inside compute_entropy_aware_kl_loss (EdgeRazor-aligned).
+                    loss = ori_loss * (1 - alpha) + distill_loss * alpha
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 

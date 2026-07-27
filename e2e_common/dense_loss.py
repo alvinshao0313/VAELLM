@@ -146,7 +146,8 @@ def compute_dense_loss_from_logits(
             temperature=temperature,
             confidence_k=int(eakld_confidence_k),
         )
-        return ce_loss * (1.0 - float(alpha)) + eakld_loss * (float(alpha) * temperature * temperature)
+        # T² is already applied inside compute_entropy_aware_kl_loss (EdgeRazor-aligned).
+        return ce_loss * (1.0 - float(alpha)) + eakld_loss * float(alpha)
     if norm.startswith("dual_kl_top"):
         k = parse_topk(norm, prefix="dual_kl_top", default_k=1000)
         return compute_dual_kl_topk_loss(

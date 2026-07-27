@@ -73,18 +73,47 @@ def _resolve_distill_temperature(temperature: float) -> float:
     return max(float(temperature), 0.1)
 
 
+def _masked_batch_mean_kl_log_target(
+    *,
+    input_log_prob: torch.Tensor,
+    target_log_prob: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """EdgeRazor compute_kld reduction=batch_mean: per-sample mean then batch mean."""
+    token_kl = F.kl_div(
+        input_log_prob,
+        target_log_prob,
+        reduction="none",
+        log_target=True,
+    ).sum(dim=-1)
+    if mask is None:
+        return token_kl.mean()
+    mask_fp32 = mask.to(device=token_kl.device, dtype=token_kl.dtype)
+    valid_lengths = mask_fp32.sum(dim=-1).clamp_min(1.0)
+    kl_per_sample = (token_kl * mask_fp32).sum(dim=-1) / valid_lengths
+    return kl_per_sample.mean()
+
+
+def _temperature_scaled_log_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    # Match EdgeRazor: softmax(...).clamp(min=eps).log() rather than log_softmax.
+    eps = 1e-8
+    probs = F.softmax(logits.float() / float(temperature), dim=-1).clamp(min=eps)
+    return probs.log()
+
+
 def compute_teacher_entropy_gamma(
     teacher_logits: torch.Tensor,
     mask: Optional[torch.Tensor],
     *,
     confidence_k: int = 16,
 ) -> torch.Tensor:
+    """Match EdgeRazor compute_teacher_confidence(use_entropy=True) actual code path."""
     resolved_k = int(confidence_k)
     if resolved_k < 2:
         raise ValueError(f"confidence_k must be >= 2, got {resolved_k}.")
 
     teacher_probs = F.softmax(teacher_logits.detach().float(), dim=-1)
-    entropy = -(teacher_probs * torch.log(teacher_probs.clamp_min(1e-8))).sum(dim=-1)
+    entropy = -(teacher_probs * torch.log(teacher_probs + 1e-8)).sum(dim=-1)
     max_entropy = math.log(float(resolved_k))
 
     if mask is not None:
@@ -107,12 +136,13 @@ def compute_forward_kl_loss(
     mask: Optional[torch.Tensor],
     temperature: float = 1.0,
 ) -> torch.Tensor:
+    """Forward KL(teacher || student), EdgeRazor compute_kld_forward + batch_mean."""
     temp = _resolve_distill_temperature(temperature)
-    student_scaled = student_logits.float() / temp
-    teacher_scaled = teacher_logits.detach().float() / temp
-    kl = _masked_token_kl_mean(
-        student_log_prob=F.log_softmax(student_scaled, dim=-1),
-        teacher_prob=F.softmax(teacher_scaled, dim=-1),
+    student_log = _temperature_scaled_log_probs(student_logits, temp)
+    teacher_log = _temperature_scaled_log_probs(teacher_logits.detach(), temp)
+    kl = _masked_batch_mean_kl_log_target(
+        input_log_prob=student_log,
+        target_log_prob=teacher_log,
         mask=mask,
     )
     return kl * (temp * temp)
@@ -125,12 +155,13 @@ def compute_reverse_kl_loss(
     mask: Optional[torch.Tensor],
     temperature: float = 1.0,
 ) -> torch.Tensor:
+    """Reverse KL(student || teacher), EdgeRazor compute_kld_reverse + batch_mean."""
     temp = _resolve_distill_temperature(temperature)
-    student_scaled = student_logits.float() / temp
-    teacher_scaled = teacher_logits.detach().float() / temp
-    kl = _masked_token_kl_mean(
-        student_log_prob=F.log_softmax(teacher_scaled, dim=-1),
-        teacher_prob=F.softmax(student_scaled, dim=-1),
+    student_log = _temperature_scaled_log_probs(student_logits, temp)
+    teacher_log = _temperature_scaled_log_probs(teacher_logits.detach(), temp)
+    kl = _masked_batch_mean_kl_log_target(
+        input_log_prob=teacher_log,
+        target_log_prob=student_log,
         mask=mask,
     )
     return kl * (temp * temp)
