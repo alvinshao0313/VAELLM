@@ -21,11 +21,11 @@ python -m compressed_e2e_fintuning.main \
   --target_modules "all" \
   --layer_device_map "auto" \
   --parallel_stage_decode "true" \
+  --parallel_mode "layer_mp" \
   --offload_mode "streaming" \
   --offload_prefetch_distance "1" \
   --offload_min_tensor_bytes "1048576" \
   --offload_pin_memory "true" \
-  --dataset_num_proc "${DATASET_NUM_PROC:-16}" \
   --model_max_length "2048" \
   --per_device_train_batch_size "1" \
   --gradient_accumulation_steps "1" \

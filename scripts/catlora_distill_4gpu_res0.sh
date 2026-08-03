@@ -15,15 +15,13 @@ export LIBRARY_PATH=/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}
 export DISTILL_NCCL_TIMEOUT_SEC=10800
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 
-# 续训：指向 after_k_proj（completed=q_proj,k_proj，从 v_proj 继续）。
-# 从头蒸馏：改回 ".result/catlora/res0-bf16-protect-channel-vae/final_model"
 # --distill_reset_completed false：按 completed_categories 跳过；true：在已有权重上再蒸一轮全部分类
 # --distill_independent_categories false：前缀累积压缩状态；true：每类独立（已完成类恢复未压缩）
 # edgerazor 配比：
   # --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
 torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.py \
   --model_path "Qwen/Qwen3-8B" \
-  --resume_from_checkpoint ".result/catlora/res0-bf16-protect-channel-vae/final_model" \
+  --resume_from_checkpoint ".result/catlora_distill/res0-bf16-protect-channel-vae/Qwen_Qwen3-8B_20260730_071653/final_model" \
   --output_dir "./.result/catlora_distill/res0-bf16-protect-channel-vae" \
   --seed "31" \
   --deterministic "true" \
@@ -40,13 +38,13 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --distill_after_category "both" \
-  --distill_reset_completed "false" \
-  --distill_independent_categories "true" \
+  --distill_reset_completed "true" \
+  --distill_independent_categories "false" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --lora_rank "default=8" \
-  --lora_alpha "default=4" \
+  --lora_alpha "default=8" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=2000" \
+  --distill_steps "default=0,after:gate_proj=2000,after:up_proj=2000,after:down_proj=2000" \
   --distill_batch_size "default=4" \
   --distill_lr "default=2e-5" \
   --distill_weight_decay "default=0.001" \
@@ -54,7 +52,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
-  --distill_loss_type "default=eakld" \
+  --distill_loss_type "default=kl_top_100" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
   --distill_hidden_loss_weight "default=0.1" \
@@ -65,7 +63,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_use_post_norm_head_linear "false" \
   --distill_hif4_act "false" \
   --eval_hif4_act "false" \
-  --distill_gradient_accumulation_steps "2" \
+  --distill_gradient_accumulation_steps "4" \
   --distill_gradient_checkpointing "true" \
   --distill_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --distill_optim "adamw_torch" \

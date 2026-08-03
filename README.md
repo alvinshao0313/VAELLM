@@ -95,11 +95,10 @@ python tools/convert_cat_checkpoint_to_bitpack.py \
   - `decoder`：训练 VAELinear decoder
   - `lora`：训练已有低秩分支并写回 `low_rank_a/b`
   - `both`：同时训练 decoder 和低秩分支
-- `compressed_e2e_fintuning` 支持 `--dataset_num_proc`：
-  - 只影响数据预处理阶段的 `datasets.map(num_proc=...)`
-  - 不影响 DataLoader worker，不影响训练并行
-  - 多卡时用 `main_process_first` 让主进程先构建 datasets cache，其余 rank 复用
-  - `--eval_strategy no` 时不会再预处理 eval 数据
+- `compressed_e2e_fintuning` 通过 `--parallel_mode` 选择并行策略：
+  - `layer_mp`（默认）：单进程层级模型并行，由 `--layer_device_map` 切层
+  - `dp`：`torchrun` 数据并行，每卡完整 student；不支持 `--offload_mode streaming`
+  - 数据走 EdgeRazor 风格 lazy 加载，tokenization 在 `__getitem__` 中按需完成
 - 新版 cat checkpoint 加载器只接受 packed 格式：
   - 旧版 `version=4` cat checkpoint 不再直接加载
   - 需要先执行 `python tools/convert_cat_checkpoint_to_bitpack.py ...`

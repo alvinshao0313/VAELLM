@@ -9,6 +9,7 @@ from transformers import HfArgumentParser
 
 from e2e_common.data import MCQA_DATASET_MIX_ALIASES, VAELLM_EDGERAZOR_SFT_ALIASES, normalize_dataset_mix_spec
 from e2e_common.e2e_args import parse_decoder_layers, parse_target_modules
+from train_utils.lora_training import parse_distill_hidden_alignment_layer_weighting
 from train_utils.model_checkpoint_io import resolve_checkpoint_dir
 from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_like, _parse_lora_loss_type
 
@@ -18,8 +19,8 @@ _SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "ra
 _MCQA_LOSS_TYPES = {"choice_kd", "choice_kd_ce"}
 _VALID_FINETUNE_MODES = {"decoder", "compressed_lora", "both"}
 _VALID_VAE_TRAIN_MODES = {"decoder", "compressed_lora", "both"}
+_VALID_PARALLEL_MODES = {"layer_mp", "dp"}
 _VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
-_VALID_HIDDEN_LAYER_WEIGHTING = {"uniform", "linear_depth"}
 _DISALLOWED_DENSE_LORA_FLAGS = {
     "--lora_variant",
     "--lora_rank",
@@ -57,6 +58,7 @@ class VAEDecoderE2EArguments:
     finetune_mode: str = "decoder"
     decode_device: str = "auto"
     decode_group_size: int = 8
+    parallel_mode: str = "layer_mp"
     layer_device_map: str = "auto"
     parallel_stage_decode: bool = True
     vae_decoder_checkpoint: bool = True
@@ -75,17 +77,15 @@ class VAEDecoderE2EArguments:
     eval_lm_limit: Optional[int] = None
     eval_device: str = "cuda"
     eval_prewarm_group_size: int = 8
+    eval_before_save: bool = False
     skip_ppl_eval: bool = False
     ppl_seqlen: int = 2048
     ppl_limit: int = -1
     dataset_mix: Optional[str] = None
     dataset_task: str = "lm"
     train_file: Optional[str] = None
-    eval_file: Optional[str] = None
     text_field: str = "text"
-    dataset_num_proc: int = 1
     max_train_samples: Optional[int] = None
-    max_eval_samples: Optional[int] = None
     save_tokenizer: bool = True
     decoder_layer_ids: Optional[List[int]] = field(default=None, init=False)
     target_module_names: Optional[List[str]] = field(default=None, init=False)
@@ -126,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--finetune_mode", type=str, default="decoder")
     parser.add_argument("--decode_device", type=str, default="auto")
     parser.add_argument("--decode_group_size", type=int, default=8)
+    parser.add_argument("--parallel_mode", type=str, default="layer_mp")
     parser.add_argument("--layer_device_map", type=str, default="auto")
     parser.add_argument(
         "--parallel_stage_decode",
@@ -172,17 +173,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_lm_limit", "--lm_limit", dest="eval_lm_limit", type=int, default=None)
     parser.add_argument("--eval_device", type=str, default="cuda")
     parser.add_argument("--eval_prewarm_group_size", type=int, default=8)
+    parser.add_argument(
+        "--eval_before_save",
+        type=lambda v: _parse_bool_like(v, arg_name="--eval_before_save"),
+        default=False,
+    )
     parser.add_argument("--skip_ppl_eval", type=lambda v: _parse_bool_like(v, arg_name="--skip_ppl_eval"), default=False)
     parser.add_argument("--ppl_seqlen", type=int, default=2048)
     parser.add_argument("--ppl_limit", type=int, default=-1)
     parser.add_argument("--dataset_mix", type=str, default=None)
     parser.add_argument("--dataset_task", type=str, default="lm")
     parser.add_argument("--train_file", type=str, default=None)
-    parser.add_argument("--eval_file", type=str, default=None)
     parser.add_argument("--text_field", type=str, default="text")
-    parser.add_argument("--dataset_num_proc", type=int, default=1)
     parser.add_argument("--max_train_samples", type=int, default=None)
-    parser.add_argument("--max_eval_samples", type=int, default=None)
     parser.add_argument("--save_tokenizer", type=lambda v: _parse_bool_like(v, arg_name="--save_tokenizer"), default=True)
     return parser
 
@@ -195,7 +198,7 @@ def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: VAEDecoderE2
             sources, weights, spec = normalize_dataset_mix_spec(dataset_mix_raw)
         except ValueError as exc:
             parser.error(str(exc))
-        conflicts = ["--train_file", "--eval_file", "--text_field", "--max_train_samples", "--max_eval_samples"]
+        conflicts = ["--train_file", "--text_field", "--max_train_samples"]
         used_conflicts = [flag for flag in conflicts if flag in explicit_cli_flags]
         if used_conflicts:
             parser.error("--dataset_mix cannot be combined with: " + ",".join(used_conflicts))
@@ -211,11 +214,6 @@ def _validate_dataset_inputs(parser: argparse.ArgumentParser, args: VAEDecoderE2
     if not os.path.exists(train_file):
         parser.error(f"--train_file does not exist: {train_file}")
     args.train_file = train_file
-    if args.eval_file:
-        eval_file = os.path.abspath(str(args.eval_file))
-        if not os.path.exists(eval_file):
-            parser.error(f"--eval_file does not exist: {eval_file}")
-        args.eval_file = eval_file
 
 
 def validate_args(
@@ -271,10 +269,17 @@ def validate_args(
         parser.error("--hidden_loss_weight must be >= 0.")
     if int(args.eakld_confidence_k) < 2:
         parser.error("--eakld_confidence_k must be >= 2.")
-    hidden_layer_weighting = str(args.hidden_layer_weighting or "").strip().lower()
-    if hidden_layer_weighting not in _VALID_HIDDEN_LAYER_WEIGHTING:
-        parser.error("--hidden_layer_weighting must be one of: uniform | linear_depth.")
-    args.hidden_layer_weighting = hidden_layer_weighting
+    try:
+        args.hidden_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
+            str(args.hidden_layer_weighting or "uniform")
+        )
+    except ValueError as exc:
+        parser.error(
+            str(exc).replace(
+                "--distill_hidden_alignment_layer_weighting",
+                "--hidden_layer_weighting",
+            )
+        )
     finetune_mode = str(args.finetune_mode or "").strip().lower()
     if finetune_mode not in _VALID_FINETUNE_MODES:
         parser.error("--finetune_mode must be one of: decoder | compressed_lora | both.")
@@ -312,17 +317,24 @@ def validate_args(
         parser.error("--eval_device cannot be empty.")
     if int(args.eval_prewarm_group_size) < 1:
         parser.error("--eval_prewarm_group_size must be >= 1.")
-    if int(args.dataset_num_proc) < 1:
-        parser.error("--dataset_num_proc is deprecated and must be >= 1 when provided.")
     if args.max_train_samples is not None and int(args.max_train_samples) < 1:
         parser.error("--max_train_samples must be >= 1 when provided.")
-    if args.max_eval_samples is not None and int(args.max_eval_samples) < 1:
-        parser.error("--max_eval_samples must be >= 1 when provided.")
     offload_mode = str(args.offload_mode or "").strip().lower()
     if offload_mode not in {"none", "saved_tensors", "streaming"}:
         parser.error("--offload_mode must be one of: none | saved_tensors | streaming.")
     args.offload_mode = offload_mode
+    parallel_mode = str(args.parallel_mode or "").strip().lower()
+    if parallel_mode not in _VALID_PARALLEL_MODES:
+        parser.error("--parallel_mode must be one of: layer_mp | dp.")
+    args.parallel_mode = parallel_mode
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if parallel_mode == "layer_mp" and world_size != 1:
+        parser.error(
+            "--parallel_mode layer_mp requires single-process launch (WORLD_SIZE=1). "
+            "Use python instead of torchrun, or set --parallel_mode dp."
+        )
+    if parallel_mode == "dp" and offload_mode == "streaming":
+        parser.error("--parallel_mode dp does not support --offload_mode streaming.")
     if offload_mode == "streaming" and world_size != 1:
         parser.error("offload_mode=streaming only supports single-process multi-GPU. Do not launch it with torchrun/DDP.")
     if int(args.offload_prefetch_distance) < 0:
@@ -342,10 +354,22 @@ def validate_args(
     else:
         args.resume_from_checkpoint = None
 
+    if bool(args.eval_before_save):
+        if not args.eval_tasks:
+            parser.error("--eval_before_save=true requires non-empty --eval_tasks.")
+        if training_args is None:
+            parser.error("--eval_before_save=true requires TrainingArguments (save_strategy/save_steps).")
+        save_strategy = getattr(training_args, "save_strategy", None)
+        save_strategy_value = getattr(save_strategy, "value", save_strategy)
+        if str(save_strategy_value).strip().lower() != "steps":
+            parser.error("--eval_before_save=true requires --save_strategy steps.")
+        if int(getattr(training_args, "save_steps", 0) or 0) < 1:
+            parser.error("--eval_before_save=true requires --save_steps > 0.")
+
     if training_args is not None:
         fsdp = getattr(training_args, "fsdp", "")
         if not (fsdp is None or fsdp == "" or fsdp == []):
-            parser.error("compressed_e2e_fintuning uses manual layer model parallelism and does not support FSDP.")
+            parser.error("compressed_e2e_fintuning does not support FSDP.")
 
     args.decoder_layer_ids = parse_decoder_layers(args.decoder_layers)
     args.target_module_names = parse_target_modules(args.target_modules)
@@ -376,6 +400,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[VAEDecoderE2EArgum
     raw_ns, remaining = parser.parse_known_args(raw_argv)
     vae_e2e_args = VAEDecoderE2EArguments(**vars(raw_ns))
     vae_e2e_args.explicit_cli_flags = _collect_explicit_cli_flags(raw_argv)
+    # Validate parallel_mode before HF TrainingArguments device setup, which may
+    # initialize Accelerate when WORLD_SIZE>1.
+    parallel_mode = str(vae_e2e_args.parallel_mode or "").strip().lower()
+    if parallel_mode not in _VALID_PARALLEL_MODES:
+        parser.error("--parallel_mode must be one of: layer_mp | dp.")
+    vae_e2e_args.parallel_mode = parallel_mode
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if parallel_mode == "layer_mp" and world_size != 1:
+        parser.error(
+            "--parallel_mode layer_mp requires single-process launch (WORLD_SIZE=1). "
+            "Use python instead of torchrun, or set --parallel_mode dp."
+        )
+    offload_mode = str(vae_e2e_args.offload_mode or "").strip().lower()
+    if parallel_mode == "dp" and offload_mode == "streaming":
+        parser.error("--parallel_mode dp does not support --offload_mode streaming.")
     hf_parser = HfArgumentParser((HFArguments, TrainingArguments))
     hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=list(remaining))
     validate_args(parser, vae_e2e_args, training_args)

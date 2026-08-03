@@ -212,3 +212,4 @@ checkpoint distill **不支持** `remaining_lora` / `none`。
 - 优化清单：`docs/cat_distill_optimization.md`
 - 参数说明：`docs/cat_train_args.md`
 - 蒸馏数据：`docs/edgerazor_dataset.md`
+- 前缀累加 vs 独立类别实验记录：`docs/cat_distill_prefix_vs_independent.md`

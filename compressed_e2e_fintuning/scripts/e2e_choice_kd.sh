@@ -29,7 +29,7 @@ python -m compressed_e2e_fintuning.main \
   --finetune_mode decoder \
   --dataset_task mcqa \
   --dataset_mix "mmlu=0.5,race=0.2,sciq=0.15,arc=0.1,openbookqa=0.05" \
-  --dataset_num_proc 64 \
+  --parallel_mode layer_mp \
   --loss_type choice_kd_ce \
   --distill_temperature 1.0 \
   --distill_alpha 0.8 \
@@ -46,10 +46,6 @@ python -m compressed_e2e_fintuning.main \
   --use_post_norm_head_linear true \
   --vae_tune_bias false \
   --offload_mode none \
-  --offload_checkpoint true \
-  --offload_prefetch_distance 18 \
-  --offload_min_tensor_bytes 16777216 \
-  --offload_pin_memory true \
   --eval_hif4_act false \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --eval_num_fewshot 0 \

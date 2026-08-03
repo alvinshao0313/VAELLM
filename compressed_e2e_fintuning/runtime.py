@@ -35,12 +35,14 @@ from train_utils.model_checkpoint_io import (
 )
 from train_utils.utils import get_logger
 from compressed_e2e_fintuning.device_map import apply_boundary_device_map, apply_layer_device_map, resolve_layer_device_map
+from compressed_e2e_fintuning.mid_eval import EvalBeforeSaveCallback, run_e2e_lm_eval
 from compressed_e2e_fintuning.offload import (
     SavedTensorOffloadContext,
     unwrap_streaming_offload_layers,
     validate_streaming_layer_devices,
     wrap_model_layers_for_streaming_offload,
 )
+from train_utils.lora_utils import ensure_distill_process_group_initialized, is_distill_distributed
 from compressed_e2e_fintuning.trainables import (
     VAEDecoderTrainableSelection,
     collect_selected_vae_linears,
@@ -270,7 +272,32 @@ def _peft_base_model(model: nn.Module) -> nn.Module:
     return model
 
 
-def _load_teacher(*, args, hf_args, base_model_path: str, log):
+def _resolve_dp_local_device() -> torch.device:
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{local_rank}")
+    return torch.device("cpu")
+
+
+def _ensure_torch_distributed_initialized(log) -> None:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return
+    already = torch.distributed.is_available() and torch.distributed.is_initialized()
+    ensure_distill_process_group_initialized()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    if not already:
+        log.info(
+            "Initialized torch.distributed for DP: world_size=%d rank=%s local_rank=%d",
+            world_size,
+            str(os.environ.get("RANK", "0")),
+            local_rank,
+        )
+
+
+def _load_teacher(*, args, hf_args, base_model_path: str, log, device: Optional[torch.device] = None):
     if not needs_teacher(args.loss_type) and float(getattr(args, "hidden_loss_weight", 0.0)) <= 0.0:
         return None, "disabled"
     teacher_path = str(args.teacher_model_path or base_model_path)
@@ -281,6 +308,9 @@ def _load_teacher(*, args, hf_args, base_model_path: str, log):
         teacher_model.config.use_cache = False
     for param in teacher_model.parameters():
         param.requires_grad = False
+    if device is not None:
+        teacher_model.to(device)
+        log.info("Moved teacher model to %s", device)
     return teacher_model, "external_teacher"
 
 
@@ -365,6 +395,45 @@ def _clear_vae_linear_cache(model: torch.nn.Module, log, *, reason: str) -> int:
     return int(cleared)
 
 
+def _release_trainer_cuda_state(trainer, log) -> None:
+    """Drop optimizer/scheduler CUDA tensors before final eval/prewarm."""
+    import gc
+
+    released = []
+    for attr_name in ("optimizer", "lr_scheduler", "scaler"):
+        if getattr(trainer, attr_name, None) is not None:
+            setattr(trainer, attr_name, None)
+            released.append(attr_name)
+    accelerator = getattr(trainer, "accelerator", None)
+    if accelerator is not None:
+        for attr_name in ("optimizer", "lr_scheduler", "scaler"):
+            if getattr(accelerator, attr_name, None) is not None:
+                setattr(accelerator, attr_name, None)
+                released.append(f"accelerator.{attr_name}")
+        free_memory = getattr(accelerator, "free_memory", None)
+        if callable(free_memory):
+            try:
+                free_memory()
+            except TypeError:
+                # Some accelerate versions require explicit args; best-effort only.
+                pass
+    if released:
+        log.info("Released trainer CUDA training state: %s", ", ".join(released))
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _park_model_on_cpu(model: torch.nn.Module, log, *, reason: str) -> None:
+    import gc
+
+    model.to("cpu")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log.info("%s: parked model on CPU and cleared CUDA cache.", reason)
+
+
 def _prewarm_final_eval_model(*, model: torch.nn.Module, args, log) -> Dict[str, int]:
     device = _resolve_eval_device(str(args.eval_device))
     group_size = int(getattr(args, "eval_prewarm_group_size", 8))
@@ -399,52 +468,28 @@ def _prewarm_final_eval_model(*, model: torch.nn.Module, args, log) -> Dict[str,
     return stats
 
 
-def _run_final_lm_eval(*, model, tokenizer, args, base_model_path: str, output_dir: str, log):
-    tasks = None if args.eval_tasks is None else str(args.eval_tasks).strip()
-    if not tasks:
-        return None
-
-    device = _resolve_eval_device(str(args.eval_device))
-    eval_log_dir = os.path.join(output_dir, "lm_eval")
-    os.makedirs(eval_log_dir, exist_ok=True)
-    log.info("[lm_eval] Moving final saved model to %s ...", device)
-    model.to(device)
-
-    from train_utils.eval_utils import run_lm_eval
-    from train_utils.hif4_act import applied_hif4_act
-
-    lm_args = argparse.Namespace(
-        tasks=tasks,
-        num_fewshot=int(args.eval_num_fewshot),
-        batch_size=str(args.eval_lm_batch_size),
-        lm_limit=args.eval_lm_limit,
-        model_path=str(base_model_path),
-        eval_log_dir=eval_log_dir,
-        eval_run_ts="final",
+def _run_final_lm_eval(
+    *,
+    model,
+    tokenizer,
+    args,
+    base_model_path: str,
+    output_dir: str,
+    log,
+    parallel_mode: str,
+):
+    return run_e2e_lm_eval(
+        model=model,
+        tokenizer=tokenizer,
+        args=args,
+        base_model_path=str(base_model_path),
+        output_dir=str(output_dir),
+        log=log,
+        eval_tag="final",
+        # layer_mp keeps the existing device map; dp / multi-process moves to local rank device.
+        move_to_device=str(parallel_mode).strip().lower() == "dp" or is_distill_distributed(),
+        parallel_stage_decode=bool(args.parallel_stage_decode),
     )
-    log.info(
-        "[lm_eval] tasks=%s fewshot=%d batch_size=%s limit=%s",
-        tasks,
-        int(args.eval_num_fewshot),
-        str(args.eval_lm_batch_size),
-        str(args.eval_lm_limit),
-    )
-    with applied_hif4_act(
-        model,
-        enabled=bool(args.eval_hif4_act),
-        logger=log,
-        log_prefix="[lm_eval] ",
-    ):
-        result = run_lm_eval(model, tokenizer, lm_args)
-
-    table = str(result.get("summary_table", "")).strip()
-    if table:
-        log.info("[lm_eval] Summary table:\n%s", table)
-    return {
-        "result": result,
-        "json_path": os.path.join(eval_log_dir, "lm_eval_results_final.json"),
-        "summary_path": os.path.join(eval_log_dir, "lm_eval_summary_final.md"),
-    }
 
 
 def _build_run_meta(
@@ -472,6 +517,7 @@ def _build_run_meta(
         "student_checkpoint_dir": str(resolved_student_checkpoint_dir),
         "base_model_path": str(base_model_path),
         "source_checkpoint_state_dict_file": STATE_DICT_FILENAME,
+        "parallel_mode": str(getattr(args, "parallel_mode", "layer_mp")),
         "layer_device_map": dict(layer_device_map),
         "offload_mode": str(offload_mode),
         "global_step": int(global_step),
@@ -489,6 +535,11 @@ def _build_run_meta(
 
 def run(args, hf_args, training_args):
     stage = str(getattr(args, "e2e_stage", "compressed_e2e_fintuning"))
+    parallel_mode = str(getattr(args, "parallel_mode", "layer_mp")).strip().lower()
+    # Temporary logger before run dir exists; replaced after output dir is ready.
+    log = get_logger(stage)
+    if parallel_mode == "dp":
+        _ensure_torch_distributed_initialized(log)
     run_output_dir = _build_distributed_run_output_dir(
         args.run_root_dir,
         os.path.basename(args.student_checkpoint_dir),
@@ -498,6 +549,7 @@ def run(args, hf_args, training_args):
     resume_from_checkpoint = None if args.resume_from_checkpoint is None else str(args.resume_from_checkpoint).strip()
 
     log.info("Run output directory: %s", run_output_dir)
+    log.info("Parallel mode: %s", parallel_mode)
     log.info("Resolved student checkpoint directory: %s", args.student_checkpoint_dir)
     log.info("Input VAE decoder e2e args:\n%s", json.dumps(vars(args), ensure_ascii=False, indent=2))
 
@@ -599,48 +651,78 @@ def run(args, hf_args, training_args):
         str(selection.parallel_stage_decode).lower(),
     )
 
-    resolved_layer_device_map = resolve_layer_device_map(args.layer_device_map, len(layers))
-    device_map_model = _peft_base_model(model) if train_mode == "compressed_lora" else model
     offload_mode = str(args.offload_mode).strip().lower()
     streaming_manager = None
     saved_tensor_offload = None
-    if offload_mode == "streaming":
-        validate_streaming_layer_devices(resolved_layer_device_map)
-        if bool(getattr(training_args, "gradient_checkpointing", False)):
+    hook_handles = []
+    dp_local_device: Optional[torch.device] = None
+    if parallel_mode == "dp":
+        if str(args.layer_device_map).strip().lower() not in {"", "auto"}:
             log.info(
-                "offload_mode=streaming manages layer checkpointing itself; overriding HF gradient_checkpointing=false."
+                "Ignoring --layer_device_map=%s under --parallel_mode dp; placing full model on local rank device.",
+                args.layer_device_map,
             )
-            training_args.gradient_checkpointing = False
-        hook_handles, boundary_map = apply_boundary_device_map(device_map_model, layer_device_map=resolved_layer_device_map)
-        streaming_manager, streaming_map = wrap_model_layers_for_streaming_offload(
-            device_map_model,
-            layer_devices=resolved_layer_device_map,
-            prefetch_distance=int(args.offload_prefetch_distance),
-            checkpoint_layers=bool(args.offload_checkpoint),
+        dp_local_device = _resolve_dp_local_device()
+        if dp_local_device.type == "cuda":
+            torch.cuda.set_device(dp_local_device)
+        model.to(dp_local_device)
+        # Do not set model_parallel / is_parallelizable / hf_device_map so HF Trainer can wrap DDP.
+        hf_device_map = {"all": str(dp_local_device)}
+        log.info(
+            "Applied DP device placement: device=%s offload_mode=%s",
+            dp_local_device,
+            offload_mode,
         )
-        hf_device_map = {**boundary_map, **streaming_map}
+        if offload_mode == "saved_tensors":
+            saved_tensor_offload = SavedTensorOffloadContext(
+                enabled=True,
+                min_tensor_bytes=int(args.offload_min_tensor_bytes),
+                pin_memory=bool(args.offload_pin_memory),
+            )
     else:
-        hook_handles, hf_device_map = apply_layer_device_map(device_map_model, layer_device_map=resolved_layer_device_map)
-    if train_mode == "compressed_lora":
-        setattr(model, "hf_device_map", hf_device_map)
-        setattr(model, "is_parallelizable", True)
-        setattr(model, "model_parallel", True)
+        resolved_layer_device_map = resolve_layer_device_map(args.layer_device_map, len(layers))
+        device_map_model = _peft_base_model(model) if train_mode == "compressed_lora" else model
+        if offload_mode == "streaming":
+            validate_streaming_layer_devices(resolved_layer_device_map)
+            if bool(getattr(training_args, "gradient_checkpointing", False)):
+                log.info(
+                    "offload_mode=streaming manages layer checkpointing itself; overriding HF gradient_checkpointing=false."
+                )
+                training_args.gradient_checkpointing = False
+            hook_handles, boundary_map = apply_boundary_device_map(
+                device_map_model, layer_device_map=resolved_layer_device_map
+            )
+            streaming_manager, streaming_map = wrap_model_layers_for_streaming_offload(
+                device_map_model,
+                layer_devices=resolved_layer_device_map,
+                prefetch_distance=int(args.offload_prefetch_distance),
+                checkpoint_layers=bool(args.offload_checkpoint),
+            )
+            hf_device_map = {**boundary_map, **streaming_map}
+        else:
+            hook_handles, hf_device_map = apply_layer_device_map(
+                device_map_model, layer_device_map=resolved_layer_device_map
+            )
+        if train_mode == "compressed_lora":
+            setattr(model, "hf_device_map", hf_device_map)
+            setattr(model, "is_parallelizable", True)
+            setattr(model, "model_parallel", True)
 
-    if offload_mode in {"saved_tensors", "streaming"}:
-        saved_tensor_offload = SavedTensorOffloadContext(
-            enabled=True,
-            min_tensor_bytes=int(args.offload_min_tensor_bytes),
-            pin_memory=bool(args.offload_pin_memory),
+        if offload_mode in {"saved_tensors", "streaming"}:
+            saved_tensor_offload = SavedTensorOffloadContext(
+                enabled=True,
+                min_tensor_bytes=int(args.offload_min_tensor_bytes),
+                pin_memory=bool(args.offload_pin_memory),
+            )
+
+        log.info(
+            "Applied layer device/offload config: offload_mode=%s offload_checkpoint=%s map=%s saved_tensor_min_bytes=%d pin_memory=%s",
+            offload_mode,
+            str(bool(args.offload_checkpoint)).lower(),
+            json.dumps(hf_device_map, ensure_ascii=False, sort_keys=True),
+            int(args.offload_min_tensor_bytes),
+            str(bool(args.offload_pin_memory)).lower(),
         )
-
-    log.info(
-        "Applied layer device/offload config: offload_mode=%s offload_checkpoint=%s map=%s saved_tensor_min_bytes=%d pin_memory=%s",
-        offload_mode,
-        str(bool(args.offload_checkpoint)).lower(),
-        json.dumps(hf_device_map, ensure_ascii=False, sort_keys=True),
-        int(args.offload_min_tensor_bytes),
-        str(bool(args.offload_pin_memory)).lower(),
-    )
     sparse_residual_prewarm = _prewarm_sparse_residual_cache(
         model,
         dtype=_resolve_train_sparse_residual_dtype(training_args),
@@ -691,6 +773,7 @@ def run(args, hf_args, training_args):
         hf_args=hf_args,
         base_model_path=str(base_model_path),
         log=log,
+        device=dp_local_device if parallel_mode == "dp" else None,
     )
     log.info("Teacher source: %s", teacher_source)
     log.info(
@@ -705,6 +788,25 @@ def run(args, hf_args, training_args):
     if bool(getattr(training_args, "save_safetensors", False)):
         log.info("Disabling safetensors for Trainer checkpoints; VAE state_dict may contain shared storage.")
         training_args.save_safetensors = False
+
+    eval_before_save_callback = None
+    trainer_callbacks = None
+    if bool(getattr(args, "eval_before_save", False)):
+        eval_before_save_callback = EvalBeforeSaveCallback(
+            e2e_args=args,
+            tokenizer=tokenizer,
+            base_model_path=str(base_model_path),
+            run_output_dir=str(run_output_dir),
+            log=log,
+            parallel_stage_decode=bool(args.parallel_stage_decode),
+            parallel_mode=str(parallel_mode),
+        )
+        trainer_callbacks = [eval_before_save_callback]
+        log.info(
+            "Enabled eval-before-save: save_steps=%s eval_tasks=%s",
+            str(getattr(training_args, "save_steps", None)),
+            str(args.eval_tasks),
+        )
 
     trainer = VAEDecoderE2ETrainer(
         model=model,
@@ -723,7 +825,10 @@ def run(args, hf_args, training_args):
         eakld_confidence_k=int(args.eakld_confidence_k),
         saved_tensor_offload=saved_tensor_offload,
         streaming_offload_manager=streaming_manager,
+        callbacks=trainer_callbacks,
     )
+    if eval_before_save_callback is not None:
+        eval_before_save_callback.bind_trainer(trainer)
     try:
         trainer.train(resume_from_checkpoint=resume_from_checkpoint or None)
     except Exception:
@@ -735,8 +840,13 @@ def run(args, hf_args, training_args):
 
     final_model = trainer.accelerator.unwrap_model(trainer.model) if getattr(trainer, "accelerator", None) else trainer.model
     final_model.eval()
-    if teacher_model is not None:
+    if hasattr(trainer, "offload_teacher_to_cpu"):
+        previous_teacher_device = trainer.offload_teacher_to_cpu()
+        if previous_teacher_device is not None and previous_teacher_device.type != "cpu":
+            log.info("Offloaded teacher to CPU after training (was %s).", previous_teacher_device)
+    elif teacher_model is not None:
         teacher_model.to("cpu")
+    _release_trainer_cuda_state(trainer, log)
 
     for handle in hook_handles:
         handle.remove()
@@ -768,12 +878,31 @@ def run(args, hf_args, training_args):
         disabled_decode = _disable_trainable_decode_for_eval(final_model)
         log.info("Disabled trainable decode mode on %d VAELinear modules before final save/eval.", disabled_decode)
     _clear_vae_linear_cache(final_model, log, reason="Final save/eval prep")
-    final_model.to("cpu")
+
+    lm_eval = None
+    has_eval_tasks = bool(str(getattr(args, "eval_tasks", None) or "").strip())
+    need_ppl_eval = not bool(getattr(args, "skip_ppl_eval", False))
+    # DP（含 NPROC=1）：在模型落到 CPU 前先做 lm-eval，避免后续 prewarm 与残留训练状态抢显存。
+    # WORLD_SIZE>1 时各 rank 仍走 mid_eval 内的分卡聚合路径。
+    if has_eval_tasks and (parallel_mode == "dp" or is_distill_distributed()):
+        local_device = dp_local_device if dp_local_device is not None else _resolve_dp_local_device()
+        final_model.to(local_device)
+        lm_eval = _run_final_lm_eval(
+            model=final_model,
+            tokenizer=tokenizer,
+            args=args,
+            base_model_path=str(base_model_path),
+            output_dir=run_output_dir,
+            log=log,
+            parallel_mode=parallel_mode,
+        )
+    _park_model_on_cpu(final_model, log, reason="Before final save")
+    if getattr(trainer, "model", None) is not None and trainer.model is not final_model:
+        trainer.model.to("cpu")
 
     model_out = None
     run_meta_path = None
     ppl_eval = None
-    lm_eval = None
     eval_prewarm = None
     if bool(getattr(training_args, "should_save", True)):
         model_out = os.path.join(run_output_dir, "final_model")
@@ -814,26 +943,32 @@ def run(args, hf_args, training_args):
         with open(run_meta_path, "w", encoding="utf-8") as handle:
             json.dump(run_meta, handle, ensure_ascii=False, indent=2)
         log.info("Saved final compressed model to %s", save_paths["output_dir"])
-        eval_prewarm = _prewarm_final_eval_model(
-            model=final_model,
-            args=args,
-            log=log,
-        )
-        ppl_eval = eval_final_ppl(
-            model=final_model,
-            args=args,
-            model_path=str(base_model_path),
-            output_dir=run_output_dir,
-            log=log,
-        )
-        lm_eval = _run_final_lm_eval(
-            model=final_model,
-            tokenizer=tokenizer,
-            args=args,
-            base_model_path=str(base_model_path),
-            output_dir=run_output_dir,
-            log=log,
-        )
+        need_post_save_lm_eval = lm_eval is None and has_eval_tasks
+        if need_ppl_eval or need_post_save_lm_eval:
+            eval_prewarm = _prewarm_final_eval_model(
+                model=final_model,
+                args=args,
+                log=log,
+            )
+            ppl_eval = eval_final_ppl(
+                model=final_model,
+                args=args,
+                model_path=str(base_model_path),
+                output_dir=run_output_dir,
+                log=log,
+            )
+            if need_post_save_lm_eval:
+                lm_eval = _run_final_lm_eval(
+                    model=final_model,
+                    tokenizer=tokenizer,
+                    args=args,
+                    base_model_path=str(base_model_path),
+                    output_dir=run_output_dir,
+                    log=log,
+                    parallel_mode=parallel_mode,
+                )
+        else:
+            log.info("Skipping final eval prewarm because PPL and post-save lm-eval are both disabled.")
     else:
         log.info("Skipping final model save on this rank because should_save=false.")
 

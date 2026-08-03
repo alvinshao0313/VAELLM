@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 SEED="${SEED:-0}"
 export PYTHONHASHSEED="${SEED}"
@@ -13,10 +13,17 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
 MAX_STEPS="${MAX_STEPS:-5000}"
-STUDENT_CKPT="${STUDENT_CKPT:-.result/cat_train_final_model}"
-EVAL_TASKS="${EVAL_TASKS:-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
+STUDENT_CKPT="${STUDENT_CKPT:-.result/catlora_distill/res0-bf16-protect-channel-vae/Qwen_Qwen3-8B_20260730_071653/final_model}"
+# 用 ${VAR-default}：仅在未设置时填默认；允许 EVAL_TASKS="" 关闭最终 lm-eval。
+EVAL_TASKS="${EVAL_TASKS-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
+PARALLEL_MODE="${PARALLEL_MODE:-layer_mp}"   # layer_mp | dp
+NPROC="${NPROC:-4}"
+EVAL_BEFORE_SAVE="${EVAL_BEFORE_SAVE:-false}"
+# 分卡 lm-eval（尤其 mmlu）gather 等待；对齐 catlora_distill_4gpu_res0.sh
+export DISTILL_NCCL_TIMEOUT_SEC="${DISTILL_NCCL_TIMEOUT_SEC:-10800}"
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-10800}"
 
 if [[ "${FULL_DETERMINISM}" == "true" ]]; then
   export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
@@ -30,72 +37,132 @@ fi
 
 # 说明：
 # - packed 压缩 checkpoint -> 直接端到端微调 VAELinear 多阶 decoder -> 保存新的 packed final_model。
-# - 训练 VAELinear decoder，并默认额外训练 final norm / post-norm head linear。
-# - vq_weight 和原模型其它参数保持冻结；VAELinear bias 默认不训练。
-# - 这里是单进程多卡模型并行，不使用 torchrun。多卡切分由 --layer_device_map 控制。
-# - 默认开启 streaming offload：Transformer layers 常驻 CPU，按需预取到 GPU，并卸载大 saved tensors。
-# - auto 会按当前 CUDA_VISIBLE_DEVICES 内可见 GPU 均分 Transformer layers。
+# - 训练超参以 DP 分支为准；layer_mp 与 DP 同步（仅启动方式 / parallel_mode / layer_device_map 不同）。
+# - 默认 --finetune_mode both；不训练 final norm / post-norm head linear；VAELinear bias 不训练。
+# - PARALLEL_MODE=layer_mp：单进程层级模型并行，不用 torchrun；多卡切分由 --layer_device_map 控制。
+# - PARALLEL_MODE=dp：torchrun 数据并行；每卡一份完整 student + teacher，忽略 --layer_device_map。
+# - 当前默认 --offload_mode none（层常驻 GPU）。若改 streaming，只能配合 layer_mp。
+# - auto（layer_mp）会按当前 CUDA_VISIBLE_DEVICES 内可见 GPU 均分 Transformer layers。
 # - 训练保存 final_model 后会跑 lm-eval：${EVAL_TASKS}
 # - 冒烟建议：
 #   MAX_STEPS=30 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --skip_ppl_eval true --eval_tasks ""
-# - 用显存换速度：
-#   VAE_DECODER_CHECKPOINT=false bash compressed_e2e_fintuning/scripts/e2e_decoder.sh
+# - 关闭 VAE decoder activation checkpoint（用显存换速度）：
+#   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --vae_decoder_checkpoint false
+# - DP 示例：
+#   PARALLEL_MODE=dp NPROC=4 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh
+# - 保存中间 ckpt 前先分卡 lm-eval：
+#   EVAL_BEFORE_SAVE=true PARALLEL_MODE=dp NPROC=4 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --save_steps 1000
 
-python -m compressed_e2e_fintuning.main \
-  --seed "${SEED}" \
-  --data_seed "${SEED}" \
-  --full_determinism "${FULL_DETERMINISM}" \
-  --gradient_checkpointing false \
-  --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
-  --student_checkpoint_dir "${STUDENT_CKPT}" \
-  --run_root_dir .result/compressed_e2e_fintuning \
-  --finetune_mode decoder \
-  --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --dataset_task sft \
-  --dataset_num_proc 64 \
-  --loss_type eakld_kd \
-  --eakld_confidence_k 16 \
-  --distill_temperature 1.0 \
-  --distill_alpha 0.5 \
-  --post_attn false \
-  --hidden_loss_weight 0.0 \
-  --hidden_layer_weighting linear_depth \
-  --model_max_length "8192" \
-  --decoder_layers 0-35 \
-  --target_modules all \
-  --layer_device_map auto \
-  --parallel_stage_decode true \
-  --vae_decoder_checkpoint true \
-  --tune_final_norm true \
-  --use_post_norm_head_linear true \
-  --vae_tune_bias false \
-  --offload_mode none \
-  --offload_checkpoint true \
-  --offload_prefetch_distance 18 \
-  --offload_min_tensor_bytes 16777216 \
-  --offload_pin_memory true \
-  --eval_hif4_act false \
-  --eval_tasks "${EVAL_TASKS}" \
-  --eval_num_fewshot 0 \
-  --eval_lm_batch_size auto \
-  --eval_device "${EVAL_DEVICE}" \
-  --eval_prewarm_group_size "${EVAL_PREWARM_GROUP_SIZE}" \
-  --skip_ppl_eval false \
-  --ppl_seqlen 2048 \
-  --ppl_limit -1 \
-  --save_tokenizer true \
-  --bf16 true \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 1 \
-  --learning_rate 1e-5 \
-  --lr_scheduler_type linear \
-  --warmup_ratio 0.03 \
-  --weight_decay 0.0 \
-  --max_grad_norm 1.5 \
-  --logging_steps 10 \
-  --eval_strategy no \
-  --save_strategy steps \
-  --save_steps 1000 \
-  --save_total_limit 2 \
-  --max_steps "${MAX_STEPS}" \
-  "$@"
+if [[ "${PARALLEL_MODE}" == "dp" ]]; then
+  torchrun --standalone --nproc_per_node="${NPROC}" -m compressed_e2e_fintuning.main \
+    --seed "${SEED}" \
+    --data_seed "${SEED}" \
+    --full_determinism "${FULL_DETERMINISM}" \
+    --gradient_checkpointing true \
+    --student_checkpoint_dir "${STUDENT_CKPT}" \
+    --run_root_dir .result/compressed_e2e_fintuning \
+    --finetune_mode both \
+    --parallel_mode dp \
+    --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
+    --dataset_task sft \
+    --loss_type kl_top_100 \
+    --eakld_confidence_k 16 \
+    --distill_temperature 1.0 \
+    --distill_alpha 0.5 \
+    --post_attn false \
+    --hidden_loss_weight 0.01 \
+    --hidden_layer_weighting adaptive_top_3 \
+    --model_max_length "1024" \
+    --decoder_layers 0-35 \
+    --target_modules all \
+    --parallel_stage_decode true \
+    --vae_decoder_checkpoint true \
+    --tune_final_norm false \
+    --use_post_norm_head_linear false \
+    --vae_tune_bias false \
+    --offload_mode none \
+    --eval_before_save "${EVAL_BEFORE_SAVE}" \
+    --eval_hif4_act false \
+    --eval_tasks "${EVAL_TASKS}" \
+    --eval_num_fewshot 0 \
+    --eval_lm_batch_size auto \
+    --eval_device "${EVAL_DEVICE}" \
+    --eval_prewarm_group_size "${EVAL_PREWARM_GROUP_SIZE}" \
+    --skip_ppl_eval true \
+    --ppl_seqlen 2048 \
+    --ppl_limit -1 \
+    --save_tokenizer true \
+    --bf16 true \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 2 \
+    --learning_rate 1e-5 \
+    --lr_scheduler_type cosine \
+    --warmup_ratio 0.03 \
+    --weight_decay 0.0001 \
+    --max_grad_norm 1.5 \
+    --logging_steps 10 \
+    --eval_strategy no \
+    --save_strategy steps \
+    --save_steps 1000 \
+    --save_total_limit 2 \
+    --max_steps "${MAX_STEPS}" \
+    "$@"
+elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
+  python -m compressed_e2e_fintuning.main \
+    --seed "${SEED}" \
+    --data_seed "${SEED}" \
+    --full_determinism "${FULL_DETERMINISM}" \
+    --gradient_checkpointing true \
+    --student_checkpoint_dir "${STUDENT_CKPT}" \
+    --run_root_dir .result/compressed_e2e_fintuning \
+    --finetune_mode both \
+    --parallel_mode layer_mp \
+    --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
+    --dataset_task sft \
+    --loss_type kl_top_100 \
+    --eakld_confidence_k 16 \
+    --distill_temperature 1.0 \
+    --distill_alpha 0.5 \
+    --post_attn false \
+    --hidden_loss_weight 0.01 \
+    --hidden_layer_weighting adaptive_top_3 \
+    --model_max_length "1024" \
+    --decoder_layers 0-35 \
+    --target_modules all \
+    --layer_device_map auto \
+    --parallel_stage_decode true \
+    --vae_decoder_checkpoint true \
+    --tune_final_norm false \
+    --use_post_norm_head_linear false \
+    --vae_tune_bias false \
+    --offload_mode none \
+    --eval_before_save "${EVAL_BEFORE_SAVE}" \
+    --eval_hif4_act false \
+    --eval_tasks "${EVAL_TASKS}" \
+    --eval_num_fewshot 0 \
+    --eval_lm_batch_size auto \
+    --eval_device "${EVAL_DEVICE}" \
+    --eval_prewarm_group_size "${EVAL_PREWARM_GROUP_SIZE}" \
+    --skip_ppl_eval true \
+    --ppl_seqlen 2048 \
+    --ppl_limit -1 \
+    --save_tokenizer true \
+    --bf16 true \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 2 \
+    --learning_rate 1e-5 \
+    --lr_scheduler_type cosine \
+    --warmup_ratio 0.03 \
+    --weight_decay 0.0001 \
+    --max_grad_norm 1.5 \
+    --logging_steps 10 \
+    --eval_strategy no \
+    --save_strategy steps \
+    --save_steps 1000 \
+    --save_total_limit 2 \
+    --max_steps "${MAX_STEPS}" \
+    "$@"
+else
+  echo "Unsupported PARALLEL_MODE=${PARALLEL_MODE}. Expected layer_mp or dp." >&2
+  exit 1
+fi

@@ -35,7 +35,7 @@ python -m compressed_e2e_fintuning.main \
   --finetune_mode decoder \
   --dataset_task sft \
   --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --dataset_num_proc "${DATASET_NUM_PROC:-64}" \
+  --parallel_mode layer_mp \
   --loss_type eakld_kd \
   --eakld_confidence_k 16 \
   --distill_temperature 1.0 \
@@ -50,10 +50,6 @@ python -m compressed_e2e_fintuning.main \
   --use_post_norm_head_linear true \
   --vae_tune_bias false \
   --offload_mode none \
-  --offload_checkpoint true \
-  --offload_prefetch_distance 18 \
-  --offload_min_tensor_bytes 16777216 \
-  --offload_pin_memory true \
   --eval_hif4_act false \
   --eval_tasks "${EVAL_TASKS}" \
   --eval_num_fewshot 0 \

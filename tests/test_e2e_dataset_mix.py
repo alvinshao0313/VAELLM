@@ -94,25 +94,6 @@ def _dataset_signature(dataset, *, limit: int = 8):
     return [_tensorish_to_tuple(dataset[idx]["input_ids"]) for idx in range(min(len(dataset), limit))]
 
 
-def _build_datasets_with_recorded_num_proc(args, training_args, tokenizer, dataset):
-    requested_num_proc = []
-    original_map = Dataset.map
-
-    def _wrapped_map(self, *map_args, **map_kwargs):
-        requested_num_proc.append(map_kwargs.get("num_proc"))
-        call_kwargs = dict(map_kwargs)
-        if call_kwargs.get("num_proc") == 2:
-            call_kwargs["num_proc"] = None
-        return original_map(self, *map_args, **call_kwargs)
-
-    with mock.patch("e2e_common.data.load_dataset", return_value=dataset), mock.patch(
-        "datasets.arrow_dataset.Dataset.map",
-        new=_wrapped_map,
-    ):
-        built = build_datasets(args, training_args, tokenizer)
-    return built, requested_num_proc
-
-
 class DatasetMixArgsTest(unittest.TestCase):
     def _checkpoint_dir(self):
         tmp = tempfile.TemporaryDirectory()
@@ -180,6 +161,118 @@ class DatasetMixArgsTest(unittest.TestCase):
         self.assertEqual(e2e_args.dataset_mix_sources, ["longalpaca", "longalign"])
         self.assertEqual(e2e_args.dataset_mix_spec, "longalpaca=0.666666666667,longalign=0.333333333333")
 
+    def test_parse_args_accepts_parallel_mode_dp(self):
+        e2e_args, _hf_args, _training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--parallel_mode",
+                "dp",
+                "--offload_mode",
+                "none",
+                "--max_steps",
+                "10",
+            ]
+        )
+        self.assertEqual(e2e_args.parallel_mode, "dp")
+
+    def test_parse_args_rejects_layer_mp_under_torchrun(self):
+        with mock.patch.dict("os.environ", {"WORLD_SIZE": "4"}, clear=False):
+            with self.assertRaises(SystemExit):
+                parse_args(
+                    [
+                        "--student_checkpoint_dir",
+                        self._checkpoint_dir(),
+                        "--dataset_mix",
+                        "openorca=1",
+                        "--parallel_mode",
+                        "layer_mp",
+                        "--max_steps",
+                        "10",
+                    ]
+                )
+
+    def test_parse_args_rejects_dp_with_streaming_offload(self):
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--student_checkpoint_dir",
+                    self._checkpoint_dir(),
+                    "--dataset_mix",
+                    "openorca=1",
+                    "--parallel_mode",
+                    "dp",
+                    "--offload_mode",
+                    "streaming",
+                    "--max_steps",
+                    "10",
+                ]
+            )
+
+
+    def test_parse_args_eval_before_save_requires_tasks_and_save_steps(self):
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--student_checkpoint_dir",
+                    self._checkpoint_dir(),
+                    "--dataset_mix",
+                    "openorca=1",
+                    "--eval_before_save",
+                    "true",
+                    "--save_strategy",
+                    "steps",
+                    "--save_steps",
+                    "100",
+                    "--max_steps",
+                    "10",
+                ]
+            )
+        e2e_args, _hf_args, training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--eval_before_save",
+                "true",
+                "--eval_tasks",
+                "boolq,rte",
+                "--save_strategy",
+                "steps",
+                "--save_steps",
+                "100",
+                "--max_steps",
+                "10",
+            ]
+        )
+        self.assertTrue(e2e_args.eval_before_save)
+        self.assertEqual(e2e_args.eval_tasks, "boolq,rte")
+        self.assertEqual(training_args.save_steps, 100)
+
+    def test_parse_args_rejects_removed_dataset_cli_flags(self):
+        for flag, value in (
+            ("--dataset_num_proc", "2"),
+            ("--eval_file", "dummy_eval.txt"),
+            ("--max_eval_samples", "8"),
+        ):
+            with self.subTest(flag=flag):
+                with self.assertRaises((SystemExit, ValueError)):
+                    parse_args(
+                        [
+                            "--student_checkpoint_dir",
+                            self._checkpoint_dir(),
+                            "--dataset_mix",
+                            "openorca=1",
+                            flag,
+                            value,
+                            "--max_steps",
+                            "10",
+                        ]
+                    )
+
 
 class VAEE2EHiddenLossArgsTest(unittest.TestCase):
     def _parse_with_checkpoint(self, extra_args):
@@ -217,6 +310,19 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
 
         self.assertEqual(args.hidden_loss_weight, 0.003)
         self.assertEqual(args.hidden_layer_weighting, "linear_depth")
+
+    def test_hidden_loss_accepts_adaptive_top_3(self):
+        args = self._parse_with_checkpoint(
+            [
+                "--hidden_loss_weight",
+                "0.1",
+                "--hidden_layer_weighting",
+                "adaptive_top_3",
+            ]
+        )
+
+        self.assertEqual(args.hidden_loss_weight, 0.1)
+        self.assertEqual(args.hidden_layer_weighting, "adaptive_top_3")
 
     def test_hidden_loss_rejects_negative_weight(self):
         with self.assertRaises(SystemExit):
@@ -308,6 +414,28 @@ class VAEE2EHiddenLossTest(unittest.TestCase):
             dtype=torch.float32,
         )
         self.assertTrue(torch.allclose(loss, expected_weights[1] / 2.0))
+
+    def test_adaptive_top_1_selects_largest_teacher_layer_change(self):
+        # Block0 ~= embedding (high cosine), block1 jumps a lot (low cosine) -> select block1.
+        teacher = (
+            torch.ones(1, 2, 2),
+            torch.ones(1, 2, 2),
+            torch.tensor([[[0.0, 1.0], [0.0, 1.0]]]),
+        )
+        student = (
+            torch.ones(1, 2, 2),
+            torch.full((1, 2, 2), 2.0),  # block0 relative MSE = 1
+            torch.full((1, 2, 2), 3.0),  # block1 relative MSE = ((3-0)^2+(3-1)^2)/((0)^2+(1)^2) = 13
+        )
+
+        loss = compute_vae_hidden_alignment_loss(
+            teacher_hidden_states=teacher,
+            student_hidden_states=student,
+            attention_mask=None,
+            layer_weighting="adaptive_top_1",
+            loss_device=torch.device("cpu"),
+        )
+        self.assertTrue(torch.allclose(loss, torch.tensor(13.0)))
 
 
 class DatasetMixBuilderTest(unittest.TestCase):
@@ -445,7 +573,6 @@ class DatasetMixBuilderTest(unittest.TestCase):
             dataset_mix_spec="openorca=0.5,alpaca=0.5",
             dataset_mix_sources=["openorca", "alpaca"],
             dataset_mix_weights=[0.5, 0.5],
-            dataset_num_proc=1,
         )
         training_args = SimpleNamespace(
             model_max_length=4,
@@ -480,7 +607,6 @@ class DatasetMixBuilderTest(unittest.TestCase):
             dataset_mix_spec="openorca=0.5,alpaca=0.5",
             dataset_mix_sources=["openorca", "alpaca"],
             dataset_mix_weights=[0.5, 0.5],
-            dataset_num_proc=1,
         )
 
         def fake_load_dataset(*, path, name=None, **_kwargs):
@@ -514,7 +640,6 @@ class DatasetMixBuilderTest(unittest.TestCase):
             dataset_mix_spec="openorca=0.5,alpaca=0.5",
             dataset_mix_sources=["openorca", "alpaca"],
             dataset_mix_weights=[0.5, 0.5],
-            dataset_num_proc=1,
         )
 
         def fake_load_dataset(*, path, name=None, **_kwargs):
@@ -547,7 +672,6 @@ class DatasetMixBuilderTest(unittest.TestCase):
             dataset_mix_spec="openorca=0.5,alpaca=0.5",
             dataset_mix_sources=["openorca", "alpaca"],
             dataset_mix_weights=[0.5, 0.5],
-            dataset_num_proc=1,
         )
         training_args = SimpleNamespace(
             model_max_length=4,
@@ -697,11 +821,8 @@ class DatasetMixBuilderTest(unittest.TestCase):
             train_split="train",
             eval_split="validation",
             train_file="dummy.txt",
-            eval_file="dummy_eval.txt",
             text_field="text",
             max_train_samples=None,
-            max_eval_samples=None,
-            dataset_num_proc=1,
             dataset_mix_spec=None,
         )
         training_args = SimpleNamespace(
@@ -727,7 +848,6 @@ class DatasetMixBuilderTest(unittest.TestCase):
             dataset_mix_spec="openorca=0.5,alpaca=0.5",
             dataset_mix_sources=["openorca", "alpaca"],
             dataset_mix_weights=[0.5, 0.5],
-            dataset_num_proc=1,
         )
         training_args = SimpleNamespace(
             model_max_length=4,
@@ -786,118 +906,6 @@ class DatasetMixBuilderTest(unittest.TestCase):
         self.assertGreater(len(train_dataset), 0)
         self.assertIsNone(eval_dataset)
         self.assertEqual([stat["eval_packed_rows"] for stat in data_info["source_stats"]], [0, 0])
-
-    def test_build_datasets_num_proc_preserves_single_source_outputs(self):
-        args_base = {
-            "dataset_name": "dummy",
-            "dataset_config_name": None,
-            "train_split": "train",
-            "eval_split": "validation",
-            "train_file": "dummy.txt",
-            "eval_file": "dummy_eval.txt",
-            "text_field": "text",
-            "max_train_samples": None,
-            "max_eval_samples": None,
-            "dataset_mix_spec": None,
-        }
-        training_args = SimpleNamespace(
-            model_max_length=4,
-            eval_strategy=IntervalStrategy.STEPS,
-        )
-        dataset = DatasetDict(
-            {
-                "train": Dataset.from_dict(
-                    {
-                        "text": [
-                            "alpha beta gamma delta",
-                            "epsilon zeta eta theta",
-                            "iota kappa lambda mu",
-                            "nu xi omicron pi",
-                        ]
-                    }
-                ),
-                "validation": Dataset.from_dict({"text": ["rho sigma tau upsilon", "phi chi psi omega"]}),
-            }
-        )
-
-        (train_single, eval_single, _), single_requested = _build_datasets_with_recorded_num_proc(
-            SimpleNamespace(dataset_num_proc=1, **args_base),
-            training_args,
-            self.tokenizer,
-            dataset,
-        )
-        (train_multi, eval_multi, _), multi_requested = _build_datasets_with_recorded_num_proc(
-            SimpleNamespace(dataset_num_proc=2, **args_base),
-            training_args,
-            self.tokenizer,
-            dataset,
-        )
-
-        self.assertEqual(len(train_single), len(train_multi))
-        self.assertEqual(len(eval_single), len(eval_multi))
-        self.assertEqual(set(train_single.column_names), set(train_multi.column_names))
-        self.assertTrue(torch.equal(train_single[0]["input_ids"], train_multi[0]["input_ids"]))
-        self.assertTrue(torch.equal(train_single[0]["labels"], train_multi[0]["labels"]))
-        self.assertTrue(torch.equal(eval_single[0]["input_ids"], eval_multi[0]["input_ids"]))
-        self.assertNotIn(2, single_requested)
-        self.assertIn(2, multi_requested)
-
-    def test_build_datasets_num_proc_preserves_structured_outputs(self):
-        args_base = {
-            "dataset_name": "dummy",
-            "dataset_config_name": None,
-            "train_split": "train",
-            "eval_split": "validation",
-            "train_file": "dummy.txt",
-            "eval_file": "dummy_eval.txt",
-            "text_field": "text",
-            "max_train_samples": None,
-            "max_eval_samples": None,
-            "dataset_mix_spec": None,
-        }
-        training_args = SimpleNamespace(
-            model_max_length=4,
-            eval_strategy=IntervalStrategy.STEPS,
-        )
-        dataset = DatasetDict(
-            {
-                "train": Dataset.from_dict(
-                    {
-                        "question": ["q1 words words", "q2 words words"],
-                        "response": ["a1 words words", "a2 words words"],
-                        "system_prompt": ["sys words", "sys words"],
-                    }
-                ),
-                "validation": Dataset.from_dict(
-                    {
-                        "question": ["vq1 words words", "vq2 words words"],
-                        "response": ["va1 words words", "va2 words words"],
-                        "system_prompt": ["vsys words", "vsys words"],
-                    }
-                ),
-            }
-        )
-
-        (train_single, eval_single, _), single_requested = _build_datasets_with_recorded_num_proc(
-            SimpleNamespace(dataset_num_proc=1, **args_base),
-            training_args,
-            self.tokenizer,
-            dataset,
-        )
-        (train_multi, eval_multi, _), multi_requested = _build_datasets_with_recorded_num_proc(
-            SimpleNamespace(dataset_num_proc=2, **args_base),
-            training_args,
-            self.tokenizer,
-            dataset,
-        )
-
-        self.assertEqual(len(train_single), len(train_multi))
-        self.assertEqual(len(eval_single), len(eval_multi))
-        self.assertTrue(torch.equal(train_single[0]["input_ids"], train_multi[0]["input_ids"]))
-        self.assertTrue(torch.equal(train_single[0]["labels"], train_multi[0]["labels"]))
-        self.assertTrue(torch.equal(eval_single[0]["input_ids"], eval_multi[0]["input_ids"]))
-        self.assertNotIn(2, single_requested)
-        self.assertIn(2, multi_requested)
 
 
 class DistillDataTest(unittest.TestCase):

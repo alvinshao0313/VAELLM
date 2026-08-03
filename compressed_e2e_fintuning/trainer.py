@@ -8,8 +8,11 @@ from transformers import Trainer
 
 from e2e_common.dense_loss import compute_dense_loss_from_logits, get_output_logits
 from train_utils.distill_losses import build_distill_token_mask
-
-_HIDDEN_LAYER_WEIGHTING_CHOICES = ("uniform", "linear_depth")
+from train_utils.lora_training import (
+    build_distill_hidden_layer_weights,
+    compute_distill_hidden_alignment_loss,
+    parse_distill_hidden_alignment_layer_weighting,
+)
 
 
 def build_vae_hidden_layer_weights(
@@ -19,33 +22,12 @@ def build_vae_hidden_layer_weights(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    num_layers = int(num_layers)
-    if num_layers <= 0:
-        raise ValueError(f"num_layers must be > 0, got {num_layers}.")
-    mode = str(layer_weighting).strip().lower()
-    if mode == "uniform":
-        return torch.ones(num_layers, device=device, dtype=dtype)
-    if mode == "linear_depth":
-        denom = max(num_layers - 1, 1)
-        raw = 1.0 + torch.arange(num_layers, device=device, dtype=dtype) / float(denom)
-        return raw / raw.mean()
-    raise ValueError(
-        f"Unsupported hidden layer weighting: {layer_weighting}. "
-        f"Supported: {', '.join(_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
+    return build_distill_hidden_layer_weights(
+        num_layers=int(num_layers),
+        layer_weighting=str(layer_weighting),
+        device=device,
+        dtype=dtype,
     )
-
-
-def _masked_mean_square(value: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
-    value = value.float()
-    square = value.pow(2)
-    if attention_mask is None:
-        return square.mean()
-    mask = attention_mask.to(device=value.device, dtype=value.dtype)
-    while mask.ndim < value.ndim:
-        mask = mask.unsqueeze(-1)
-    mask = mask.expand_as(value)
-    count = mask.sum().clamp_min(1.0)
-    return (square * mask).sum() / count
 
 
 def compute_vae_hidden_alignment_loss(
@@ -57,40 +39,14 @@ def compute_vae_hidden_alignment_loss(
     loss_device: torch.device,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    if teacher_hidden_states is None or student_hidden_states is None:
-        raise ValueError("Hidden states are required when VAE hidden alignment loss is enabled.")
-    if len(teacher_hidden_states) != len(student_hidden_states):
-        raise ValueError(
-            "Teacher/student hidden state counts differ: "
-            f"{len(teacher_hidden_states)} vs {len(student_hidden_states)}."
-        )
-    if len(teacher_hidden_states) <= 1:
-        raise ValueError("Hidden states must include embedding output plus at least one transformer block output.")
-
-    target_device = torch.device(loss_device)
-    layer_losses = []
-    for layer_idx, (teacher_hidden, student_hidden) in enumerate(
-        zip(teacher_hidden_states[1:], student_hidden_states[1:])
-    ):
-        if tuple(teacher_hidden.shape) != tuple(student_hidden.shape):
-            raise ValueError(
-                f"Teacher/student hidden shape mismatch at block layer {layer_idx}: "
-                f"{tuple(teacher_hidden.shape)} vs {tuple(student_hidden.shape)}."
-            )
-        teacher_hidden = teacher_hidden.detach().to(device=student_hidden.device)
-        diff = student_hidden.float() - teacher_hidden.float()
-        numerator = _masked_mean_square(diff, attention_mask)
-        denominator = _masked_mean_square(teacher_hidden, attention_mask)
-        layer_losses.append((numerator / (denominator + float(eps))).to(device=target_device))
-
-    stacked = torch.stack(layer_losses)
-    weights = build_vae_hidden_layer_weights(
-        num_layers=len(layer_losses),
-        layer_weighting=layer_weighting,
-        device=stacked.device,
-        dtype=stacked.dtype,
+    loss = compute_distill_hidden_alignment_loss(
+        teacher_hidden_states=teacher_hidden_states,
+        student_hidden_states=student_hidden_states,
+        attention_mask=attention_mask,
+        layer_weighting=str(layer_weighting),
+        eps=float(eps),
     )
-    return (stacked * weights).mean()
+    return loss.to(device=torch.device(loss_device))
 
 
 def _causal_lm_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -190,12 +146,17 @@ class VAEDecoderE2ETrainer(Trainer):
         self.eakld_confidence_k = int(eakld_confidence_k)
         if self.eakld_confidence_k < 2:
             raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
-        self.hidden_layer_weighting = str(hidden_layer_weighting).strip().lower()
-        if self.hidden_layer_weighting not in _HIDDEN_LAYER_WEIGHTING_CHOICES:
-            raise ValueError(
-                f"Unsupported hidden_layer_weighting: {hidden_layer_weighting}. "
-                f"Supported: {', '.join(_HIDDEN_LAYER_WEIGHTING_CHOICES)}."
+        try:
+            self.hidden_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
+                str(hidden_layer_weighting)
             )
+        except ValueError as exc:
+            raise ValueError(
+                str(exc).replace(
+                    "--distill_hidden_alignment_layer_weighting",
+                    "hidden_layer_weighting",
+                )
+            ) from exc
         self._teacher_device = None
         self.saved_tensor_offload = saved_tensor_offload
         self.streaming_offload_manager = streaming_offload_manager
@@ -209,6 +170,23 @@ class VAEDecoderE2ETrainer(Trainer):
         self.teacher_model.to(device)
         self.teacher_model.eval()
         self._teacher_device = device
+
+    def offload_teacher_to_cpu(self) -> Optional[torch.device]:
+        """Move teacher off GPU for eval; returns previous device for restore."""
+        if self.teacher_model is None:
+            return None
+        previous = self._teacher_device
+        self.teacher_model.to("cpu")
+        self._teacher_device = torch.device("cpu")
+        return previous
+
+    def restore_teacher_device(self, device: Optional[torch.device]) -> None:
+        if device is None or self.teacher_model is None:
+            return
+        if device.type == "cpu":
+            self.offload_teacher_to_cpu()
+            return
+        self._ensure_teacher_device(device)
 
     def _compute_teacher_outputs(self, teacher_inputs: Dict[str, torch.Tensor], *, output_hidden_states: bool = False):
         if self.teacher_model is None:
