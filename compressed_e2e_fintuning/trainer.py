@@ -1,10 +1,16 @@
+import logging
 from contextlib import nullcontext
 from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
+
+try:
+    from transformers.trainer_callback import ProgressCallback
+except Exception:  # pragma: no cover
+    ProgressCallback = None
 
 from e2e_common.dense_loss import compute_dense_loss_from_logits, get_output_logits
 from train_utils.distill_losses import build_distill_token_mask
@@ -13,6 +19,72 @@ from train_utils.lora_training import (
     compute_distill_hidden_alignment_loss,
     parse_distill_hidden_alignment_layer_weighting,
 )
+
+
+class E2ETrainerLogCallback(TrainerCallback):
+    """Write Trainer metrics into the run FileHandler, matching LoRA distill logging."""
+
+    def __init__(self, *, logger: logging.Logger):
+        self.logger = logger
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not bool(getattr(state, "is_world_process_zero", True)):
+            return
+        if not logs:
+            return
+        values = dict(logs)
+        values.pop("total_flos", None)
+        ordered_keys = (
+            "loss",
+            "distill_loss",
+            "hidden_loss",
+            "train_loss",
+            "eval_loss",
+            "learning_rate",
+            "grad_norm",
+            "epoch",
+        )
+        parts = []
+        for key in ordered_keys:
+            if key in values:
+                parts.append(f"{key}={values.pop(key)}")
+        for key in sorted(values):
+            parts.append(f"{key}={values[key]}")
+        if not parts:
+            return
+        record = self.logger.makeRecord(
+            self.logger.name,
+            logging.INFO,
+            fn="",
+            lno=0,
+            msg="E2E train: step=%s %s",
+            args=(str(getattr(state, "global_step", "unknown")), " ".join(parts)),
+            exc_info=None,
+        )
+        for handler in list(getattr(self.logger, "handlers", [])):
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            if record.levelno < handler.level:
+                continue
+            handler.handle(record)
+
+
+class _QuietProgressCallback(ProgressCallback if ProgressCallback is not None else object):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        return
+
+
+def replace_progress_log_callback(trainer):
+    if ProgressCallback is None:
+        return trainer
+    callback_handler = getattr(trainer, "callback_handler", None)
+    callbacks = getattr(callback_handler, "callbacks", None)
+    if not isinstance(callbacks, list):
+        return trainer
+    for idx, callback in enumerate(callbacks):
+        if isinstance(callback, ProgressCallback) and not isinstance(callback, _QuietProgressCallback):
+            callbacks[idx] = _QuietProgressCallback()
+    return trainer
 
 
 def build_vae_hidden_layer_weights(
@@ -160,7 +232,15 @@ class VAEDecoderE2ETrainer(Trainer):
         self._teacher_device = None
         self.saved_tensor_offload = saved_tensor_offload
         self.streaming_offload_manager = streaming_offload_manager
+        self._last_loss_parts: Dict[str, float] = {}
         super().__init__(*args, **kwargs)
+        # Custom compute_loss returns token-mean losses. HF treats models with
+        # forward(**kwargs) as accepting num_items_in_batch and then skips
+        # dividing by gradient_accumulation_steps, which inflates logged loss
+        # and gradients. Disable that path explicitly.
+        self.model_accepts_loss_kwargs = False
+        if self.model is not None:
+            self.model.accepts_loss_kwargs = False
 
     def _ensure_teacher_device(self, device: torch.device) -> None:
         if self.teacher_model is None:
@@ -196,17 +276,26 @@ class VAEDecoderE2ETrainer(Trainer):
         with torch.no_grad():
             return self.teacher_model(**teacher_inputs, output_hidden_states=bool(output_hidden_states))
 
-    def _add_hidden_alignment_loss(self, loss, teacher_outputs, student_outputs, inputs):
-        if float(self.hidden_loss_weight) <= 0.0:
-            return loss
-        hidden_loss = compute_vae_hidden_alignment_loss(
+    def _compute_hidden_alignment_loss(self, teacher_outputs, student_outputs, inputs, *, loss_device):
+        return compute_vae_hidden_alignment_loss(
             teacher_hidden_states=teacher_outputs.hidden_states,
             student_hidden_states=student_outputs.hidden_states,
             attention_mask=inputs.get("attention_mask"),
             layer_weighting=self.hidden_layer_weighting,
-            loss_device=loss.device,
+            loss_device=loss_device,
         )
-        return loss + float(self.hidden_loss_weight) * hidden_loss
+
+    def _store_loss_parts(self, *, distill_loss: torch.Tensor, hidden_loss: Optional[torch.Tensor] = None) -> None:
+        parts = {"distill_loss": float(distill_loss.detach().float().item())}
+        if hidden_loss is not None:
+            parts["hidden_loss"] = float(hidden_loss.detach().float().item())
+        self._last_loss_parts = parts
+
+    def log(self, logs, start_time=None):
+        merged = dict(logs)
+        for key, value in getattr(self, "_last_loss_parts", {}).items():
+            merged.setdefault(key, value)
+        return super().log(merged, start_time=start_time)
 
     def _compute_choice_kd_loss(self, model, inputs, return_outputs: bool):
         if float(self.hidden_loss_weight) > 0.0:
@@ -251,15 +340,19 @@ class VAEDecoderE2ETrainer(Trainer):
             temperature=self.distill_temperature,
             alpha=self.distill_alpha,
         )
+        self._store_loss_parts(distill_loss=loss)
         return (loss, outputs) if return_outputs else loss
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        del num_items_in_batch, kwargs
         if "choice_input_ids" in inputs:
             return self._compute_choice_kd_loss(model, inputs, return_outputs=bool(return_outputs))
 
         labels = inputs.get("labels")
         student_inputs = dict(inputs)
         student_inputs.pop("labels", None)
+        # Custom distill losses ignore HF num_items_in_batch scaling.
+        student_inputs.pop("num_items_in_batch", None)
         hidden_loss_enabled = float(self.hidden_loss_weight) > 0.0
         offload_context = (
             self.saved_tensor_offload.context()
@@ -278,15 +371,26 @@ class VAEDecoderE2ETrainer(Trainer):
         if loss_type in {"sft", "origin"}:
             if ce_loss is None:
                 raise ValueError(f"loss_type={loss_type} requires labels.")
+            hidden_loss = None
+            loss = ce_loss
             if hidden_loss_enabled:
                 teacher_inputs = dict(inputs)
                 teacher_inputs.pop("labels", None)
+                teacher_inputs.pop("num_items_in_batch", None)
                 teacher_outputs = self._compute_teacher_outputs(teacher_inputs, output_hidden_states=True)
-                ce_loss = self._add_hidden_alignment_loss(ce_loss, teacher_outputs, outputs, inputs)
-            return (ce_loss, outputs) if return_outputs else ce_loss
+                hidden_loss = self._compute_hidden_alignment_loss(
+                    teacher_outputs,
+                    outputs,
+                    inputs,
+                    loss_device=loss.device,
+                )
+                loss = loss + float(self.hidden_loss_weight) * hidden_loss
+            self._store_loss_parts(distill_loss=ce_loss, hidden_loss=hidden_loss)
+            return (loss, outputs) if return_outputs else loss
 
         teacher_inputs = dict(inputs)
         teacher_inputs.pop("labels", None)
+        teacher_inputs.pop("num_items_in_batch", None)
         teacher_outputs = self._compute_teacher_outputs(teacher_inputs, output_hidden_states=hidden_loss_enabled)
         teacher_logits = get_output_logits(teacher_outputs).to(device=logits.device)
         token_mask = build_distill_token_mask(
@@ -294,7 +398,7 @@ class VAEDecoderE2ETrainer(Trainer):
             attention_mask=inputs.get("attention_mask"),
             reference_logits=logits,
         )
-        loss = compute_dense_loss_from_logits(
+        distill_loss = compute_dense_loss_from_logits(
             loss_type=loss_type,
             student_logits=logits,
             teacher_logits=teacher_logits,
@@ -305,7 +409,17 @@ class VAEDecoderE2ETrainer(Trainer):
             post_attn=self.post_attn,
             eakld_confidence_k=int(self.eakld_confidence_k),
         )
-        loss = self._add_hidden_alignment_loss(loss, teacher_outputs, outputs, inputs)
+        hidden_loss = None
+        loss = distill_loss
+        if hidden_loss_enabled:
+            hidden_loss = self._compute_hidden_alignment_loss(
+                teacher_outputs,
+                outputs,
+                inputs,
+                loss_device=distill_loss.device,
+            )
+            loss = loss + float(self.hidden_loss_weight) * hidden_loss
+        self._store_loss_parts(distill_loss=distill_loss, hidden_loss=hidden_loss)
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):

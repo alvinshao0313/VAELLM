@@ -80,11 +80,11 @@ Cat 默认纯 EAKLD（`eakld`）；E2E / Block 仍用 `eakld_kd` 或 attention E
 | E2E stage1/decoder | `--loss_type eakld_kd` | `--eakld_confidence_k 16` |
 | Block attention KL | `--block_distill_entropy_aware_kl true` | `--block_distill_eakld_confidence_k 16` |
 
-`eakld` / `eakld_kd` 的 logits CAKLD 已对齐 EdgeRazor 仓库实际落地的 `compute_kld_confidence`（全词表熵、`log(K)` 归一化、`batch_mean`、KL 内 `T²`）。EdgeRazor 文档里写的 `H(topk)` / `min(H, log K)` 在其代码中也未实现，本仓库同样按实际代码而非文档公式。`eakld` 为纯 CAKLD；`eakld_kd` 为 `(1-α)·CE + α·CAKLD`，不再在外侧额外乘 `T²`。
+`eakld` / `eakld_kd` / `eakld_top[_K]` 对齐 `loss.py`：reverse KL 手写 `Σ p_s(log p_s - log p_t)`（避免 `F.kl_div` 不对 target 反传），γ 用全词表教师熵的全局 token 均值 / `log(confidence_k)`，KL 内乘 `T²`。`eakld` 为全词表 CAKLD；`eakld_top_K` / `eakld_topk[_K]` 的 FKL/RKL 分别取教师/学生 top-k；`eakld_kd` 为 `(1-α)·CE + α·CAKLD`，外侧不再额外乘 `T²`。
 
 8K 全词表 EAKLD 建议开启 `--distill_teacher_logits_cpu_staging true`（默认已开）：teacher logits 暂存 CPU，算 loss 前整段搬回 GPU，数学等价、降低双 forward 峰值显存。
 
-`confidence_k=16` 是**熵归一化常数 K**（`γ = 1 - mean(H)/log(K)`，再 clamp），**不是** `kd_top_1000` 那种 vocab top-k 截断。KL 仍在全词表上计算。
+`confidence_k=16` 是**熵归一化常数 K**（`γ = 1 - H/log(K)`，再 clamp），**不是** vocab top-k。`eakld` 的 KL 在全词表；`eakld_top_K` 的 KL 在 top-k。
 
 旧 loss（`kd_top_1000` 等）仍可用，例如：
 

@@ -42,6 +42,8 @@ def _parse_lora_loss_type(value: str) -> str:
         "dual_kd",
         "eakld",
         "eakld_kd",
+        "eakld_top",
+        "eakld_topk",
         "r_kl_top",
         "dual_r_kl_top",
         "kl_top",
@@ -56,6 +58,8 @@ def _parse_lora_loss_type(value: str) -> str:
         "r_kl_top_",
         "kd_top_",
         "dual_kd_top_",
+        "eakld_topk_",
+        "eakld_top_",
         "kl_top_",
         "dual_kl_top_",
     ):
@@ -65,8 +69,9 @@ def _parse_lora_loss_type(value: str) -> str:
                 return raw
     raise argparse.ArgumentTypeError(
         "Invalid --lora_loss_type. Supported: sft, origin, rkl, dual_rkl, kl, mse, kd, kd_top[_K], "
-        "eakld, eakld_kd, dual_kd_top[_K], dual_kl, dual_kd, r_kl_top[_K], dual_r_kl_top[_K], kl_top[_K], "
-        "dual_kl_top[_K], choice_kd, choice_kd_ce (K must be a positive integer)."
+        "eakld, eakld_kd, eakld_top[_K]/eakld_topk[_K], dual_kd_top[_K], dual_kl, dual_kd, "
+        "r_kl_top[_K], dual_r_kl_top[_K], kl_top[_K], dual_kl_top[_K], choice_kd, choice_kd_ce "
+        "(K must be a positive integer)."
     )
 
 

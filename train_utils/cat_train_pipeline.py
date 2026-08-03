@@ -58,7 +58,7 @@ from train_utils.mlp_channel_selection import (
     mlp_protect_axis_for_category,
     write_mlp_channel_selection_summary,
 )
-from train_utils.cat_arg_overrides import validate_category_keys
+from train_utils.cat_arg_overrides import resolve_after_category_value, validate_category_keys
 from train_utils.cat_train_data import (
     apply_stage_norm as _apply_stage_norm,
     build_block_data_loaders as _build_block_data_loaders,
@@ -3033,7 +3033,15 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 )
 
             if distill_after_category != "none":
-                if run_category_eval:
+                category_steps = int(resolve_after_category_value(cat_args.distill_steps, cat))
+                run_this_category_eval = bool(run_category_eval) and category_steps > 0
+                if run_category_eval and not run_this_category_eval:
+                    log.info(
+                        "类别 %s distill_steps=%d，跳过该类别评估。",
+                        str(cat),
+                        category_steps,
+                    )
+                if run_this_category_eval:
                     log.info("每类后蒸馏前评估...")
                     _eval_after_category(
                         model=model,
@@ -3104,20 +3112,20 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     )
                     log.info("Saved after-category model to %s", save_paths["output_dir"])
 
-            if run_category_eval and distill_after_category != "none":
-                log.info("每类后蒸馏后评估...")
-                _eval_after_category(
-                    model=model,
-                    vae_args=vae_args,
-                    ppl_limit=cat_args.ppl_limit,
-                    category=cat,
-                    logger=log,
-                    eval_device=cat_args.train_device,
-                    eval_hif4_act=cat_args.eval_hif4_act,
-                    eval_ppl=cat_args.eval_ppl,
-                    eval_tasks=eval_tasks_text,
-                    tokenizer=eval_tokenizer,
-                )
+                if run_this_category_eval:
+                    log.info("每类后蒸馏后评估...")
+                    _eval_after_category(
+                        model=model,
+                        vae_args=vae_args,
+                        ppl_limit=cat_args.ppl_limit,
+                        category=cat,
+                        logger=log,
+                        eval_device=cat_args.train_device,
+                        eval_hif4_act=cat_args.eval_hif4_act,
+                        eval_ppl=cat_args.eval_ppl,
+                        eval_tasks=eval_tasks_text,
+                        tokenizer=eval_tokenizer,
+                    )
 
         if run_category_eval:
             log.info("所有类别训练完成后最终评估...")

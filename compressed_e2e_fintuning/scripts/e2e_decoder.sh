@@ -65,7 +65,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --parallel_mode dp \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
     --dataset_task sft \
-    --loss_type kl_top_100 \
+    --loss_type eakld_top_100 \
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
@@ -119,7 +119,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --parallel_mode layer_mp \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
     --dataset_task sft \
-    --loss_type kl_top_100 \
+    --loss_type eakld_top_100 \
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \

@@ -51,7 +51,11 @@ from compressed_e2e_fintuning.trainables import (
     unpack_parallel_stage_decoders,
     validate_selected_low_rank_payloads,
 )
-from compressed_e2e_fintuning.trainer import VAEDecoderE2ETrainer
+from compressed_e2e_fintuning.trainer import (
+    E2ETrainerLogCallback,
+    VAEDecoderE2ETrainer,
+    replace_progress_log_callback,
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -790,7 +794,7 @@ def run(args, hf_args, training_args):
         training_args.save_safetensors = False
 
     eval_before_save_callback = None
-    trainer_callbacks = None
+    trainer_callbacks = [E2ETrainerLogCallback(logger=log)]
     if bool(getattr(args, "eval_before_save", False)):
         eval_before_save_callback = EvalBeforeSaveCallback(
             e2e_args=args,
@@ -801,13 +805,15 @@ def run(args, hf_args, training_args):
             parallel_stage_decode=bool(args.parallel_stage_decode),
             parallel_mode=str(parallel_mode),
         )
-        trainer_callbacks = [eval_before_save_callback]
+        trainer_callbacks.append(eval_before_save_callback)
         log.info(
             "Enabled eval-before-save: save_steps=%s eval_tasks=%s",
             str(getattr(training_args, "save_steps", None)),
             str(args.eval_tasks),
         )
 
+    # Custom token-mean distill loss; disable HF num_items_in_batch loss scaling.
+    model.accepts_loss_kwargs = False
     trainer = VAEDecoderE2ETrainer(
         model=model,
         args=training_args,
@@ -827,6 +833,7 @@ def run(args, hf_args, training_args):
         streaming_offload_manager=streaming_manager,
         callbacks=trainer_callbacks,
     )
+    replace_progress_log_callback(trainer)
     if eval_before_save_callback is not None:
         eval_before_save_callback.bind_trainer(trainer)
     try:

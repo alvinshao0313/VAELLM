@@ -20,6 +20,7 @@ from train_utils.cat_after_category_distill import (
     collect_compressed_category_targets,
     run_after_category_distill,
 )
+from train_utils.cat_arg_overrides import resolve_after_category_value
 from train_utils.cat_train_args import resolve_category_runtime_configs
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.cat_train_runtime import save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot
@@ -906,7 +907,16 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             lora_round_idx = int(lora_round_idx) + 1
             continue
 
-        if run_category_eval:
+        category_steps = int(resolve_after_category_value(cat_args.distill_steps, category))
+        run_this_category_eval = bool(run_category_eval) and category_steps > 0
+        if run_category_eval and not run_this_category_eval:
+            logger.info(
+                "Checkpoint distill: category=%s distill_steps=%d，跳过该类别评估。",
+                str(category),
+                category_steps,
+            )
+
+        if run_this_category_eval:
             if is_distill_main_process():
                 logger.info("每类后蒸馏前评估...")
             _eval_after_category(
@@ -983,7 +993,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                     logger=logger,
                 )
 
-        if run_category_eval:
+        if run_this_category_eval:
             if is_distill_main_process():
                 logger.info("每类后蒸馏后评估...")
             _eval_after_category(
