@@ -585,6 +585,25 @@ def _set_active_vae_category_prefix(
     return prewarm_targets
 
 
+def _restore_final_vae_representation(
+    *,
+    model: nn.Module,
+    residency: _CheckpointDistillResidency,
+    completed_categories: Sequence[str],
+    logger,
+) -> List[NamedVAELinearTarget]:
+    _restore_checkpoint_distill_residency(
+        model=model,
+        residency=residency,
+        logger=logger,
+    )
+    return _set_active_vae_category_prefix(
+        model=model,
+        active_categories=list(completed_categories),
+        logger=logger,
+    )
+
+
 def _load_checkpoint_for_distill(*, cat_args, hf_args, vae_args, logger) -> nn.Module:
     checkpoint_dir = resolve_checkpoint_dir(str(cat_args.resume_from_checkpoint))
     meta_path = os.path.join(checkpoint_dir, META_FILENAME)
@@ -930,6 +949,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 eval_ppl=cat_args.eval_ppl,
                 eval_tasks=eval_tasks_text,
                 tokenizer=eval_tokenizer,
+                run_output_dir=run_output_dir,
             )
 
         distill_result = run_after_category_distill(
@@ -1007,30 +1027,27 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 eval_ppl=cat_args.eval_ppl,
                 eval_tasks=eval_tasks_text,
                 tokenizer=eval_tokenizer,
+                run_output_dir=run_output_dir,
             )
 
-    if run_category_eval:
-        if independent_categories and completed_categories:
-            logger.info(
-                "Checkpoint distill independent: 最终评估前激活全部 completed_categories=%s",
-                ",".join(completed_categories),
-            )
-            _apply_checkpoint_distill_residency(
-                model=model,
-                active_categories=list(completed_categories),
-                completed_categories=completed_categories,
-                residency=residency,
-                device=residency_device,
-                dtype=residency_dtype,
-                logger=logger,
-            )
-            _set_active_vae_category_prefix(
-                model=model,
-                active_categories=list(completed_categories),
-                logger=logger,
-            )
+    needs_final_vae_representation = bool(run_category_eval) or bool(cat_args.save_model)
+    if needs_final_vae_representation:
         if is_distill_main_process():
-            logger.info("所有类别蒸馏完成后最终评估...")
+            logger.info(
+                "Finalizing checkpoint distill with VAELinear representation: completed_categories=%s",
+                ",".join(completed_categories) if completed_categories else "(none)",
+            )
+        _restore_final_vae_representation(
+            model=model,
+            residency=residency,
+            completed_categories=completed_categories,
+            logger=logger,
+        )
+        distill_distributed_barrier()
+
+    if run_category_eval:
+        if is_distill_main_process():
+            logger.info("所有类别蒸馏完成后最终评估（VAELinear 路径）...")
         _eval_after_category(
             model=model,
             vae_args=vae_args,
@@ -1042,9 +1059,10 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             eval_ppl=cat_args.eval_ppl,
             eval_tasks=eval_tasks_text,
             tokenizer=eval_tokenizer,
+            run_output_dir=run_output_dir,
         )
+
     if cat_args.save_model and is_distill_main_process():
-        _restore_checkpoint_distill_residency(model=model, residency=residency, logger=logger)
         _save_final_model(
             model=model,
             run_output_dir=run_output_dir,

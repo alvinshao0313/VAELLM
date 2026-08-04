@@ -1,11 +1,16 @@
 from typing import Any, List, Optional
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from train_utils.eval_utils import calculate_ppl, merge_lm_eval_results, run_lm_eval
 from train_utils.hif4_act import applied_hif4_act
+from train_utils.lm_eval_partial_io import (
+    cleanup_lm_eval_partial_dir,
+    exchange_lm_eval_partial_via_files,
+    lm_eval_partial_dir,
+    prepare_lm_eval_partial_dir,
+)
 from train_utils.lora_utils import (
     distill_distributed_barrier,
     distill_rank,
@@ -93,11 +98,14 @@ def _eval_after_category_distributed(
     eval_ppl: bool,
     task_names: List[str],
     tokenizer: object,
+    run_output_dir: str,
 ) -> None:
     rank = distill_rank()
     world_size = distill_world_size()
     local_device = get_distill_local_device(fallback=eval_device)
     eval_model = unwrap_distill_model(model)
+    tag = f"after_{category}"
+    partial_dir = lm_eval_partial_dir(str(run_output_dir), tag)
 
     distill_distributed_barrier()
     if bool(eval_ppl):
@@ -119,6 +127,10 @@ def _eval_after_category_distributed(
 
     if not task_names:
         return
+
+    if is_distill_main_process():
+        prepare_lm_eval_partial_dir(partial_dir)
+    distill_distributed_barrier()
 
     local_tasks = split_tasks_for_distill_rank(task_names, rank=rank, world_size=world_size)
     logger.info(
@@ -143,20 +155,29 @@ def _eval_after_category_distributed(
     else:
         partial_result = {"task_metrics": {}, "task_metric_keys": {}}
 
-    gathered: Optional[List[Optional[dict]]] = [None] * world_size if rank == 0 else None
-    dist.gather_object(partial_result, gathered, dst=0)
-
-    if is_distill_main_process():
-        merged_result = merge_lm_eval_results(gathered or [], task_names)
-        summary_table = merged_result.get("summary_table")
-        if isinstance(summary_table, str) and summary_table.strip():
-            logger.info("类别 %s LM-Eval summary table:\n%s", category, summary_table)
-        _log_task_metrics(
-            category=category,
-            task_names=task_names,
-            lm_result=merged_result,
-            logger=logger,
+    try:
+        gathered = exchange_lm_eval_partial_via_files(
+            partial_result,
+            run_output_dir=str(run_output_dir),
+            tag=tag,
+            rank=int(rank),
+            world_size=int(world_size),
+            is_main=is_distill_main_process(),
         )
+        if is_distill_main_process():
+            merged_result = merge_lm_eval_results(gathered or [], task_names)
+            summary_table = merged_result.get("summary_table")
+            if isinstance(summary_table, str) and summary_table.strip():
+                logger.info("类别 %s LM-Eval summary table:\n%s", category, summary_table)
+            _log_task_metrics(
+                category=category,
+                task_names=task_names,
+                lm_result=merged_result,
+                logger=logger,
+            )
+    finally:
+        if is_distill_main_process():
+            cleanup_lm_eval_partial_dir(partial_dir)
 
     distill_distributed_barrier()
 
@@ -174,6 +195,7 @@ def eval_after_category(
     eval_tasks: str = "",
     tokenizer: Optional[object] = None,
     move_model_to_cpu_after_eval: bool = True,
+    run_output_dir: Optional[str] = None,
 ) -> None:
     run_ppl = bool(eval_ppl)
     task_names = [task.strip() for task in str(eval_tasks).split(",") if task.strip()]
@@ -185,7 +207,13 @@ def eval_after_category(
     if run_tasks and tokenizer is None:
         raise ValueError(f"类别 {category} 启用了 --eval_tasks，但 tokenizer 未提供。")
 
+    resolved_run_output_dir = None if run_output_dir is None else str(run_output_dir).strip() or None
+
     if is_distill_distributed():
+        if run_tasks and not resolved_run_output_dir:
+            raise ValueError(
+                f"类别 {category} 的分布式 lm_eval 需要非空 run_output_dir（本次 run 日志目录）。"
+            )
         if is_distill_main_process():
             logger.info(
                 "开始类别 %s 的训练后评估(分布式任务并行): eval_ppl=%s eval_tasks=%s world_size=%d",
@@ -205,6 +233,7 @@ def eval_after_category(
             eval_ppl=run_ppl,
             task_names=task_names,
             tokenizer=tokenizer,
+            run_output_dir=str(resolved_run_output_dir or ""),
         )
         return
 

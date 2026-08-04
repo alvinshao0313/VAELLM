@@ -58,3 +58,4 @@ docs/重要日志/
 .vscode/
 BiSCo-LLM_TNNLS_English_LaTeX/
 data/
+**/plans/

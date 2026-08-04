@@ -754,6 +754,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     eval_tasks=str(args.block_eval_tasks),
                     tokenizer=tokenizer,
                     move_model_to_cpu_after_eval=False,
+                    run_output_dir=run_output_dir,
                 )
         logger.info("[block %d] finished.", int(layer_idx))
 

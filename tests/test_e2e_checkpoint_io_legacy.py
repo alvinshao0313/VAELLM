@@ -8,7 +8,11 @@ from unittest import mock
 import torch
 from torch import nn
 
-from e2e_common.checkpoint_io import _collect_single_vae_linear_spec, _remap_legacy_decoder_keys_if_needed
+from e2e_common.checkpoint_io import (
+    _collect_single_vae_linear_spec,
+    _remap_legacy_decoder_keys_if_needed,
+    load_e2e_checkpoint_into_model,
+)
 from litebsq.autoencoder import Decoder
 from litebsq.bitpack import (
     build_bitpack_u8_spec,
@@ -19,8 +23,9 @@ from litebsq.vae_linear import VAELinear
 from tools.convert_cat_checkpoint_to_bitpack import convert_checkpoint
 from train_utils.model_checkpoint_io import (
     _build_distributed_run_output_dir,
-    _decoder_to_spec,
     _collect_vae_linear_specs,
+    _decoder_to_spec,
+    _refresh_vae_linear_runtime_after_state_load,
     load_checkpoint_into_model,
     save_model_checkpoint,
 )
@@ -93,6 +98,47 @@ def _build_single_stage_vae_linear() -> tuple[VAELinear, torch.Tensor, Decoder]:
         transpose=False,
     )
     return layer, bits, decoder
+
+
+def _build_two_stage_parallel_vae_linear() -> VAELinear:
+    latent_dim = 9
+    codebook_dim = 4
+    part0 = torch.tensor(
+        [
+            [[True, False, True, False, True, False, True, False, True]],
+            [[False, True, False, True, False, True, False, True, False]],
+        ],
+        dtype=torch.bool,
+    )
+    part1 = torch.tensor(
+        [
+            [[True, True, False, False, True, True, False, False, True]],
+            [[False, False, True, True, False, False, True, True, False]],
+        ],
+        dtype=torch.bool,
+    )
+    stage0 = [part0, part1]
+    stage1 = [~part0, ~part1]
+    stage_decoders = [
+        [_make_decoder(latent_dim, codebook_dim), _make_decoder(latent_dim, codebook_dim)],
+        [_make_decoder(latent_dim, codebook_dim), _make_decoder(latent_dim, codebook_dim)],
+    ]
+    return VAELinear(
+        in_features=4,
+        out_features=4,
+        bias=None,
+        original_weight=None,
+        vq_weight=None,
+        decoder=None,
+        stage_vq_weights=[stage0, stage1],
+        stage_decoders=stage_decoders,
+        codebook_dim=codebook_dim,
+        stage_codebook_dims=[codebook_dim, codebook_dim],
+        transpose=False,
+        parallel_parts=2,
+        parallel_rows=1,
+        parallel_cols=2,
+    )
 
 
 class LegacyCheckpointRemapTest(unittest.TestCase):
@@ -358,6 +404,75 @@ class CheckpointBitpackIOTest(unittest.TestCase):
 
             restored_model, _, _ = load_checkpoint_into_model(_DummyModel(), packed_dir)
             self.assertTrue(torch.allclose(model.proj._decode_weight(dtype=torch.float32), restored_model.proj._decode_weight(dtype=torch.float32)))
+
+    def test_e2e_loader_rebuilds_parallel_grouped_vq_after_state_load(self):
+        source_model = _DummyModel()
+        source_model.proj = _build_two_stage_parallel_vae_linear()
+        source_weight = source_model.proj._decode_weight(dtype=torch.float32).detach().clone()
+        x = torch.tensor(
+            [
+                [1.0, -2.0, 0.5, 3.0],
+                [-1.0, 0.25, 2.0, -0.5],
+            ],
+            dtype=torch.float32,
+        )
+        source_output = source_model.proj(x).detach().clone()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_model_checkpoint(source_model, tmpdir, save_config=False)
+
+            restored_model = _DummyModel()
+            restored_model, meta, _ = load_e2e_checkpoint_into_model(
+                restored_model,
+                tmpdir,
+                map_location="cpu",
+                strict=True,
+                materialize_proxy_decoded_linears=False,
+            )
+
+            restored = restored_model.proj
+            self.assertIsInstance(restored, VAELinear)
+            self.assertTrue(bool(meta["converted_modules"][0]["parallel_stage_decode"]))
+            self.assertIsNotNone(restored._parallel_stage_decoder)
+
+            layout = list(restored._parallel_stage_layout)
+            expected_grouped_vq = restored._build_parallel_stage_grouped_vq_weight(layout)
+            actual_grouped_vq = restored._parallel_stage_grouped_vq_weight
+            self.assertTrue(torch.equal(actual_grouped_vq, expected_grouped_vq))
+
+            restored_weight = restored._decode_weight(dtype=torch.float32)
+            restored_output = restored(x)
+            self.assertTrue(torch.allclose(restored_weight, source_weight, rtol=0.0, atol=1e-6))
+            self.assertTrue(torch.allclose(restored_output, source_output, rtol=0.0, atol=1e-5))
+
+
+class RuntimeRefreshContractTest(unittest.TestCase):
+    def test_refresh_rebuilds_main_and_protected_parallel_plans_before_clearing_cache(self):
+        layer = _build_two_stage_parallel_vae_linear()
+        model = _DummyModel()
+        model.proj = layer
+
+        main_calls = []
+        protected_calls = []
+        clear_calls = []
+
+        layer._parallel_stage_decoder = nn.Identity()
+        layer._protected_residual_parallel_decoder = nn.Identity()
+        layer._build_parallel_stage_decode_plan = mock.Mock(
+            side_effect=lambda: main_calls.append("main")
+        )
+        layer._build_protected_residual_parallel_decode_plan = mock.Mock(
+            side_effect=lambda: protected_calls.append("protected")
+        )
+        layer.clear_decoded_weight_cache = mock.Mock(
+            side_effect=lambda: clear_calls.append("clear")
+        )
+
+        _refresh_vae_linear_runtime_after_state_load(model)
+
+        self.assertEqual(main_calls, ["main"])
+        self.assertEqual(protected_calls, ["protected"])
+        self.assertEqual(clear_calls, ["clear"])
 
 
 if __name__ == "__main__":

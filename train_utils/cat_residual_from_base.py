@@ -690,6 +690,7 @@ def _maybe_eval_residual_stage(
         eval_ppl=bool(args.eval_ppl),
         eval_tasks=eval_tasks_text,
         tokenizer=eval_tokenizer,
+        run_output_dir=str(args.output_dir),
     )
     eval_results[key] = {
         "ran": True,

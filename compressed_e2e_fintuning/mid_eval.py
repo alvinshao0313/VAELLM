@@ -9,13 +9,18 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
-import torch.distributed as dist
 from torch import nn
 from transformers import TrainerCallback
 
 from litebsq.vae_linear import VAELinear
 from train_utils.eval_utils import merge_lm_eval_results, run_lm_eval
 from train_utils.hif4_act import applied_hif4_act
+from train_utils.lm_eval_partial_io import (
+    cleanup_lm_eval_partial_dir,
+    exchange_lm_eval_partial_via_files,
+    lm_eval_partial_dir,
+    prepare_lm_eval_partial_dir,
+)
 from train_utils.lora_utils import (
     distill_distributed_barrier,
     distill_rank,
@@ -225,6 +230,10 @@ def run_e2e_lm_eval(
                 tag,
                 ",".join(local_tasks) if local_tasks else "(none)",
             )
+            partial_dir = lm_eval_partial_dir(str(output_dir), tag)
+            if is_distill_main_process():
+                prepare_lm_eval_partial_dir(partial_dir)
+            distill_distributed_barrier()
             if move_to_device:
                 model.to(local_device)
             if local_tasks:
@@ -241,23 +250,32 @@ def run_e2e_lm_eval(
             else:
                 partial_result = {"task_metrics": {}, "task_metric_keys": {}}
 
-            gathered: Optional[List[Optional[dict]]] = [None] * world_size if rank == 0 else None
-            dist.gather_object(partial_result, gathered, dst=0)
-
             result_payload = None
-            if is_distill_main_process():
-                merged = merge_lm_eval_results(gathered or [], task_names)
-                table = str(merged.get("summary_table", "")).strip()
-                if table:
-                    log.info("[%s] LM-Eval summary table:\n%s", tag, table)
-                _log_merged_task_metrics(tag=tag, task_names=task_names, lm_result=merged, log=log)
-                paths = _write_lm_eval_artifacts(
-                    result=merged,
-                    output_dir=output_dir,
-                    eval_tag=tag,
-                    log=log,
+            try:
+                gathered = exchange_lm_eval_partial_via_files(
+                    partial_result,
+                    run_output_dir=str(output_dir),
+                    tag=tag,
+                    rank=int(rank),
+                    world_size=int(world_size),
+                    is_main=is_distill_main_process(),
                 )
-                result_payload = {"result": merged, **paths}
+                if is_distill_main_process():
+                    merged = merge_lm_eval_results(gathered or [], task_names)
+                    table = str(merged.get("summary_table", "")).strip()
+                    if table:
+                        log.info("[%s] LM-Eval summary table:\n%s", tag, table)
+                    _log_merged_task_metrics(tag=tag, task_names=task_names, lm_result=merged, log=log)
+                    paths = _write_lm_eval_artifacts(
+                        result=merged,
+                        output_dir=output_dir,
+                        eval_tag=tag,
+                        log=log,
+                    )
+                    result_payload = {"result": merged, **paths}
+            finally:
+                if is_distill_main_process():
+                    cleanup_lm_eval_partial_dir(partial_dir)
             distill_distributed_barrier()
             return result_payload
 
@@ -288,8 +306,8 @@ def run_e2e_lm_eval(
         }
 
 
-class EvalBeforeSaveCallback(TrainerCallback):
-    """Run lm-eval on save_steps before HF Trainer writes checkpoint-*."""
+class EvalAfterSaveCallback(TrainerCallback):
+    """Run lm-eval after HF Trainer finishes writing checkpoint-* on save_steps."""
 
     def __init__(
         self,
@@ -315,14 +333,18 @@ class EvalBeforeSaveCallback(TrainerCallback):
     def bind_trainer(self, trainer) -> None:
         self._trainer = trainer
 
-    def _resolve_eval_model(self, model: nn.Module) -> nn.Module:
+    def _resolve_eval_model(self, model: Optional[nn.Module]) -> nn.Module:
         trainer = self._trainer
         if trainer is not None and getattr(trainer, "accelerator", None) is not None:
             return trainer.accelerator.unwrap_model(trainer.model)
-        return model
+        if model is not None:
+            return model
+        if trainer is not None and getattr(trainer, "model", None) is not None:
+            return trainer.model
+        raise RuntimeError("EvalAfterSaveCallback could not resolve the eval model.")
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if not bool(getattr(self.e2e_args, "eval_before_save", False)):
+    def on_save(self, args, state, control, model=None, **kwargs):
+        if not bool(getattr(self.e2e_args, "eval_after_save", False)):
             return control
         save_steps = int(getattr(args, "save_steps", 0) or 0)
         if save_steps < 1:
@@ -336,13 +358,11 @@ class EvalBeforeSaveCallback(TrainerCallback):
             return control
         if self._last_eval_step == global_step:
             return control
-        if model is None:
-            raise RuntimeError("EvalBeforeSaveCallback requires model in on_step_end.")
 
         self._last_eval_step = global_step
         eval_tag = f"step_{global_step}"
         self.log.info(
-            "Eval-before-save at global_step=%d (save_steps=%d, parallel_mode=%s)",
+            "Eval-after-save at global_step=%d (save_steps=%d, parallel_mode=%s)",
             global_step,
             save_steps,
             self.parallel_mode,
@@ -358,7 +378,7 @@ class EvalBeforeSaveCallback(TrainerCallback):
                 previous_teacher_device = trainer.offload_teacher_to_cpu()
                 if previous_teacher_device is not None and previous_teacher_device.type != "cpu":
                     self.log.info(
-                        "Offloaded teacher to CPU for eval-before-save (was %s).",
+                        "Offloaded teacher to CPU for eval-after-save (was %s).",
                         previous_teacher_device,
                     )
             optimizer = getattr(trainer, "optimizer", None)
@@ -371,7 +391,7 @@ class EvalBeforeSaveCallback(TrainerCallback):
                     )
                 moved = _offload_optimizer_state_to_cpu(optimizer)
                 if moved > 0:
-                    self.log.info("Offloaded %d optimizer state tensors to CPU for eval-before-save.", moved)
+                    self.log.info("Offloaded %d optimizer state tensors to CPU for eval-after-save.", moved)
             if hasattr(eval_model, "zero_grad"):
                 eval_model.zero_grad(set_to_none=True)
             if torch.cuda.is_available():
@@ -396,12 +416,12 @@ class EvalBeforeSaveCallback(TrainerCallback):
                     moved = _restore_optimizer_state_to_device(optimizer, torch.device(optimizer_device))
                     if moved > 0:
                         self.log.info(
-                            "Restored %d optimizer state tensors to %s after eval-before-save.",
+                            "Restored %d optimizer state tensors to %s after eval-after-save.",
                             moved,
                             optimizer_device,
                         )
                 if hasattr(trainer, "restore_teacher_device"):
                     trainer.restore_teacher_device(previous_teacher_device)
                     if previous_teacher_device is not None and previous_teacher_device.type != "cpu":
-                        self.log.info("Restored teacher to %s after eval-before-save.", previous_teacher_device)
+                        self.log.info("Restored teacher to %s after eval-after-save.", previous_teacher_device)
         return control

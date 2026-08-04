@@ -12,15 +12,15 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
-MAX_STEPS="${MAX_STEPS:-5000}"
-STUDENT_CKPT="${STUDENT_CKPT:-.result/catlora_distill/res0-bf16-protect-channel-vae/Qwen_Qwen3-8B_20260730_071653/final_model}"
+MAX_STEPS="${MAX_STEPS:-20000}"
+STUDENT_CKPT="${STUDENT_CKPT:-.result/catlora_distill/res0-bf16-protect-channel-vae/cat_distill_best/final_model}"
 # 用 ${VAR-default}：仅在未设置时填默认；允许 EVAL_TASKS="" 关闭最终 lm-eval。
 EVAL_TASKS="${EVAL_TASKS-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
 PARALLEL_MODE="${PARALLEL_MODE:-layer_mp}"   # layer_mp | dp
 NPROC="${NPROC:-4}"
-EVAL_BEFORE_SAVE="${EVAL_BEFORE_SAVE:-false}"
+EVAL_AFTER_SAVE="${EVAL_AFTER_SAVE:-false}"
 # 分卡 lm-eval（尤其 mmlu）gather 等待；对齐 catlora_distill_4gpu_res0.sh
 export DISTILL_NCCL_TIMEOUT_SEC="${DISTILL_NCCL_TIMEOUT_SEC:-10800}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-10800}"
@@ -50,8 +50,8 @@ fi
 #   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --vae_decoder_checkpoint false
 # - DP 示例：
 #   PARALLEL_MODE=dp NPROC=4 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh
-# - 保存中间 ckpt 前先分卡 lm-eval：
-#   EVAL_BEFORE_SAVE=true PARALLEL_MODE=dp NPROC=4 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --save_steps 1000
+# - 保存中间 ckpt 后再分卡 lm-eval：
+#   EVAL_AFTER_SAVE=true PARALLEL_MODE=dp NPROC=4 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --save_steps 1000
 
 if [[ "${PARALLEL_MODE}" == "dp" ]]; then
   torchrun --standalone --nproc_per_node="${NPROC}" -m compressed_e2e_fintuning.main \
@@ -65,7 +65,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --parallel_mode dp \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
     --dataset_task sft \
-    --loss_type eakld_top_100 \
+    --loss_type kl_top_100 \
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
@@ -81,7 +81,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --use_post_norm_head_linear false \
     --vae_tune_bias false \
     --offload_mode none \
-    --eval_before_save "${EVAL_BEFORE_SAVE}" \
+    --eval_after_save "${EVAL_AFTER_SAVE}" \
     --eval_hif4_act false \
     --eval_tasks "${EVAL_TASKS}" \
     --eval_num_fewshot 0 \
@@ -136,7 +136,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --use_post_norm_head_linear false \
     --vae_tune_bias false \
     --offload_mode none \
-    --eval_before_save "${EVAL_BEFORE_SAVE}" \
+    --eval_after_save "${EVAL_AFTER_SAVE}" \
     --eval_hif4_act false \
     --eval_tasks "${EVAL_TASKS}" \
     --eval_num_fewshot 0 \

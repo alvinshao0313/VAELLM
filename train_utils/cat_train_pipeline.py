@@ -3030,6 +3030,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     eval_ppl=cat_args.eval_ppl,
                     eval_tasks=eval_tasks_text,
                     tokenizer=eval_tokenizer,
+                    run_output_dir=run_output_dir,
                 )
 
             if distill_after_category != "none":
@@ -3054,6 +3055,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         eval_ppl=cat_args.eval_ppl,
                         eval_tasks=eval_tasks_text,
                         tokenizer=eval_tokenizer,
+                        run_output_dir=run_output_dir,
                     )
                 distill_result = run_after_category_distill(
                     model=model,
@@ -3125,6 +3127,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         eval_ppl=cat_args.eval_ppl,
                         eval_tasks=eval_tasks_text,
                         tokenizer=eval_tokenizer,
+                        run_output_dir=run_output_dir,
                     )
 
         if run_category_eval:
@@ -3140,6 +3143,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 eval_ppl=cat_args.eval_ppl,
                 eval_tasks=eval_tasks_text,
                 tokenizer=eval_tokenizer,
+                run_output_dir=run_output_dir,
             )
         if cat_args.save_model:
             if not cat_args.convert:

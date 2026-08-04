@@ -77,7 +77,7 @@ class VAEDecoderE2EArguments:
     eval_lm_limit: Optional[int] = None
     eval_device: str = "cuda"
     eval_prewarm_group_size: int = 8
-    eval_before_save: bool = False
+    eval_after_save: bool = False
     skip_ppl_eval: bool = False
     ppl_seqlen: int = 2048
     ppl_limit: int = -1
@@ -174,9 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_device", type=str, default="cuda")
     parser.add_argument("--eval_prewarm_group_size", type=int, default=8)
     parser.add_argument(
-        "--eval_before_save",
-        type=lambda v: _parse_bool_like(v, arg_name="--eval_before_save"),
+        "--eval_after_save",
+        type=lambda v: _parse_bool_like(v, arg_name="--eval_after_save"),
         default=False,
+        help="After Trainer writes a checkpoint on save_steps, run distributed lm-eval.",
     )
     parser.add_argument("--skip_ppl_eval", type=lambda v: _parse_bool_like(v, arg_name="--skip_ppl_eval"), default=False)
     parser.add_argument("--ppl_seqlen", type=int, default=2048)
@@ -354,17 +355,17 @@ def validate_args(
     else:
         args.resume_from_checkpoint = None
 
-    if bool(args.eval_before_save):
+    if bool(args.eval_after_save):
         if not args.eval_tasks:
-            parser.error("--eval_before_save=true requires non-empty --eval_tasks.")
+            parser.error("--eval_after_save=true requires non-empty --eval_tasks.")
         if training_args is None:
-            parser.error("--eval_before_save=true requires TrainingArguments (save_strategy/save_steps).")
+            parser.error("--eval_after_save=true requires TrainingArguments (save_strategy/save_steps).")
         save_strategy = getattr(training_args, "save_strategy", None)
         save_strategy_value = getattr(save_strategy, "value", save_strategy)
         if str(save_strategy_value).strip().lower() != "steps":
-            parser.error("--eval_before_save=true requires --save_strategy steps.")
+            parser.error("--eval_after_save=true requires --save_strategy steps.")
         if int(getattr(training_args, "save_steps", 0) or 0) < 1:
-            parser.error("--eval_before_save=true requires --save_steps > 0.")
+            parser.error("--eval_after_save=true requires --save_steps > 0.")
 
     if training_args is not None:
         fsdp = getattr(training_args, "fsdp", "")
@@ -415,7 +416,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[VAEDecoderE2EArgum
     offload_mode = str(vae_e2e_args.offload_mode or "").strip().lower()
     if parallel_mode == "dp" and offload_mode == "streaming":
         parser.error("--parallel_mode dp does not support --offload_mode streaming.")
+
+    # WORLD_SIZE>1 时 HF TrainingArguments 会经 Accelerate 初始化 process group，
+    # 默认 ddp_timeout=1800。先按 DISTILL_NCCL_TIMEOUT_SEC 注入/初始化，避免 mid-eval barrier 30min 超时。
+    remaining_list = list(remaining)
+    if world_size > 1:
+        from train_utils.lora_utils import (
+            _resolve_distill_process_group_timeout_sec,
+            ensure_distill_process_group_initialized,
+        )
+
+        distill_pg_timeout_sec = _resolve_distill_process_group_timeout_sec()
+        if "--ddp_timeout" not in remaining_list:
+            remaining_list.extend(["--ddp_timeout", str(distill_pg_timeout_sec)])
+        ensure_distill_process_group_initialized()
+
     hf_parser = HfArgumentParser((HFArguments, TrainingArguments))
-    hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=list(remaining))
+    hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=remaining_list)
+    if world_size > 1:
+        training_args.ddp_timeout = int(distill_pg_timeout_sec)
+        from train_utils.lora_utils import ensure_distill_process_group_initialized
+
+        # Accelerate 可能已用默认超时建组；再次强制写回 DISTILL_NCCL_TIMEOUT_SEC。
+        ensure_distill_process_group_initialized()
     validate_args(parser, vae_e2e_args, training_args)
     return vae_e2e_args, hf_args, training_args

@@ -35,7 +35,7 @@ from train_utils.model_checkpoint_io import (
 )
 from train_utils.utils import get_logger
 from compressed_e2e_fintuning.device_map import apply_boundary_device_map, apply_layer_device_map, resolve_layer_device_map
-from compressed_e2e_fintuning.mid_eval import EvalBeforeSaveCallback, run_e2e_lm_eval
+from compressed_e2e_fintuning.mid_eval import EvalAfterSaveCallback, run_e2e_lm_eval
 from compressed_e2e_fintuning.offload import (
     SavedTensorOffloadContext,
     unwrap_streaming_offload_layers,
@@ -287,18 +287,23 @@ def _ensure_torch_distributed_initialized(log) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         return
+    from train_utils.lora_utils import _resolve_distill_process_group_timeout_sec
+
     already = torch.distributed.is_available() and torch.distributed.is_initialized()
+    timeout_sec = _resolve_distill_process_group_timeout_sec()
     ensure_distill_process_group_initialized()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
-    if not already:
-        log.info(
-            "Initialized torch.distributed for DP: world_size=%d rank=%s local_rank=%d",
-            world_size,
-            str(os.environ.get("RANK", "0")),
-            local_rank,
-        )
+    log.info(
+        "%s torch.distributed for DP: world_size=%d rank=%s local_rank=%d pg_timeout_sec=%d "
+        "(DISTILL_NCCL_TIMEOUT_SEC)",
+        "Reconfirmed" if already else "Initialized",
+        world_size,
+        str(os.environ.get("RANK", "0")),
+        local_rank,
+        int(timeout_sec),
+    )
 
 
 def _load_teacher(*, args, hf_args, base_model_path: str, log, device: Optional[torch.device] = None):
@@ -793,10 +798,10 @@ def run(args, hf_args, training_args):
         log.info("Disabling safetensors for Trainer checkpoints; VAE state_dict may contain shared storage.")
         training_args.save_safetensors = False
 
-    eval_before_save_callback = None
+    eval_after_save_callback = None
     trainer_callbacks = [E2ETrainerLogCallback(logger=log)]
-    if bool(getattr(args, "eval_before_save", False)):
-        eval_before_save_callback = EvalBeforeSaveCallback(
+    if bool(getattr(args, "eval_after_save", False)):
+        eval_after_save_callback = EvalAfterSaveCallback(
             e2e_args=args,
             tokenizer=tokenizer,
             base_model_path=str(base_model_path),
@@ -805,9 +810,9 @@ def run(args, hf_args, training_args):
             parallel_stage_decode=bool(args.parallel_stage_decode),
             parallel_mode=str(parallel_mode),
         )
-        trainer_callbacks.append(eval_before_save_callback)
+        trainer_callbacks.append(eval_after_save_callback)
         log.info(
-            "Enabled eval-before-save: save_steps=%s eval_tasks=%s",
+            "Enabled eval-after-save: save_steps=%s eval_tasks=%s",
             str(getattr(training_args, "save_steps", None)),
             str(args.eval_tasks),
         )
@@ -834,8 +839,8 @@ def run(args, hf_args, training_args):
         callbacks=trainer_callbacks,
     )
     replace_progress_log_callback(trainer)
-    if eval_before_save_callback is not None:
-        eval_before_save_callback.bind_trainer(trainer)
+    if eval_after_save_callback is not None:
+        eval_after_save_callback.bind_trainer(trainer)
     try:
         trainer.train(resume_from_checkpoint=resume_from_checkpoint or None)
     except Exception:

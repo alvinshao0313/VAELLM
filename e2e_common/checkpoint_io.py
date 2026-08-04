@@ -30,6 +30,7 @@ from train_utils.model_checkpoint_io import (
     _dtype_to_name,
     _get_module_by_name,
     _materialize_missing_bias_params_from_state_dict,
+    _refresh_vae_linear_runtime_after_state_load,
     _remap_legacy_parallel_linear_state_dict_keys,
     _rebuild_converted_modules,
     _torch_load_state_dict,
@@ -474,6 +475,7 @@ def load_e2e_checkpoint_into_model(
         _materialize_missing_original_weights_from_model(model, state_dict)
 
     load_result = model.load_state_dict(state_dict, strict=strict)
+    _refresh_vae_linear_runtime_after_state_load(model)
     if materialize_proxy_decoded_linears:
         materialize_peft_proxy_decoded_linears(
             model,

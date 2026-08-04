@@ -193,7 +193,7 @@ def distill_distributed_barrier() -> None:
 
 
 def _resolve_distill_process_group_timeout_sec() -> int:
-    # 分布式 lm_eval 按 task 分片时，mmlu 等长任务会让先完成的 rank 在 gather 上久等。
+    # 分布式 lm_eval / barrier 时，mmlu 等长任务会让先完成的 rank 久等。
     # 默认 3 小时；可用 DISTILL_NCCL_TIMEOUT_SEC 覆盖。
     raw = str(os.environ.get("DISTILL_NCCL_TIMEOUT_SEC", "10800")).strip()
     try:
@@ -207,19 +207,33 @@ def _resolve_distill_process_group_timeout_sec() -> int:
     return int(timeout_sec)
 
 
+def _apply_distill_process_group_timeout(timeout: timedelta) -> None:
+    """Force default PG collective timeout even if another library already initialized it."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    import torch.distributed.distributed_c10d as c10d
+
+    group = c10d._get_default_group()
+    c10d._set_pg_timeout(timeout, group)
+
+
 def ensure_distill_process_group_initialized() -> None:
     if not is_distill_distributed():
         return
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return
     if not torch.distributed.is_available():
         raise RuntimeError("torch.distributed is unavailable but WORLD_SIZE > 1.")
+    timeout_sec = _resolve_distill_process_group_timeout_sec()
+    timeout = timedelta(seconds=timeout_sec)
+    if torch.distributed.is_initialized():
+        # HF TrainingArguments / Accelerate may have initialized with ddp_timeout=1800.
+        _apply_distill_process_group_timeout(timeout)
+        return
     backend = "nccl" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "gloo"
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if backend == "nccl":
         torch.cuda.set_device(local_rank)
-    timeout_sec = _resolve_distill_process_group_timeout_sec()
-    torch.distributed.init_process_group(backend=backend, timeout=timedelta(seconds=timeout_sec))
+    torch.distributed.init_process_group(backend=backend, timeout=timeout)
+    _apply_distill_process_group_timeout(timeout)
 
 
 def distill_rank() -> int:
