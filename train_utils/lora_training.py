@@ -1,5 +1,5 @@
 from contextlib import contextmanager, nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -207,6 +207,148 @@ def _masked_mean_square(value: torch.Tensor, attention_mask: Optional[torch.Tens
     mask = mask.expand_as(value)
     count = mask.sum().clamp_min(1.0)
     return (square * mask).sum() / count
+
+
+def compute_masked_hidden_transition_cosine(
+    *,
+    input_hidden: torch.Tensor,
+    output_hidden: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    sequence_chunk_size: int = 64,
+) -> torch.Tensor:
+    if input_hidden.ndim != 3 or output_hidden.ndim != 3:
+        raise ValueError("hidden tensors must have shape [B, L, H].")
+    if tuple(input_hidden.shape) != tuple(output_hidden.shape):
+        raise ValueError(
+            "input/output hidden shape mismatch: "
+            f"{tuple(input_hidden.shape)} vs {tuple(output_hidden.shape)}."
+        )
+    resolved_chunk = int(sequence_chunk_size)
+    if resolved_chunk < 1:
+        raise ValueError(
+            f"sequence_chunk_size must be >= 1, got {sequence_chunk_size}."
+        )
+    if attention_mask is not None and tuple(attention_mask.shape) != tuple(input_hidden.shape[:2]):
+        raise ValueError(
+            "attention_mask shape mismatch: "
+            f"expected {tuple(input_hidden.shape[:2])}, got {tuple(attention_mask.shape)}."
+        )
+
+    total = torch.zeros((), device=output_hidden.device, dtype=torch.float32)
+    count = torch.zeros((), device=output_hidden.device, dtype=torch.float32)
+    sequence_length = int(output_hidden.shape[1])
+    for start in range(0, sequence_length, resolved_chunk):
+        end = min(sequence_length, start + resolved_chunk)
+        input_chunk = input_hidden[:, start:end, :].detach().float()
+        output_chunk = output_hidden[:, start:end, :].detach().float()
+        cosine = F.cosine_similarity(output_chunk, input_chunk, dim=-1)
+        if attention_mask is None:
+            mask_chunk = torch.ones_like(cosine, dtype=torch.float32)
+        else:
+            mask_chunk = attention_mask[:, start:end].to(
+                device=cosine.device,
+                dtype=torch.float32,
+            )
+        total.add_((cosine * mask_chunk).sum())
+        count.add_(mask_chunk.sum())
+    return total / count.clamp_min(1.0)
+
+
+def compute_selected_distill_hidden_alignment_loss(
+    *,
+    teacher_hidden_by_layer: Dict[int, torch.Tensor],
+    student_hidden_by_layer: Dict[int, torch.Tensor],
+    hidden_layer_indices: Tuple[int, ...],
+    attention_mask: Optional[torch.Tensor],
+    layer_weighting: str,
+    num_layers: int,
+    loss_device: torch.device,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if not hidden_layer_indices:
+        raise ValueError("hidden_layer_indices must be non-empty.")
+    normalized_indices = tuple(int(layer_id) for layer_id in hidden_layer_indices)
+    if len(set(normalized_indices)) != len(normalized_indices):
+        raise ValueError("hidden_layer_indices must be unique.")
+    resolved_num_layers = int(num_layers)
+    if resolved_num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
+    for layer_id in normalized_indices:
+        if layer_id < 0 or layer_id >= resolved_num_layers:
+            raise ValueError(
+                f"hidden layer id {layer_id} is outside [0, {resolved_num_layers})."
+            )
+
+    expected_keys = set(normalized_indices)
+    teacher_keys = set(int(key) for key in teacher_hidden_by_layer.keys())
+    student_keys = set(int(key) for key in student_hidden_by_layer.keys())
+    if teacher_keys != expected_keys:
+        raise ValueError(
+            "teacher_hidden_by_layer keys must exactly match hidden_layer_indices: "
+            f"expected={sorted(expected_keys)} got={sorted(teacher_keys)}."
+        )
+    if student_keys != expected_keys:
+        raise ValueError(
+            "student_hidden_by_layer keys must exactly match hidden_layer_indices: "
+            f"expected={sorted(expected_keys)} got={sorted(student_keys)}."
+        )
+
+    mode = parse_distill_hidden_alignment_layer_weighting(layer_weighting)
+    if not is_adaptive_hidden_alignment_layer_weighting(mode):
+        full_indices = tuple(range(resolved_num_layers))
+        if normalized_indices != full_indices:
+            raise ValueError(
+                "static hidden alignment requires hidden_layer_indices == "
+                f"tuple(range(num_layers)); got {normalized_indices}."
+            )
+
+    for layer_id in normalized_indices:
+        teacher_hidden_cpu = teacher_hidden_by_layer[int(layer_id)]
+        student_hidden = student_hidden_by_layer[int(layer_id)]
+        if teacher_hidden_cpu.device.type != "cpu":
+            raise ValueError(
+                f"teacher hidden for layer {layer_id} must reside on CPU, "
+                f"got {teacher_hidden_cpu.device}."
+            )
+        if tuple(teacher_hidden_cpu.shape) != tuple(student_hidden.shape):
+            raise ValueError(
+                f"Teacher/student hidden shape mismatch at layer {layer_id}: "
+                f"{tuple(teacher_hidden_cpu.shape)} vs {tuple(student_hidden.shape)}."
+            )
+
+    loss_device = torch.device(loss_device)
+    layer_losses = []
+
+    if not is_adaptive_hidden_alignment_layer_weighting(mode):
+        full_weights = build_distill_hidden_layer_weights(
+            num_layers=int(num_layers),
+            layer_weighting=mode,
+            device=loss_device,
+            dtype=torch.float32,
+        )
+
+    for layer_id in hidden_layer_indices:
+        student_hidden = student_hidden_by_layer[int(layer_id)]
+        teacher_hidden_cpu = teacher_hidden_by_layer[int(layer_id)]
+        teacher_hidden = teacher_hidden_cpu.to(
+            device=student_hidden.device,
+            non_blocking=bool(
+                teacher_hidden_cpu.is_pinned()
+                and student_hidden.device.type == "cuda"
+            ),
+        )
+        diff = student_hidden.float() - teacher_hidden.float()
+        numerator = _masked_mean_square(diff, attention_mask)
+        denominator = _masked_mean_square(teacher_hidden, attention_mask)
+        local_loss = numerator / (denominator + float(eps))
+        if is_adaptive_hidden_alignment_layer_weighting(mode):
+            layer_losses.append(local_loss.to(device=loss_device))
+        else:
+            layer_losses.append(
+                (local_loss * full_weights[int(layer_id)]).to(device=loss_device)
+            )
+
+    return torch.stack(layer_losses).mean()
 
 
 def compute_distill_hidden_alignment_loss(
