@@ -5,6 +5,13 @@ import math
 import torch
 import torch.nn.functional as F
 
+from torch.utils import checkpoint as torch_checkpoint
+
+from compressed_e2e_fintuning.teacher_targets import (
+    copy_teacher_logit_chunk_to_device,
+    iter_token_chunk_ranges,
+)
+
 
 DEFAULT_DUAL_SCALE_EPS = 1e-6
 DEFAULT_TEACHER_ENTROPY_SEQUENCE_CHUNK_SIZE = 16
@@ -521,3 +528,296 @@ def compute_dual_rkl_topk_loss(
     mask_fp32 = mask.to(device=token_kl.device, dtype=token_kl.dtype)
     denom = mask_fp32.sum().clamp_min(1.0)
     return (token_kl * mask_fp32).sum() / denom
+
+def _validate_cpu_teacher_distill_inputs(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits_cpu: torch.Tensor,
+    gamma: torch.Tensor,
+    sequence_chunk_size: int,
+) -> None:
+    if student_logits.ndim != 3:
+        raise ValueError(
+            "student_logits must have shape [B, L, V], "
+            f"got {tuple(student_logits.shape)}."
+        )
+    if teacher_logits_cpu.device.type != "cpu":
+        raise ValueError("teacher_logits_cpu must reside on CPU.")
+    if teacher_logits_cpu.ndim != 3:
+        raise ValueError(
+            "teacher_logits_cpu must have shape [B, L, V], "
+            f"got {tuple(teacher_logits_cpu.shape)}."
+        )
+    if tuple(student_logits.shape) != tuple(teacher_logits_cpu.shape):
+        raise ValueError(
+            "student/teacher logits shape mismatch: "
+            f"{tuple(student_logits.shape)} vs {tuple(teacher_logits_cpu.shape)}."
+        )
+    if int(sequence_chunk_size) < 1:
+        raise ValueError(
+            f"sequence_chunk_size must be >= 1, got {sequence_chunk_size}."
+        )
+    if not torch.is_tensor(gamma) or int(gamma.numel()) != 1:
+        raise ValueError("gamma must be a scalar tensor.")
+
+
+def _full_eakld_chunk_sums(
+    *,
+    student_logits_chunk: torch.Tensor,
+    teacher_logits_chunk: torch.Tensor,
+    mask_chunk: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    temp = _resolve_distill_temperature(temperature)
+    student_scaled = student_logits_chunk.float() / temp
+    teacher_scaled = teacher_logits_chunk.detach().float() / temp
+
+    log_student = F.log_softmax(student_scaled, dim=-1)
+    log_teacher = F.log_softmax(teacher_scaled, dim=-1)
+
+    reverse_token = (
+        log_student.exp() * (log_student - log_teacher)
+    ).sum(dim=-1)
+    forward_token = F.kl_div(
+        log_student,
+        F.softmax(teacher_scaled, dim=-1),
+        reduction="none",
+    ).sum(dim=-1)
+
+    mask_fp32 = mask_chunk.to(
+        device=student_logits_chunk.device,
+        dtype=torch.float32,
+    )
+    return torch.stack(
+        (
+            (reverse_token * mask_fp32).sum(),
+            (forward_token * mask_fp32).sum(),
+        )
+    )
+
+
+def _topk_eakld_chunk_sums(
+    *,
+    student_logits_chunk: torch.Tensor,
+    teacher_logits_chunk: torch.Tensor,
+    mask_chunk: torch.Tensor,
+    k: int,
+    temperature: float,
+    post_attn: bool,
+) -> torch.Tensor:
+    temp = _resolve_distill_temperature(temperature)
+    student_scaled = student_logits_chunk.float() / temp
+    teacher_scaled = teacher_logits_chunk.detach().float() / temp
+    resolved_k = min(int(k), int(student_scaled.shape[-1]))
+
+    _, student_indices = student_scaled.topk(
+        resolved_k,
+        dim=-1,
+        sorted=False,
+    )
+    if bool(post_attn):
+        reverse_log_student = F.log_softmax(student_scaled, dim=-1).gather(
+            -1,
+            student_indices,
+        )
+        reverse_log_teacher = F.log_softmax(teacher_scaled, dim=-1).gather(
+            -1,
+            student_indices,
+        )
+    else:
+        reverse_log_student = F.log_softmax(
+            student_scaled.gather(-1, student_indices),
+            dim=-1,
+        )
+        reverse_log_teacher = F.log_softmax(
+            teacher_scaled.gather(-1, student_indices),
+            dim=-1,
+        )
+    reverse_token = (
+        reverse_log_student.exp()
+        * (reverse_log_student - reverse_log_teacher)
+    ).sum(dim=-1)
+
+    _, teacher_indices = teacher_scaled.topk(
+        resolved_k,
+        dim=-1,
+        sorted=False,
+    )
+    if bool(post_attn):
+        forward_teacher_prob = F.softmax(teacher_scaled, dim=-1).gather(
+            -1,
+            teacher_indices,
+        )
+        forward_student_log_prob = F.log_softmax(student_scaled, dim=-1).gather(
+            -1,
+            teacher_indices,
+        )
+    else:
+        forward_teacher_prob = F.softmax(
+            teacher_scaled.gather(-1, teacher_indices),
+            dim=-1,
+        )
+        forward_student_log_prob = F.log_softmax(
+            student_scaled.gather(-1, teacher_indices),
+            dim=-1,
+        )
+    forward_token = F.kl_div(
+        forward_student_log_prob,
+        forward_teacher_prob,
+        reduction="none",
+    ).sum(dim=-1)
+
+    mask_fp32 = mask_chunk.to(
+        device=student_logits_chunk.device,
+        dtype=torch.float32,
+    )
+    return torch.stack(
+        (
+            (reverse_token * mask_fp32).sum(),
+            (forward_token * mask_fp32).sum(),
+        )
+    )
+
+
+def _make_checkpointed_eakld_chunk_forward(
+    *,
+    teacher_logits_cpu: torch.Tensor,
+    start: int,
+    end: int,
+    mask_chunk: torch.Tensor,
+    temperature: float,
+    k: Optional[int],
+    post_attn: bool,
+):
+    fixed_start = int(start)
+    fixed_end = int(end)
+
+    def chunk_forward(active_student_chunk: torch.Tensor) -> torch.Tensor:
+        teacher_chunk = copy_teacher_logit_chunk_to_device(
+            teacher_logits_cpu,
+            start=fixed_start,
+            end=fixed_end,
+            target_device=active_student_chunk.device,
+        )
+        if k is None:
+            return _full_eakld_chunk_sums(
+                student_logits_chunk=active_student_chunk,
+                teacher_logits_chunk=teacher_chunk,
+                mask_chunk=mask_chunk,
+                temperature=temperature,
+            )
+        return _topk_eakld_chunk_sums(
+            student_logits_chunk=active_student_chunk,
+            teacher_logits_chunk=teacher_chunk,
+            mask_chunk=mask_chunk,
+            k=int(k),
+            temperature=temperature,
+            post_attn=bool(post_attn),
+        )
+
+    return chunk_forward
+
+
+def _compute_eakld_from_cpu_teacher_logits_impl(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits_cpu: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    gamma: torch.Tensor,
+    temperature: float,
+    sequence_chunk_size: int,
+    k: Optional[int],
+    post_attn: bool,
+) -> torch.Tensor:
+    _validate_cpu_teacher_distill_inputs(
+        student_logits=student_logits,
+        teacher_logits_cpu=teacher_logits_cpu,
+        gamma=gamma,
+        sequence_chunk_size=sequence_chunk_size,
+    )
+    if k is not None and int(k) < 1:
+        raise ValueError(f"k must be >= 1, got {k}.")
+
+    resolved_mask = _default_token_mask(student_logits, mask)
+    denominator = resolved_mask.sum().clamp_min(1.0)
+    chunk_results = []
+
+    for start, end in iter_token_chunk_ranges(
+        int(student_logits.shape[1]),
+        int(sequence_chunk_size),
+    ):
+        student_chunk = student_logits[:, start:end, :]
+        mask_chunk = resolved_mask[:, start:end]
+        chunk_forward = _make_checkpointed_eakld_chunk_forward(
+            teacher_logits_cpu=teacher_logits_cpu,
+            start=start,
+            end=end,
+            mask_chunk=mask_chunk,
+            temperature=float(temperature),
+            k=k,
+            post_attn=bool(post_attn),
+        )
+        if torch.is_grad_enabled() and student_chunk.requires_grad:
+            chunk_result = torch_checkpoint.checkpoint(
+                chunk_forward,
+                student_chunk,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            chunk_result = chunk_forward(student_chunk)
+        chunk_results.append(chunk_result)
+
+    total_sums = torch.stack(chunk_results, dim=0).sum(dim=0)
+    temp = _resolve_distill_temperature(temperature)
+    reverse_kl = total_sums[0] / denominator * (temp * temp)
+    forward_kl = total_sums[1] / denominator * (temp * temp)
+    gamma_device = gamma.detach().reshape(()).to(
+        device=student_logits.device,
+        dtype=torch.float32,
+    )
+    return gamma_device * reverse_kl + (1.0 - gamma_device) * forward_kl
+
+
+def compute_eakld_from_cpu_teacher_logits(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits_cpu: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    gamma: torch.Tensor,
+    temperature: float = 1.0,
+    sequence_chunk_size: int = 1,
+) -> torch.Tensor:
+    return _compute_eakld_from_cpu_teacher_logits_impl(
+        student_logits=student_logits,
+        teacher_logits_cpu=teacher_logits_cpu,
+        mask=mask,
+        gamma=gamma,
+        temperature=float(temperature),
+        sequence_chunk_size=int(sequence_chunk_size),
+        k=None,
+        post_attn=False,
+    )
+
+
+def compute_eakld_topk_from_cpu_teacher_logits(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits_cpu: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    gamma: torch.Tensor,
+    k: int,
+    temperature: float = 1.0,
+    post_attn: bool = False,
+    sequence_chunk_size: int = 1,
+) -> torch.Tensor:
+    return _compute_eakld_from_cpu_teacher_logits_impl(
+        student_logits=student_logits,
+        teacher_logits_cpu=teacher_logits_cpu,
+        mask=mask,
+        gamma=gamma,
+        temperature=float(temperature),
+        sequence_chunk_size=int(sequence_chunk_size),
+        k=int(k),
+        post_attn=bool(post_attn),
+    )
