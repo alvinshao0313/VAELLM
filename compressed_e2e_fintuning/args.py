@@ -53,6 +53,9 @@ class VAEDecoderE2EArguments:
     hidden_loss_weight: float = 0.0
     eakld_confidence_k: int = 16
     hidden_layer_weighting: str = "uniform"
+    teacher_output_offload: str = "none"
+    teacher_output_pin_memory: bool = True
+    teacher_output_chunk_tokens: int = 8
     decoder_layers: str = "all"
     target_modules: str = "all"
     finetune_mode: str = "decoder"
@@ -121,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
     parser.add_argument("--eakld_confidence_k", type=int, default=16)
     parser.add_argument("--hidden_layer_weighting", type=str, default="uniform")
+    parser.add_argument("--teacher_output_offload", type=str, default="none")
+    parser.add_argument(
+        "--teacher_output_pin_memory",
+        type=lambda value: _parse_bool_like(
+            value,
+            arg_name="--teacher_output_pin_memory",
+        ),
+        default=True,
+    )
+    parser.add_argument("--teacher_output_chunk_tokens", type=int, default=8)
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
     parser.add_argument("--finetune_mode", type=str, default="decoder")
@@ -281,6 +294,13 @@ def validate_args(
                 "--hidden_layer_weighting",
             )
         )
+    teacher_output_offload = str(args.teacher_output_offload or "").strip().lower()
+    if teacher_output_offload not in {"none", "cpu"}:
+        parser.error("--teacher_output_offload must be one of: none | cpu.")
+    args.teacher_output_offload = teacher_output_offload
+
+    if int(args.teacher_output_chunk_tokens) < 1:
+        parser.error("--teacher_output_chunk_tokens must be >= 1.")
     finetune_mode = str(args.finetune_mode or "").strip().lower()
     if finetune_mode not in _VALID_FINETUNE_MODES:
         parser.error("--finetune_mode must be one of: decoder | compressed_lora | both.")

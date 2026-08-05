@@ -332,6 +332,33 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._parse_with_checkpoint(["--hidden_layer_weighting", "quadratic"])
 
+    def test_teacher_output_offload_accepts_cpu_mode(self):
+        args = self._parse_with_checkpoint(
+            [
+                "--teacher_output_offload",
+                "cpu",
+                "--teacher_output_pin_memory",
+                "true",
+                "--teacher_output_chunk_tokens",
+                "8",
+            ]
+        )
+        self.assertEqual(args.teacher_output_offload, "cpu")
+        self.assertTrue(args.teacher_output_pin_memory)
+        self.assertEqual(args.teacher_output_chunk_tokens, 8)
+
+    def test_teacher_output_offload_rejects_invalid_mode(self):
+        with self.assertRaises(SystemExit):
+            self._parse_with_checkpoint(
+                ["--teacher_output_offload", "disk"]
+            )
+
+    def test_teacher_output_chunk_tokens_must_be_positive(self):
+        with self.assertRaises(SystemExit):
+            self._parse_with_checkpoint(
+                ["--teacher_output_chunk_tokens", "0"]
+            )
+
 
 class VAEE2EHiddenLossTest(unittest.TestCase):
     def test_uniform_hidden_loss_skips_embedding_state(self):
