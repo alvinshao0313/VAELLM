@@ -12,11 +12,26 @@ try:
 except Exception:  # pragma: no cover
     ProgressCallback = None
 
-from e2e_common.dense_loss import compute_dense_loss_from_logits, get_output_logits
-from train_utils.distill_losses import build_distill_token_mask
+from compressed_e2e_fintuning.teacher_targets import (
+    StudentHiddenCollector,
+    TeacherHiddenTargetCollector,
+    TeacherTargetBatch,
+    copy_detached_tensor_to_cpu,
+)
+from e2e_common.dense_loss import (
+    compute_dense_loss_from_logits,
+    compute_dense_loss_from_offloaded_teacher,
+    get_output_logits,
+)
+from train_utils.distill_losses import (
+    build_distill_token_mask,
+    compute_teacher_entropy_gamma,
+    is_eakld_top_loss,
+)
 from train_utils.lora_training import (
     build_distill_hidden_layer_weights,
     compute_distill_hidden_alignment_loss,
+    compute_selected_distill_hidden_alignment_loss,
     parse_distill_hidden_alignment_layer_weighting,
 )
 
@@ -191,6 +206,11 @@ def compute_choice_kd_loss_from_scores(
     return ce_loss * (1.0 - alpha) + kd_loss * alpha
 
 
+def _is_cpu_offload_supported_loss(loss_type: str) -> bool:
+    norm = str(loss_type or "").strip().lower()
+    return norm in {"sft", "origin", "eakld", "eakld_kd"} or is_eakld_top_loss(norm)
+
+
 class VAEDecoderE2ETrainer(Trainer):
     def __init__(
         self,
@@ -205,6 +225,9 @@ class VAEDecoderE2ETrainer(Trainer):
         hidden_layer_weighting: str = "uniform",
         saved_tensor_offload=None,
         streaming_offload_manager=None,
+        teacher_output_offload: str = "none",
+        teacher_output_pin_memory: bool = True,
+        teacher_output_chunk_tokens: int = 8,
         **kwargs,
     ):
         self.loss_type = str(loss_type).strip().lower()
@@ -229,6 +252,16 @@ class VAEDecoderE2ETrainer(Trainer):
                     "hidden_layer_weighting",
                 )
             ) from exc
+        self.teacher_output_offload = str(teacher_output_offload).strip().lower()
+        if self.teacher_output_offload not in {"none", "cpu"}:
+            raise ValueError("teacher_output_offload must be one of: none | cpu.")
+        self.teacher_output_pin_memory = bool(teacher_output_pin_memory)
+        self.teacher_output_chunk_tokens = int(teacher_output_chunk_tokens)
+        if self.teacher_output_chunk_tokens < 1:
+            raise ValueError("teacher_output_chunk_tokens must be >= 1.")
+        self._active_teacher_targets: Optional[TeacherTargetBatch] = None
+        self._last_teacher_target_stats: Dict[str, object] = {}
+        self._logged_teacher_target_stats = False
         self._teacher_device = None
         self.saved_tensor_offload = saved_tensor_offload
         self.streaming_offload_manager = streaming_offload_manager
@@ -297,6 +330,105 @@ class VAEDecoderE2ETrainer(Trainer):
             merged.setdefault(key, value)
         return super().log(merged, start_time=start_time)
 
+    def _release_active_teacher_targets(self) -> None:
+        targets = self._active_teacher_targets
+        self._active_teacher_targets = None
+        if targets is not None:
+            targets.clear()
+
+    def _build_cpu_teacher_targets(
+        self,
+        *,
+        inputs: Dict[str, torch.Tensor],
+        logits_required: bool,
+        hidden_required: bool,
+    ) -> TeacherTargetBatch:
+        if self._active_teacher_targets is not None:
+            raise RuntimeError(
+                "Active teacher targets already exist; release them before building a new batch."
+            )
+
+        targets = TeacherTargetBatch()
+        teacher_outputs = None
+        teacher_logits = None
+        gamma_mask = None
+        gamma = None
+        try:
+            teacher_inputs = dict(inputs)
+            teacher_inputs.pop("labels", None)
+            teacher_inputs.pop("num_items_in_batch", None)
+
+            collector_ctx = (
+                TeacherHiddenTargetCollector(
+                    model=self.teacher_model,
+                    attention_mask=inputs.get("attention_mask"),
+                    layer_weighting=self.hidden_layer_weighting,
+                    pin_memory=self.teacher_output_pin_memory,
+                    score_chunk_tokens=64,
+                )
+                if hidden_required
+                else nullcontext(None)
+            )
+
+            with collector_ctx as collector:
+                teacher_outputs = self._compute_teacher_outputs(
+                    teacher_inputs,
+                    output_hidden_states=False,
+                )
+
+            logits_cpu = None
+            gamma_cpu = None
+            if logits_required:
+                teacher_logits = get_output_logits(teacher_outputs)
+                gamma_mask = build_distill_token_mask(
+                    labels=inputs.get("labels"),
+                    attention_mask=inputs.get("attention_mask"),
+                    reference_logits=teacher_logits,
+                )
+                gamma = compute_teacher_entropy_gamma(
+                    teacher_logits,
+                    gamma_mask,
+                    confidence_k=self.eakld_confidence_k,
+                )
+                logits_cpu = copy_detached_tensor_to_cpu(
+                    teacher_logits,
+                    pin_memory=self.teacher_output_pin_memory,
+                )
+                gamma_cpu = gamma.detach().reshape(()).to(device="cpu", dtype=torch.float32)
+
+            hidden_layer_indices: tuple = ()
+            hidden_cpu_by_layer: Dict[int, torch.Tensor] = {}
+            num_hidden_layers = 0
+            if hidden_required:
+                if collector is None:
+                    raise RuntimeError("hidden_required=True but teacher hidden collector is missing.")
+                hidden_layer_indices, hidden_cpu_by_layer, num_hidden_layers = collector.finalize()
+
+            del teacher_outputs, teacher_logits, gamma_mask, gamma
+            teacher_outputs = None
+            teacher_logits = None
+            gamma_mask = None
+            gamma = None
+
+            targets = TeacherTargetBatch(
+                logits_cpu=logits_cpu,
+                eakld_gamma_cpu=gamma_cpu,
+                hidden_cpu_by_layer=dict(hidden_cpu_by_layer),
+                hidden_layer_indices=tuple(hidden_layer_indices),
+                num_hidden_layers=int(num_hidden_layers),
+            )
+            self._last_teacher_target_stats = {
+                "logits_device": "cpu" if logits_required else "none",
+                "hidden_layer_indices": tuple(hidden_layer_indices),
+                "hidden_layer_count": len(hidden_layer_indices),
+                "num_hidden_layers": int(num_hidden_layers),
+            }
+            return targets
+        except Exception:
+            targets.clear()
+            del teacher_outputs, teacher_logits, gamma_mask, gamma
+            raise
+
     def _compute_choice_kd_loss(self, model, inputs, return_outputs: bool):
         if float(self.hidden_loss_weight) > 0.0:
             raise ValueError("dataset_task=mcqa does not support hidden_loss_weight > 0.")
@@ -343,11 +475,7 @@ class VAEDecoderE2ETrainer(Trainer):
         self._store_loss_parts(distill_loss=loss)
         return (loss, outputs) if return_outputs else loss
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
-        del num_items_in_batch, kwargs
-        if "choice_input_ids" in inputs:
-            return self._compute_choice_kd_loss(model, inputs, return_outputs=bool(return_outputs))
-
+    def _compute_legacy_dense_loss(self, model, inputs, return_outputs: bool):
         labels = inputs.get("labels")
         student_inputs = dict(inputs)
         student_inputs.pop("labels", None)
@@ -422,14 +550,174 @@ class VAEDecoderE2ETrainer(Trainer):
         self._store_loss_parts(distill_loss=distill_loss, hidden_loss=hidden_loss)
         return (loss, outputs) if return_outputs else loss
 
-    def training_step(self, model, inputs, num_items_in_batch=None):
+    def _compute_teacher_first_cpu_loss(self, model, inputs, return_outputs: bool):
+        loss_type = self.loss_type
+        hidden_required = float(self.hidden_loss_weight) > 0.0
+        logits_required = loss_type not in {"sft", "origin"}
+        needs_teacher = hidden_required or logits_required
+
+        if not _is_cpu_offload_supported_loss(loss_type):
+            raise ValueError(
+                "teacher_output_offload=cpu supports only sft/origin hidden alignment and EAKLD-family losses."
+            )
+
+        labels = inputs.get("labels")
+        student_inputs = dict(inputs)
+        student_inputs.pop("labels", None)
+        student_inputs.pop("num_items_in_batch", None)
+
+        targets: Optional[TeacherTargetBatch] = None
         try:
-            loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
-        except TypeError:
-            loss = super().training_step(model, inputs)
+            if needs_teacher:
+                targets = self._build_cpu_teacher_targets(
+                    inputs=inputs,
+                    logits_required=logits_required,
+                    hidden_required=hidden_required,
+                )
+
+            student_collector_ctx = (
+                StudentHiddenCollector(
+                    model=model,
+                    layer_indices=targets.hidden_layer_indices,
+                )
+                if hidden_required
+                else nullcontext(None)
+            )
+            offload_context = (
+                self.saved_tensor_offload.context()
+                if self.saved_tensor_offload is not None
+                else nullcontext()
+            )
+            with offload_context, student_collector_ctx as student_collector:
+                outputs = model(**student_inputs, output_hidden_states=False)
+            logits = get_output_logits(outputs)
+
+            ce_loss = None
+            if labels is not None:
+                ce_loss = _causal_lm_cross_entropy(logits, labels)
+
+            if loss_type in {"sft", "origin"}:
+                if ce_loss is None:
+                    raise ValueError(f"loss_type={loss_type} requires labels.")
+                if targets is not None and targets.logits_cpu is not None:
+                    raise RuntimeError("sft/origin must not cache teacher logits.")
+                distill_loss = ce_loss
+            else:
+                if (
+                    targets is None
+                    or targets.logits_cpu is None
+                    or targets.eakld_gamma_cpu is None
+                ):
+                    raise RuntimeError(
+                        "EAKLD-family loss requires teacher logits and gamma on CPU."
+                    )
+                token_mask = build_distill_token_mask(
+                    labels=labels,
+                    attention_mask=inputs.get("attention_mask"),
+                    reference_logits=logits,
+                )
+                distill_loss = compute_dense_loss_from_offloaded_teacher(
+                    loss_type=loss_type,
+                    student_logits=logits,
+                    teacher_logits_cpu=targets.logits_cpu,
+                    teacher_gamma_cpu=targets.eakld_gamma_cpu,
+                    ce_loss=ce_loss,
+                    mask=token_mask,
+                    temperature=self.distill_temperature,
+                    alpha=self.distill_alpha,
+                    post_attn=self.post_attn,
+                    eakld_confidence_k=int(self.eakld_confidence_k),
+                    sequence_chunk_size=int(self.teacher_output_chunk_tokens),
+                )
+
+            hidden_loss = None
+            loss = distill_loss
+            if hidden_required:
+                if targets is None or student_collector is None:
+                    raise RuntimeError("hidden alignment requires teacher and student collectors.")
+                hidden_loss = compute_selected_distill_hidden_alignment_loss(
+                    teacher_hidden_by_layer=targets.hidden_cpu_by_layer,
+                    student_hidden_by_layer=student_collector.collected(),
+                    hidden_layer_indices=targets.hidden_layer_indices,
+                    attention_mask=inputs.get("attention_mask"),
+                    layer_weighting=self.hidden_layer_weighting,
+                    num_layers=int(targets.num_hidden_layers),
+                    loss_device=distill_loss.device,
+                )
+                loss = loss + float(self.hidden_loss_weight) * hidden_loss
+
+            self._store_loss_parts(distill_loss=distill_loss, hidden_loss=hidden_loss)
+
+            if torch.is_grad_enabled() and torch.is_tensor(loss) and bool(loss.requires_grad):
+                self._active_teacher_targets = targets
+                targets = None
+            else:
+                if targets is not None:
+                    targets.clear()
+                targets = None
+                self._active_teacher_targets = None
+
+            return (loss, outputs) if return_outputs else loss
+        except Exception:
+            if targets is not None:
+                targets.clear()
+            self._active_teacher_targets = None
+            raise
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        del num_items_in_batch, kwargs
+        if "choice_input_ids" in inputs:
+            return self._compute_choice_kd_loss(model, inputs, return_outputs=bool(return_outputs))
+        if self.teacher_output_offload == "none":
+            return self._compute_legacy_dense_loss(model, inputs, return_outputs=bool(return_outputs))
+        if self.teacher_output_offload == "cpu":
+            return self._compute_teacher_first_cpu_loss(model, inputs, return_outputs=bool(return_outputs))
+        raise ValueError("teacher_output_offload must be one of: none | cpu.")
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        track_peak = (
+            self.teacher_output_offload == "cpu"
+            and not self._logged_teacher_target_stats
+            and torch.cuda.is_available()
+            and torch.device(self.args.device).type == "cuda"
+        )
+        if track_peak:
+            torch.cuda.reset_peak_memory_stats(torch.device(self.args.device))
+
+        try:
+            try:
+                loss = super().training_step(
+                    model,
+                    inputs,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            except TypeError:
+                self._release_active_teacher_targets()
+                loss = super().training_step(model, inputs)
+        finally:
+            self._release_active_teacher_targets()
+
         if self.streaming_offload_manager is not None:
             self.streaming_offload_manager.offload_all(synchronize=True)
+
         target_device = torch.device(self.args.device)
         if torch.is_tensor(loss) and loss.device != target_device:
             loss = loss.to(device=target_device)
+
+        if not self._logged_teacher_target_stats and self.teacher_output_offload == "cpu":
+            peak_bytes = (
+                int(torch.cuda.max_memory_allocated(target_device))
+                if track_peak
+                else -1
+            )
+            logging.getLogger("compressed_e2e_fintuning").info(
+                "Teacher target first-step stats: logits_device=%s hidden_layers=%s "
+                "hidden_layer_count=%d peak_allocated_bytes=%d teacher_weight_offload=false",
+                self._last_teacher_target_stats.get("logits_device", "none"),
+                self._last_teacher_target_stats.get("hidden_layer_indices", ()),
+                int(self._last_teacher_target_stats.get("hidden_layer_count", 0)),
+                peak_bytes,
+            )
+            self._logged_teacher_target_stats = True
+
         return loss
