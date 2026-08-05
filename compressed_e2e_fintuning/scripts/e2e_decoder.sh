@@ -42,6 +42,11 @@ fi
 # - PARALLEL_MODE=layer_mp：单进程层级模型并行，不用 torchrun；多卡切分由 --layer_device_map 控制。
 # - PARALLEL_MODE=dp：torchrun 数据并行；每卡一份完整 student + teacher，忽略 --layer_device_map。
 # - 当前默认 --offload_mode none（层常驻 GPU）。若改 streaming，只能配合 layer_mp。
+#   --offload_mode 控制 student activation/layer offload，与 teacher-output offload 无关。
+# - teacher 权重常驻 GPU，不做权重 offload。
+# - CPU output 模式先 teacher forward，再把 logits 和必要 hidden targets 放到 CPU。
+# - EAKLD 每次只回传 8 个 token 的完整词表 teacher logits。
+# - adaptive_top_3 仅捕获 3 个 student hidden states。
 # - auto（layer_mp）会按当前 CUDA_VISIBLE_DEVICES 内可见 GPU 均分 Transformer layers。
 # - 训练保存 final_model 后会跑 lm-eval：${EVAL_TASKS}
 # - 冒烟建议：
@@ -72,6 +77,9 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --post_attn false \
     --hidden_loss_weight 0.01 \
     --hidden_layer_weighting adaptive_top_3 \
+    --teacher_output_offload cpu \
+    --teacher_output_pin_memory true \
+    --teacher_output_chunk_tokens 8 \
     --model_max_length "1024" \
     --decoder_layers 0-35 \
     --target_modules all \
@@ -126,6 +134,9 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --post_attn false \
     --hidden_loss_weight 0.01 \
     --hidden_layer_weighting adaptive_top_3 \
+    --teacher_output_offload cpu \
+    --teacher_output_pin_memory true \
+    --teacher_output_chunk_tokens 8 \
     --model_max_length "1024" \
     --decoder_layers 0-35 \
     --target_modules all \

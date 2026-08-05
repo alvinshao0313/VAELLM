@@ -790,6 +790,13 @@ def run(args, hf_args, training_args):
         float(getattr(args, "hidden_loss_weight", 0.0)),
         str(getattr(args, "hidden_layer_weighting", "uniform")),
     )
+    log.info(
+        "Teacher output config: offload=%s pin_memory=%s chunk_tokens=%d "
+        "teacher_weight_offload=false",
+        str(args.teacher_output_offload),
+        str(bool(args.teacher_output_pin_memory)).lower(),
+        int(args.teacher_output_chunk_tokens),
+    )
 
     training_args.output_dir = os.path.join(run_output_dir, "trainer_state")
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -833,6 +840,9 @@ def run(args, hf_args, training_args):
         post_attn=bool(args.post_attn),
         hidden_loss_weight=float(args.hidden_loss_weight),
         hidden_layer_weighting=str(args.hidden_layer_weighting),
+        teacher_output_offload=str(args.teacher_output_offload),
+        teacher_output_pin_memory=bool(args.teacher_output_pin_memory),
+        teacher_output_chunk_tokens=int(args.teacher_output_chunk_tokens),
         eakld_confidence_k=int(args.eakld_confidence_k),
         saved_tensor_offload=saved_tensor_offload,
         streaming_offload_manager=streaming_manager,
