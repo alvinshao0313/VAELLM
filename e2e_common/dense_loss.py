@@ -9,7 +9,9 @@ from train_utils.distill_losses import (
     compute_dual_rkl_loss,
     compute_dual_rkl_topk_loss,
     compute_eakld,
+    compute_eakld_from_cpu_teacher_logits,
     compute_eakld_topk,
+    compute_eakld_topk_from_cpu_teacher_logits,
     compute_entropy_aware_kl_loss,
     compute_forward_kl_loss,
     compute_kl_topk,
@@ -233,3 +235,53 @@ def compute_dense_loss_from_logits(
         "eakld_top[_K]/eakld_topk[_K], dual_kd_top[_K], dual_kl, dual_kd, kl_top[_K], "
         "r_kl_top[_K], dual_r_kl_top[_K], dual_kl_top[_K]."
     )
+
+
+def compute_dense_loss_from_offloaded_teacher(
+    *,
+    loss_type: str,
+    student_logits: torch.Tensor,
+    teacher_logits_cpu: torch.Tensor,
+    teacher_gamma_cpu: torch.Tensor,
+    ce_loss: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+    alpha: float = 0.5,
+    post_attn: bool = False,
+    eakld_confidence_k: int = 16,
+    sequence_chunk_size: int = 16,
+) -> torch.Tensor:
+    norm = str(loss_type or "").strip().lower()
+    if int(eakld_confidence_k) < 2:
+        raise ValueError("eakld_confidence_k must be >= 2.")
+
+    if norm == "eakld" or norm == "eakld_kd":
+        eakld_loss = compute_eakld_from_cpu_teacher_logits(
+            student_logits=student_logits,
+            teacher_logits_cpu=teacher_logits_cpu,
+            mask=mask,
+            gamma=teacher_gamma_cpu,
+            temperature=float(temperature),
+            sequence_chunk_size=int(sequence_chunk_size),
+        )
+    elif is_eakld_top_loss(norm):
+        eakld_loss = compute_eakld_topk_from_cpu_teacher_logits(
+            student_logits=student_logits,
+            teacher_logits_cpu=teacher_logits_cpu,
+            mask=mask,
+            gamma=teacher_gamma_cpu,
+            k=parse_eakld_top_k(norm, default_k=1000),
+            temperature=float(temperature),
+            post_attn=bool(post_attn),
+            sequence_chunk_size=int(sequence_chunk_size),
+        )
+    else:
+        raise ValueError(
+            "teacher_output_offload=cpu supports only EAKLD-family losses."
+        )
+
+    if norm != "eakld_kd":
+        return eakld_loss
+    if ce_loss is None:
+        raise ValueError("loss_type=eakld_kd requires ce_loss.")
+    return ce_loss * (1.0 - float(alpha)) + eakld_loss * float(alpha)
