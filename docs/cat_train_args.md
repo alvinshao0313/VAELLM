@@ -281,7 +281,6 @@
 | `--lfq_weight` | `1.0` | quantizer 辅助损失系数 | 参与 VAE loss |
 | `--commitment_loss_weight` | `0.25` | BSQ commitment 权重 | 传入量化器 |
 | `--entropy_loss_weight` | `0.1` | BSQ entropy 权重 | 传入量化器 |
-| `--diversity_gamma` | `1.0` | BSQ diversity 超参 | 传入量化器 |
 | `--quantizer_type` | `BSQ` | 量化器类型 | 当前实现支持 `BSQ` 和 `Identity` |
 | `--gamma0` | `1.0` | BSQ 超参 | |
 | `--gamma` | `1.0` | BSQ 超参 | |
@@ -350,7 +349,7 @@
 - `eval_every` 同时作用于 VAE stage 和 joint decoder 的中间评估。
 - `eval_every=0` 表示不做中间评估。
 - `eval_blocks` 只限制中间评估最多使用多少个 blocks。
-- VAE stage 中间评估会输出当前 stage 的 `mse` 和 `top_k_mse(k=100)`。
+- VAE stage 中间评估会输出当前 stage 的 `mse` 和固定评估诊断 `top_k_mse(k=100)`（非可选 recon loss；按 parallel model 独立选 top-k）。
 - joint decoder 中间评估会输出当前 `recon_loss_type` 下的 `recon_loss`，并使用前 `eval_blocks` 个 blocks，不是随机采样。
 - joint decoder 在联合优化前后一定会记录完整权重重建损失，不受 `eval_every/eval_blocks` 限制：
   - `full_recon_loss_before`：联合优化前，全量 blocks 的重建损失

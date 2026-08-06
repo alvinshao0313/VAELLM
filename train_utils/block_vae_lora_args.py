@@ -19,7 +19,14 @@ from train_utils.cat_train_args import ResolvedCategoryRuntimeConfig, parse_skip
 
 
 _CATEGORY_SELECTORS = ("default", "cat")
-_RECON_LOSS_TYPE_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse")
+_RECON_LOSS_TYPE_CHOICES = (
+    "mse",
+    "l1",
+    "huber",
+    "relative_l1",
+    "w_mse",
+    "w2_mse",
+)
 _NORM_TYPE_CHOICES = ("group", "batch", "layer", "rms", "no")
 _ACTIVATION_TYPE_CHOICES = ("swish", "relu", "none", "sigmoid", "gelu", "hard_swish")
 _DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
@@ -104,7 +111,6 @@ class BlockVaeLoraArgs:
     lfq_weight: float
     commitment_loss_weight: float
     entropy_loss_weight: float
-    diversity_gamma: float
     normalize_weight: bool
     use_checkpoint: bool
     new_quant: bool
@@ -471,7 +477,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lfq_weight", type=float, default=5.0)
     parser.add_argument("--commitment_loss_weight", type=float, default=0.1)
     parser.add_argument("--entropy_loss_weight", type=float, default=1e-4)
-    parser.add_argument("--diversity_gamma", type=float, default=1.0)
     parser.add_argument("--normalize_weight", action="store_true", default=False)
     parser.add_argument("--use_checkpoint", action="store_true", default=False)
     parser.add_argument("--new_quant", action="store_true", default=False)
@@ -638,7 +643,6 @@ def _normalize_args(raw_args) -> BlockVaeLoraArgs:
         lfq_weight=float(raw_args.lfq_weight),
         commitment_loss_weight=float(raw_args.commitment_loss_weight),
         entropy_loss_weight=float(raw_args.entropy_loss_weight),
-        diversity_gamma=float(raw_args.diversity_gamma),
         normalize_weight=bool(raw_args.normalize_weight),
         use_checkpoint=bool(raw_args.use_checkpoint),
         new_quant=bool(raw_args.new_quant),

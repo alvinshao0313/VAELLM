@@ -120,7 +120,6 @@ def _build_internal_vae_namespace(args: BlockVaeLoraArgs, training_args) -> argp
         lfq_weight=float(args.lfq_weight),
         commitment_loss_weight=float(args.commitment_loss_weight),
         entropy_loss_weight=float(args.entropy_loss_weight),
-        diversity_gamma=float(args.diversity_gamma),
         normalize_weight=bool(args.normalize_weight),
         use_checkpoint=bool(args.use_checkpoint),
         new_quant=bool(args.new_quant),

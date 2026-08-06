@@ -136,11 +136,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vae_adalora_orth_reg_weight", type=float, default=0.5)
     parser.add_argument("--loss_type", type=str, default="sft")
     parser.add_argument(
-        "--post_attn",
-        type=lambda v: _parse_bool_like(v, arg_name="--post_attn"),
-        default=False,
-    )
-    parser.add_argument(
         "--lora_hif4_act",
         type=lambda v: _parse_bool_like(v, arg_name="--lora_hif4_act"),
         default=False,
@@ -228,7 +223,6 @@ def _build_extra_meta(args, selection) -> Dict[str, object]:
         "target_decoder_layers": list(selection.decoder_layer_ids),
         "target_module_names": None if args.target_module_names is None else list(args.target_module_names),
         "loss_type": str(args.loss_type),
-        "post_attn": bool(args.post_attn),
         "lora_hif4_act": bool(args.lora_hif4_act),
         "finetune_mode": _E2E_FINETUNE_MODE,
         "vae_lora_variant": str(args.vae_lora_variant),

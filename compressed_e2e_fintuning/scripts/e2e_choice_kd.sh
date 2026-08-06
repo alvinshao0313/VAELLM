@@ -33,7 +33,6 @@ python -m compressed_e2e_fintuning.main \
   --loss_type choice_kd_ce \
   --distill_temperature 1.0 \
   --distill_alpha 0.8 \
-  --post_attn false \
   --hidden_loss_weight 0.0 \
   --hidden_layer_weighting uniform \
   --model_max_length 2048 \

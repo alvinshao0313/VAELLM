@@ -39,7 +39,6 @@ python -m compressed_e2e_fintuning.main \
   --loss_type sft \
   --distill_temperature 1.0 \
   --distill_alpha 0.5 \
-  --post_attn false \
   --model_max_length "8192" \
   --decoder_layers "${DECODER_LAYERS:-0-35}" \
   --target_modules all \

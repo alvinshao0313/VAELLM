@@ -49,8 +49,6 @@ HiFloat4/**/.ipynb_checkpoints/
 adapters/
 notebook/
 
-tests/
-test/
 docs/重要日志/
 .ai-bridge/
 .agents/
@@ -59,3 +57,5 @@ docs/重要日志/
 BiSCo-LLM_TNNLS_English_LaTeX/
 data/
 **/plans/
+AGENTS.md
+.cursor/

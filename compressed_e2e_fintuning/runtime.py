@@ -837,7 +837,6 @@ def run(args, hf_args, training_args):
         teacher_model=teacher_model,
         distill_temperature=args.distill_temperature,
         distill_alpha=args.distill_alpha,
-        post_attn=bool(args.post_attn),
         hidden_loss_weight=float(args.hidden_loss_weight),
         hidden_layer_weighting=str(args.hidden_layer_weighting),
         teacher_output_offload=str(args.teacher_output_offload),

@@ -1,0 +1,525 @@
+{
+  "cat_args": {
+    "activation_calib_dataset": "",
+    "activation_calib_device": "",
+    "activation_calib_log_every": 0,
+    "activation_calib_nsamples": 512,
+    "activation_calib_seed": 0,
+    "activation_calib_seqlen": 512,
+    "allow_tail_group": true,
+    "batch_size": 256,
+    "candidate_artifact_output_dir": null,
+    "candidate_artifact_spec": null,
+    "convert": false,
+    "convert_device": "cuda",
+    "deterministic": false,
+    "distill_after_category": "none",
+    "distill_batch_size": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_batch_size",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 2,
+      "has_default": true
+    },
+    "distill_dataset": "",
+    "distill_eakld_confidence_k": 16,
+    "distill_hidden_alignment_layer_weighting": "uniform",
+    "distill_hidden_loss_weight": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_hidden_loss_weight",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0.0,
+      "has_default": true
+    },
+    "distill_independent_categories": false,
+    "distill_log_every": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_log_every",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 1,
+      "has_default": true
+    },
+    "distill_loss_alpha": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_loss_alpha",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0.5,
+      "has_default": true
+    },
+    "distill_loss_type": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_loss_type",
+      "by_after_category": {},
+      "by_category": {},
+      "default": "eakld",
+      "has_default": true
+    },
+    "distill_lr": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_lr",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0.0001,
+      "has_default": true
+    },
+    "distill_pre_mlp_hidden_loss_weight": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_pre_mlp_hidden_loss_weight",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0.0,
+      "has_default": true
+    },
+    "distill_reset_completed": false,
+    "distill_steps": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_steps",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 50,
+      "has_default": true
+    },
+    "distill_temperature": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_temperature",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 1.0,
+      "has_default": true
+    },
+    "distill_tune_final_norm": false,
+    "distill_use_post_norm_head_linear": false,
+    "distill_weight_decay": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--distill_weight_decay",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0.0,
+      "has_default": true
+    },
+    "eval_blocks": 256,
+    "eval_every": 0,
+    "eval_hif4_act": false,
+    "eval_ppl": true,
+    "eval_tasks": "",
+    "gpu_resident_data": false,
+    "include_all_linears": false,
+    "intra_part_sort_mode": {
+      "allowed_selectors": [
+        "default",
+        "cat"
+      ],
+      "arg_name": "--intra_part_sort_mode",
+      "by_after_category": {},
+      "by_category": {},
+      "default": "none",
+      "has_default": true
+    },
+    "linear_group_size": 32,
+    "log_every": 50,
+    "lora_alpha": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--lora_alpha",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 16.0,
+      "has_default": true
+    },
+    "lora_dropout": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--lora_dropout",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0.0,
+      "has_default": true
+    },
+    "lora_rank": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--lora_rank",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 8,
+      "has_default": true
+    },
+    "lora_use_dora": {
+      "allowed_selectors": [
+        "default",
+        "after"
+      ],
+      "arg_name": "--lora_use_dora",
+      "by_after_category": {},
+      "by_category": {},
+      "default": true,
+      "has_default": true
+    },
+    "outlier_channel_scope": "layer",
+    "outlier_mlp_fuse_weights": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "outlier_mlp_rank_metric": "none",
+    "outlier_protect_axis": "input",
+    "outlier_protect_channel_quant": "none",
+    "outlier_protect_count": {
+      "allowed_selectors": [
+        "default",
+        "cat"
+      ],
+      "arg_name": "--outlier_protect_count",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0,
+      "has_default": true
+    },
+    "outlier_protect_min_per_layer": 0,
+    "outlier_protect_mode": "channel",
+    "outlier_rank_metric": "sparse_residual_abs",
+    "outlier_residual_block_shape": [
+      256,
+      256
+    ],
+    "outlier_residual_codec": "coo_fp16",
+    "outlier_residual_index_bits": 8,
+    "outlier_residual_min_abs": 1e-06,
+    "outlier_residual_top_p": {
+      "allowed_selectors": [
+        "default",
+        "cat"
+      ],
+      "arg_name": "--outlier_residual_top_p",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0.0,
+      "has_default": true
+    },
+    "outlier_residual_vae_batch_multiplier": 1,
+    "outlier_residual_vae_codebook_bits": {
+      "allowed_selectors": [
+        "default",
+        "cat"
+      ],
+      "arg_name": "--outlier_residual_vae_codebook_bits",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0,
+      "has_default": true
+    },
+    "outlier_residual_vae_codebook_dim": {
+      "allowed_selectors": [
+        "default",
+        "cat"
+      ],
+      "arg_name": "--outlier_residual_vae_codebook_dim",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 0,
+      "has_default": true
+    },
+    "outlier_residual_vae_decoder_share_scope": "none",
+    "outlier_residual_vae_lr": 0.0,
+    "outlier_residual_vae_stages": {
+      "allowed_selectors": [
+        "default",
+        "cat"
+      ],
+      "arg_name": "--outlier_residual_vae_stages",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 1,
+      "has_default": true
+    },
+    "outlier_residual_vae_steps": 0,
+    "outlier_residual_value_bits": 8,
+    "output_dir": "./output_linear_by_category/meta-llama_Llama-2-7b-hf_20260805_071833",
+    "ppl_limit": -1,
+    "resume_from_checkpoint": null,
+    "rot_llm": false,
+    "save_candidate_artifact": false,
+    "save_model": false,
+    "seed": 0,
+    "skip_layers": "",
+    "steps_per_category": {
+      "allowed_selectors": [
+        "default",
+        "cat"
+      ],
+      "arg_name": "--steps_per_category",
+      "by_after_category": {},
+      "by_category": {},
+      "default": 2000,
+      "has_default": true
+    },
+    "target_categories": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    "train_device": "cuda",
+    "transpose_modules": "v_proj,o_proj,gate_proj,up_proj,down_proj",
+    "unload_vae_original_weights_on_final_save": false
+  },
+  "resolved_category_runtime": {
+    "down_proj": {
+      "activation_type": "swish",
+      "base_ch": 128,
+      "category": "down_proj",
+      "codebook_bits": 16,
+      "codebook_dim": 8,
+      "decoder_base_ch": null,
+      "decoder_num_res_blocks": null,
+      "decoder_type": "linear",
+      "intra_part_sort_mode": "none",
+      "norm_type": "group",
+      "num_res_blocks": 1,
+      "outlier_protect_count": 0,
+      "outlier_residual_top_p": 0.0,
+      "outlier_residual_vae_codebook_bits": 16,
+      "outlier_residual_vae_codebook_dim": 8,
+      "outlier_residual_vae_stages": 1,
+      "recon_loss_type": "mse",
+      "residual_stages": 1,
+      "steps": 2000
+    },
+    "gate_proj": {
+      "activation_type": "swish",
+      "base_ch": 128,
+      "category": "gate_proj",
+      "codebook_bits": 16,
+      "codebook_dim": 8,
+      "decoder_base_ch": null,
+      "decoder_num_res_blocks": null,
+      "decoder_type": "linear",
+      "intra_part_sort_mode": "none",
+      "norm_type": "group",
+      "num_res_blocks": 1,
+      "outlier_protect_count": 0,
+      "outlier_residual_top_p": 0.0,
+      "outlier_residual_vae_codebook_bits": 16,
+      "outlier_residual_vae_codebook_dim": 8,
+      "outlier_residual_vae_stages": 1,
+      "recon_loss_type": "mse",
+      "residual_stages": 1,
+      "steps": 2000
+    },
+    "k_proj": {
+      "activation_type": "swish",
+      "base_ch": 128,
+      "category": "k_proj",
+      "codebook_bits": 16,
+      "codebook_dim": 8,
+      "decoder_base_ch": null,
+      "decoder_num_res_blocks": null,
+      "decoder_type": "linear",
+      "intra_part_sort_mode": "none",
+      "norm_type": "group",
+      "num_res_blocks": 1,
+      "outlier_protect_count": 0,
+      "outlier_residual_top_p": 0.0,
+      "outlier_residual_vae_codebook_bits": 16,
+      "outlier_residual_vae_codebook_dim": 8,
+      "outlier_residual_vae_stages": 1,
+      "recon_loss_type": "mse",
+      "residual_stages": 1,
+      "steps": 2000
+    },
+    "o_proj": {
+      "activation_type": "swish",
+      "base_ch": 128,
+      "category": "o_proj",
+      "codebook_bits": 16,
+      "codebook_dim": 8,
+      "decoder_base_ch": null,
+      "decoder_num_res_blocks": null,
+      "decoder_type": "linear",
+      "intra_part_sort_mode": "none",
+      "norm_type": "group",
+      "num_res_blocks": 1,
+      "outlier_protect_count": 0,
+      "outlier_residual_top_p": 0.0,
+      "outlier_residual_vae_codebook_bits": 16,
+      "outlier_residual_vae_codebook_dim": 8,
+      "outlier_residual_vae_stages": 1,
+      "recon_loss_type": "mse",
+      "residual_stages": 1,
+      "steps": 2000
+    },
+    "q_proj": {
+      "activation_type": "swish",
+      "base_ch": 128,
+      "category": "q_proj",
+      "codebook_bits": 16,
+      "codebook_dim": 8,
+      "decoder_base_ch": null,
+      "decoder_num_res_blocks": null,
+      "decoder_type": "linear",
+      "intra_part_sort_mode": "none",
+      "norm_type": "group",
+      "num_res_blocks": 1,
+      "outlier_protect_count": 0,
+      "outlier_residual_top_p": 0.0,
+      "outlier_residual_vae_codebook_bits": 16,
+      "outlier_residual_vae_codebook_dim": 8,
+      "outlier_residual_vae_stages": 1,
+      "recon_loss_type": "mse",
+      "residual_stages": 1,
+      "steps": 2000
+    },
+    "up_proj": {
+      "activation_type": "swish",
+      "base_ch": 128,
+      "category": "up_proj",
+      "codebook_bits": 16,
+      "codebook_dim": 8,
+      "decoder_base_ch": null,
+      "decoder_num_res_blocks": null,
+      "decoder_type": "linear",
+      "intra_part_sort_mode": "none",
+      "norm_type": "group",
+      "num_res_blocks": 1,
+      "outlier_protect_count": 0,
+      "outlier_residual_top_p": 0.0,
+      "outlier_residual_vae_codebook_bits": 16,
+      "outlier_residual_vae_codebook_dim": 8,
+      "outlier_residual_vae_stages": 1,
+      "recon_loss_type": "mse",
+      "residual_stages": 1,
+      "steps": 2000
+    },
+    "v_proj": {
+      "activation_type": "swish",
+      "base_ch": 128,
+      "category": "v_proj",
+      "codebook_bits": 16,
+      "codebook_dim": 8,
+      "decoder_base_ch": null,
+      "decoder_num_res_blocks": null,
+      "decoder_type": "linear",
+      "intra_part_sort_mode": "none",
+      "norm_type": "group",
+      "num_res_blocks": 1,
+      "outlier_protect_count": 0,
+      "outlier_residual_top_p": 0.0,
+      "outlier_residual_vae_codebook_bits": 16,
+      "outlier_residual_vae_codebook_dim": 8,
+      "outlier_residual_vae_stages": 1,
+      "recon_loss_type": "mse",
+      "residual_stages": 1,
+      "steps": 2000
+    }
+  },
+  "training_args": {
+    "bf16": false,
+    "distill_gradient_accumulation_steps": 1,
+    "distill_gradient_checkpointing": false,
+    "distill_gradient_checkpointing_kwargs": null,
+    "distill_group_by_length": true,
+    "distill_hif4_act": false,
+    "distill_lr_scheduler_type": "linear",
+    "distill_max_grad_norm": 0.3,
+    "distill_model_max_length": 2048,
+    "distill_optim": "paged_adamw_8bit",
+    "distill_post_attn": false,
+    "distill_teacher_logits_cpu_staging": true,
+    "distill_warmup_ratio": 0.3,
+    "fp16": false
+  },
+  "vae_args": {
+    "access_token": null,
+    "activation_type": {
+      "default": "swish"
+    },
+    "base_ch": {
+      "default": 128
+    },
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "codebook_bits": {
+      "default": 16
+    },
+    "codebook_dim": {
+      "default": 8
+    },
+    "commitment_loss_weight": 0.25,
+    "decoder_base_ch": {
+      "default": null
+    },
+    "decoder_num_res_blocks": {
+      "default": null
+    },
+    "decoder_type": {
+      "default": "linear"
+    },
+    "diversity_gamma": 1.0,
+    "entropy_loss_weight": 0.1,
+    "gamma": 1.0,
+    "gamma0": 1.0,
+    "inv_temperature": 100.0,
+    "l1_weight": 1.0,
+    "lfq_weight": 1.0,
+    "lr": 0.0001,
+    "lr_scheduler": "constant",
+    "lr_warmup_steps": 0,
+    "model_path": "meta-llama/Llama-2-7b-hf",
+    "new_quant": false,
+    "norm_type": {
+      "default": "group"
+    },
+    "normalize_weight": false,
+    "num_res_blocks": {
+      "default": 1
+    },
+    "optimizer": "adamw",
+    "quantizer_type": "BSQ",
+    "recon_loss_type": {
+      "default": "mse"
+    },
+    "residual_stages": {
+      "default": 1
+    },
+    "vae_autocast_dtype": "fp32",
+    "vae_decoder_checkpoint": null,
+    "vae_weight_dtype": "fp32",
+    "weight_decay": 0.01,
+    "zeta": 1.0
+  }
+}

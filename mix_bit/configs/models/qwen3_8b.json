@@ -1,0 +1,27 @@
+{
+  "model_id": "qwen3_8b",
+  "model_path": "Qwen/Qwen3-8B",
+  "adapter": "generic_decoder",
+  "only_decoder_projections": true,
+  "candidate_training": {
+    "linear_group_size": "all",
+    "allow_tail_group": true
+  },
+  "layer_index_patterns": [
+    "(?:^|\\.)model\\.layers\\.(\\d+)\\."
+  ],
+  "categories": [
+    {"name": "q_proj", "module_suffix": "q_proj", "transpose": true},
+    {"name": "k_proj", "module_suffix": "k_proj", "transpose": false},
+    {"name": "v_proj", "module_suffix": "v_proj", "transpose": true},
+    {"name": "o_proj", "module_suffix": "o_proj", "transpose": true},
+    {"name": "gate_proj", "module_suffix": "gate_proj", "transpose": false},
+    {"name": "up_proj", "module_suffix": "up_proj", "transpose": false},
+    {"name": "down_proj", "module_suffix": "down_proj", "transpose": true}
+  ],
+  "regression_expectations": {
+    "block_count": 36,
+    "target_linear_count": 252,
+    "category_count": 7
+  }
+}

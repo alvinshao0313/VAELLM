@@ -116,6 +116,8 @@ class TeacherTargetOffloadUtilityTest(unittest.TestCase):
         batch = TeacherTargetBatch(
             logits_cpu=torch.randn(2, 4, 8),
             eakld_gamma_cpu=torch.randn(2, 4),
+            teacher_entropy_mean_cpu=torch.tensor(1.5),
+            teacher_valid_token_count_cpu=torch.tensor(8.0),
             hidden_cpu_by_layer={0: torch.randn(2, 4, 16)},
             hidden_layer_indices=(0,),
             num_hidden_layers=1,
@@ -125,6 +127,8 @@ class TeacherTargetOffloadUtilityTest(unittest.TestCase):
 
         self.assertIsNone(batch.logits_cpu)
         self.assertIsNone(batch.eakld_gamma_cpu)
+        self.assertIsNone(batch.teacher_entropy_mean_cpu)
+        self.assertIsNone(batch.teacher_valid_token_count_cpu)
         self.assertEqual(batch.hidden_cpu_by_layer, {})
         self.assertEqual(batch.hidden_layer_indices, ())
         self.assertEqual(batch.num_hidden_layers, 0)

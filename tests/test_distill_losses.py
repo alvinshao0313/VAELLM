@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from unittest import mock
 
 import pytest
@@ -123,6 +124,101 @@ def test_teacher_entropy_never_runs_softmax_on_full_sequence() -> None:
     assert not any(shape == (4, 41, 257) for shape in observed_shapes)
 
 
+def test_eakld_gamma_uses_full_vocab_entropy_and_log_confidence_k() -> None:
+    teacher_logits = torch.zeros(1, 2, 32, dtype=torch.float32)
+    mask = torch.ones(1, 2, dtype=torch.float32)
+
+    entropy_mean, gamma_reverse, valid_count = (
+        distill_losses.compute_teacher_entropy_mean_and_gamma(
+            teacher_logits,
+            mask,
+            confidence_k=16,
+        )
+    )
+
+    expected_entropy = torch.tensor(
+        math.log(32.0),
+        dtype=torch.float32,
+    )
+    expected_gamma = torch.clamp(
+        1.0 - expected_entropy / math.log(16.0),
+        min=0.0,
+        max=1.0,
+    )
+
+    assert torch.allclose(entropy_mean, expected_entropy, atol=1e-6)
+    assert torch.allclose(gamma_reverse, expected_gamma, atol=1e-6)
+    assert valid_count.item() == pytest.approx(2.0)
+
+
+def test_eakld_telemetry_reuses_existing_entropy_and_kl_computation() -> None:
+    torch.manual_seed(47)
+    teacher = torch.randn(2, 4, 19)
+    mask = torch.tensor(
+        [
+            [0.0, 1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+        ]
+    )
+    original_softmax = distill_losses.F.softmax
+
+    baseline_student = torch.randn(2, 4, 19, requires_grad=True)
+    with mock.patch.object(
+        distill_losses.F,
+        "softmax",
+        wraps=original_softmax,
+    ) as baseline_softmax:
+        baseline_loss = distill_losses.compute_eakld(
+            student_logits=baseline_student,
+            teacher_logits=teacher,
+            mask=mask,
+            temperature=1.0,
+            confidence_k=16,
+            telemetry_out=None,
+        )
+    baseline_loss.backward()
+    baseline_grad = baseline_student.grad.detach().clone()
+    baseline_calls = baseline_softmax.call_count
+
+    telemetry_student = baseline_student.detach().clone().requires_grad_(True)
+    telemetry: dict[str, torch.Tensor] = {}
+    with mock.patch.object(
+        distill_losses.F,
+        "softmax",
+        wraps=original_softmax,
+    ) as telemetry_softmax:
+        telemetry_loss = distill_losses.compute_eakld(
+            student_logits=telemetry_student,
+            teacher_logits=teacher,
+            mask=mask,
+            temperature=1.0,
+            confidence_k=16,
+            telemetry_out=telemetry,
+        )
+    telemetry_loss.backward()
+
+    assert telemetry_softmax.call_count == baseline_calls
+    assert torch.allclose(telemetry_loss, baseline_loss, rtol=1e-6, atol=1e-7)
+    assert torch.allclose(
+        telemetry_student.grad,
+        baseline_grad,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    assert set(telemetry) == {
+        "teacher_entropy_mean",
+        "gamma_reverse",
+        "lambda_forward",
+        "forward_kl",
+        "reverse_kl",
+        "eakld_total",
+        "valid_tokens",
+    }
+    for value in telemetry.values():
+        assert value.ndim == 0
+        assert value.requires_grad is False
+
+
 def _dense_eakld_topk_reference(
     *,
     student_logits: torch.Tensor,
@@ -131,7 +227,6 @@ def _dense_eakld_topk_reference(
     k: int,
     temperature: float,
     confidence_k: int,
-    post_attn: bool,
 ) -> torch.Tensor:
     temp = max(float(temperature), 0.1)
     expected_entropy_sum, expected_valid = _dense_teacher_entropy_stats_reference(
@@ -150,22 +245,17 @@ def _dense_eakld_topk_reference(
         teacher_scaled=teacher_scaled,
         mask=mask,
         k=int(k),
-        post_attn=bool(post_attn),
     ) * (temp * temp)
     forward_kl = distill_losses._topk_forward_kl_mean(
         student_scaled=student_scaled,
         teacher_scaled=teacher_scaled,
         mask=mask,
         k=int(k),
-        post_attn=bool(post_attn),
     ) * (temp * temp)
     return gamma * reverse_kl + (1.0 - gamma) * forward_kl
 
 
-@pytest.mark.parametrize("post_attn", [False, True])
-def test_eakld_topk_chunked_entropy_matches_dense_output_and_gradient(
-    post_attn: bool,
-) -> None:
+def test_eakld_topk_chunked_entropy_matches_dense_output_and_gradient() -> None:
     torch.manual_seed(17)
     teacher_logits = torch.randn(2, 5, 23, dtype=torch.bfloat16)
     mask = torch.tensor(
@@ -190,7 +280,6 @@ def test_eakld_topk_chunked_entropy_matches_dense_output_and_gradient(
         k=7,
         temperature=1.3,
         confidence_k=16,
-        post_attn=post_attn,
     )
     expected.backward()
     expected_grad = student_expected.grad.detach().clone()
@@ -203,7 +292,6 @@ def test_eakld_topk_chunked_entropy_matches_dense_output_and_gradient(
         k=7,
         temperature=1.3,
         confidence_k=16,
-        post_attn=post_attn,
     )
     actual.backward()
 
@@ -243,7 +331,6 @@ def test_dense_loss_dispatches_eakld_top_100_with_finite_backward() -> None:
         mask=mask,
         temperature=1.0,
         alpha=0.5,
-        post_attn=False,
         eakld_confidence_k=16,
     )
     loss.backward()
@@ -382,6 +469,71 @@ def test_forward_kl_gradient_uses_shifted_causal_positions() -> None:
     assert gradient_by_position[4].item() == pytest.approx(0.0, abs=0.0)
 
 
+def test_masked_logit_mse_matches_manual_valid_token_mean() -> None:
+    student = torch.tensor(
+        [[[1.0, 2.0], [9.0, 9.0], [3.0, 5.0]]],
+        requires_grad=True,
+    )
+    teacher = torch.tensor(
+        [[[0.0, 0.0], [-99.0, 99.0], [1.0, 1.0]]],
+    )
+    mask = torch.tensor([[1.0, 0.0, 1.0]])
+
+    actual = distill_losses.compute_masked_logit_mse_loss(
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=mask,
+    )
+
+    token0 = ((student[0, 0] - teacher[0, 0]) ** 2).mean()
+    token2 = ((student[0, 2] - teacher[0, 2]) ** 2).mean()
+    expected = (token0 + token2) / 2.0
+
+    assert torch.allclose(actual, expected)
+
+
+def test_mse_gradient_uses_shifted_causal_positions() -> None:
+    student = torch.randn(1, 5, 13, requires_grad=True)
+    teacher = torch.randn(1, 5, 13)
+    labels = torch.tensor([[-100, -100, 3, 4, 2]])
+
+    mask = distill_losses.build_distill_token_mask(
+        labels=labels,
+        attention_mask=torch.ones(1, 5, dtype=torch.long),
+        reference_logits=student,
+    )
+    loss = distill_losses.compute_masked_logit_mse_loss(
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=mask,
+    )
+    loss.backward()
+
+    grad_by_position = student.grad.abs().sum(dim=-1).squeeze(0)
+    assert grad_by_position[0].item() == pytest.approx(0.0, abs=0.0)
+    assert grad_by_position[1].item() > 0.0
+    assert grad_by_position[2].item() > 0.0
+    assert grad_by_position[3].item() > 0.0
+    assert grad_by_position[4].item() == pytest.approx(0.0, abs=0.0)
+
+
+def test_masked_logit_mse_all_zero_mask_returns_differentiable_zero() -> None:
+    student = torch.randn(2, 4, 7, requires_grad=True)
+    teacher = torch.randn(2, 4, 7)
+    mask = torch.zeros(2, 4)
+
+    loss = distill_losses.compute_masked_logit_mse_loss(
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=mask,
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(0.0, abs=0.0)
+    assert student.grad is not None
+    assert torch.equal(student.grad, torch.zeros_like(student.grad))
+
+
 def test_distill_mask_exactly_matches_next_label_validity() -> None:
     torch.manual_seed(53)
     batch_size = 4
@@ -450,10 +602,8 @@ def test_cpu_teacher_eakld_matches_dense_value_and_gradient(
     assert torch.allclose(chunk_grad, dense_grad, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("post_attn", [False, True])
 @pytest.mark.parametrize("sequence_chunk_size", [1, 3, 8])
 def test_cpu_teacher_eakld_topk_matches_dense_value_and_gradient(
-    post_attn: bool,
     sequence_chunk_size: int,
 ) -> None:
     torch.manual_seed(103)
@@ -482,7 +632,6 @@ def test_cpu_teacher_eakld_topk_matches_dense_value_and_gradient(
         k=7,
         temperature=0.9,
         confidence_k=16,
-        post_attn=post_attn,
     )
     chunk_loss = distill_losses.compute_eakld_topk_from_cpu_teacher_logits(
         student_logits=chunk_student,
@@ -491,7 +640,6 @@ def test_cpu_teacher_eakld_topk_matches_dense_value_and_gradient(
         gamma=gamma_cpu,
         k=7,
         temperature=0.9,
-        post_attn=post_attn,
         sequence_chunk_size=sequence_chunk_size,
     )
 
@@ -624,7 +772,14 @@ def test_cpu_teacher_eakld_rejects_invalid_inputs() -> None:
 def _offloaded_teacher_loss_fixtures(
     *,
     loss_type: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
     torch.manual_seed(211)
     teacher_logits = torch.randn(2, 6, 31, dtype=torch.float32)
     student_logits = torch.randn(2, 6, 31, dtype=torch.float32, requires_grad=True)
@@ -635,11 +790,16 @@ def _offloaded_teacher_loss_fixtures(
         ],
         dtype=torch.float32,
     )
-    teacher_gamma_cpu = distill_losses.compute_teacher_entropy_gamma(
-        teacher_logits,
-        mask,
-        confidence_k=16,
-    ).detach().cpu()
+    entropy_mean, teacher_gamma, valid_count = (
+        distill_losses.compute_teacher_entropy_mean_and_gamma(
+            teacher_logits,
+            mask,
+            confidence_k=16,
+        )
+    )
+    teacher_gamma_cpu = teacher_gamma.detach().cpu()
+    teacher_entropy_mean_cpu = entropy_mean.detach().cpu()
+    teacher_valid_token_count_cpu = valid_count.detach().cpu()
     ce_loss = None
     if loss_type == "eakld_kd":
         ce_loss = torch.tensor(1.25, dtype=torch.float32, requires_grad=True)
@@ -647,6 +807,8 @@ def _offloaded_teacher_loss_fixtures(
         student_logits,
         teacher_logits.cpu(),
         teacher_gamma_cpu,
+        teacher_entropy_mean_cpu,
+        teacher_valid_token_count_cpu,
         ce_loss,
     )
 
@@ -656,15 +818,22 @@ def _offloaded_teacher_loss_fixtures(
     ["eakld", "eakld_kd", "eakld_top_7", "eakld_topk_7"],
 )
 def test_offloaded_teacher_dense_loss_finite_backward(loss_type: str) -> None:
-    student_logits, teacher_logits_cpu, teacher_gamma_cpu, ce_loss = (
-        _offloaded_teacher_loss_fixtures(loss_type=loss_type)
-    )
+    (
+        student_logits,
+        teacher_logits_cpu,
+        teacher_gamma_cpu,
+        teacher_entropy_mean_cpu,
+        teacher_valid_token_count_cpu,
+        ce_loss,
+    ) = _offloaded_teacher_loss_fixtures(loss_type=loss_type)
 
     loss = compute_dense_loss_from_offloaded_teacher(
         loss_type=loss_type,
         student_logits=student_logits,
         teacher_logits_cpu=teacher_logits_cpu,
         teacher_gamma_cpu=teacher_gamma_cpu,
+        teacher_entropy_mean_cpu=teacher_entropy_mean_cpu,
+        teacher_valid_token_count_cpu=teacher_valid_token_count_cpu,
         ce_loss=ce_loss,
         mask=torch.tensor(
             [
@@ -675,7 +844,6 @@ def test_offloaded_teacher_dense_loss_finite_backward(loss_type: str) -> None:
         ),
         temperature=1.1,
         alpha=0.4,
-        post_attn=False,
         eakld_confidence_k=16,
         sequence_chunk_size=3,
     )
@@ -706,10 +874,11 @@ def test_offloaded_teacher_dense_loss_rejects_non_eakld() -> None:
             student_logits=student_logits,
             teacher_logits_cpu=teacher_logits_cpu,
             teacher_gamma_cpu=teacher_gamma_cpu,
+            teacher_entropy_mean_cpu=None,
+            teacher_valid_token_count_cpu=None,
             mask=mask,
             temperature=1.0,
             alpha=0.5,
-            post_attn=False,
-            eakld_confidence_k=16,
+                eakld_confidence_k=16,
             sequence_chunk_size=2,
         )

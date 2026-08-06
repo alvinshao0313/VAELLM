@@ -205,7 +205,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lfq_weight", type=float, default=2.5)
     parser.add_argument("--commitment_loss_weight", type=float, default=0.25)
     parser.add_argument("--entropy_loss_weight", type=float, default=0.01)
-    parser.add_argument("--diversity_gamma", type=float, default=1.0)
     parser.add_argument("--normalize_weight", action="store_true")
     parser.add_argument("--new_quant", action="store_true")
     parser.add_argument("--vae_decoder_checkpoint", type=_str_to_bool, default=True)

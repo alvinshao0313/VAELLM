@@ -1,0 +1,12 @@
+{
+  "candidate_space_id": "vae_1to3bit",
+  "baseline_mode": "b32d32s2",
+  "target_average_bit": 2.0,
+  "modes": [
+    {"name": "b16d32s2", "nominal_bit": 1.0, "codebook_bits": 16, "codebook_dim": 32, "residual_stages": 2},
+    {"name": "b24d32s2", "nominal_bit": 1.5, "codebook_bits": 24, "codebook_dim": 32, "residual_stages": 2},
+    {"name": "b32d32s2", "nominal_bit": 2.0, "codebook_bits": 32, "codebook_dim": 32, "residual_stages": 2},
+    {"name": "b40d32s2", "nominal_bit": 2.5, "codebook_bits": 40, "codebook_dim": 32, "residual_stages": 2},
+    {"name": "b48d32s2", "nominal_bit": 3.0, "codebook_bits": 48, "codebook_dim": 32, "residual_stages": 2}
+  ]
+}

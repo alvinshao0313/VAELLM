@@ -6,14 +6,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch import nn
 
 from tools.cat_eval import _compute_checkpoint_fingerprint, _validate_adapter_checkpoint_match
 from train_utils import lora_utils
 from train_utils.cat_train_args import process_cat_train_args, resolve_distill_runtime_config
 from train_utils.lora_training import (
+    CustomSFTTrainer,
     build_distill_hidden_layer_weights,
+    capture_pre_mlp_hiddens,
     compute_distill_hidden_alignment_loss,
     compute_distill_pre_mlp_hidden_alignment_loss,
+    parse_distill_hidden_alignment_layer_weighting,
 )
 
 
@@ -110,7 +114,7 @@ class CatDistillHiddenArgsTest(unittest.TestCase):
 
     def test_distill_hidden_loss_rejects_unknown_weighting(self):
         with self.assertRaises(argparse.ArgumentTypeError):
-            process_cat_train_args(["--distill_hidden_alignment_layer_weighting", "quadratic"])
+            parse_distill_hidden_alignment_layer_weighting("quadratic")
 
 
 class CatDistillHiddenLossTest(unittest.TestCase):
@@ -269,6 +273,7 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
             hidden_loss_weight=0.0,
             pre_mlp_hidden_loss_weight=0.01,
             hidden_alignment_layer_weighting="uniform",
+            eakld_confidence_k=16,
         )
         training_args = SimpleNamespace(distill_model_max_length=128)
 
@@ -293,6 +298,227 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
         self.assertEqual(captured_kwargs["hidden_loss_weight"], 0.0)
         self.assertEqual(captured_kwargs["pre_mlp_hidden_loss_weight"], 0.01)
         self.assertEqual(captured_kwargs["hidden_alignment_layer_weighting"], "uniform")
+
+
+class _FakeOutput:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+
+class _TempScale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.temporary = True
+        self.scale = nn.Parameter(torch.tensor(1.5))
+
+    def set_temporary(self, temporary: bool) -> None:
+        self.temporary = bool(temporary)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.temporary:
+            return hidden * self.scale
+        return hidden
+
+
+class _PreMlpLayer(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.post_attention_layernorm = nn.LayerNorm(hidden_size)
+        self.mlp = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+
+
+class _PreMlpBackbone(nn.Module):
+    def __init__(self, hidden_size: int, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([_PreMlpLayer(hidden_size) for _ in range(num_layers)])
+
+
+class _PreMlpFakeCausalLM(nn.Module):
+    def __init__(self, *, vocab_size: int = 11, hidden_size: int = 4, num_layers: int = 2):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.model = _PreMlpBackbone(hidden_size, num_layers)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.temp_scale = _TempScale()
+        self.output_hidden_states_calls: list[bool] = []
+        self.last_hidden_states = None
+        self.num_layers = num_layers
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
+        **_kwargs,
+    ):
+        del attention_mask
+        self.output_hidden_states_calls.append(bool(output_hidden_states))
+        hidden = self.temp_scale(self.embed_tokens(input_ids))
+        hidden_states = [hidden] if output_hidden_states else None
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+            if hidden_states is not None:
+                hidden_states.append(hidden)
+        logits = self.lm_head(hidden)
+        if labels is None:
+            loss = logits.float().pow(2).mean()
+        else:
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+            )
+        packed_hidden_states = tuple(hidden_states) if hidden_states is not None else None
+        self.last_hidden_states = packed_hidden_states
+        return _FakeOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=packed_hidden_states,
+        )
+
+
+def _build_pre_mlp_trainer(
+    *,
+    hidden_loss_weight: float,
+    pre_mlp_hidden_loss_weight: float,
+    hidden_alignment_layer_weighting: str,
+    loss_type: str = "sft",
+) -> CustomSFTTrainer:
+    trainer = CustomSFTTrainer.__new__(CustomSFTTrainer)
+    trainer.args = SimpleNamespace(bf16=False, fp16=False)
+    trainer.loss_type = loss_type
+    trainer.temperature = 1.0
+    trainer.loss_alpha = 0.5
+    trainer.hidden_loss_weight = float(hidden_loss_weight)
+    trainer.pre_mlp_hidden_loss_weight = float(pre_mlp_hidden_loss_weight)
+    trainer.hidden_alignment_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
+        hidden_alignment_layer_weighting
+    )
+    trainer.eakld_confidence_k = 16
+    trainer.teacher_logits_cpu_staging = False
+    trainer.distill_hif4_act_controller = None
+    trainer.teacher_param_snapshots = []
+    trainer.accelerator = None
+    return trainer
+
+
+def _pre_mlp_inputs() -> dict[str, torch.Tensor]:
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": input_ids.clone(),
+    }
+
+
+class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
+    def test_uniform_pre_mlp_only_skips_full_hidden_states(self):
+        model = _PreMlpFakeCausalLM()
+        trainer = _build_pre_mlp_trainer(
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.25,
+            hidden_alignment_layer_weighting="uniform",
+        )
+        inputs = _pre_mlp_inputs()
+
+        with patch(
+            "train_utils.lora_training.compute_distill_hidden_alignment_loss",
+            wraps=compute_distill_hidden_alignment_loss,
+        ) as hidden_mock, patch(
+            "train_utils.lora_training.compute_distill_pre_mlp_hidden_alignment_loss",
+            wraps=compute_distill_pre_mlp_hidden_alignment_loss,
+        ) as pre_mlp_mock:
+            loss = trainer.compute_loss(model, inputs)
+
+        self.assertEqual(model.output_hidden_states_calls, [False, False])
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertEqual(hidden_mock.call_count, 0)
+        self.assertEqual(pre_mlp_mock.call_count, 1)
+        pre_kwargs = pre_mlp_mock.call_args.kwargs
+        self.assertEqual(len(pre_kwargs["teacher_pre_mlp_hiddens"]), model.num_layers)
+        self.assertEqual(len(pre_kwargs["student_pre_mlp_hiddens"]), model.num_layers)
+        self.assertIsNone(pre_kwargs["teacher_reference_hidden"])
+
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+        self.assertIsNotNone(model.temp_scale.scale.grad)
+        self.assertGreater(float(model.temp_scale.scale.grad.abs().sum()), 0.0)
+
+    def test_adaptive_pre_mlp_only_requests_teacher_reference_hidden(self):
+        model = _PreMlpFakeCausalLM()
+        trainer = _build_pre_mlp_trainer(
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.25,
+            # plan shorthand adaptive_3 == project adaptive_top_3
+            hidden_alignment_layer_weighting="adaptive_top_3",
+        )
+        inputs = _pre_mlp_inputs()
+        captured = {}
+
+        def _wrapped_pre_mlp(**kwargs):
+            captured["teacher_reference_hidden"] = kwargs.get("teacher_reference_hidden")
+            return compute_distill_pre_mlp_hidden_alignment_loss(**kwargs)
+
+        with patch(
+            "train_utils.lora_training.compute_distill_pre_mlp_hidden_alignment_loss",
+            side_effect=_wrapped_pre_mlp,
+        ):
+            loss = trainer.compute_loss(model, inputs)
+
+        self.assertEqual(model.output_hidden_states_calls, [True, False])
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertIsNotNone(captured["teacher_reference_hidden"])
+        # Teacher forward is first; last_hidden_states was overwritten by student (None).
+        # Re-run teacher-only forward to recover the reference embedding state.
+        with torch.no_grad():
+            model.temp_scale.set_temporary(False)
+            teacher_outputs = model(**{k: v for k, v in inputs.items() if k != "labels"}, output_hidden_states=True)
+        self.assertTrue(
+            torch.equal(captured["teacher_reference_hidden"], teacher_outputs.hidden_states[0])
+        )
+
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+        self.assertIsNotNone(model.temp_scale.scale.grad)
+
+    def test_ordinary_hidden_plus_pre_mlp_requests_both_hidden_states(self):
+        model = _PreMlpFakeCausalLM()
+        trainer = _build_pre_mlp_trainer(
+            hidden_loss_weight=0.2,
+            pre_mlp_hidden_loss_weight=0.25,
+            hidden_alignment_layer_weighting="uniform",
+        )
+        inputs = _pre_mlp_inputs()
+        loss = trainer.compute_loss(model, inputs)
+        self.assertEqual(model.output_hidden_states_calls, [True, True])
+        self.assertTrue(torch.isfinite(loss).item())
+
+    def test_disabled_hidden_paths_skip_hidden_states_and_pre_mlp_hooks(self):
+        model = _PreMlpFakeCausalLM()
+        trainer = _build_pre_mlp_trainer(
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.0,
+            hidden_alignment_layer_weighting="uniform",
+            loss_type="kl",
+        )
+        inputs = _pre_mlp_inputs()
+
+        with patch(
+            "train_utils.lora_training.capture_pre_mlp_hiddens",
+            wraps=capture_pre_mlp_hiddens,
+        ) as capture_mock:
+            loss = trainer.compute_loss(model, inputs)
+
+        self.assertEqual(model.output_hidden_states_calls, [False, False])
+        self.assertEqual(capture_mock.call_count, 0)
+        self.assertTrue(torch.isfinite(loss).item())
 
 
 if __name__ == "__main__":

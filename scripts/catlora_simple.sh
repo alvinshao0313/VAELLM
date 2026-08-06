@@ -97,7 +97,6 @@ python tools/cat_train.py \
   --lfq_weight "2.5" \
   --commitment_loss_weight "0.25" \
   --entropy_loss_weight "0.01" \
-  --diversity_gamma "1.0" \
   --normalize_weight \
   --vae_decoder_checkpoint "true" \
   --new_quant \
@@ -138,7 +137,6 @@ python tools/cat_train.py \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
-  --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
   --distill_loss_type "default=eakld" \

@@ -1,10 +1,9 @@
-from typing import Optional
+from typing import MutableMapping, Optional
 
 import math
 
 import torch
 import torch.nn.functional as F
-
 from torch.utils import checkpoint as torch_checkpoint
 
 from compressed_e2e_fintuning.teacher_targets import (
@@ -49,26 +48,38 @@ def build_distill_token_mask(
         )
 
     expected_shape = tuple(int(dim) for dim in reference_logits.shape[:2])
-    mask_tensor: Optional[torch.Tensor] = None
+    source_validity: Optional[torch.Tensor] = None
 
     if isinstance(labels, torch.Tensor):
-        mask_tensor = labels.ne(-100)
+        source_validity = labels.ne(-100)
     elif isinstance(attention_mask, torch.Tensor):
-        mask_tensor = attention_mask.ne(0)
+        source_validity = attention_mask.ne(0)
 
-    if mask_tensor is None:
-        return torch.ones(
+    if source_validity is None:
+        source_validity = torch.ones(
             expected_shape,
-            dtype=torch.float32,
+            dtype=torch.bool,
             device=reference_logits.device,
         )
-
-    if tuple(int(dim) for dim in mask_tensor.shape) != expected_shape:
-        raise ValueError(
-            f"mask shape mismatch: expected {expected_shape}, got {tuple(mask_tensor.shape)}"
+    else:
+        if tuple(int(dim) for dim in source_validity.shape) != expected_shape:
+            raise ValueError(
+                f"mask shape mismatch: expected {expected_shape}, got {tuple(source_validity.shape)}"
+            )
+        source_validity = source_validity.to(
+            device=reference_logits.device,
+            dtype=torch.bool,
         )
 
-    return mask_tensor.to(device=reference_logits.device, dtype=torch.float32)
+    causal_mask = torch.zeros(
+        expected_shape,
+        dtype=torch.float32,
+        device=reference_logits.device,
+    )
+    sequence_length = int(expected_shape[1])
+    if sequence_length > 1:
+        causal_mask[:, :-1] = source_validity[:, 1:].to(dtype=torch.float32)
+    return causal_mask
 
 
 def _default_token_mask(reference: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -199,6 +210,32 @@ def gamma_from_entropy_sums(
     return (1.0 - avg / float(max_entropy)).clamp(0.0, 1.0)
 
 
+def compute_teacher_entropy_mean_and_gamma(
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    *,
+    confidence_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        teacher_entropy_mean: scalar fp32
+        gamma_reverse: scalar fp32
+        valid_count: scalar fp32
+    """
+    resolved_mask = _default_token_mask(teacher_logits, mask)
+    entropy_sum, valid_count = accumulate_teacher_entropy_stats(
+        teacher_logits,
+        resolved_mask,
+    )
+    entropy_mean = entropy_sum / valid_count.clamp_min(1.0)
+    gamma_reverse = gamma_from_entropy_sums(
+        entropy_sum,
+        valid_count,
+        confidence_k=confidence_k,
+    )
+    return entropy_mean, gamma_reverse, valid_count
+
+
 def compute_teacher_entropy_gamma(
     teacher_logits: torch.Tensor,
     mask: Optional[torch.Tensor],
@@ -206,9 +243,42 @@ def compute_teacher_entropy_gamma(
     confidence_k: int = 16,
 ) -> torch.Tensor:
     """Global token-mean teacher entropy -> gamma (aligned with loss.py)."""
-    resolved_mask = _default_token_mask(teacher_logits, mask)
-    sum_e, sum_v = accumulate_teacher_entropy_stats(teacher_logits, resolved_mask)
-    return gamma_from_entropy_sums(sum_e, sum_v, confidence_k=int(confidence_k))
+    _entropy_mean, gamma_reverse, _valid_count = compute_teacher_entropy_mean_and_gamma(
+        teacher_logits,
+        mask,
+        confidence_k=int(confidence_k),
+    )
+    return gamma_reverse
+
+
+def _write_eakld_telemetry(
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]],
+    *,
+    teacher_entropy_mean: torch.Tensor,
+    gamma_reverse: torch.Tensor,
+    forward_kl: torch.Tensor,
+    reverse_kl: torch.Tensor,
+    eakld_total: torch.Tensor,
+    valid_tokens: torch.Tensor,
+) -> None:
+    if telemetry_out is None:
+        return
+    gamma_scalar = gamma_reverse.detach().reshape(()).to(dtype=torch.float32)
+    telemetry_out.update(
+        {
+            "teacher_entropy_mean": teacher_entropy_mean.detach().reshape(()).to(
+                dtype=torch.float32
+            ),
+            "gamma_reverse": gamma_scalar,
+            "lambda_forward": (1.0 - gamma_scalar).detach().reshape(()).to(
+                dtype=torch.float32
+            ),
+            "forward_kl": forward_kl.detach().reshape(()).to(dtype=torch.float32),
+            "reverse_kl": reverse_kl.detach().reshape(()).to(dtype=torch.float32),
+            "eakld_total": eakld_total.detach().reshape(()).to(dtype=torch.float32),
+            "valid_tokens": valid_tokens.detach().reshape(()).to(dtype=torch.float32),
+        }
+    )
 
 
 def _topk_forward_kl_mean(
@@ -217,17 +287,12 @@ def _topk_forward_kl_mean(
     teacher_scaled: torch.Tensor,
     mask: torch.Tensor,
     k: int,
-    post_attn: bool,
 ) -> torch.Tensor:
     """Forward KL on teacher top-k. Inputs must already be temperature-scaled."""
     resolved_k = min(int(k), int(student_scaled.shape[-1]))
     _, indices = teacher_scaled.topk(resolved_k, dim=-1, sorted=False)
-    if bool(post_attn):
-        teacher_prob = F.softmax(teacher_scaled, dim=-1).gather(-1, indices)
-        student_log_prob = F.log_softmax(student_scaled, dim=-1).gather(-1, indices)
-    else:
-        teacher_prob = F.softmax(teacher_scaled.gather(-1, indices), dim=-1)
-        student_log_prob = F.log_softmax(student_scaled.gather(-1, indices), dim=-1)
+    teacher_prob = F.softmax(teacher_scaled.gather(-1, indices), dim=-1)
+    student_log_prob = F.log_softmax(student_scaled.gather(-1, indices), dim=-1)
     return _masked_token_kl_mean(
         student_log_prob=student_log_prob,
         teacher_prob=teacher_prob,
@@ -241,21 +306,32 @@ def _topk_reverse_kl_mean(
     teacher_scaled: torch.Tensor,
     mask: torch.Tensor,
     k: int,
-    post_attn: bool,
 ) -> torch.Tensor:
     """Reverse KL on student top-k. Inputs must already be temperature-scaled."""
     resolved_k = min(int(k), int(student_scaled.shape[-1]))
     _, indices = student_scaled.topk(resolved_k, dim=-1, sorted=False)
-    if bool(post_attn):
-        log_s = F.log_softmax(student_scaled, dim=-1).gather(-1, indices)
-        log_t = F.log_softmax(teacher_scaled, dim=-1).gather(-1, indices)
-    else:
-        log_s = F.log_softmax(student_scaled.gather(-1, indices), dim=-1)
-        log_t = F.log_softmax(teacher_scaled.gather(-1, indices), dim=-1)
+    log_s = F.log_softmax(student_scaled.gather(-1, indices), dim=-1)
+    log_t = F.log_softmax(teacher_scaled.gather(-1, indices), dim=-1)
     token_kl = (log_s.exp() * (log_s - log_t)).sum(dim=-1)
     mask_fp = mask.to(device=token_kl.device, dtype=token_kl.dtype)
     denom = mask_fp.sum().clamp_min(1.0)
     return (token_kl * mask_fp).sum() / denom
+
+
+def compute_masked_logit_mse_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Per-token vocab-mean MSE, then masked global token mean. No temperature."""
+    student_f = student_logits.float()
+    teacher_f = teacher_logits.detach().float()
+    token_mse = (student_f - teacher_f).pow(2).mean(dim=-1)
+    mask_f = _default_token_mask(token_mse, mask)
+    numerator = (token_mse * mask_f).sum()
+    denominator = mask_f.sum()
+    return numerator / denominator.clamp_min(1.0)
 
 
 def compute_forward_kl_loss(
@@ -305,11 +381,15 @@ def compute_eakld(
     mask: Optional[torch.Tensor],
     temperature: float = 1.0,
     confidence_k: int = 16,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     resolved_mask = _default_token_mask(student_logits, mask)
     temp = _resolve_distill_temperature(temperature)
-    sum_e, sum_v = accumulate_teacher_entropy_stats(teacher_logits, resolved_mask)
-    gamma = gamma_from_entropy_sums(sum_e, sum_v, confidence_k=int(confidence_k))
+    entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
+        teacher_logits,
+        resolved_mask,
+        confidence_k=int(confidence_k),
+    )
     student_scaled = student_logits.float() / temp
     teacher_scaled = teacher_logits.detach().float() / temp
     reverse_kl = _masked_token_reverse_kl_mean(
@@ -322,7 +402,17 @@ def compute_eakld(
         teacher_prob=F.softmax(teacher_scaled, dim=-1),
         mask=resolved_mask,
     ) * (temp * temp)
-    return gamma * reverse_kl + (1.0 - gamma) * forward_kl
+    eakld_total = gamma * reverse_kl + (1.0 - gamma) * forward_kl
+    _write_eakld_telemetry(
+        telemetry_out,
+        teacher_entropy_mean=entropy_mean,
+        gamma_reverse=gamma,
+        forward_kl=forward_kl,
+        reverse_kl=reverse_kl,
+        eakld_total=eakld_total,
+        valid_tokens=valid_count,
+    )
+    return eakld_total
 
 
 def compute_entropy_aware_kl_loss(
@@ -332,6 +422,7 @@ def compute_entropy_aware_kl_loss(
     mask: Optional[torch.Tensor],
     temperature: float = 1.0,
     confidence_k: int = 16,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Backward-compatible alias for compute_eakld."""
     return compute_eakld(
@@ -340,6 +431,7 @@ def compute_entropy_aware_kl_loss(
         mask=mask,
         temperature=float(temperature),
         confidence_k=int(confidence_k),
+        telemetry_out=telemetry_out,
     )
 
 
@@ -350,7 +442,6 @@ def compute_kl_topk(
     mask: Optional[torch.Tensor],
     k: int,
     temperature: float = 1.0,
-    post_attn: bool = False,
 ) -> torch.Tensor:
     """Forward KL on teacher top-k."""
     if int(k) <= 0:
@@ -362,7 +453,6 @@ def compute_kl_topk(
         teacher_scaled=teacher_logits.detach().float() / temp,
         mask=resolved_mask,
         k=int(k),
-        post_attn=bool(post_attn),
     ) * (temp * temp)
 
 
@@ -373,7 +463,6 @@ def compute_rkl_topk(
     mask: Optional[torch.Tensor],
     k: int,
     temperature: float = 1.0,
-    post_attn: bool = False,
 ) -> torch.Tensor:
     """Reverse KL on student top-k."""
     if int(k) <= 0:
@@ -385,7 +474,6 @@ def compute_rkl_topk(
         teacher_scaled=teacher_logits.detach().float() / temp,
         mask=resolved_mask,
         k=int(k),
-        post_attn=bool(post_attn),
     ) * (temp * temp)
 
 
@@ -397,7 +485,7 @@ def compute_eakld_topk(
     k: int,
     temperature: float = 1.0,
     confidence_k: int = 16,
-    post_attn: bool = False,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """EAKLD top-k: gamma from full-vocab teacher entropy; FKL/RKL use teacher/student top-k."""
     if int(k) <= 0:
@@ -405,8 +493,11 @@ def compute_eakld_topk(
     resolved_mask = _default_token_mask(student_logits, mask)
     temp = _resolve_distill_temperature(temperature)
 
-    sum_e, sum_v = accumulate_teacher_entropy_stats(teacher_logits, resolved_mask)
-    gamma = gamma_from_entropy_sums(sum_e, sum_v, confidence_k=int(confidence_k))
+    entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
+        teacher_logits,
+        resolved_mask,
+        confidence_k=int(confidence_k),
+    )
 
     student_scaled = student_logits.float() / temp
     teacher_scaled = teacher_logits.detach().float() / temp
@@ -415,16 +506,24 @@ def compute_eakld_topk(
         teacher_scaled=teacher_scaled,
         mask=resolved_mask,
         k=int(k),
-        post_attn=bool(post_attn),
     ) * (temp * temp)
     forward_kl = _topk_forward_kl_mean(
         student_scaled=student_scaled,
         teacher_scaled=teacher_scaled,
         mask=resolved_mask,
         k=int(k),
-        post_attn=bool(post_attn),
     ) * (temp * temp)
-    return gamma * reverse_kl + (1.0 - gamma) * forward_kl
+    eakld_total = gamma * reverse_kl + (1.0 - gamma) * forward_kl
+    _write_eakld_telemetry(
+        telemetry_out,
+        teacher_entropy_mean=entropy_mean,
+        gamma_reverse=gamma,
+        forward_kl=forward_kl,
+        reverse_kl=reverse_kl,
+        eakld_total=eakld_total,
+        valid_tokens=valid_count,
+    )
+    return eakld_total
 
 
 
@@ -466,7 +565,6 @@ def compute_dual_kl_topk_loss(
     teacher_logits: torch.Tensor,
     mask: Optional[torch.Tensor],
     k: int,
-    post_attn: bool = False,
     eps: float = DEFAULT_DUAL_SCALE_EPS,
 ) -> torch.Tensor:
     resolved_k = int(k)
@@ -479,15 +577,6 @@ def compute_dual_kl_topk_loss(
 
     resolved_k = min(resolved_k, int(teacher_logits_fp32.shape[-1]))
     _, indices = teacher_logits_fp32.topk(resolved_k, dim=-1, sorted=False)
-    if bool(post_attn):
-        top_teacher_prob = F.softmax(teacher_scaled, dim=-1).gather(-1, indices)
-        top_student_log_prob = F.log_softmax(student_scaled, dim=-1).gather(-1, indices)
-        return _masked_token_kl_mean(
-            student_log_prob=top_student_log_prob,
-            teacher_prob=top_teacher_prob,
-            mask=mask,
-        )
-
     top_teacher_scaled = teacher_scaled.gather(-1, indices)
     top_student_scaled = student_scaled.gather(-1, indices)
     return _masked_token_kl_mean(
@@ -503,7 +592,6 @@ def compute_dual_rkl_topk_loss(
     teacher_logits: torch.Tensor,
     mask: Optional[torch.Tensor],
     k: int,
-    post_attn: bool = False,
     eps: float = DEFAULT_DUAL_SCALE_EPS,
 ) -> torch.Tensor:
     resolved_k = int(k)
@@ -516,18 +604,15 @@ def compute_dual_rkl_topk_loss(
 
     resolved_k = min(resolved_k, int(student_logits_fp32.shape[-1]))
     _, indices = student_logits_fp32.topk(resolved_k, dim=-1, sorted=False)
-    if bool(post_attn):
-        log_s = F.log_softmax(student_scaled, dim=-1).gather(-1, indices)
-        log_t = F.log_softmax(teacher_scaled, dim=-1).gather(-1, indices)
-    else:
-        log_s = F.log_softmax(student_scaled.gather(-1, indices), dim=-1)
-        log_t = F.log_softmax(teacher_scaled.gather(-1, indices), dim=-1)
+    log_s = F.log_softmax(student_scaled.gather(-1, indices), dim=-1)
+    log_t = F.log_softmax(teacher_scaled.gather(-1, indices), dim=-1)
     token_kl = (log_s.exp() * (log_s - log_t)).sum(dim=-1)
     if mask is None:
         return token_kl.mean()
     mask_fp32 = mask.to(device=token_kl.device, dtype=token_kl.dtype)
     denom = mask_fp32.sum().clamp_min(1.0)
     return (token_kl * mask_fp32).sum() / denom
+
 
 def _validate_cpu_teacher_distill_inputs(
     *,
@@ -603,7 +688,6 @@ def _topk_eakld_chunk_sums(
     mask_chunk: torch.Tensor,
     k: int,
     temperature: float,
-    post_attn: bool,
 ) -> torch.Tensor:
     temp = _resolve_distill_temperature(temperature)
     student_scaled = student_logits_chunk.float() / temp
@@ -615,24 +699,14 @@ def _topk_eakld_chunk_sums(
         dim=-1,
         sorted=False,
     )
-    if bool(post_attn):
-        reverse_log_student = F.log_softmax(student_scaled, dim=-1).gather(
-            -1,
-            student_indices,
-        )
-        reverse_log_teacher = F.log_softmax(teacher_scaled, dim=-1).gather(
-            -1,
-            student_indices,
-        )
-    else:
-        reverse_log_student = F.log_softmax(
-            student_scaled.gather(-1, student_indices),
-            dim=-1,
-        )
-        reverse_log_teacher = F.log_softmax(
-            teacher_scaled.gather(-1, student_indices),
-            dim=-1,
-        )
+    reverse_log_student = F.log_softmax(
+        student_scaled.gather(-1, student_indices),
+        dim=-1,
+    )
+    reverse_log_teacher = F.log_softmax(
+        teacher_scaled.gather(-1, student_indices),
+        dim=-1,
+    )
     reverse_token = (
         reverse_log_student.exp()
         * (reverse_log_student - reverse_log_teacher)
@@ -643,24 +717,14 @@ def _topk_eakld_chunk_sums(
         dim=-1,
         sorted=False,
     )
-    if bool(post_attn):
-        forward_teacher_prob = F.softmax(teacher_scaled, dim=-1).gather(
-            -1,
-            teacher_indices,
-        )
-        forward_student_log_prob = F.log_softmax(student_scaled, dim=-1).gather(
-            -1,
-            teacher_indices,
-        )
-    else:
-        forward_teacher_prob = F.softmax(
-            teacher_scaled.gather(-1, teacher_indices),
-            dim=-1,
-        )
-        forward_student_log_prob = F.log_softmax(
-            student_scaled.gather(-1, teacher_indices),
-            dim=-1,
-        )
+    forward_teacher_prob = F.softmax(
+        teacher_scaled.gather(-1, teacher_indices),
+        dim=-1,
+    )
+    forward_student_log_prob = F.log_softmax(
+        student_scaled.gather(-1, teacher_indices),
+        dim=-1,
+    )
     forward_token = F.kl_div(
         forward_student_log_prob,
         forward_teacher_prob,
@@ -687,7 +751,6 @@ def _make_checkpointed_eakld_chunk_forward(
     mask_chunk: torch.Tensor,
     temperature: float,
     k: Optional[int],
-    post_attn: bool,
 ):
     fixed_start = int(start)
     fixed_end = int(end)
@@ -712,7 +775,6 @@ def _make_checkpointed_eakld_chunk_forward(
             mask_chunk=mask_chunk,
             k=int(k),
             temperature=temperature,
-            post_attn=bool(post_attn),
         )
 
     return chunk_forward
@@ -727,7 +789,9 @@ def _compute_eakld_from_cpu_teacher_logits_impl(
     temperature: float,
     sequence_chunk_size: int,
     k: Optional[int],
-    post_attn: bool,
+    teacher_entropy_mean: Optional[torch.Tensor] = None,
+    teacher_valid_token_count: Optional[torch.Tensor] = None,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     _validate_cpu_teacher_distill_inputs(
         student_logits=student_logits,
@@ -737,6 +801,12 @@ def _compute_eakld_from_cpu_teacher_logits_impl(
     )
     if k is not None and int(k) < 1:
         raise ValueError(f"k must be >= 1, got {k}.")
+    if telemetry_out is not None:
+        if teacher_entropy_mean is None or teacher_valid_token_count is None:
+            raise ValueError(
+                "CPU EAKLD telemetry requires teacher_entropy_mean and "
+                "teacher_valid_token_count."
+            )
 
     resolved_mask = _default_token_mask(student_logits, mask)
     denominator = resolved_mask.sum().clamp_min(1.0)
@@ -755,7 +825,6 @@ def _compute_eakld_from_cpu_teacher_logits_impl(
             mask_chunk=mask_chunk,
             temperature=float(temperature),
             k=k,
-            post_attn=bool(post_attn),
         )
         if torch.is_grad_enabled() and student_chunk.requires_grad:
             chunk_result = torch_checkpoint.checkpoint(
@@ -776,7 +845,18 @@ def _compute_eakld_from_cpu_teacher_logits_impl(
         device=student_logits.device,
         dtype=torch.float32,
     )
-    return gamma_device * reverse_kl + (1.0 - gamma_device) * forward_kl
+    eakld_total = gamma_device * reverse_kl + (1.0 - gamma_device) * forward_kl
+    if telemetry_out is not None:
+        _write_eakld_telemetry(
+            telemetry_out,
+            teacher_entropy_mean=teacher_entropy_mean,
+            gamma_reverse=gamma_device,
+            forward_kl=forward_kl,
+            reverse_kl=reverse_kl,
+            eakld_total=eakld_total,
+            valid_tokens=teacher_valid_token_count,
+        )
+    return eakld_total
 
 
 def compute_eakld_from_cpu_teacher_logits(
@@ -787,6 +867,9 @@ def compute_eakld_from_cpu_teacher_logits(
     gamma: torch.Tensor,
     temperature: float = 1.0,
     sequence_chunk_size: int = 1,
+    teacher_entropy_mean: Optional[torch.Tensor] = None,
+    teacher_valid_token_count: Optional[torch.Tensor] = None,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     return _compute_eakld_from_cpu_teacher_logits_impl(
         student_logits=student_logits,
@@ -796,7 +879,9 @@ def compute_eakld_from_cpu_teacher_logits(
         temperature=float(temperature),
         sequence_chunk_size=int(sequence_chunk_size),
         k=None,
-        post_attn=False,
+        teacher_entropy_mean=teacher_entropy_mean,
+        teacher_valid_token_count=teacher_valid_token_count,
+        telemetry_out=telemetry_out,
     )
 
 
@@ -808,8 +893,10 @@ def compute_eakld_topk_from_cpu_teacher_logits(
     gamma: torch.Tensor,
     k: int,
     temperature: float = 1.0,
-    post_attn: bool = False,
     sequence_chunk_size: int = 1,
+    teacher_entropy_mean: Optional[torch.Tensor] = None,
+    teacher_valid_token_count: Optional[torch.Tensor] = None,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     return _compute_eakld_from_cpu_teacher_logits_impl(
         student_logits=student_logits,
@@ -819,5 +906,7 @@ def compute_eakld_topk_from_cpu_teacher_logits(
         temperature=float(temperature),
         sequence_chunk_size=int(sequence_chunk_size),
         k=int(k),
-        post_attn=bool(post_attn),
+        teacher_entropy_mean=teacher_entropy_mean,
+        teacher_valid_token_count=teacher_valid_token_count,
+        telemetry_out=telemetry_out,
     )

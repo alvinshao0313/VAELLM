@@ -2,7 +2,19 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import math
 import re
-from typing import Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    Collection,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import torch
 import torch.nn.functional as F
@@ -802,6 +814,123 @@ def _qk_states_for_attention(model: nn.Module, layer_idx: int, hidden_states: to
     return query_states, key_states, causal_mask
 
 
+def _valid_keys_from_additive_attention_mask(
+    attention_mask: torch.Tensor,
+    *,
+    query_start: int,
+    query_end: int,
+    key_length: int,
+    num_heads: int,
+) -> torch.Tensor:
+    chunk = attention_mask[
+        :,
+        :,
+        int(query_start):int(query_end),
+        :int(key_length),
+    ]
+    valid = chunk == 0
+    if int(valid.shape[1]) == 1 and int(num_heads) > 1:
+        valid = valid.expand(-1, int(num_heads), -1, -1)
+    if int(valid.shape[1]) != int(num_heads):
+        raise ValueError(
+            "attention mask head dimension mismatch: "
+            f"mask_heads={int(valid.shape[1])}, num_heads={int(num_heads)}"
+        )
+    return valid
+
+
+def _attention_map_kl_chunk_losses(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    valid_key_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        forward_kl_per_query: [B, H, Q], KL(teacher || student)
+        reverse_kl_per_query: [B, H, Q], KL(student || teacher)
+        teacher_entropy_per_query: [B, H, Q]
+        valid_query_mask: [B, H, Q], bool
+    """
+    if teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            "teacher/student attention logits shape mismatch: "
+            f"{tuple(teacher_logits.shape)} vs {tuple(student_logits.shape)}"
+        )
+
+    valid = valid_key_mask.to(
+        device=teacher_logits.device,
+        dtype=torch.bool,
+    ).expand_as(teacher_logits)
+
+    min_fp32 = torch.finfo(torch.float32).min
+    teacher_logits_f = teacher_logits.float().masked_fill(~valid, min_fp32)
+    student_logits_f = student_logits.float().masked_fill(~valid, min_fp32)
+
+    teacher_log_prob = F.log_softmax(teacher_logits_f, dim=-1)
+    student_log_prob = F.log_softmax(student_logits_f, dim=-1)
+    teacher_prob = teacher_log_prob.exp()
+    student_prob = student_log_prob.exp()
+
+    forward_terms = teacher_prob * (teacher_log_prob - student_log_prob)
+    reverse_terms = student_prob * (student_log_prob - teacher_log_prob)
+    entropy_terms = -(teacher_prob * teacher_log_prob)
+
+    forward_per_query = forward_terms.masked_fill(~valid, 0.0).sum(dim=-1)
+    reverse_per_query = reverse_terms.masked_fill(~valid, 0.0).sum(dim=-1)
+    entropy_per_query = entropy_terms.masked_fill(~valid, 0.0).sum(dim=-1)
+    valid_query = valid.any(dim=-1)
+
+    return (
+        forward_per_query,
+        reverse_per_query,
+        entropy_per_query,
+        valid_query,
+    )
+
+
+def _chunk_attention_logits_and_valid_mask(
+    *,
+    teacher_q: torch.Tensor,
+    teacher_k: torch.Tensor,
+    teacher_mask: torch.Tensor,
+    student_q: torch.Tensor,
+    student_k: torch.Tensor,
+    student_mask: torch.Tensor,
+    start: int,
+    end: int,
+    scaling: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    teacher_logits = torch.matmul(
+        teacher_q[:, :, start:end, :],
+        teacher_k.transpose(2, 3),
+    ) * scaling
+    student_logits = torch.matmul(
+        student_q[:, :, start:end, :],
+        student_k.transpose(2, 3),
+    ) * scaling
+    num_heads = int(teacher_q.shape[1])
+    teacher_valid = _valid_keys_from_additive_attention_mask(
+        teacher_mask,
+        query_start=start,
+        query_end=end,
+        key_length=int(teacher_k.shape[-2]),
+        num_heads=num_heads,
+    )
+    student_valid = _valid_keys_from_additive_attention_mask(
+        student_mask,
+        query_start=start,
+        query_end=end,
+        key_length=int(student_k.shape[-2]),
+        num_heads=int(student_q.shape[1]),
+    )
+    if teacher_valid.shape != student_valid.shape or not torch.equal(teacher_valid, student_valid):
+        raise ValueError(
+            "teacher/student attention valid-key mask mismatch: "
+            f"{tuple(teacher_valid.shape)} vs {tuple(student_valid.shape)}"
+        )
+    return teacher_logits, student_logits, teacher_valid
+
+
 def attention_map_kl_loss(
     model: nn.Module,
     layer_idx: int,
@@ -809,7 +938,6 @@ def attention_map_kl_loss(
     teacher_hidden: torch.Tensor,
     *,
     query_chunk_size: int,
-    eps: float = 1e-6,
     hif4_controller=None,
     active_block_targets: Optional[Collection[Tuple[int, str]]] = None,
     layer_temporary_modules: Optional[Sequence[Tuple[str, nn.Module]]] = None,
@@ -850,49 +978,25 @@ def attention_map_kl_loss(
     valid_count = student_q.new_zeros(())
     for start in range(0, seqlen, int(query_chunk_size)):
         end = min(start + int(query_chunk_size), seqlen)
-        teacher_logits = torch.matmul(
-            teacher_q[:, :, start:end, :],
-            teacher_k.transpose(2, 3),
-        ) * scaling
-        teacher_logits = teacher_logits + teacher_mask[:, :, start:end, : teacher_k.shape[-2]]
-        teacher_attn = F.softmax(teacher_logits, dim=-1, dtype=torch.float32).to(dtype=student_q.dtype)
-        student_logits = torch.matmul(
-            student_q[:, :, start:end, :],
-            student_k.transpose(2, 3),
-        ) * scaling
-        student_logits = student_logits + student_mask[:, :, start:end, : student_k.shape[-2]]
-        student_attn = F.softmax(student_logits, dim=-1, dtype=torch.float32).to(dtype=student_q.dtype)
-        teacher_attn_f = teacher_attn.float()
-        student_attn_f = student_attn.float()
-        valid = teacher_attn_f > 0
-        teacher_prob = teacher_attn_f.clamp_min(float(eps))
-        student_prob = student_attn_f.clamp_min(float(eps))
-        kl = teacher_prob * (teacher_prob.log() - student_prob.log())
-        kl_per_query = kl.masked_fill(~valid, 0.0).sum(dim=-1)
-        valid_query = valid.any(dim=-1)
-        kl_sum = kl_sum + kl_per_query.masked_select(valid_query).sum()
+        teacher_logits, student_logits, valid_key_mask = _chunk_attention_logits_and_valid_mask(
+            teacher_q=teacher_q,
+            teacher_k=teacher_k,
+            teacher_mask=teacher_mask,
+            student_q=student_q,
+            student_k=student_k,
+            student_mask=student_mask,
+            start=start,
+            end=end,
+            scaling=scaling,
+        )
+        forward_per_query, _, _, valid_query = _attention_map_kl_chunk_losses(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            valid_key_mask=valid_key_mask,
+        )
+        kl_sum = kl_sum + forward_per_query.masked_select(valid_query).sum()
         valid_count = valid_count + valid_query.sum().to(device=kl_sum.device, dtype=kl_sum.dtype)
     return kl_sum / valid_count.clamp_min(1.0)
-
-
-def _attention_map_kl_chunk_losses(
-    teacher_attn: torch.Tensor,
-    student_attn: torch.Tensor,
-    *,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    teacher_attn_f = teacher_attn.float()
-    student_attn_f = student_attn.float()
-    valid = teacher_attn_f > 0
-    teacher_prob = teacher_attn_f.clamp_min(float(eps))
-    student_prob = student_attn_f.clamp_min(float(eps))
-    reverse_kl = teacher_prob * (teacher_prob.log() - student_prob.log())
-    forward_kl = student_prob * (student_prob.log() - teacher_prob.log())
-    kl_per_query_reverse = reverse_kl.masked_fill(~valid, 0.0).sum(dim=-1)
-    kl_per_query_forward = forward_kl.masked_fill(~valid, 0.0).sum(dim=-1)
-    entropy_per_query = -(teacher_prob * teacher_prob.log()).sum(dim=-1)
-    valid_query = valid.any(dim=-1)
-    return kl_per_query_reverse, kl_per_query_forward, entropy_per_query, valid_query
 
 
 def entropy_aware_attention_map_kl_loss(
@@ -903,12 +1007,12 @@ def entropy_aware_attention_map_kl_loss(
     *,
     query_chunk_size: int,
     confidence_k: int = 16,
-    eps: float = 1e-6,
     hif4_controller=None,
     active_block_targets: Optional[Collection[Tuple[int, str]]] = None,
     layer_temporary_modules: Optional[Sequence[Tuple[str, nn.Module]]] = None,
     active_layer_categories: Optional[Collection[str]] = None,
     student_scope_already_active: bool = False,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     if int(confidence_k) < 2:
         raise ValueError(f"confidence_k must be >= 2, got {confidence_k}.")
@@ -947,39 +1051,68 @@ def entropy_aware_attention_map_kl_loss(
     forward_sum = student_q.new_zeros(())
     entropy_sum = student_q.new_zeros(())
     valid_count = student_q.new_zeros(())
-    max_entropy = math.log(float(confidence_k))
 
     for start in range(0, seqlen, int(query_chunk_size)):
         end = min(start + int(query_chunk_size), seqlen)
-        teacher_logits = torch.matmul(
-            teacher_q[:, :, start:end, :],
-            teacher_k.transpose(2, 3),
-        ) * scaling
-        teacher_logits = teacher_logits + teacher_mask[:, :, start:end, : teacher_k.shape[-2]]
-        teacher_attn = F.softmax(teacher_logits, dim=-1, dtype=torch.float32).to(dtype=student_q.dtype)
-        student_logits = torch.matmul(
-            student_q[:, :, start:end, :],
-            student_k.transpose(2, 3),
-        ) * scaling
-        student_logits = student_logits + student_mask[:, :, start:end, : student_k.shape[-2]]
-        student_attn = F.softmax(student_logits, dim=-1, dtype=torch.float32).to(dtype=student_q.dtype)
-        reverse_kl, forward_kl, entropy, valid_query = _attention_map_kl_chunk_losses(
-            teacher_attn,
-            student_attn,
-            eps=float(eps),
+        teacher_logits, student_logits, valid_key_mask = _chunk_attention_logits_and_valid_mask(
+            teacher_q=teacher_q,
+            teacher_k=teacher_k,
+            teacher_mask=teacher_mask,
+            student_q=student_q,
+            student_k=student_k,
+            student_mask=student_mask,
+            start=start,
+            end=end,
+            scaling=scaling,
         )
-        reverse_sum = reverse_sum + reverse_kl.masked_select(valid_query).sum()
-        forward_sum = forward_sum + forward_kl.masked_select(valid_query).sum()
-        entropy_sum = entropy_sum + entropy.masked_select(valid_query).sum()
-        valid_count = valid_count + valid_query.sum().to(device=reverse_sum.device, dtype=reverse_sum.dtype)
+        forward_per_query, reverse_per_query, entropy_per_query, valid_query = (
+            _attention_map_kl_chunk_losses(
+                teacher_logits=teacher_logits,
+                student_logits=student_logits,
+                valid_key_mask=valid_key_mask,
+            )
+        )
+        forward_sum = forward_sum + forward_per_query.masked_select(valid_query).sum()
+        reverse_sum = reverse_sum + reverse_per_query.masked_select(valid_query).sum()
+        entropy_sum = entropy_sum + entropy_per_query.masked_select(valid_query).sum()
+        valid_count = valid_count + valid_query.sum().to(device=forward_sum.device, dtype=forward_sum.dtype)
 
-    denom = valid_count.clamp_min(1.0)
-    sample_avg_entropy = entropy_sum / denom
-    normalized_entropy = (sample_avg_entropy / float(max_entropy)).clamp(max=1.0)
-    gamma = (1.0 - normalized_entropy).clamp(0.0, 1.0)
-    reverse_mean = reverse_sum / denom
-    forward_mean = forward_sum / denom
-    return gamma * reverse_mean + (1.0 - gamma) * forward_mean
+    denominator = valid_count.clamp_min(1.0)
+    forward_kl = forward_sum / denominator
+    reverse_kl = reverse_sum / denominator
+    teacher_entropy_mean = entropy_sum / denominator
+
+    max_entropy = math.log(float(confidence_k))
+    gamma_reverse = torch.clamp(
+        1.0 - teacher_entropy_mean / max_entropy,
+        min=0.0,
+        max=1.0,
+    )
+    lambda_forward = 1.0 - gamma_reverse
+    eakld_total = gamma_reverse * reverse_kl + lambda_forward * forward_kl
+
+    if telemetry_out is not None:
+        telemetry_out.update(
+            {
+                "teacher_entropy_mean": teacher_entropy_mean.detach().reshape(()).to(
+                    dtype=torch.float32
+                ),
+                "gamma_reverse": gamma_reverse.detach().reshape(()).to(
+                    dtype=torch.float32
+                ),
+                "lambda_forward": lambda_forward.detach().reshape(()).to(
+                    dtype=torch.float32
+                ),
+                "forward_kl": forward_kl.detach().reshape(()).to(dtype=torch.float32),
+                "reverse_kl": reverse_kl.detach().reshape(()).to(dtype=torch.float32),
+                "eakld_total": eakld_total.detach().reshape(()).to(dtype=torch.float32),
+                "valid_queries": valid_count.detach().reshape(()).to(
+                    dtype=torch.float32
+                ),
+            }
+        )
+
+    return eakld_total
 
 
 def _resolve_block_attention_kl_loss(
@@ -994,6 +1127,7 @@ def _resolve_block_attention_kl_loss(
     layer_temporary_modules: Optional[Sequence[Tuple[str, nn.Module]]],
     active_layer_categories: Optional[Collection[str]],
     student_scope_already_active: bool,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     common_kwargs = dict(
         model=model,
@@ -1001,7 +1135,6 @@ def _resolve_block_attention_kl_loss(
         student_hidden=student_hidden,
         teacher_hidden=teacher_hidden,
         query_chunk_size=int(config.attn_query_chunk_size),
-        eps=float(config.eps),
         hif4_controller=hif4_controller,
         active_block_targets=active_block_targets,
         layer_temporary_modules=layer_temporary_modules,
@@ -1012,6 +1145,7 @@ def _resolve_block_attention_kl_loss(
         return entropy_aware_attention_map_kl_loss(
             **common_kwargs,
             confidence_k=int(config.eakld_confidence_k),
+            telemetry_out=telemetry_out,
         )
     return attention_map_kl_loss(**common_kwargs)
 
@@ -1621,6 +1755,7 @@ def train_block_lora_distill(
                 else:
                     student_out = None
                     hidden_loss = student_in.new_zeros(())
+                attn_telemetry: Dict[str, torch.Tensor] = {}
                 if attn_weight > 0.0:
                     attn_loss = _resolve_block_attention_kl_loss(
                         config=config,
@@ -1633,6 +1768,9 @@ def train_block_lora_distill(
                         layer_temporary_modules=layer_temporary_modules,
                         active_layer_categories=active_layer_categories,
                         student_scope_already_active=True,
+                        telemetry_out=(
+                            attn_telemetry if bool(config.entropy_aware_kl) else None
+                        ),
                     )
                 else:
                     attn_loss = student_in.new_zeros(())
@@ -1646,19 +1784,39 @@ def train_block_lora_distill(
             update_peft_vae_proxy_adalora(model, global_step=int(step + 1))
 
         if logger is not None and (step + 1 == 1 or (step + 1) % int(config.log_every) == 0 or step + 1 == int(config.steps)):
-            logger.info(
-                "[block %d] distill step=%d/%d loss=%.6e attn_kl=%.6e linear=%.6e hidden=%.6e lr=%.6e",
-                int(layer_idx),
-                int(step + 1),
-                int(config.steps),
-                float(loss.detach().cpu()),
-                float(attn_loss.detach().cpu()),
-                float(linear_loss.detach().cpu()),
-                float(hidden_loss.detach().cpu()),
-                float(optimizer.param_groups[0]["lr"]),
-            )
+            if attn_telemetry:
+                logger.info(
+                    "[block %d] distill step=%d/%d loss=%.6e attn_kl=%.6e "
+                    "attn_entropy=%.6e attn_gamma_reverse=%.6e attn_lambda_forward=%.6e "
+                    "attn_forward_kl=%.6e attn_reverse_kl=%.6e linear=%.6e hidden=%.6e lr=%.6e",
+                    int(layer_idx),
+                    int(step + 1),
+                    int(config.steps),
+                    float(loss.detach().cpu()),
+                    float(attn_loss.detach().cpu()),
+                    float(attn_telemetry["teacher_entropy_mean"].cpu()),
+                    float(attn_telemetry["gamma_reverse"].cpu()),
+                    float(attn_telemetry["lambda_forward"].cpu()),
+                    float(attn_telemetry["forward_kl"].cpu()),
+                    float(attn_telemetry["reverse_kl"].cpu()),
+                    float(linear_loss.detach().cpu()),
+                    float(hidden_loss.detach().cpu()),
+                    float(optimizer.param_groups[0]["lr"]),
+                )
+            else:
+                logger.info(
+                    "[block %d] distill step=%d/%d loss=%.6e attn_kl=%.6e linear=%.6e hidden=%.6e lr=%.6e",
+                    int(layer_idx),
+                    int(step + 1),
+                    int(config.steps),
+                    float(loss.detach().cpu()),
+                    float(attn_loss.detach().cpu()),
+                    float(linear_loss.detach().cpu()),
+                    float(hidden_loss.detach().cpu()),
+                    float(optimizer.param_groups[0]["lr"]),
+                )
 
-        del teacher_in, student_in, teacher_out, student_out, loss, linear_loss, attn_loss, hidden_loss
+        del teacher_in, student_in, teacher_out, student_out, loss, linear_loss, attn_loss, hidden_loss, attn_telemetry
 
     if use_decoder:
         fuse_stats = VAELinear.get_fuse_stats()

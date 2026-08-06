@@ -49,7 +49,6 @@ class VAEDecoderE2EArguments:
     loss_type: str = "sft"
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
-    post_attn: bool = False
     hidden_loss_weight: float = 0.0
     eakld_confidence_k: int = 16
     hidden_layer_weighting: str = "uniform"
@@ -120,7 +119,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loss_type", type=_parse_lora_loss_type, default="sft")
     parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--distill_alpha", type=float, default=0.5)
-    parser.add_argument("--post_attn", type=lambda v: _parse_bool_like(v, arg_name="--post_attn"), default=False)
     parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
     parser.add_argument("--eakld_confidence_k", type=int, default=16)
     parser.add_argument("--hidden_layer_weighting", type=str, default="uniform")
@@ -287,7 +285,7 @@ def validate_args(
         args.hidden_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
             str(args.hidden_layer_weighting or "uniform")
         )
-    except ValueError as exc:
+    except (ValueError, argparse.ArgumentTypeError) as exc:
         parser.error(
             str(exc).replace(
                 "--distill_hidden_alignment_layer_weighting",

@@ -47,7 +47,6 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
-  --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
   --distill_loss_type "default=eakld" \

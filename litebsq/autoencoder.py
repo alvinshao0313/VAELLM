@@ -359,7 +359,6 @@ class AutoEncoder(nn.Module):
                 codebook_scale=1,
                 entropy_loss_weight=getattr(args, "entropy_loss_weight", 0.1),
                 commitment_loss_weight=getattr(args, "commitment_loss_weight", 0.25),
-                diversity_gamma=getattr(args, "diversity_gamma", 1.0),
                 has_projections=False,
                 spherical=True,
                 new_quant=getattr(args, "new_quant", False),
@@ -407,17 +406,8 @@ class AutoEncoder(nn.Module):
             return F.huber_loss(x_recon, x, reduction="mean", delta=1.0)
         if self.recon_loss_type == "relative_l1":
             return (x_recon - x).abs().sum() / (x.abs().sum() + 1e-10)
-        if self.recon_loss_type == "top_k_mse":
-            k = max(1, int(0.1 * x.shape[-1]))
-            errors = (x_recon - x).pow(2)
-            topk_errors, _ = torch.topk(errors, k, dim=-1)
-            return topk_errors.sum()
         if self.recon_loss_type == "mse":
             return F.mse_loss(x_recon, x)
-        if self.recon_loss_type == "cosine":
-            x_recon_flat = x_recon.view(x_recon.size(0), -1)
-            x_flat = x.view(x.size(0), -1)
-            return 1 - F.cosine_similarity(x_recon_flat, x_flat, dim=-1).mean()
         if self.recon_loss_type == "w_mse":
             return ((x_recon - x).pow(2) * x.abs()).mean()
         if self.recon_loss_type == "w2_mse":
@@ -447,7 +437,9 @@ class AutoEncoder(nn.Module):
             h_f = act_max.float()
             errors = (x_recon_f - x_f).pow(2)
             return (errors * h_f).mean()
-        return torch.zeros((), device=x.device, dtype=torch.float32)
+        raise ValueError(
+            f"Unsupported recon_loss_type={self.recon_loss_type!r}."
+        )
 
     def _forward_train(self, x: Tensor, act_max: Optional[Tensor] = None):
         x_recon, quant_result = self._run_encode_quantize_decode(x)

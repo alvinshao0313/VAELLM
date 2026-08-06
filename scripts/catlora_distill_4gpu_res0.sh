@@ -21,9 +21,9 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
   # --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
 torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.py \
   --model_path "Qwen/Qwen3-8B" \
-  --resume_from_checkpoint ".result/catlora_distill/res0-bf16-protect-channel-vae/Qwen_Qwen3-8B_20260730_071653/final_model" \
+  --resume_from_checkpoint ".result/catlora/res0-bf16-protect-channel-vae/final_model" \
   --output_dir "./.result/catlora_distill/res0-bf16-protect-channel-vae" \
-  --seed "31" \
+  --seed "33" \
   --deterministic "true" \
   --train_device "cuda" \
   --convert \
@@ -41,15 +41,14 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_reset_completed "true" \
   --distill_independent_categories "false" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --lora_rank "default=8" \
-  --lora_alpha "default=8" \
+  --lora_rank "default=8,after:gate_proj=32,after:up_proj=32,after:down_proj=32" \
+  --lora_alpha "default=8,after:gate_proj=32,after:up_proj=32,after:down_proj=32" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=0,after:gate_proj=2000,after:up_proj=2000,after:down_proj=2000" \
+  --distill_steps "default=2000" \
   --distill_batch_size "default=4" \
   --distill_lr "default=2e-5" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=10" \
-  --distill_post_attn "false" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
   --distill_loss_type "default=eakld_top_100" \
@@ -67,7 +66,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_gradient_checkpointing "true" \
   --distill_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --distill_optim "adamw_torch" \
-  --distill_max_grad_norm "1.3" \
+  --distill_max_grad_norm "1.5" \
   --distill_warmup_ratio "0.05" \
   --distill_group_by_length "false" \
   --distill_lr_scheduler_type "cosine" \

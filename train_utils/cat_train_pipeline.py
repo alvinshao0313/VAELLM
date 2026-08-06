@@ -158,17 +158,8 @@ def _compute_recon_loss(
         return torch.nn.functional.huber_loss(x_recon, x, reduction="mean", delta=1.0)
     if resolved == "relative_l1":
         return (x_recon - x).abs().sum() / (x.abs().sum() + 1e-10)
-    if resolved == "top_k_mse":
-        k = max(1, int(0.1 * x.shape[-1]))
-        errors = (x_recon - x).pow(2)
-        topk_errors, _ = torch.topk(errors, k, dim=-1)
-        return topk_errors.sum()
     if resolved == "mse":
         return torch.nn.functional.mse_loss(x_recon, x)
-    if resolved == "cosine":
-        x_recon_flat = x_recon.view(x_recon.size(0), -1)
-        x_flat = x.view(x.size(0), -1)
-        return 1 - torch.nn.functional.cosine_similarity(x_recon_flat, x_flat, dim=-1).mean()
     if resolved == "w_mse":
         return ((x_recon - x).pow(2) * x.abs()).mean()
     if resolved == "w2_mse":
@@ -186,7 +177,74 @@ def _compute_recon_loss(
         errors = (x_recon_f - x_f).pow(2)
         weights = x_f.abs() * act_f
         return (errors * weights).mean()
-    return torch.zeros((), device=x.device, dtype=torch.float32)
+    if resolved == "amse":
+        if act_max is None:
+            raise ValueError("recon_loss_type=amse requires hessian_diag/channel_weight tensor.")
+        if tuple(act_max.shape) != tuple(x.shape):
+            raise ValueError(
+                f"amse shape mismatch: hessian_diag={tuple(act_max.shape)} vs x={tuple(x.shape)}"
+            )
+        x_f = x.float()
+        x_recon_f = x_recon.float()
+        h_f = act_max.float()
+        errors = (x_recon_f - x_f).pow(2)
+        return (errors * h_f).mean()
+    raise ValueError(
+        f"Unsupported recon_loss_type={resolved!r}."
+    )
+
+
+def _compute_reconstruction_eval_metrics(
+    x_eval: torch.Tensor,
+    x_recon: torch.Tensor,
+    *,
+    top_k: int = 100,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    if tuple(x_eval.shape) != tuple(x_recon.shape):
+        raise ValueError(
+            "reconstruction eval shape mismatch: "
+            f"{tuple(x_eval.shape)} vs {tuple(x_recon.shape)}"
+        )
+    if x_eval.ndim != 3:
+        raise ValueError(
+            "reconstruction eval expects [B, P, C], "
+            f"got {tuple(x_eval.shape)}"
+        )
+    if int(top_k) < 1:
+        raise ValueError(f"top_k must be >= 1, got {top_k}.")
+
+    x_eval_f = x_eval.float()
+    squared_error = (x_recon.float() - x_eval_f).pow(2)
+    overall_sum = squared_error.sum()
+    overall_numel = int(squared_error.numel())
+
+    flat_reference = x_eval_f.permute(1, 0, 2).reshape(
+        int(x_eval_f.shape[1]),
+        -1,
+    )
+    flat_error = squared_error.permute(1, 0, 2).reshape(
+        int(squared_error.shape[1]),
+        -1,
+    )
+    resolved_k = min(int(top_k), int(flat_reference.shape[1]))
+    selected_indices = torch.topk(
+        flat_reference.abs(),
+        k=resolved_k,
+        dim=1,
+    ).indices
+    selected_error = torch.gather(
+        flat_error,
+        dim=1,
+        index=selected_indices,
+    )
+    selected_sum = selected_error.sum()
+    selected_numel = int(selected_error.numel())
+    return (
+        overall_sum,
+        selected_sum,
+        overall_numel,
+        selected_numel,
+    )
 
 
 def _split_weight_into_part_flats(
@@ -1736,32 +1794,23 @@ def train_group_vae_payload(
                     eval_blocks_seen = 0
                     for x_eval in _iter_eval_tensors():
                         x_recon, _ = vae(x_eval, is_train=False)
-                        x_eval_f = x_eval.float()
-                        x_recon_f = x_recon.float()
-                        batch_numel = int(x_eval_f.numel())
-                        if batch_numel > 0:
-                            batch_mse = torch.nn.functional.mse_loss(x_recon_f, x_eval_f, reduction="mean")
-                            mse_sum += float(batch_mse.detach().cpu().item()) * batch_numel
-                            mse_numel += batch_numel
-                            eval_blocks_seen += int(x_eval_f.shape[0])
-
-                        # 对每个并行模型（P 维）独立选 top-k：
-                        # x_eval/x_recon: [B, P, C] -> [P, B*C]
-                        flat_eval = x_eval_f.permute(1, 0, 2).reshape(x_eval_f.shape[1], -1)
-                        flat_recon = x_recon_f.permute(1, 0, 2).reshape(x_recon_f.shape[1], -1)
-                        k = min(100, flat_eval.shape[1])
-                        _, topk_idx = torch.topk(flat_eval.abs(), k=k, dim=1)
-                        top_eval = torch.gather(flat_eval, dim=1, index=topk_idx)
-                        top_recon = torch.gather(flat_recon, dim=1, index=topk_idx)
-                        top_k_numel = int(top_eval.numel())
-                        if top_k_numel > 0:
-                            batch_top_k_mse = torch.nn.functional.mse_loss(
-                                top_recon,
-                                top_eval,
-                                reduction="mean",
-                            )
-                            top_k_mse_sum += float(batch_top_k_mse.detach().cpu().item()) * top_k_numel
-                            top_k_mse_numel += top_k_numel
+                        (
+                            batch_overall_sum,
+                            batch_selected_sum,
+                            batch_overall_numel,
+                            batch_selected_numel,
+                        ) = _compute_reconstruction_eval_metrics(
+                            x_eval,
+                            x_recon,
+                            top_k=100,
+                        )
+                        if batch_overall_numel > 0:
+                            mse_sum += float(batch_overall_sum.detach().cpu().item())
+                            mse_numel += batch_overall_numel
+                            eval_blocks_seen += int(x_eval.shape[0])
+                        if batch_selected_numel > 0:
+                            top_k_mse_sum += float(batch_selected_sum.detach().cpu().item())
+                            top_k_mse_numel += batch_selected_numel
                     mse = mse_sum / float(mse_numel) if mse_numel > 0 else 0.0
                     top_k_mse = top_k_mse_sum / float(top_k_mse_numel) if top_k_mse_numel > 0 else 0.0
                 log.info(
@@ -3145,7 +3194,19 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 tokenizer=eval_tokenizer,
                 run_output_dir=run_output_dir,
             )
-        if cat_args.save_model:
+        if cat_args.save_candidate_artifact:
+            from mix_bit.candidate_artifact import save_candidate_artifact_from_model
+
+            if not cat_args.convert:
+                raise ValueError("--save_candidate_artifact requires --convert")
+            save_paths = save_candidate_artifact_from_model(
+                model=model,
+                trial_spec_path=str(cat_args.candidate_artifact_spec),
+                output_dir=str(cat_args.candidate_artifact_output_dir),
+                source_run_dir=str(run_output_dir),
+            )
+            log.info("Saved candidate artifact to %s", save_paths["output_dir"])
+        elif cat_args.save_model:
             if not cat_args.convert:
                 raise ValueError("--save_model requires --convert")
             from transformers import AutoTokenizer

@@ -1,3 +1,4 @@
+import argparse
 from contextlib import contextmanager, nullcontext
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -16,6 +17,7 @@ from train_utils.distill_losses import (
     compute_entropy_aware_kl_loss,
     compute_forward_kl_loss,
     compute_kl_topk,
+    compute_masked_logit_mse_loss,
     compute_reverse_kl_loss,
     compute_rkl_topk,
     is_eakld_top_loss,
@@ -59,12 +61,12 @@ def parse_distill_hidden_alignment_layer_weighting(raw: str) -> str:
         if suffix.startswith("_"):
             suffix = suffix[1:]
         if not suffix.isdigit() or int(suffix) < 1:
-            raise ValueError(
+            raise argparse.ArgumentTypeError(
                 f"Invalid --distill_hidden_alignment_layer_weighting: {raw!r}. "
                 "adaptive_top suffix must be a positive integer, e.g. adaptive_top_3."
             )
         return mode
-    raise ValueError(
+    raise argparse.ArgumentTypeError(
         f"Invalid --distill_hidden_alignment_layer_weighting: {raw!r}. "
         "Supported: uniform, linear_depth, adaptive, adaptive_top_<K>."
     )
@@ -598,6 +600,17 @@ else:
             loss_type = self.loss_type
             hidden_loss_enabled = float(self.hidden_loss_weight) > 0.0
             pre_mlp_hidden_loss_enabled = float(self.pre_mlp_hidden_loss_weight) > 0.0
+            pre_mlp_reference_hidden_required = bool(
+                pre_mlp_hidden_loss_enabled
+                and is_adaptive_hidden_alignment_layer_weighting(
+                    self.hidden_alignment_layer_weighting
+                )
+            )
+            need_teacher_output_hidden_states = bool(
+                hidden_loss_enabled
+                or pre_mlp_reference_hidden_required
+            )
+            need_student_output_hidden_states = bool(hidden_loss_enabled)
             teacher_inputs = dict(inputs)
             teacher_inputs.pop("labels", None)
             student_inputs = dict(inputs)
@@ -653,9 +666,6 @@ else:
                     return default_k
                 return max(1, int(suffix))
 
-            def use_post_attn() -> bool:
-                return bool(getattr(args, "distill_post_attn", False))
-
             @contextmanager
             def teacher_param_context():
                 if not self.teacher_param_snapshots:
@@ -684,7 +694,10 @@ else:
                 )
                 pre_mlp_context = capture_pre_mlp_hiddens(unwrapped_model) if pre_mlp_hidden_loss_enabled else nullcontext()
                 with adapter_context, teacher_param_context(), pre_mlp_context as captured_pre_mlp:
-                    outputs = model(**teacher_inputs, output_hidden_states=hidden_loss_enabled)
+                    outputs = model(
+                        **teacher_inputs,
+                        output_hidden_states=need_teacher_output_hidden_states,
+                    )
                 if pre_mlp_hidden_loss_enabled:
                     teacher_pre_mlp_hiddens = tuple(captured_pre_mlp)
                 return outputs
@@ -693,10 +706,10 @@ else:
                 nonlocal student_pre_mlp_hiddens
                 pre_mlp_context = capture_pre_mlp_hiddens(unwrapped_model) if pre_mlp_hidden_loss_enabled else nullcontext()
                 with pre_mlp_context as captured_pre_mlp:
-                    if hidden_loss_enabled:
-                        outputs = model(**model_inputs, output_hidden_states=True)
-                    else:
-                        outputs = model(**model_inputs)
+                    outputs = model(
+                        **model_inputs,
+                        output_hidden_states=need_student_output_hidden_states,
+                    )
                 if pre_mlp_hidden_loss_enabled:
                     student_pre_mlp_hiddens = tuple(captured_pre_mlp)
                 return outputs
@@ -713,12 +726,19 @@ else:
                 if pre_mlp_hidden_loss_enabled:
                     if teacher_pre_mlp_hiddens is None or student_pre_mlp_hiddens is None:
                         raise RuntimeError("pre-MLP hidden alignment requires teacher and student captured hiddens.")
+                    teacher_reference_hidden = None
+                    if pre_mlp_reference_hidden_required:
+                        if teacher_outputs.hidden_states is None:
+                            raise RuntimeError(
+                                "adaptive pre-MLP hidden alignment requires teacher hidden states."
+                            )
+                        teacher_reference_hidden = teacher_outputs.hidden_states[0]
                     pre_mlp_hidden_loss = compute_distill_pre_mlp_hidden_alignment_loss(
                         teacher_pre_mlp_hiddens=teacher_pre_mlp_hiddens,
                         student_pre_mlp_hiddens=student_pre_mlp_hiddens,
                         attention_mask=full_inputs.get("attention_mask"),
                         layer_weighting=self.hidden_alignment_layer_weighting,
-                        teacher_reference_hidden=teacher_outputs.hidden_states[0],
+                        teacher_reference_hidden=teacher_reference_hidden,
                     )
                     loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
                 return loss
@@ -828,7 +848,6 @@ else:
                         mask=token_mask,
                         k=k,
                         temperature=float(self.temperature),
-                        post_attn=use_post_attn(),
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -851,7 +870,6 @@ else:
                         teacher_logits=teacher_logits,
                         mask=token_mask,
                         k=k,
-                        post_attn=use_post_attn(),
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -875,7 +893,6 @@ else:
                         mask=token_mask,
                         k=k,
                         temperature=float(self.temperature),
-                        post_attn=use_post_attn(),
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -901,7 +918,6 @@ else:
                         mask=token_mask,
                         k=k,
                         temperature=float(T),
-                        post_attn=use_post_attn(),
                     )
                     # T² is already applied inside compute_kl_topk.
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
@@ -915,7 +931,16 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    loss = F.mse_loss(logits, teacher_logits)
+                    token_mask = build_distill_token_mask(
+                        labels=full_inputs.get("labels"),
+                        attention_mask=full_inputs.get("attention_mask"),
+                        reference_logits=logits,
+                    )
+                    loss = compute_masked_logit_mse_loss(
+                        student_logits=logits,
+                        teacher_logits=teacher_logits,
+                        mask=token_mask,
+                    )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
 
@@ -982,7 +1007,6 @@ else:
                         teacher_logits=teacher_logits,
                         mask=token_mask,
                         k=k,
-                        post_attn=use_post_attn(),
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -1006,7 +1030,6 @@ else:
                         teacher_logits=teacher_logits,
                         mask=token_mask,
                         k=k,
-                        post_attn=use_post_attn(),
                     )
                     alpha = self.loss_alpha
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
@@ -1056,7 +1079,6 @@ else:
                         k=k,
                         temperature=float(self.temperature),
                         confidence_k=int(self.eakld_confidence_k),
-                        post_attn=use_post_attn(),
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss

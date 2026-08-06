@@ -1,3 +1,4 @@
+import argparse
 import logging
 from contextlib import nullcontext
 from typing import Dict, Optional
@@ -25,8 +26,18 @@ from e2e_common.dense_loss import (
 )
 from train_utils.distill_losses import (
     build_distill_token_mask,
-    compute_teacher_entropy_gamma,
+    compute_teacher_entropy_mean_and_gamma,
     is_eakld_top_loss,
+)
+
+# Rank-local EAKLD telemetry keys (no all_reduce; logging-rank microbatch stats).
+_EAKLD_WEIGHTED_KEYS = (
+    "teacher_entropy_mean",
+    "gamma_reverse",
+    "lambda_forward",
+    "forward_kl",
+    "reverse_kl",
+    "eakld_total",
 )
 from train_utils.lora_training import (
     build_distill_hidden_layer_weights,
@@ -219,7 +230,6 @@ class VAEDecoderE2ETrainer(Trainer):
         teacher_model: Optional[nn.Module] = None,
         distill_temperature: float = 1.0,
         distill_alpha: float = 0.5,
-        post_attn: bool = False,
         hidden_loss_weight: float = 0.0,
         eakld_confidence_k: int = 16,
         hidden_layer_weighting: str = "uniform",
@@ -234,7 +244,6 @@ class VAEDecoderE2ETrainer(Trainer):
         self.teacher_model = teacher_model
         self.distill_temperature = float(distill_temperature)
         self.distill_alpha = float(distill_alpha)
-        self.post_attn = bool(post_attn)
         self.hidden_loss_weight = float(hidden_loss_weight)
         if self.hidden_loss_weight < 0.0:
             raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
@@ -245,7 +254,7 @@ class VAEDecoderE2ETrainer(Trainer):
             self.hidden_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
                 str(hidden_layer_weighting)
             )
-        except ValueError as exc:
+        except (ValueError, argparse.ArgumentTypeError) as exc:
             raise ValueError(
                 str(exc).replace(
                     "--distill_hidden_alignment_layer_weighting",
@@ -266,6 +275,11 @@ class VAEDecoderE2ETrainer(Trainer):
         self.saved_tensor_offload = saved_tensor_offload
         self.streaming_offload_manager = streaming_offload_manager
         self._last_loss_parts: Dict[str, float] = {}
+        # Rank-local EAKLD telemetry accumulator (reset on each training log flush).
+        self._eakld_telemetry_weighted_sums: Dict[str, float] = {}
+        self._eakld_telemetry_weight = 0.0
+        self._eakld_gamma_zero_weight = 0.0
+        self._eakld_gamma_one_weight = 0.0
         super().__init__(*args, **kwargs)
         # Custom compute_loss returns token-mean losses. HF treats models with
         # forward(**kwargs) as accepting num_items_in_batch and then skips
@@ -324,11 +338,56 @@ class VAEDecoderE2ETrainer(Trainer):
             parts["hidden_loss"] = float(hidden_loss.detach().float().item())
         self._last_loss_parts = parts
 
+    def _record_eakld_telemetry(self, telemetry: Dict[str, torch.Tensor]) -> None:
+        if not telemetry:
+            return
+        valid_tokens = float(telemetry["valid_tokens"].detach().float().item())
+        weight = max(valid_tokens, 1.0)
+        for key in _EAKLD_WEIGHTED_KEYS:
+            value = float(telemetry[key].detach().float().item())
+            self._eakld_telemetry_weighted_sums[key] = (
+                self._eakld_telemetry_weighted_sums.get(key, 0.0) + value * weight
+            )
+        self._eakld_telemetry_weight += weight
+        gamma_reverse = float(telemetry["gamma_reverse"].detach().float().item())
+        if gamma_reverse <= 1e-6:
+            self._eakld_gamma_zero_weight += weight
+        if gamma_reverse >= 1.0 - 1e-6:
+            self._eakld_gamma_one_weight += weight
+
+    def _consume_eakld_telemetry_logs(self) -> Dict[str, float]:
+        # Rank-local telemetry: no all_reduce (avoids deadlock if only some ranks log).
+        total_weight = float(self._eakld_telemetry_weight)
+        if total_weight <= 0.0:
+            return {}
+        sums = self._eakld_telemetry_weighted_sums
+        logs = {
+            "eakld/teacher_entropy_mean": sums["teacher_entropy_mean"] / total_weight,
+            "eakld/gamma_reverse_mean": sums["gamma_reverse"] / total_weight,
+            "eakld/lambda_forward_mean": sums["lambda_forward"] / total_weight,
+            "eakld/gamma_reverse_zero_fraction": (
+                self._eakld_gamma_zero_weight / total_weight
+            ),
+            "eakld/gamma_reverse_one_fraction": (
+                self._eakld_gamma_one_weight / total_weight
+            ),
+            "eakld/forward_kl_mean": sums["forward_kl"] / total_weight,
+            "eakld/reverse_kl_mean": sums["reverse_kl"] / total_weight,
+            "eakld/total_mean": sums["eakld_total"] / total_weight,
+        }
+        self._eakld_telemetry_weighted_sums = {}
+        self._eakld_telemetry_weight = 0.0
+        self._eakld_gamma_zero_weight = 0.0
+        self._eakld_gamma_one_weight = 0.0
+        return logs
+
     def log(self, logs, start_time=None):
-        merged = dict(logs)
         for key, value in getattr(self, "_last_loss_parts", {}).items():
-            merged.setdefault(key, value)
-        return super().log(merged, start_time=start_time)
+            logs.setdefault(key, value)
+        # Rank-local telemetry merge into the existing training log event.
+        for key, value in self._consume_eakld_telemetry_logs().items():
+            logs.setdefault(key, value)
+        return super().log(logs, start_time=start_time)
 
     def _release_active_teacher_targets(self) -> None:
         targets = self._active_teacher_targets
@@ -378,6 +437,8 @@ class VAEDecoderE2ETrainer(Trainer):
 
             logits_cpu = None
             gamma_cpu = None
+            entropy_mean_cpu = None
+            valid_count_cpu = None
             if logits_required:
                 teacher_logits = get_output_logits(teacher_outputs)
                 gamma_mask = build_distill_token_mask(
@@ -385,7 +446,7 @@ class VAEDecoderE2ETrainer(Trainer):
                     attention_mask=inputs.get("attention_mask"),
                     reference_logits=teacher_logits,
                 )
-                gamma = compute_teacher_entropy_gamma(
+                entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
                     teacher_logits,
                     gamma_mask,
                     confidence_k=self.eakld_confidence_k,
@@ -395,6 +456,14 @@ class VAEDecoderE2ETrainer(Trainer):
                     pin_memory=self.teacher_output_pin_memory,
                 )
                 gamma_cpu = gamma.detach().reshape(()).to(device="cpu", dtype=torch.float32)
+                entropy_mean_cpu = entropy_mean.detach().reshape(()).to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                valid_count_cpu = valid_count.detach().reshape(()).to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )
 
             hidden_layer_indices: tuple = ()
             hidden_cpu_by_layer: Dict[int, torch.Tensor] = {}
@@ -413,6 +482,8 @@ class VAEDecoderE2ETrainer(Trainer):
             targets = TeacherTargetBatch(
                 logits_cpu=logits_cpu,
                 eakld_gamma_cpu=gamma_cpu,
+                teacher_entropy_mean_cpu=entropy_mean_cpu,
+                teacher_valid_token_count_cpu=valid_count_cpu,
                 hidden_cpu_by_layer=dict(hidden_cpu_by_layer),
                 hidden_layer_indices=tuple(hidden_layer_indices),
                 num_hidden_layers=int(num_hidden_layers),
@@ -526,6 +597,7 @@ class VAEDecoderE2ETrainer(Trainer):
             attention_mask=inputs.get("attention_mask"),
             reference_logits=logits,
         )
+        telemetry: Dict[str, torch.Tensor] = {}
         distill_loss = compute_dense_loss_from_logits(
             loss_type=loss_type,
             student_logits=logits,
@@ -534,9 +606,10 @@ class VAEDecoderE2ETrainer(Trainer):
             mask=token_mask,
             temperature=self.distill_temperature,
             alpha=self.distill_alpha,
-            post_attn=self.post_attn,
             eakld_confidence_k=int(self.eakld_confidence_k),
+            telemetry_out=telemetry,
         )
+        self._record_eakld_telemetry(telemetry)
         hidden_loss = None
         loss = distill_loss
         if hidden_loss_enabled:
@@ -607,28 +680,37 @@ class VAEDecoderE2ETrainer(Trainer):
                     targets is None
                     or targets.logits_cpu is None
                     or targets.eakld_gamma_cpu is None
+                    or targets.teacher_entropy_mean_cpu is None
+                    or targets.teacher_valid_token_count_cpu is None
                 ):
                     raise RuntimeError(
-                        "EAKLD-family loss requires teacher logits and gamma on CPU."
+                        "EAKLD-family loss requires teacher logits, gamma, and "
+                        "entropy scalars on CPU."
                     )
                 token_mask = build_distill_token_mask(
                     labels=labels,
                     attention_mask=inputs.get("attention_mask"),
                     reference_logits=logits,
                 )
+                telemetry: Dict[str, torch.Tensor] = {}
                 distill_loss = compute_dense_loss_from_offloaded_teacher(
                     loss_type=loss_type,
                     student_logits=logits,
                     teacher_logits_cpu=targets.logits_cpu,
                     teacher_gamma_cpu=targets.eakld_gamma_cpu,
+                    teacher_entropy_mean_cpu=targets.teacher_entropy_mean_cpu,
+                    teacher_valid_token_count_cpu=(
+                        targets.teacher_valid_token_count_cpu
+                    ),
                     ce_loss=ce_loss,
                     mask=token_mask,
                     temperature=self.distill_temperature,
                     alpha=self.distill_alpha,
-                    post_attn=self.post_attn,
-                    eakld_confidence_k=int(self.eakld_confidence_k),
+                            eakld_confidence_k=int(self.eakld_confidence_k),
                     sequence_chunk_size=int(self.teacher_output_chunk_tokens),
+                    telemetry_out=telemetry,
                 )
+                self._record_eakld_telemetry(telemetry)
 
             hidden_loss = None
             loss = distill_loss

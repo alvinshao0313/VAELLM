@@ -127,21 +127,57 @@ def get_opt(model_name):
     return model
 
 
+def get_auto_causal_lm(model_name, hf_token=None):
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    kwargs = {
+        "torch_dtype": "auto",
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": False,
+    }
+    if hf_token:
+        kwargs["token"] = hf_token
+    try:
+        model = transformers.AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    except ValueError as exc:
+        message = str(exc)
+        if "trust_remote_code" in message or "remote code" in message.lower():
+            raise ValueError(
+                f"Model {model_name!r} requires remote code and is unsupported "
+                f"by the additive AutoModel fallback: {exc}"
+            ) from exc
+        raise
+    max_pos = getattr(model.config, "max_position_embeddings", None)
+    if isinstance(max_pos, int) and max_pos > 0:
+        model.seqlen = max_pos
+    else:
+        model.seqlen = 2048
+    model_type = getattr(model.config, "model_type", "unknown")
+    logging.info(
+        "---> Loading %s via AutoModelForCausalLM (model_type=%s, class=%s) with seq_len: %s",
+        model_name,
+        model_type,
+        type(model).__name__,
+        model.seqlen,
+    )
+    return model
+
+
 def get_model(
     model_name, hf_token=None
 ):
-    if 'llama' in model_name.lower():
+    if "llama" in model_name.lower():
         return get_llama(model_name, hf_token)
-    elif 'mistral' in model_name.lower():
+    elif "mistral" in model_name.lower():
         return get_mistral(model_name, hf_token)
-    elif 'Qwen2' in model_name:
+    elif "Qwen2" in model_name:
         return get_qwen2(model_name, hf_token)
-    elif 'Qwen3' in model_name:
+    elif "Qwen3" in model_name:
         return get_qwen3(model_name, hf_token)
-    elif 'opt' in model_name:
+    elif "opt" in model_name:
         return get_opt(model_name)
-    else:
-        raise ValueError(f'Unknown model {model_name}')
+    return get_auto_causal_lm(model_name, hf_token)
 
 
 def get_model_type(model):

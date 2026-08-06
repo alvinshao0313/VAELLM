@@ -70,7 +70,6 @@ python tools/block_vae_lora_train.py \
   --lfq_weight "2.5" \
   --commitment_loss_weight "0.25" \
   --entropy_loss_weight "1e-2" \
-  --diversity_gamma "1.0" \
   --normalize_weight \
   --new_quant \
   --block_distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \

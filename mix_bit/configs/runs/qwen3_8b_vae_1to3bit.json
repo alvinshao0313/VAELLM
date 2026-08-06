@@ -1,0 +1,14 @@
+{
+  "run_id": "qwen3_8b_vae_1to3bit",
+  "model_profile": "../models/qwen3_8b.json",
+  "candidate_space": "../candidate_spaces/vae_1to3bit.json",
+  "training_recipe": "../training_recipes/vae_bsq_mse_10k.json",
+  "calibration": {
+    "source_jsonl": "data/edgerazor_qwen3/task_vaellm_eval_instruct.jsonl",
+    "input_format": "auto",
+    "max_samples": 1000,
+    "max_length": 2048,
+    "seed": 31,
+    "label_mode": "all_nonpad"
+  }
+}

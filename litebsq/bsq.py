@@ -47,7 +47,6 @@ class BSQ(nn.Module):
         dim=None,
         entropy_loss_weight=0.1,
         commitment_loss_weight=0.25,
-        diversity_gamma=1.0,
         num_codebooks=1,
         keep_num_codebooks_dim=None,
         codebook_scale=1.0,
@@ -91,7 +90,6 @@ class BSQ(nn.Module):
         self.gamma = gamma
         self.zeta = zeta
         self.new_quant = new_quant
-        self.diversity_gamma = diversity_gamma
         self.entropy_loss_weight = entropy_loss_weight
         self.codebook_scale = codebook_scale
         self.commitment_loss_weight = commitment_loss_weight

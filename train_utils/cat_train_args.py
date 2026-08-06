@@ -124,6 +124,9 @@ class NormalizedCatArgs:
     convert: bool
     convert_device: str
     save_model: bool
+    save_candidate_artifact: bool
+    candidate_artifact_spec: Optional[str]
+    candidate_artifact_output_dir: Optional[str]
     unload_vae_original_weights_on_final_save: bool
     distill_reset_completed: bool
     distill_independent_categories: bool
@@ -145,10 +148,6 @@ class CatTrainHFTrainingArguments:
     distill_lr_scheduler_type: str = field(default="linear")
     distill_gradient_checkpointing: bool = field(default=False)
     distill_gradient_checkpointing_kwargs: Optional[str] = field(default=None)
-    distill_post_attn: bool = field(
-        default=False,
-        metadata={"help": "For *_top distillation losses, compute KL on gathered full-vocab probabilities instead of renormalizing within the top-k subset."},
-    )
     distill_hif4_act: bool = field(
         default=False,
         metadata={"help": "Enable HiFloat4 activation pseudo-quantization for student linear inputs during the after-category distill stage."},
@@ -214,7 +213,16 @@ class ResolvedDistillRuntimeConfig:
 _SKIP_LAYER_PATTERN = re.compile(r"^(\d+)\.([A-Za-z0-9_]+)$")
 _CATEGORY_OVERRIDE_SELECTORS = ("default", "cat")
 _AFTER_CATEGORY_OVERRIDE_SELECTORS = ("default", "after")
-_CAT_RECON_LOSS_CHOICES = ("mse", "l1", "huber", "relative_l1", "top_k_mse", "cosine", "w_mse", "w2_mse", "wa_mse", "amse")
+_CAT_RECON_LOSS_CHOICES = (
+    "mse",
+    "l1",
+    "huber",
+    "relative_l1",
+    "w_mse",
+    "w2_mse",
+    "wa_mse",
+    "amse",
+)
 _CAT_NORM_TYPE_CHOICES = ("group", "batch", "layer", "rms", "no")
 _CAT_ACTIVATION_TYPE_CHOICES = ("swish", "relu", "none", "sigmoid", "gelu", "hard_swish")
 _CAT_DECODER_TYPE_CHOICES = ("linear", "symmetric", "asymmetric")
@@ -732,7 +740,6 @@ def _build_cat_train_vae_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lfq_weight", type=float, default=1.0)
     parser.add_argument("--commitment_loss_weight", type=float, default=0.25)
     parser.add_argument("--entropy_loss_weight", type=float, default=0.1)
-    parser.add_argument("--diversity_gamma", type=float, default=1.0)
     parser.add_argument(
         "--vae_decoder_checkpoint",
         type=lambda v: _parse_bool_like(v, arg_name="--vae_decoder_checkpoint"),
@@ -855,6 +862,17 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         convert=bool(raw_args.convert),
         convert_device=str(raw_args.convert_device),
         save_model=bool(raw_args.save_model),
+        save_candidate_artifact=bool(raw_args.save_candidate_artifact),
+        candidate_artifact_spec=(
+            None
+            if raw_args.candidate_artifact_spec is None
+            else str(raw_args.candidate_artifact_spec)
+        ),
+        candidate_artifact_output_dir=(
+            None
+            if raw_args.candidate_artifact_output_dir is None
+            else str(raw_args.candidate_artifact_output_dir)
+        ),
         unload_vae_original_weights_on_final_save=bool(raw_args.unload_vae_original_weights_on_final_save),
         distill_reset_completed=bool(raw_args.distill_reset_completed),
         distill_independent_categories=bool(raw_args.distill_independent_categories),
@@ -1591,7 +1609,14 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help="启用严格确定性模式；遇到非确定性 CUDA 算子会直接报错。",
     )
     parser.add_argument("--train_device", type=str, default="cuda")
-    parser.add_argument("--rot_llm", action="store_true", default=False, help="在 VAE 压缩前先对基座 LLM 执行一次离线旋转融合。")
+    parser.add_argument(
+        "--rot_llm",
+        type=lambda v: _parse_bool_like(v, arg_name="--rot_llm"),
+        nargs="?",
+        const=True,
+        default=False,
+        help="在 VAE 压缩前先对基座 LLM 执行一次离线旋转融合。",
+    )
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
@@ -1601,6 +1626,23 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--convert", action="store_true", help="每个类别训练完成后，将 Linear 替换为压缩后的线性层。")
     parser.add_argument("--convert_device", type=str, default="cuda")
     parser.add_argument("--save_model", action="store_true", help="保存最终模型 state_dict/config/tokenizer（需要 --convert）。")
+    parser.add_argument(
+        "--save_candidate_artifact",
+        action="store_true",
+        help="仅导出当前目标类别的压缩 VAELinear candidate artifact（与 --save_model 互斥）。",
+    )
+    parser.add_argument(
+        "--candidate_artifact_spec",
+        type=str,
+        default=None,
+        help="candidate-only 导出所需的 trial_spec.json 路径。",
+    )
+    parser.add_argument(
+        "--candidate_artifact_output_dir",
+        type=str,
+        default=None,
+        help="candidate-only 导出目录。",
+    )
     parser.add_argument("--unload_vae_original_weights_on_final_save", action="store_true", default=False, help="最终保存前卸载 VAELinear 中缓存的原始 Linear 权重，减小保存体积。")
     parser.add_argument(
         "--distill_reset_completed",
@@ -1628,6 +1670,27 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_candidate_artifact_args(cat_args: NormalizedCatArgs) -> None:
+    save_candidate = bool(cat_args.save_candidate_artifact)
+    save_model = bool(cat_args.save_model)
+    spec = cat_args.candidate_artifact_spec
+    out_dir = cat_args.candidate_artifact_output_dir
+    if save_candidate and save_model:
+        raise ValueError("--save_candidate_artifact and --save_model are mutually exclusive")
+    if save_candidate:
+        if not cat_args.convert:
+            raise ValueError("--save_candidate_artifact requires --convert")
+        if not spec or not str(spec).strip():
+            raise ValueError("--save_candidate_artifact requires --candidate_artifact_spec")
+        if not out_dir or not str(out_dir).strip():
+            raise ValueError("--save_candidate_artifact requires --candidate_artifact_output_dir")
+        return
+    if spec is not None or out_dir is not None:
+        raise ValueError(
+            "--candidate_artifact_spec/--candidate_artifact_output_dir require --save_candidate_artifact"
+        )
+
+
 def process_cat_train_args(argv: Optional[Sequence[str]]):
     if argv is None:
         import sys
@@ -1636,6 +1699,7 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
     script_parser = build_cat_train_parser()
     raw_script_args, remaining = script_parser.parse_known_args(list(argv))
     cat_args = _normalize_cat_train_script_args(raw_script_args)
+    _validate_candidate_artifact_args(cat_args)
     _validate_outlier_protect_mode_args(cat_args)
     _validate_outlier_mlp_args(cat_args)
     _validate_distill_after_category_args(cat_args)

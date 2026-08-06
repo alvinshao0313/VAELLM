@@ -70,12 +70,11 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --parallel_mode dp \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
     --dataset_task sft \
-    --loss_type kl_top_100 \
+    --loss_type eakld \
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
-    --post_attn false \
-    --hidden_loss_weight 0.01 \
+    --hidden_loss_weight 0.1 \
     --hidden_layer_weighting adaptive_top_3 \
     --teacher_output_offload cpu \
     --teacher_output_pin_memory true \
@@ -131,7 +130,6 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
-    --post_attn false \
     --hidden_loss_weight 0.01 \
     --hidden_layer_weighting adaptive_top_3 \
     --teacher_output_offload cpu \

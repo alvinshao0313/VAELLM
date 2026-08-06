@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import MutableMapping, Optional
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +15,7 @@ from train_utils.distill_losses import (
     compute_entropy_aware_kl_loss,
     compute_forward_kl_loss,
     compute_kl_topk,
+    compute_masked_logit_mse_loss,
     compute_reverse_kl_loss,
     compute_rkl_topk,
     is_eakld_top_loss,
@@ -71,8 +72,8 @@ def compute_dense_loss_from_logits(
     mask: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
     alpha: float = 0.5,
-    post_attn: bool = False,
     eakld_confidence_k: int = 16,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     norm = str(loss_type or "").strip().lower()
     if norm in {"sft", "origin"}:
@@ -116,7 +117,6 @@ def compute_dense_loss_from_logits(
             mask=mask,
             k=k,
             temperature=float(temperature),
-            post_attn=bool(post_attn),
         )
     if norm.startswith("dual_r_kl_top"):
         k = parse_topk(norm, prefix="dual_r_kl_top", default_k=1000)
@@ -125,7 +125,6 @@ def compute_dense_loss_from_logits(
             teacher_logits=teacher_logits,
             mask=mask,
             k=k,
-            post_attn=bool(post_attn),
         )
     if norm.startswith("kl_top"):
         k = parse_topk(norm, prefix="kl_top", default_k=1000)
@@ -135,7 +134,6 @@ def compute_dense_loss_from_logits(
             mask=mask,
             k=k,
             temperature=float(temperature),
-            post_attn=bool(post_attn),
         )
     if norm.startswith("kd_top"):
         if ce_loss is None:
@@ -148,7 +146,6 @@ def compute_dense_loss_from_logits(
             mask=mask,
             k=k,
             temperature=temperature,
-            post_attn=bool(post_attn),
         )
         # compute_kl_topk already multiplies by T².
         return ce_loss * (1.0 - float(alpha)) + kd_loss * float(alpha)
@@ -161,7 +158,7 @@ def compute_dense_loss_from_logits(
             k=k,
             temperature=float(temperature),
             confidence_k=int(eakld_confidence_k),
-            post_attn=bool(post_attn),
+            telemetry_out=telemetry_out,
         )
     if norm == "eakld":
         return compute_eakld(
@@ -170,6 +167,7 @@ def compute_dense_loss_from_logits(
             mask=mask,
             temperature=float(temperature),
             confidence_k=int(eakld_confidence_k),
+            telemetry_out=telemetry_out,
         )
     if norm == "eakld_kd":
         if ce_loss is None:
@@ -181,6 +179,7 @@ def compute_dense_loss_from_logits(
             mask=mask,
             temperature=temperature,
             confidence_k=int(eakld_confidence_k),
+            telemetry_out=telemetry_out,
         )
         # T² is already applied inside compute_eakld.
         return ce_loss * (1.0 - float(alpha)) + eakld_loss * float(alpha)
@@ -191,10 +190,13 @@ def compute_dense_loss_from_logits(
             teacher_logits=teacher_logits,
             mask=mask,
             k=k,
-            post_attn=bool(post_attn),
         )
     if norm == "mse":
-        return F.mse_loss(student_logits, teacher_logits)
+        return compute_masked_logit_mse_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=mask,
+        )
     if norm == "kd":
         if ce_loss is None:
             raise ValueError("loss_type=kd requires ce_loss.")
@@ -225,7 +227,6 @@ def compute_dense_loss_from_logits(
             teacher_logits=teacher_logits,
             mask=mask,
             k=k,
-            post_attn=bool(post_attn),
         )
         return ce_loss * (1.0 - float(alpha)) + kd_loss * float(alpha)
 
@@ -243,13 +244,15 @@ def compute_dense_loss_from_offloaded_teacher(
     student_logits: torch.Tensor,
     teacher_logits_cpu: torch.Tensor,
     teacher_gamma_cpu: torch.Tensor,
+    teacher_entropy_mean_cpu: Optional[torch.Tensor],
+    teacher_valid_token_count_cpu: Optional[torch.Tensor],
     ce_loss: Optional[torch.Tensor] = None,
     mask: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
     alpha: float = 0.5,
-    post_attn: bool = False,
     eakld_confidence_k: int = 16,
     sequence_chunk_size: int = 16,
+    telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     norm = str(loss_type or "").strip().lower()
     if int(eakld_confidence_k) < 2:
@@ -263,6 +266,9 @@ def compute_dense_loss_from_offloaded_teacher(
             gamma=teacher_gamma_cpu,
             temperature=float(temperature),
             sequence_chunk_size=int(sequence_chunk_size),
+            teacher_entropy_mean=teacher_entropy_mean_cpu,
+            teacher_valid_token_count=teacher_valid_token_count_cpu,
+            telemetry_out=telemetry_out,
         )
     elif is_eakld_top_loss(norm):
         eakld_loss = compute_eakld_topk_from_cpu_teacher_logits(
@@ -272,8 +278,10 @@ def compute_dense_loss_from_offloaded_teacher(
             gamma=teacher_gamma_cpu,
             k=parse_eakld_top_k(norm, default_k=1000),
             temperature=float(temperature),
-            post_attn=bool(post_attn),
             sequence_chunk_size=int(sequence_chunk_size),
+            teacher_entropy_mean=teacher_entropy_mean_cpu,
+            teacher_valid_token_count=teacher_valid_token_count_cpu,
+            telemetry_out=telemetry_out,
         )
     else:
         raise ValueError(

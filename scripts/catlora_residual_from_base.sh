@@ -111,7 +111,6 @@ python tools/cat_residual_from_base.py \
   --lfq_weight "2.5" \
   --commitment_loss_weight "0.25" \
   --entropy_loss_weight "0.01" \
-  --diversity_gamma "1.0" \
   --normalize_weight \
   --vae_decoder_checkpoint "true" \
   --new_quant \

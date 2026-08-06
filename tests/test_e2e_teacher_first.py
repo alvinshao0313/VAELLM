@@ -337,3 +337,85 @@ def test_nograd_compute_loss_clears_targets(tmp_path):
         loss = trainer.compute_loss(student, inputs)
     assert torch.is_tensor(loss)
     assert trainer._active_teacher_targets is None
+
+
+def test_cpu_eakld_teacher_targets_include_entropy_scalars(tmp_path, monkeypatch):
+    copy_calls = {"count": 0}
+    original_copy = (
+        __import__(
+            "compressed_e2e_fintuning.trainer",
+            fromlist=["copy_detached_tensor_to_cpu"],
+        ).copy_detached_tensor_to_cpu
+    )
+
+    def counting_copy(tensor, *, pin_memory):
+        copy_calls["count"] += 1
+        return original_copy(tensor, pin_memory=pin_memory)
+
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.trainer.copy_detached_tensor_to_cpu",
+        counting_copy,
+    )
+    trainer, student, _teacher, _events = _build_trainer(
+        tmp_path,
+        loss_type="eakld",
+        hidden_loss_weight=0.0,
+    )
+    inputs = _inputs()
+    loss = trainer.compute_loss(student, inputs)
+    target = trainer._active_teacher_targets
+    assert target is not None
+    assert target.teacher_entropy_mean_cpu.device.type == "cpu"
+    assert target.teacher_entropy_mean_cpu.ndim == 0
+    assert target.teacher_entropy_mean_cpu.dtype == torch.float32
+    assert target.teacher_valid_token_count_cpu.ndim == 0
+    assert target.teacher_valid_token_count_cpu.device.type == "cpu"
+    assert copy_calls["count"] == 1
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_eakld_telemetry_weighted_accumulator_and_reset(tmp_path):
+    trainer, student, _teacher, _events = _build_trainer(
+        tmp_path,
+        loss_type="eakld",
+        hidden_loss_weight=0.0,
+    )
+    del student, _teacher, _events
+
+    batch_a = {
+        "teacher_entropy_mean": torch.tensor(2.0),
+        "gamma_reverse": torch.tensor(0.0),
+        "lambda_forward": torch.tensor(1.0),
+        "forward_kl": torch.tensor(0.4),
+        "reverse_kl": torch.tensor(0.1),
+        "eakld_total": torch.tensor(0.4),
+        "valid_tokens": torch.tensor(10.0),
+    }
+    batch_b = {
+        "teacher_entropy_mean": torch.tensor(0.5),
+        "gamma_reverse": torch.tensor(1.0),
+        "lambda_forward": torch.tensor(0.0),
+        "forward_kl": torch.tensor(0.2),
+        "reverse_kl": torch.tensor(0.8),
+        "eakld_total": torch.tensor(0.8),
+        "valid_tokens": torch.tensor(30.0),
+    }
+    trainer._record_eakld_telemetry(batch_a)
+    trainer._record_eakld_telemetry(batch_b)
+
+    flushed = {}
+    trainer.log(flushed)
+    assert flushed["eakld/gamma_reverse_mean"] == pytest.approx(0.75)
+    assert flushed["eakld/gamma_reverse_zero_fraction"] == pytest.approx(0.25)
+    assert flushed["eakld/gamma_reverse_one_fraction"] == pytest.approx(0.75)
+    assert trainer._eakld_telemetry_weight == pytest.approx(0.0)
+    assert trainer._eakld_telemetry_weighted_sums == {}
+    assert trainer._eakld_gamma_zero_weight == pytest.approx(0.0)
+    assert trainer._eakld_gamma_one_weight == pytest.approx(0.0)
+
+    second = {}
+    trainer.log(second)
+    assert "eakld/gamma_reverse_mean" not in second
