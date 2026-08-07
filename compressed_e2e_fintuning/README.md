@@ -83,16 +83,17 @@ bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
 - 输入 checkpoint 必须已经带有 `low_rank_a` 和 `low_rank_b`
 - 被 `--decoder_layers` 和 `--target_modules` 选中的 VAELinear 必须全部有完整低秩分支
 - 选中模块的低秩 rank 必须一致
+- 选中模块的 `low_rank_scope` 必须一致（`full` 或 `compressed_subspace`）；E2E **不新增**第二套 scope CLI，自动沿用 checkpoint 中的 scope
 
 训练逻辑：
 
-- 先把选中的 VAELinear 解码成 dense `nn.Linear`
-- dense base 权重包含 VAE decoder 和固定 sparse residual
-- dense base 权重不包含 low-rank patch
-- 再用 checkpoint 里的 `low_rank_b` 初始化 LoRA A
-- 用 checkpoint 里的 `low_rank_a` 初始化 LoRA B
-- LoRA scaling 固定为 1
-- 训练结束后，把 LoRA 写回压缩模型的 `low_rank_a/b`
+- `full`（默认/旧 checkpoint）：先把选中的 VAELinear 解码成 dense `nn.Linear`（含 VAE decoder 与固定 sparse residual，不含 low-rank patch），再 `get_peft_model` 包完整权重并训练 LoRA
+- `compressed_subspace`：把选中模块包成 `CompressedSubspacePeftProxy` + O(1) PEFT carrier，再 `get_peft_model` 得到 root `PeftModel`，只在压缩子空间训练 LoRA
+- 两种 scope 都保持 root `PeftModel`，继续共用现有 Trainer checkpoint/resume
+- 用 checkpoint 里的 effective `low_rank_a/b` 初始化 LoRA（scaling 固定为 1）
+- 训练结束后，把 LoRA 写回压缩模型的 `low_rank_a/b`，并校验 `expected_scope`
+
+说明：本功能只覆盖最终写回 `VAELinear.low_rank_a/b` 的 compressed LoRA；block-level PEFT LoRA 不在此范围。
 
 限制：
 
@@ -127,6 +128,7 @@ bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
 输入要求：
 
 - 被选中的 VAELinear 必须全部有完整 `low_rank_a/b`
+- 选中模块的 `low_rank_scope` 必须一致；`both` 直接训练 checkpoint 中的 `low_rank_a/b`（含 `compressed_subspace` shape），不创建 proxy / root PEFT
 
 训练内容：
 

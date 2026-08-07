@@ -10,6 +10,7 @@ from peft.tuners.adalora.layer import RankAllocator, SVDLinear as PeftAdaLoraLin
 from peft.tuners.lora.layer import Linear as PeftLoraLinear
 from torch import nn
 
+from litebsq.low_rank_scope import LOW_RANK_SCOPE_FULL
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear_prewarm import (
     NamedVAELinearDecodeTarget,
@@ -393,6 +394,7 @@ def export_peft_proxy_lora_to_low_rank(
                 f"{module_name}: exported low-rank inner dim mismatch "
                 f"{int(low_rank_a.shape[1])} != {int(low_rank_b.shape[0])}."
             )
+        base_layer.low_rank_scope = LOW_RANK_SCOPE_FULL
         base_layer.low_rank_a = nn.Parameter(low_rank_a, requires_grad=False)
         base_layer.low_rank_b = nn.Parameter(low_rank_b, requires_grad=False)
         _restore_base_layer_cache_policy_from_proxy(proxy)

@@ -16,14 +16,28 @@ from e2e_common.compressed_checkpoint import (
 )
 from e2e_common.data import build_tokenizer
 from e2e_common.e2e_args import needs_teacher
+from e2e_common.compressed_subspace_lora import (
+    CompressedSubspacePeftProxy,
+    PeftZeroLinearCarrier,
+    extract_subspace_peft_low_rank_payloads,
+    initialize_subspace_peft_lora_from_low_rank,
+    iter_named_compressed_subspace_peft_proxies,
+    wrap_vae_linears_with_compressed_subspace_peft_proxy,
+)
 from e2e_common.low_rank_lora import (
     extract_low_rank_payloads_from_lora,
     iter_lora_target_modules,
     write_low_rank_payloads_to_compressed_model,
 )
+from e2e_common.peft_proxy import detach_and_clear_vae_low_rank_payloads, is_peft_lora_linear
 from e2e_common.post_norm_head import ensure_post_norm_head_linear
 from e2e_common.lazy_datasets import build_edgerazor_data_collator, dataset_length_or_none, default_dataloader_num_workers
 from e2e_common.runtime_utils import build_datasets_with_main_process_first, eval_final_ppl
+from litebsq.low_rank_scope import (
+    LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
+    LOW_RANK_SCOPE_FULL,
+    normalize_low_rank_scope,
+)
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import NamedVAELinearDecodeTarget, decode_named_vae_linear_weights
@@ -50,6 +64,7 @@ from compressed_e2e_fintuning.trainables import (
     select_vae_decoder_trainables,
     unpack_parallel_stage_decoders,
     validate_selected_low_rank_payloads,
+    validate_selected_low_rank_scope,
 )
 from compressed_e2e_fintuning.trainer import (
     E2ETrainerLogCallback,
@@ -267,6 +282,184 @@ def _build_low_rank_peft_model(
         train_mode="compressed_lora",
     )
     return peft_model, selection
+
+
+def _build_subspace_low_rank_peft_model(
+    model: nn.Module,
+    *,
+    selected_modules: Sequence[Tuple[str, VAELinear]],
+    low_rank_payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    rank: int,
+    decoder_layer_ids: Sequence[int],
+    target_module_suffixes: Sequence[str],
+    parallel_stage_decode: bool,
+    log,
+) -> Tuple[nn.Module, VAEDecoderTrainableSelection]:
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("compressed_lora 训练需要 peft。请先安装：pip install peft") from exc
+
+    selected_module_names = [str(name) for name, _module in selected_modules]
+    if sorted(selected_module_names) != sorted(low_rank_payloads.keys()):
+        raise RuntimeError(
+            "subspace low-rank payload keys must match selected modules: "
+            f"payloads={sorted(low_rank_payloads.keys())} selected={sorted(selected_module_names)}."
+        )
+    for name, module in selected_modules:
+        scope = normalize_low_rank_scope(getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL))
+        if scope != LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
+            raise ValueError(
+                f"{name}: subspace PEFT path requires low_rank_scope={LOW_RANK_SCOPE_COMPRESSED_SUBSPACE!r}, "
+                f"got {scope!r}."
+            )
+
+    detach_and_clear_vae_low_rank_payloads(selected_modules)
+    wrap_vae_linears_with_compressed_subspace_peft_proxy(model, selected_modules)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=int(rank),
+        target_modules=[CompressedSubspacePeftProxy.CARRIER_NAME],
+        lora_alpha=float(rank),
+        lora_dropout=0.0,
+        bias="none",
+        init_lora_weights=True,
+    )
+    peft_model = get_peft_model(model, peft_config)
+
+    proxy_refs = list(iter_named_compressed_subspace_peft_proxies(peft_model))
+    if len(proxy_refs) != len(selected_modules):
+        raise RuntimeError(
+            f"subspace PEFT proxy count mismatch: proxies={len(proxy_refs)} selected={len(selected_modules)}."
+        )
+    for module_name, proxy in proxy_refs:
+        carrier = getattr(proxy, CompressedSubspacePeftProxy.CARRIER_NAME, None)
+        if not is_peft_lora_linear(carrier):
+            raise TypeError(
+                f"{module_name}: expected PEFT plain LoRA Linear after get_peft_model, got {type(carrier)}."
+            )
+        base_layer = carrier.base_layer
+        if not isinstance(base_layer, PeftZeroLinearCarrier):
+            raise TypeError(
+                f"{module_name}: PEFT base_layer must remain PeftZeroLinearCarrier, got {type(base_layer)}."
+            )
+        if int(base_layer.weight.numel()) != 1:
+            raise RuntimeError(
+                f"{module_name}: carrier sentinel weight must have numel==1, got {int(base_layer.weight.numel())}."
+            )
+        if not torch.equal(
+            base_layer.weight.detach().cpu().reshape(-1),
+            torch.zeros(1, dtype=base_layer.weight.dtype),
+        ):
+            raise RuntimeError(f"{module_name}: carrier sentinel weight must stay identically zero.")
+        if bool(base_layer.weight.requires_grad):
+            raise RuntimeError(f"{module_name}: carrier sentinel weight must remain frozen.")
+
+    initialized = initialize_subspace_peft_lora_from_low_rank(
+        peft_model,
+        low_rank_payloads,
+        module_names=selected_module_names,
+    )
+    trainable_names = sorted(
+        name for name, param in peft_model.named_parameters() if bool(param.requires_grad)
+    )
+    trainable_count = int(
+        sum(int(param.numel()) for _name, param in peft_model.named_parameters() if bool(param.requires_grad))
+    )
+    if trainable_count < 1:
+        raise RuntimeError("No trainable subspace LoRA parameters found.")
+    expected_trainable = 0
+    for _name, (low_rank_a, low_rank_b) in low_rank_payloads.items():
+        expected_trainable += int(low_rank_a.numel()) + int(low_rank_b.numel())
+    if int(trainable_count) != int(expected_trainable):
+        raise RuntimeError(
+            f"subspace trainable param count mismatch: got={trainable_count} expected={expected_trainable}."
+        )
+    log.info(
+        "Initialized subspace PEFT LoRA from checkpoint payloads: initialized=%d rank=%d "
+        "compressed_lora_scope=%s trainable_params=%d",
+        initialized,
+        int(rank),
+        LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
+        int(trainable_count),
+    )
+    target_modules = sorted(selected_module_names)
+    selection = VAEDecoderTrainableSelection(
+        decoder_layer_ids=[int(idx) for idx in decoder_layer_ids],
+        target_modules=target_modules,
+        target_module_suffixes=list(target_module_suffixes),
+        bias_modules=[],
+        final_norm_modules=[],
+        post_norm_head_modules=[],
+        low_rank_modules=target_modules,
+        trainable_parameter_names=trainable_names,
+        trainable_parameter_count=trainable_count,
+        parallel_stage_decode=bool(parallel_stage_decode),
+        train_mode="compressed_lora",
+    )
+    return peft_model, selection
+
+
+def _prepare_compressed_lora_train_model(
+    model: nn.Module,
+    *,
+    selected_modules: Sequence[Tuple[str, VAELinear]],
+    target_module_suffixes: Sequence[str],
+    low_rank_scope: str,
+    low_rank_rank: int,
+    low_rank_payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    decoder_layer_ids: Sequence[int],
+    parallel_stage_decode: bool,
+    decode_group_size: int,
+    decode_device: str,
+    log,
+) -> Tuple[nn.Module, VAEDecoderTrainableSelection]:
+    """Route compressed_lora setup by resolved low-rank scope."""
+    if low_rank_scope == LOW_RANK_SCOPE_FULL:
+        decode_device_diag = get_decode_device_diagnostics(str(decode_device))
+        resolved_decode_device = str(decode_device_diag["resolved_device"])
+        log.info(
+            "Low-rank dense init decode config: requested_device=%s resolved_device=%s group_size=%d",
+            str(decode_device),
+            resolved_decode_device,
+            int(decode_group_size),
+        )
+        log.info(
+            "Low-rank decode device diagnostics: LOCAL_RANK=%s CUDA_VISIBLE_DEVICES=%s visible_cuda_count=%d",
+            str(decode_device_diag["local_rank"]),
+            str(decode_device_diag["cuda_visible_devices"]),
+            int(decode_device_diag["visible_cuda_count"]),
+        )
+        _materialize_selected_vae_linears_without_low_rank(
+            model,
+            selected_modules,
+            group_size=int(decode_group_size),
+            compute_device=resolved_decode_device,
+            log=log,
+        )
+        return _build_low_rank_peft_model(
+            model,
+            low_rank_payloads=low_rank_payloads,
+            rank=int(low_rank_rank),
+            decoder_layer_ids=decoder_layer_ids,
+            target_module_suffixes=target_module_suffixes,
+            parallel_stage_decode=bool(parallel_stage_decode),
+            log=log,
+        )
+    if low_rank_scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
+        return _build_subspace_low_rank_peft_model(
+            model,
+            selected_modules=selected_modules,
+            low_rank_payloads=low_rank_payloads,
+            rank=int(low_rank_rank),
+            decoder_layer_ids=decoder_layer_ids,
+            target_module_suffixes=target_module_suffixes,
+            parallel_stage_decode=bool(parallel_stage_decode),
+            log=log,
+        )
+    raise AssertionError(f"Unreachable low_rank_scope={low_rank_scope!r}")
 
 
 def _peft_base_model(model: nn.Module) -> nn.Module:
@@ -590,7 +783,9 @@ def run(args, hf_args, training_args):
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(layers))
     train_mode = str(getattr(args, "vae_train_mode", "decoder")).strip().lower()
     low_rank_payloads_for_export: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
-    if train_mode == "compressed_lora":
+    low_rank_scope: Optional[str] = None
+    low_rank_rank: Optional[int] = None
+    if train_mode in {"compressed_lora", "both"}:
         selected_modules, target_module_suffixes = collect_selected_vae_linears(
             model,
             decoder_layer_ids=decoder_layer_ids,
@@ -598,40 +793,31 @@ def run(args, hf_args, training_args):
         )
         if not selected_modules:
             raise ValueError("No eligible VAELinear modules found for requested decoder_layers / target_modules.")
-        low_rank_rank = validate_selected_low_rank_payloads(
-            selected_modules,
-            require_uniform_rank=True,
-        )
+        if train_mode == "compressed_lora":
+            # Keep current compressed_lora uniform-rank requirement unchanged.
+            low_rank_rank = validate_selected_low_rank_payloads(
+                selected_modules,
+                require_uniform_rank=True,
+            )
+            low_rank_scope = validate_selected_low_rank_scope(selected_modules)
+        else:
+            # both: only enforce scope consistency; do not add uniform-rank.
+            low_rank_scope = validate_selected_low_rank_scope(selected_modules)
+        log.info("Resolved compressed low-rank scope: %s", low_rank_scope)
+
+    if train_mode == "compressed_lora":
         low_rank_payloads = _copy_low_rank_payloads(selected_modules)
-        requested_decode_device = str(getattr(args, "decode_device", "auto"))
-        decode_device_diag = get_decode_device_diagnostics(requested_decode_device)
-        resolved_decode_device = str(decode_device_diag["resolved_device"])
-        log.info(
-            "Low-rank dense init decode config: requested_device=%s resolved_device=%s group_size=%d",
-            requested_decode_device,
-            resolved_decode_device,
-            int(args.decode_group_size),
-        )
-        log.info(
-            "Low-rank decode device diagnostics: LOCAL_RANK=%s CUDA_VISIBLE_DEVICES=%s visible_cuda_count=%d",
-            str(decode_device_diag["local_rank"]),
-            str(decode_device_diag["cuda_visible_devices"]),
-            int(decode_device_diag["visible_cuda_count"]),
-        )
-        _materialize_selected_vae_linears_without_low_rank(
+        model, selection = _prepare_compressed_lora_train_model(
             model,
-            selected_modules,
-            group_size=int(args.decode_group_size),
-            compute_device=resolved_decode_device,
-            log=log,
-        )
-        model, selection = _build_low_rank_peft_model(
-            model,
-            low_rank_payloads=low_rank_payloads,
-            rank=int(low_rank_rank),
-            decoder_layer_ids=decoder_layer_ids,
+            selected_modules=selected_modules,
             target_module_suffixes=target_module_suffixes,
+            low_rank_scope=str(low_rank_scope),
+            low_rank_rank=int(low_rank_rank),
+            low_rank_payloads=low_rank_payloads,
+            decoder_layer_ids=decoder_layer_ids,
             parallel_stage_decode=bool(args.parallel_stage_decode),
+            decode_group_size=int(args.decode_group_size),
+            decode_device=str(getattr(args, "decode_device", "auto")),
             log=log,
         )
     else:
@@ -877,17 +1063,33 @@ def run(args, hf_args, training_args):
         unwrapped_streaming = unwrap_streaming_offload_layers(unwrap_target)
         log.info("Unwrapped %d streaming offload layers before final save.", unwrapped_streaming)
     if train_mode == "compressed_lora":
-        low_rank_payloads_for_export = extract_low_rank_payloads_from_lora(
-            final_model,
-            selection.target_modules,
-        )
+        if low_rank_scope == LOW_RANK_SCOPE_FULL:
+            low_rank_payloads_for_export = extract_low_rank_payloads_from_lora(
+                final_model,
+                selection.target_modules,
+            )
+        elif low_rank_scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
+            low_rank_payloads_for_export = extract_subspace_peft_low_rank_payloads(
+                final_model,
+                module_names=selection.target_modules,
+            )
+        else:
+            raise AssertionError(f"Unreachable low_rank_scope={low_rank_scope!r}")
         export_model, _export_meta, _export_resolved_dir = load_compressed_student_checkpoint(
             args.student_checkpoint_dir,
             access_token=hf_args.access_token,
             logger=log,
         )
-        written = write_low_rank_payloads_to_compressed_model(export_model, low_rank_payloads_for_export)
-        log.info("Exported trained LoRA payloads back to compressed low-rank branches: written=%d", written)
+        written = write_low_rank_payloads_to_compressed_model(
+            export_model,
+            low_rank_payloads_for_export,
+            expected_scope=low_rank_scope,
+        )
+        log.info(
+            "Exported trained LoRA payloads back to compressed low-rank branches: written=%d scope=%s",
+            written,
+            low_rank_scope,
+        )
         final_model = export_model
         if hasattr(final_model, "config"):
             final_model.config.use_cache = False

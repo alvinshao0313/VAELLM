@@ -4,6 +4,7 @@ from typing import List, Optional, Sequence, Set, Tuple
 from torch import nn
 
 from e2e_common.post_norm_head import resolve_post_norm_linear
+from litebsq.low_rank_scope import LOW_RANK_SCOPE_FULL, normalize_low_rank_scope
 from litebsq.vae_linear import VAELinear
 from rotation.model_utils import get_model_type, get_pre_head_layernorm
 from train_utils.utils import extract_layer_idx
@@ -135,6 +136,24 @@ def validate_selected_low_rank_payloads(
     if bool(require_uniform_rank) and len(unique_ranks) != 1:
         raise ValueError(f"--finetune_mode compressed_lora requires uniform low-rank rank, got {unique_ranks}.")
     return int(unique_ranks[0])
+
+
+def validate_selected_low_rank_scope(
+    selected_modules: Sequence[Tuple[str, VAELinear]],
+) -> str:
+    scopes: List[str] = []
+    for name, module in selected_modules:
+        if not module.has_low_rank_residual():
+            raise ValueError(f"{name}: selected VAELinear has no complete low-rank payload.")
+        scopes.append(
+            normalize_low_rank_scope(getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL))
+        )
+    unique_scopes = sorted(set(scopes))
+    if not unique_scopes:
+        raise ValueError("No selected VAELinear modules found for low-rank scope validation.")
+    if len(unique_scopes) != 1:
+        raise ValueError(f"Selected VAELinear modules have mixed low-rank scopes: {unique_scopes}.")
+    return unique_scopes[0]
 
 
 def _enable_low_rank_params(module: VAELinear, *, name: str) -> None:

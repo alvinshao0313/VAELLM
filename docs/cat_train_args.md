@@ -179,6 +179,7 @@
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
 | `--distill_after_category` | `none` | 每训练完一个类别后的蒸馏模式 | `none` / `remaining_lora` / `compressed_lora` / `decoder` / `both`；非 `none` 要求开启 `--convert` |
+| `--compressed_lora_scope` | `full` | 最终写回 `VAELinear.low_rank_a/b` 的 compressed LoRA 作用域 | 仅影响 `compressed_lora` / `both`；`full`（默认）沿用现有 full PEFT proxy；`compressed_subspace` 只在 VAE 真正压缩的权重子空间上训练 LoRA（protected channel 不被 LoRA 修改）。旧脚本不传该参数时行为不变。不覆盖 block-level PEFT LoRA / `remaining_lora` |
 | `--distill_reset_completed` | `false` | checkpoint distill 是否忽略 resume 中的 `completed_categories` 全量再蒸 | `true`：已有 `low_rank_a/b` 用其初始化 LoRA 续训并覆盖写回；`false`：按 completed / 已有 low_rank 跳过（从 `after_*` 续跑未完成类）。仅 checkpoint distill |
 | `--distill_independent_categories` | `false` | checkpoint distill 是否每类独立蒸馏（不累积前缀压缩状态） | `true` 时每轮只激活当前类，已完成类恢复为未压缩 Linear；全部类结束后再一次性激活已完成类做最终评估/保存。仅对 cat checkpoint distill 生效；inline `cat_train` 会 warning 并忽略 |
 | `--distill_dataset` | `""` | 每类后蒸馏训练混合数据集 | `--distill_after_category != none` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
@@ -384,15 +385,17 @@
 |---|---|---|---|
 | `none` | 不做每类后蒸馏 | 只保存 VAE 压缩结果 | 无 |
 | `remaining_lora` | 尚未压缩的剩余 dense `nn.Linear`，可选最终 norm / post-norm head | LoRA 训练后融合回 dense Linear；post-norm head 在最终保存前融合回 `lm_head` | 保留旧行为，支持 DoRA |
-| `compressed_lora` | 当前刚压缩类别的 `VAELinear` proxy LoRA | 先预解码 dense base，再训练 LoRA delta；训练后导出为 `VAELinear.low_rank_a/b` 并恢复普通 `VAELinear` | v1 不支持 DoRA；不训练 final norm / post-norm head |
+| `compressed_lora` | 当前刚压缩类别的 `VAELinear` LoRA（由 `--compressed_lora_scope` 决定 full / compressed_subspace） | `full`：预解码 dense base 后走现有 PEFT proxy；`compressed_subspace`：在压缩子空间 PEFT carrier 上训练；训练后导出为 `VAELinear.low_rank_a/b` 并恢复普通 `VAELinear` | v1 不支持 DoRA；不训练 final norm / post-norm head |
 | `decoder` | 当前刚压缩类别的 `VAELinear` decoder 参数 | 训练后关闭 trainable decode、拆回普通 decoder 并清 cache | 不训练 final norm / post-norm head |
-| `both` | 当前刚压缩类别的 decoder + proxy LoRA | decoder 收尾同 `decoder`；LoRA delta 导出为 `low_rank_a/b`；最终不保留 proxy | v1 不支持 DoRA；不训练 final norm / post-norm head |
+| `both` | 当前刚压缩类别的 decoder + LoRA（scope 同上） | decoder 收尾同 `decoder`；LoRA delta 导出为 `low_rank_a/b`；最终不保留 proxy | v1 不支持 DoRA；不训练 final norm / post-norm head |
 
 注意：
 
+- `--compressed_lora_scope` 默认 `full`；旧脚本不传时行为不变。`compressed_subspace` 时 protected channel 坐标上的 LoRA delta 为 0。整次运行全局 scope 必须一致，已有不同 scope 的 low-rank payload 会直接报错，不做自动转换。
+- 本参数只覆盖最终写回 `VAELinear.low_rank_a/b` 的 compressed LoRA；`remaining_lora` 与 block-level PEFT LoRA 不在此范围。
 - `compressed_lora` / `both` 如果 `--lora_use_dora` 解析为 `true` 会直接报错；v1 不做 DoRA 到低秩补丁的近似 SVD。
 - `compressed_lora` / `decoder` / `both` 如果开启 `--distill_tune_final_norm` 或 `--distill_use_post_norm_head_linear` 会直接报错，避免每类后移动最终 logits 路径。
-- 最终普通 cat checkpoint 不保留 `PeftVAELinearProxy`；保存前若仍有 proxy 残留会直接报错。
+- 最终普通 cat checkpoint 不保留 `PeftVAELinearProxy` / `CompressedSubspacePeftProxy`；保存前若仍有 proxy 残留会直接报错。
 
 ### 6.12 `normalize_weight`
 

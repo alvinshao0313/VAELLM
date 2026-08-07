@@ -1,8 +1,9 @@
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
+from litebsq.low_rank_scope import LOW_RANK_SCOPE_FULL, normalize_low_rank_scope
 from litebsq.vae_linear import VAELinear
 
 
@@ -50,8 +51,13 @@ def iter_named_vae_linears(model: nn.Module) -> Iterable[Tuple[str, VAELinear]]:
 def write_low_rank_payloads_to_compressed_model(
     model: nn.Module,
     payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    *,
+    expected_scope: Optional[str] = None,
 ) -> int:
     modules = dict(iter_named_vae_linears(model))
+    resolved_expected_scope = None
+    if expected_scope is not None:
+        resolved_expected_scope = normalize_low_rank_scope(expected_scope)
     written = 0
     for name, (low_rank_a, low_rank_b) in payloads.items():
         module = modules.get(str(name))
@@ -59,6 +65,14 @@ def write_low_rank_payloads_to_compressed_model(
             raise RuntimeError(f"Cannot export low-rank payload; VAELinear not found: {name}")
         if getattr(module, "low_rank_a", None) is None or getattr(module, "low_rank_b", None) is None:
             raise RuntimeError(f"Cannot export low-rank payload; {name} has no low_rank_a/b.")
+        if resolved_expected_scope is not None:
+            module_scope = normalize_low_rank_scope(
+                getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL)
+            )
+            if module_scope != resolved_expected_scope:
+                raise RuntimeError(
+                    f"{name}: low_rank_scope={module_scope!r} != expected_scope={resolved_expected_scope!r}."
+                )
         if tuple(module.low_rank_a.shape) != tuple(low_rank_a.shape):
             raise RuntimeError(f"{name}: low_rank_a shape mismatch: {tuple(module.low_rank_a.shape)} != {tuple(low_rank_a.shape)}.")
         if tuple(module.low_rank_b.shape) != tuple(low_rank_b.shape):

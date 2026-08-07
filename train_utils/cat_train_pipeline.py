@@ -3125,6 +3125,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         completed_distill_categories.append(str(cat))
                     from transformers import AutoTokenizer
                     from e2e_common.post_norm_head import fuse_post_norm_head_linear
+                    from e2e_common.compressed_subspace_lora import (
+                        iter_named_compressed_subspace_peft_proxies,
+                    )
                     from e2e_common.peft_proxy import iter_named_peft_vae_proxies
                     from litebsq.vae_linear import clear_model_vae_linear_cache
 
@@ -3136,10 +3139,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     if fused_post_norm_head:
                         log.info("After-category save: fused post_norm_linear into lm_head.weight.")
                     leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
-                    if leftover_proxies:
+                    leftover_subspace_proxies = [
+                        name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
+                    ]
+                    if leftover_proxies or leftover_subspace_proxies:
                         raise RuntimeError(
-                            "After-category save found unexported PeftVAELinearProxy modules: "
-                            + ", ".join(leftover_proxies)
+                            "After-category save found unexported PEFT proxy modules: "
+                            + ", ".join(leftover_proxies + leftover_subspace_proxies)
                         )
                     cleared = clear_model_vae_linear_cache(model)
                     log.info(
@@ -3211,6 +3217,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 raise ValueError("--save_model requires --convert")
             from transformers import AutoTokenizer
             from e2e_common.post_norm_head import fuse_post_norm_head_linear
+            from e2e_common.compressed_subspace_lora import (
+                iter_named_compressed_subspace_peft_proxies,
+            )
             from e2e_common.peft_proxy import iter_named_peft_vae_proxies
             from litebsq.vae_linear import clear_model_vae_linear_cache
 
@@ -3220,10 +3229,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             if fused_post_norm_head:
                 log.info("Final save: fused post_norm_linear into lm_head.weight.")
             leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
-            if leftover_proxies:
+            leftover_subspace_proxies = [
+                name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
+            ]
+            if leftover_proxies or leftover_subspace_proxies:
                 raise RuntimeError(
-                    "Final save found unexported PeftVAELinearProxy modules: "
-                    + ", ".join(leftover_proxies)
+                    "Final save found unexported PEFT proxy modules: "
+                    + ", ".join(leftover_proxies + leftover_subspace_proxies)
                 )
             cleared = clear_model_vae_linear_cache(model)
             log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)

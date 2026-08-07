@@ -12,6 +12,7 @@ _HIF4_ACT_QUANTIZER: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 _VAE_LINEAR_TYPE = None
 _PEFT_LORA_LINEAR_TYPE = None
 _PEFT_VAE_PROXY_TYPE = None
+_COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE = None
 _PEFT_PROXY_ADAPTER_PREDICATE = None
 
 
@@ -107,6 +108,18 @@ def _get_peft_vae_proxy_type():
     return None if _PEFT_VAE_PROXY_TYPE is False else _PEFT_VAE_PROXY_TYPE
 
 
+def _get_compressed_subspace_peft_proxy_type():
+    global _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE
+    if _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE is None:
+        try:
+            from e2e_common.compressed_subspace_lora import CompressedSubspacePeftProxy
+        except Exception:
+            _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE = False
+        else:
+            _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE = CompressedSubspacePeftProxy
+    return None if _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE is False else _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE
+
+
 def _get_peft_proxy_adapter_predicate():
     global _PEFT_PROXY_ADAPTER_PREDICATE
     if _PEFT_PROXY_ADAPTER_PREDICATE is None:
@@ -130,6 +143,9 @@ def _is_hif4_wrapped_module(module: nn.Module) -> bool:
         return True
     peft_vae_proxy_type = _get_peft_vae_proxy_type()
     if peft_vae_proxy_type is not None and isinstance(module, peft_vae_proxy_type):
+        return True
+    subspace_proxy_type = _get_compressed_subspace_peft_proxy_type()
+    if subspace_proxy_type is not None and isinstance(module, subspace_proxy_type):
         return True
     return _is_peft_lora_linear(module) or _is_peft_proxy_adapter_linear(module)
 

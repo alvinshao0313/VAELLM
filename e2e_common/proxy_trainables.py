@@ -3,6 +3,7 @@ from typing import Iterator, List, Optional, Sequence, Set
 
 from torch import nn
 
+from e2e_common.compressed_subspace_lora import CompressedSubspacePeftProxy
 from e2e_common.peft_proxy import PeftVAELinearProxy, ensure_peft_vae_linear_proxy
 from e2e_common.post_norm_head import resolve_post_norm_linear
 from litebsq.vae_linear import VAELinear
@@ -36,6 +37,15 @@ def iter_named_vae_module_refs(model: nn.Module) -> Iterator[VAEModuleRef]:
         if isinstance(module, PeftVAELinearProxy):
             skip_prefixes.append(f"{name}.base_layer")
             skip_prefixes.append(f"{name}.per_decoded_linear")
+            yield VAEModuleRef(
+                name=str(name),
+                module=module,
+                base_layer=module.base_layer,
+            )
+            continue
+        if isinstance(module, CompressedSubspacePeftProxy):
+            skip_prefixes.append(f"{name}.base_layer")
+            skip_prefixes.append(f"{name}.{CompressedSubspacePeftProxy.CARRIER_NAME}")
             yield VAEModuleRef(
                 name=str(name),
                 module=module,

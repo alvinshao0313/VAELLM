@@ -12,6 +12,10 @@ from torch import nn
 from litebsq.bitpack import (
     validate_bitpack_u8_spec,
 )
+from litebsq.low_rank_scope import (
+    LOW_RANK_SCOPE_FULL,
+    normalize_low_rank_scope,
+)
 from litebsq.misc import set_module_by_name
 from litebsq.llm_vae import Decoder
 from litebsq.vae_linear import VAELinear
@@ -542,55 +546,59 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
             protected_residual_stage_codebook_dims = [
                 int(v) for v in getattr(module, "protected_residual_stage_codebook_dims", [])
             ]
-        specs.append(
-            {
-                "name": name,
-                "in_features": int(module.in_features),
-                "out_features": int(module.out_features),
-                "compressed_in_features": int(getattr(module, "compressed_in_features", module.in_features)),
-                "compressed_out_features": int(getattr(module, "compressed_out_features", module.out_features)),
-                "codebook_dim": int(module.codebook_dim),
-                "transpose": bool(module.transpose),
-                "parallel_parts": parallel_parts,
-                "parallel_rows": int(getattr(module, "parallel_rows", parallel_parts)),
-                "parallel_cols": int(getattr(module, "parallel_cols", 1)),
-                "residual_stages": residual_stages,
-                "stage_codebook_dims": stage_codebook_dims,
-                "parallel_stage_decode": bool(getattr(module, "_parallel_stage_decoder", None) is not None),
-                "has_bias": bool(module.bias is not None),
-                "has_original_weight": bool(module.original_weight is not None),
-                "always_use_original": bool(getattr(module, "always_use_original", False)),
-                "protect_original_weight": bool(getattr(module, "protect_original_weight", False)),
-                "vq_weights": vq_specs,
-                "decoders": decoder_specs,
-                "stage_vq_weights": stage_vq_specs if residual_stages > 1 else None,
-                "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
-                "protected_input_indices": protected_idx_spec,
-                "protected_input_weight": protected_weight_spec,
-                "protected_input_qvalues": protected_input_qvalues_spec,
-                "protected_input_scales": protected_input_scales_spec,
-                "protected_output_indices": protected_out_idx_spec,
-                "protected_output_weight": protected_out_weight_spec,
-                "protected_output_qvalues": protected_output_qvalues_spec,
-                "protected_output_scales": protected_output_scales_spec,
-                "protected_channel_quant_format": str(
-                    getattr(module, "protected_channel_quant_format", "none")
-                ),
-                "low_rank_a": low_rank_a_spec,
-                "low_rank_b": low_rank_b_spec,
-                "protected_residual_axis": getattr(module, "protected_residual_axis", None),
-                "protected_residual_indices": protected_residual_indices_spec,
-                "protected_residual_stages": protected_residual_stages,
-                "protected_residual_stage_codebook_dims": protected_residual_stage_codebook_dims,
-                "protected_residual_parallel_stage_decode": bool(
-                    getattr(module, "_protected_residual_parallel_decoder", None) is not None
-                ),
-                "protected_residual_stage_vq_weights": protected_residual_vq_specs,
-                "protected_residual_stage_decoders": protected_residual_decoder_specs,
-                "protected_residual_shared_decoder_refs": protected_residual_shared_decoder_refs,
-                **sparse_residual_specs,
-            }
+        spec = {
+            "name": name,
+            "in_features": int(module.in_features),
+            "out_features": int(module.out_features),
+            "compressed_in_features": int(getattr(module, "compressed_in_features", module.in_features)),
+            "compressed_out_features": int(getattr(module, "compressed_out_features", module.out_features)),
+            "codebook_dim": int(module.codebook_dim),
+            "transpose": bool(module.transpose),
+            "parallel_parts": parallel_parts,
+            "parallel_rows": int(getattr(module, "parallel_rows", parallel_parts)),
+            "parallel_cols": int(getattr(module, "parallel_cols", 1)),
+            "residual_stages": residual_stages,
+            "stage_codebook_dims": stage_codebook_dims,
+            "parallel_stage_decode": bool(getattr(module, "_parallel_stage_decoder", None) is not None),
+            "has_bias": bool(module.bias is not None),
+            "has_original_weight": bool(module.original_weight is not None),
+            "always_use_original": bool(getattr(module, "always_use_original", False)),
+            "protect_original_weight": bool(getattr(module, "protect_original_weight", False)),
+            "vq_weights": vq_specs,
+            "decoders": decoder_specs,
+            "stage_vq_weights": stage_vq_specs if residual_stages > 1 else None,
+            "stage_decoders": stage_decoder_specs if residual_stages > 1 else None,
+            "protected_input_indices": protected_idx_spec,
+            "protected_input_weight": protected_weight_spec,
+            "protected_input_qvalues": protected_input_qvalues_spec,
+            "protected_input_scales": protected_input_scales_spec,
+            "protected_output_indices": protected_out_idx_spec,
+            "protected_output_weight": protected_out_weight_spec,
+            "protected_output_qvalues": protected_output_qvalues_spec,
+            "protected_output_scales": protected_output_scales_spec,
+            "protected_channel_quant_format": str(
+                getattr(module, "protected_channel_quant_format", "none")
+            ),
+            "low_rank_a": low_rank_a_spec,
+            "low_rank_b": low_rank_b_spec,
+            "protected_residual_axis": getattr(module, "protected_residual_axis", None),
+            "protected_residual_indices": protected_residual_indices_spec,
+            "protected_residual_stages": protected_residual_stages,
+            "protected_residual_stage_codebook_dims": protected_residual_stage_codebook_dims,
+            "protected_residual_parallel_stage_decode": bool(
+                getattr(module, "_protected_residual_parallel_decoder", None) is not None
+            ),
+            "protected_residual_stage_vq_weights": protected_residual_vq_specs,
+            "protected_residual_stage_decoders": protected_residual_decoder_specs,
+            "protected_residual_shared_decoder_refs": protected_residual_shared_decoder_refs,
+            **sparse_residual_specs,
+        }
+        resolved_scope = normalize_low_rank_scope(
+            getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL)
         )
+        if resolved_scope != LOW_RANK_SCOPE_FULL:
+            spec["low_rank_scope"] = resolved_scope
+        specs.append(spec)
     return specs
 
 
@@ -1214,6 +1222,7 @@ def _rebuild_converted_modules(
         keep_original_weight = bool(spec.get("has_original_weight", False)) or bool(
             preserve_original_weights_from_base
         )
+        low_rank_scope = normalize_low_rank_scope(spec.get("low_rank_scope", "full"))
         new_module = VAELinear(
             in_features=int(spec["in_features"]),
             out_features=int(spec["out_features"]),
@@ -1262,6 +1271,7 @@ def _rebuild_converted_modules(
             sparse_residual_zero_points=sparse_zero_points_payload,
             low_rank_a=low_rank_a_payload,
             low_rank_b=low_rank_b_payload,
+            low_rank_scope=low_rank_scope,
             protected_residual_axis=spec.get("protected_residual_axis"),
             protected_residual_indices=protected_residual_idx_payload,
             protected_residual_stage_vq_weights=protected_residual_stage_vq_payload,

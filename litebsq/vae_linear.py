@@ -12,6 +12,11 @@ from litebsq.bitpack import (
     unpack_uint8_tensor_to_bool,
     validate_bitpack_u8_spec,
 )
+from litebsq.low_rank_scope import (
+    LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
+    LOW_RANK_SCOPE_FULL,
+    normalize_low_rank_scope,
+)
 from litebsq.fused_multistage_decoder import (
     _TRITON_AVAILABLE,
     fused_decode_packed_symmetric_decoder,
@@ -116,6 +121,7 @@ class VAELinear(nn.Module):
         sparse_residual_zero_points: Optional[torch.Tensor] = None,
         low_rank_a: Optional[torch.Tensor] = None,
         low_rank_b: Optional[torch.Tensor] = None,
+        low_rank_scope: str = LOW_RANK_SCOPE_FULL,
         protected_residual_axis: Optional[str] = None,
         protected_residual_indices: Optional[torch.Tensor] = None,
         protected_residual_stage_vq_weights: Optional[Sequence[Any]] = None,
@@ -665,6 +671,7 @@ class VAELinear(nn.Module):
             self.register_buffer("sparse_residual_scales", None, persistent=True)
             self.register_buffer("sparse_residual_zero_points", None, persistent=True)
 
+        self.low_rank_scope = normalize_low_rank_scope(low_rank_scope)
         if low_rank_a is None and low_rank_b is None:
             self.register_parameter("low_rank_a", None)
             self.register_parameter("low_rank_b", None)
@@ -679,24 +686,11 @@ class VAELinear(nn.Module):
                 low_rank_b_param = low_rank_b
             else:
                 low_rank_b_param = nn.Parameter(low_rank_b.detach().contiguous(), requires_grad=False)
-            if low_rank_a_param.ndim != 2 or low_rank_b_param.ndim != 2:
-                raise ValueError(
-                    f"low_rank_a/low_rank_b must be 2D, got {tuple(low_rank_a_param.shape)} and {tuple(low_rank_b_param.shape)}"
-                )
-            if int(low_rank_a_param.shape[0]) != self.out_features:
-                raise ValueError(
-                    f"low_rank_a rows {int(low_rank_a_param.shape[0])} != out_features {self.out_features}"
-                )
-            if int(low_rank_b_param.shape[1]) != self.in_features:
-                raise ValueError(
-                    f"low_rank_b cols {int(low_rank_b_param.shape[1])} != in_features {self.in_features}"
-                )
-            if int(low_rank_a_param.shape[1]) != int(low_rank_b_param.shape[0]):
-                raise ValueError(
-                    f"low rank inner dim mismatch: {int(low_rank_a_param.shape[1])} != {int(low_rank_b_param.shape[0])}"
-                )
-            if not low_rank_a_param.is_floating_point() or not low_rank_b_param.is_floating_point():
-                raise ValueError("low_rank_a and low_rank_b must be floating tensors.")
+            self._validate_low_rank_payload_tensors(
+                low_rank_a_param,
+                low_rank_b_param,
+                scope=self.low_rank_scope,
+            )
             low_rank_a_param.requires_grad = False
             low_rank_b_param.requires_grad = False
             self.register_parameter("low_rank_a", low_rank_a_param)
@@ -2356,6 +2350,49 @@ class VAELinear(nn.Module):
         full_in.index_copy_(1, compressed_idx, full_weight)
         return full_in
 
+    def _expected_low_rank_shape_for_scope(
+        self,
+        scope: Optional[str] = None,
+    ) -> Tuple[int, int]:
+        resolved = normalize_low_rank_scope(
+            self.low_rank_scope if scope is None else scope
+        )
+        if resolved == LOW_RANK_SCOPE_FULL:
+            return int(self.out_features), int(self.in_features)
+        return int(self.compressed_out_features), int(self.compressed_in_features)
+
+    def _validate_low_rank_payload_tensors(
+        self,
+        low_rank_a: torch.Tensor,
+        low_rank_b: torch.Tensor,
+        *,
+        scope: Optional[str] = None,
+    ) -> int:
+        if low_rank_a.ndim != 2 or low_rank_b.ndim != 2:
+            raise ValueError(
+                f"low_rank_a/low_rank_b must be 2D, got "
+                f"{tuple(low_rank_a.shape)} and {tuple(low_rank_b.shape)}."
+            )
+        if not low_rank_a.is_floating_point() or not low_rank_b.is_floating_point():
+            raise ValueError("low_rank_a and low_rank_b must be floating tensors.")
+        expected_rows, expected_cols = self._expected_low_rank_shape_for_scope(scope)
+        if int(low_rank_a.shape[0]) != expected_rows:
+            raise ValueError(
+                f"low_rank_a rows {int(low_rank_a.shape[0])} != expected rows {expected_rows}."
+            )
+        if int(low_rank_b.shape[1]) != expected_cols:
+            raise ValueError(
+                f"low_rank_b cols {int(low_rank_b.shape[1])} != expected cols {expected_cols}."
+            )
+        rank = int(low_rank_a.shape[1])
+        if rank < 1:
+            raise ValueError("low-rank inner dimension must be positive.")
+        if rank != int(low_rank_b.shape[0]):
+            raise ValueError(
+                f"low rank inner dim mismatch: {rank} != {int(low_rank_b.shape[0])}."
+            )
+        return rank
+
     def _finalize_decoded_weight_from_compressed(
         self,
         compressed_weight: torch.Tensor,
@@ -2365,16 +2402,35 @@ class VAELinear(nn.Module):
         include_low_rank: bool = True,
         include_sparse_residual: bool = True,
     ) -> torch.Tensor:
+        scope = normalize_low_rank_scope(self.low_rank_scope)
+
+        if bool(include_low_rank) and scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
+            compressed_weight = self._apply_low_rank_patch_to_weight(
+                compressed_weight,
+                dtype,
+                expected_rows=self.compressed_out_features,
+                expected_cols=self.compressed_in_features,
+            )
+
         full_weight = self._materialize_full_weight(
             compressed_weight,
             dtype=dtype,
         )
+
         if bool(include_protected_residual):
             full_weight = self._apply_protected_residual_vae_patch(full_weight, dtype=dtype)
-        if bool(include_low_rank):
-            full_weight = self._apply_low_rank_patch(full_weight, dtype=dtype)
+
+        if bool(include_low_rank) and scope == LOW_RANK_SCOPE_FULL:
+            full_weight = self._apply_low_rank_patch_to_weight(
+                full_weight,
+                dtype,
+                expected_rows=self.out_features,
+                expected_cols=self.in_features,
+            )
+
         if bool(include_sparse_residual):
             full_weight = self._apply_sparse_residual_patch(full_weight, dtype=dtype)
+
         return full_weight.contiguous()
 
     def _decode_weight(
@@ -2394,21 +2450,49 @@ class VAELinear(nn.Module):
             include_sparse_residual=bool(include_sparse_residual),
         )
 
-    def _apply_low_rank_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def _apply_low_rank_patch_to_weight(
+        self,
+        base_weight: torch.Tensor,
+        dtype: torch.dtype,
+        *,
+        expected_rows: int,
+        expected_cols: int,
+    ) -> torch.Tensor:
         low_rank_a = getattr(self, "low_rank_a", None)
         low_rank_b = getattr(self, "low_rank_b", None)
         if low_rank_a is None and low_rank_b is None:
-            return full_weight
+            return base_weight
         if low_rank_a is None or low_rank_b is None:
             raise RuntimeError("Low-rank payload is incomplete.")
-        low_rank_a = low_rank_a.to(device=full_weight.device, dtype=dtype, non_blocking=True)
-        low_rank_b = low_rank_b.to(device=full_weight.device, dtype=dtype, non_blocking=True)
-        patch = low_rank_a @ low_rank_b
-        if tuple(patch.shape) != (self.out_features, self.in_features):
+        expected_shape = (int(expected_rows), int(expected_cols))
+        if tuple(base_weight.shape) != expected_shape:
             raise RuntimeError(
-                f"low-rank patch shape {tuple(patch.shape)} != ({self.out_features}, {self.in_features})"
+                f"low-rank base weight shape {tuple(base_weight.shape)} != {expected_shape}."
             )
-        return full_weight.add(patch)
+        low_rank_a = low_rank_a.to(
+            device=base_weight.device,
+            dtype=dtype,
+            non_blocking=True,
+        )
+        low_rank_b = low_rank_b.to(
+            device=base_weight.device,
+            dtype=dtype,
+            non_blocking=True,
+        )
+        patch = low_rank_a @ low_rank_b
+        if tuple(patch.shape) != expected_shape:
+            raise RuntimeError(
+                f"low-rank patch shape {tuple(patch.shape)} != {expected_shape}."
+            )
+        return base_weight.add(patch)
+
+    def _apply_low_rank_patch(self, full_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return self._apply_low_rank_patch_to_weight(
+            full_weight,
+            dtype,
+            expected_rows=self.out_features,
+            expected_cols=self.in_features,
+        )
 
     def _decode_sparse_residual_patch(
         self,

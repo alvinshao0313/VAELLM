@@ -5,6 +5,11 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import transformers
 
+from litebsq.low_rank_scope import (
+    LOW_RANK_SCOPE_FULL,
+    VALID_LOW_RANK_SCOPES,
+    normalize_low_rank_scope,
+)
 from litebsq.protected_channel_quant import (
     PROTECTED_CHANNEL_QUANT_CHOICES,
     PROTECTED_CHANNEL_QUANT_NONE,
@@ -97,6 +102,7 @@ class NormalizedCatArgs:
     ppl_limit: int
     eval_hif4_act: bool
     distill_after_category: str
+    compressed_lora_scope: str
     distill_dataset: str
     lora_rank: OverrideTable[int]
     lora_alpha: OverrideTable[float]
@@ -827,6 +833,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         ppl_limit=int(raw_args.ppl_limit),
         eval_hif4_act=bool(raw_args.eval_hif4_act),
         distill_after_category=_normalize_distill_after_category(raw_args.distill_after_category),
+        compressed_lora_scope=normalize_low_rank_scope(raw_args.compressed_lora_scope),
         distill_dataset=_normalize_distill_dataset_arg(
             raw_args.distill_dataset,
             distill_after_category=str(raw_args.distill_after_category),
@@ -1546,6 +1553,16 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         help=(
             "每个类别 VAE 训练后的蒸馏模式：none 不蒸馏；remaining_lora 保留旧的剩余 dense Linear LoRA；"
             "compressed_lora 只给刚压缩类别挂 proxy LoRA；decoder 只微调刚压缩类别 decoder；both 同时训练两者。"
+        ),
+    )
+    parser.add_argument(
+        "--compressed_lora_scope",
+        type=str,
+        choices=sorted(VALID_LOW_RANK_SCOPES),
+        default=LOW_RANK_SCOPE_FULL,
+        help=(
+            "compressed_lora / both 模式下最终写入 VAELinear 的 LoRA 作用域："
+            "full 作用于完整权重；compressed_subspace 只作用于 VAE 压缩子空间。"
         ),
     )
     parser.add_argument(

@@ -38,6 +38,7 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --distill_after_category "compressed_lora" \
+  --compressed_lora_scope "full" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --lora_rank "default=4" \
   --lora_alpha "default=4,after:k_proj=256" \

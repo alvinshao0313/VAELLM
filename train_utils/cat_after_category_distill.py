@@ -4,17 +4,32 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
+from e2e_common.compressed_subspace_lora import (
+    CompressedSubspacePeftProxy,
+    export_compressed_subspace_peft_lora_to_vae_low_rank,
+    initialize_subspace_peft_lora_from_low_rank,
+    inject_compressed_subspace_peft_lora,
+    unwrap_compressed_subspace_peft_proxies,
+    wrap_vae_linears_with_compressed_subspace_peft_proxy,
+)
 from e2e_common.peft_proxy import (
     PeftVAELinearProxy,
+    _get_default_adapter_name,
     detach_and_clear_vae_low_rank_payloads,
     ensure_peft_vae_linear_proxy,
     ensure_peft_vae_proxy_adapter,
     export_peft_proxy_lora_to_low_rank,
     initialize_peft_proxy_lora_from_low_rank,
+    is_peft_lora_linear,
     is_peft_proxy_adapter_linear,
     iter_named_peft_vae_proxies,
     materialize_peft_proxy_decoded_linears,
     unwrap_peft_vae_proxies,
+)
+from litebsq.low_rank_scope import (
+    LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
+    LOW_RANK_SCOPE_FULL,
+    normalize_low_rank_scope,
 )
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import NamedVAELinearTarget, prime_model_vae_linear_cache, prime_named_vae_linear_cache
@@ -66,9 +81,98 @@ def _get_module_by_name(model: nn.Module, module_name: str) -> nn.Module:
 def _resolve_base_layer(module_name: str, module: nn.Module) -> VAELinear:
     if isinstance(module, PeftVAELinearProxy):
         return module.base_layer
+    if isinstance(module, CompressedSubspacePeftProxy):
+        return module.base_layer
     if isinstance(module, VAELinear):
         return module
-    raise TypeError(f"{module_name}: expected VAELinear or PeftVAELinearProxy, got {type(module)}")
+    raise TypeError(
+        f"{module_name}: expected VAELinear/PeftVAELinearProxy/"
+        f"CompressedSubspacePeftProxy, got {type(module)}"
+    )
+
+
+def _validate_existing_model_low_rank_scope(
+    model: nn.Module,
+    *,
+    requested_scope: str,
+) -> Optional[str]:
+    requested = normalize_low_rank_scope(requested_scope)
+    stored_scopes: List[str] = []
+    stored_names: List[str] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, VAELinear):
+            continue
+        has_a = getattr(module, "low_rank_a", None) is not None
+        has_b = getattr(module, "low_rank_b", None) is not None
+        if has_a != has_b:
+            raise ValueError(f"{name}: existing low-rank payload is incomplete.")
+        if not has_a:
+            continue
+        stored_names.append(str(name))
+        stored_scopes.append(
+            normalize_low_rank_scope(
+                getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL)
+            )
+        )
+
+    unique = sorted(set(stored_scopes))
+    if len(unique) > 1:
+        raise ValueError(
+            f"Existing model already contains mixed low-rank scopes: {unique}; "
+            f"modules={stored_names}."
+        )
+    if not unique:
+        return None
+    stored = unique[0]
+    if stored != requested:
+        raise ValueError(
+            f"Existing model low-rank scope={stored!r} does not match "
+            f"requested --compressed_lora_scope={requested!r}."
+        )
+    return stored
+
+
+def _validate_category_targets_low_rank_scope(
+    targets: Sequence[Tuple[str, VAELinear]],
+    *,
+    requested_scope: str,
+    category: str,
+) -> Optional[str]:
+    requested = normalize_low_rank_scope(requested_scope)
+    stored_scopes: List[str] = []
+    stored_names: List[str] = []
+    for name, module in targets:
+        has_a = getattr(module, "low_rank_a", None) is not None
+        has_b = getattr(module, "low_rank_b", None) is not None
+        if has_a != has_b:
+            raise ValueError(
+                f"category={category} module={name}: existing low-rank payload is incomplete."
+            )
+        if not has_a:
+            continue
+        stored_names.append(str(name))
+        stored_scopes.append(
+            normalize_low_rank_scope(
+                getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL)
+            )
+        )
+
+    unique = sorted(set(stored_scopes))
+    if len(unique) > 1:
+        raise ValueError(
+            f"category={category}: existing low-rank scopes are mixed: {unique}; "
+            f"modules={stored_names}."
+        )
+    if not unique:
+        return None
+    stored = unique[0]
+    if stored != requested:
+        raise ValueError(
+            f"category={category}: stored scope={stored!r} does not match "
+            f"requested scope={requested!r}. Use a matching --compressed_lora_scope, "
+            "or restart from a checkpoint before low-rank distill."
+        )
+    return stored
 
 
 def _logger_warning(logger, message: str, *args) -> None:
@@ -254,6 +358,62 @@ def _enable_compressed_trainable_params(
     return trainable
 
 
+def _enable_subspace_compressed_trainable_params(
+    model: nn.Module,
+    module_names: Sequence[str],
+    *,
+    mode: str,
+) -> List[nn.Parameter]:
+    for param in model.parameters():
+        param.requires_grad = False
+
+    trainable: List[nn.Parameter] = []
+    seen: set[int] = set()
+    for name in module_names:
+        module = _get_module_by_name(model, str(name))
+        if not isinstance(module, CompressedSubspacePeftProxy):
+            raise TypeError(
+                f"{name}: expected CompressedSubspacePeftProxy for compressed_subspace, "
+                f"got {type(module)}"
+            )
+        carrier = module.compressed_subspace_adapter_linear
+        if not is_peft_lora_linear(carrier):
+            raise TypeError(
+                f"{name}: expected PEFT plain LoRA Linear on subspace carrier, got {type(carrier)}"
+            )
+        if mode == "both":
+            for param in _enable_only_decoder_params(module.base_layer):
+                param_id = id(param)
+                if param_id in seen:
+                    continue
+                seen.add(param_id)
+                trainable.append(param)
+        elif mode != "compressed_lora":
+            raise ValueError(
+                f"{name}: subspace trainable helper only supports compressed_lora/both, got {mode!r}."
+            )
+
+        adapter_name = _get_default_adapter_name(carrier)
+        for lora_attr in ("lora_A", "lora_B"):
+            lora_module = getattr(carrier, lora_attr)[adapter_name]
+            param = lora_module.weight
+            param.requires_grad = True
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            trainable.append(param)
+
+        sentinel = carrier.base_layer.weight
+        if bool(sentinel.requires_grad):
+            raise RuntimeError(f"{name}: subspace carrier base weight must stay frozen.")
+        if int(sentinel.numel()) != 1:
+            raise RuntimeError(
+                f"{name}: subspace carrier sentinel numel must stay 1, got {int(sentinel.numel())}."
+            )
+    return trainable
+
+
 def _finalize_decoder_trainables(model: nn.Module, module_names: Sequence[str]) -> int:
     finalized = 0
     for name in module_names:
@@ -329,13 +489,31 @@ def _run_compressed_category_distill(
     reset_completed = bool(getattr(cat_args, "distill_reset_completed", False))
     continue_from_low_rank = False
     low_rank_payloads = {}
+    compressed_lora_scope = LOW_RANK_SCOPE_FULL
     if mode in {"compressed_lora", "both"}:
+        compressed_lora_scope = normalize_low_rank_scope(cat_args.compressed_lora_scope)
+        _validate_existing_model_low_rank_scope(
+            model,
+            requested_scope=compressed_lora_scope,
+        )
         low_rank_present, low_rank_total = _category_low_rank_presence(targets)
         if low_rank_present > 0 and low_rank_present < low_rank_total:
             raise ValueError(
                 f"category={category}: low_rank_a/b 不完整 "
                 f"({low_rank_present}/{low_rank_total})；无法决定跳过或续蒸。"
             )
+        if low_rank_present > 0:
+            _validate_category_targets_low_rank_scope(
+                targets,
+                requested_scope=compressed_lora_scope,
+                category=str(category),
+            )
+        logger.info(
+            "After-category distill: mode=%s category=%s compressed_lora_scope=%s",
+            str(mode),
+            str(category),
+            str(compressed_lora_scope),
+        )
         if low_rank_present == low_rank_total and low_rank_total > 0:
             if not reset_completed:
                 logger.info(
@@ -428,38 +606,82 @@ def _run_compressed_category_distill(
                 expected_rank=int(cfg.rank),
                 category=str(category),
             )
-        module_names = _wrap_targets_as_peft_proxies(model, targets)
-        materialize_peft_proxy_decoded_linears(
-            model,
-            group_size=8,
-            compute_device=cfg.device,
-            logger=logger,
-            log_prefix=f"After-category distill {category}: ",
-        )
-        injected = ensure_peft_vae_proxy_adapter(
-            model,
-            variant="plain",
-            rank=cfg.rank,
-            alpha=cfg.alpha,
-            dropout=cfg.dropout,
-            init_mode="peft_default",
-            materialize_before_inject=False,
-        )
-        if int(injected) != int(len(module_names)):
-            raise RuntimeError(
-                f"After-category distill expected {len(module_names)} proxy adapters, injected {injected}."
-            )
-        if continue_from_low_rank:
-            initialized = initialize_peft_proxy_lora_from_low_rank(
+        if compressed_lora_scope == LOW_RANK_SCOPE_FULL:
+            module_names = _wrap_targets_as_peft_proxies(model, targets)
+            materialize_peft_proxy_decoded_linears(
                 model,
-                low_rank_payloads,
-                module_names=module_names,
+                group_size=8,
+                compute_device=cfg.device,
+                logger=logger,
+                log_prefix=f"After-category distill {category}: ",
             )
-            logger.info(
-                "After-category distill: category=%s 已用 low_rank_a/b 初始化 LoRA adapters=%d。",
-                str(category),
-                int(initialized),
+            injected = ensure_peft_vae_proxy_adapter(
+                model,
+                variant="plain",
+                rank=cfg.rank,
+                alpha=cfg.alpha,
+                dropout=cfg.dropout,
+                init_mode="peft_default",
+                materialize_before_inject=False,
             )
+            if int(injected) != int(len(module_names)):
+                raise RuntimeError(
+                    f"After-category distill expected {len(module_names)} proxy adapters, injected {injected}."
+                )
+            if continue_from_low_rank:
+                initialized = initialize_peft_proxy_lora_from_low_rank(
+                    model,
+                    low_rank_payloads,
+                    module_names=module_names,
+                )
+                logger.info(
+                    "After-category distill: category=%s 已用 low_rank_a/b 初始化 LoRA adapters=%d。",
+                    str(category),
+                    int(initialized),
+                )
+        else:
+            if compressed_lora_scope != LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
+                raise ValueError(
+                    f"Unsupported compressed_lora_scope={compressed_lora_scope!r}."
+                )
+            if not continue_from_low_rank:
+                nonempty = [
+                    name
+                    for name, base_layer in targets
+                    if base_layer.has_low_rank_residual()
+                ]
+                if nonempty:
+                    raise RuntimeError(
+                        f"category={category}: subspace wrap requires empty low_rank_a/b, "
+                        f"but found payloads on {nonempty}."
+                    )
+            module_names = wrap_vae_linears_with_compressed_subspace_peft_proxy(
+                model,
+                targets,
+            )
+            injected = inject_compressed_subspace_peft_lora(
+                model,
+                rank=cfg.rank,
+                alpha=cfg.alpha,
+                dropout=cfg.dropout,
+            )
+            if int(injected) != int(len(module_names)):
+                raise RuntimeError(
+                    f"After-category distill expected {len(module_names)} subspace adapters, "
+                    f"injected {injected}."
+                )
+            if continue_from_low_rank:
+                initialized = initialize_subspace_peft_lora_from_low_rank(
+                    model,
+                    low_rank_payloads,
+                    module_names=module_names,
+                )
+                logger.info(
+                    "After-category distill: category=%s 已用 low_rank_a/b 初始化 "
+                    "subspace LoRA adapters=%d。",
+                    str(category),
+                    int(initialized),
+                )
 
     previous_use_cache = _freeze_model_for_lora(model, device=cfg.device, logger=logger)
     try:
@@ -470,7 +692,8 @@ def _run_compressed_category_distill(
         )
         # decoder/both: current-category modules will clear cache under trainable_decode;
         # only prewarm other VAELinear that still use cache (e.g. completed prefix).
-        # compressed_lora: proxies skip prewarm via _skip_global_cache_prewarm; warm the rest.
+        # full compressed_lora: proxies skip prewarm via _skip_global_cache_prewarm; warm the rest.
+        # subspace compressed_lora: base VAELinear may prewarm; do not set full-proxy skip flag.
         if use_decoder:
             skip_names = set(module_names)
             prewarm_targets = []
@@ -518,11 +741,50 @@ def _run_compressed_category_distill(
             prefix=f"After-category distill {category}: after prewarm",
         )
 
-        _set_proxy_decoder_adapter_mode(model, module_names, enabled=mode == "both")
-        trainable = _enable_compressed_trainable_params(model, module_names, mode=mode)
+        if use_lora and compressed_lora_scope == LOW_RANK_SCOPE_FULL:
+            _set_proxy_decoder_adapter_mode(model, module_names, enabled=mode == "both")
+        if use_lora and compressed_lora_scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
+            trainable = _enable_subspace_compressed_trainable_params(
+                model, module_names, mode=mode
+            )
+            trainable_lora_params = 0
+            full_lora_equivalent_params = 0
+            for name in module_names:
+                proxy = _get_module_by_name(model, str(name))
+                if not isinstance(proxy, CompressedSubspacePeftProxy):
+                    raise TypeError(
+                        f"{name}: expected CompressedSubspacePeftProxy after subspace wrap, "
+                        f"got {type(proxy)}"
+                    )
+                rank = int(cfg.rank)
+                trainable_lora_params += int(
+                    rank * int(proxy.compressed_in_features)
+                    + int(proxy.compressed_out_features) * rank
+                )
+                full_lora_equivalent_params += int(
+                    rank * int(proxy.in_features) + int(proxy.out_features) * rank
+                )
+            logger.info(
+                "After-category distill: category=%s compressed_lora_scope=%s "
+                "target_count=%d rank=%d trainable_lora_params=%d full_lora_equivalent_params=%d",
+                str(category),
+                str(compressed_lora_scope),
+                int(len(module_names)),
+                int(cfg.rank),
+                int(trainable_lora_params),
+                int(full_lora_equivalent_params),
+            )
+        else:
+            trainable = _enable_compressed_trainable_params(model, module_names, mode=mode)
         if not trainable:
             if use_lora:
-                restored = _unwrap_peft_proxies_without_export(model, module_names)
+                if compressed_lora_scope == LOW_RANK_SCOPE_FULL:
+                    restored = _unwrap_peft_proxies_without_export(model, module_names)
+                else:
+                    restored = unwrap_compressed_subspace_peft_proxies(
+                        model,
+                        module_names=module_names,
+                    )
                 logger.info(
                     "After-category distill: 没有可训练参数，已拆掉 proxy=%d，跳过。",
                     int(restored),
@@ -603,15 +865,24 @@ def _run_compressed_category_distill(
             finalized = _finalize_decoder_trainables(model, module_names)
             logger.info("After-category distill: finalized trainable decoder modules=%d.", int(finalized))
         if use_lora:
-            exported = export_peft_proxy_lora_to_low_rank(
-                model,
-                module_names=module_names,
-                allow_overwrite=bool(continue_from_low_rank),
-            )
+            if compressed_lora_scope == LOW_RANK_SCOPE_FULL:
+                exported = export_peft_proxy_lora_to_low_rank(
+                    model,
+                    module_names=module_names,
+                    allow_overwrite=bool(continue_from_low_rank),
+                )
+            else:
+                exported = export_compressed_subspace_peft_lora_to_vae_low_rank(
+                    model,
+                    module_names=module_names,
+                    allow_overwrite=bool(continue_from_low_rank),
+                )
             logger.info(
-                "After-category distill: exported compressed LoRA adapters to low_rank_a/b=%d allow_overwrite=%s.",
+                "After-category distill: exported compressed LoRA adapters to low_rank_a/b=%d "
+                "allow_overwrite=%s compressed_lora_scope=%s.",
                 int(exported),
                 str(bool(continue_from_low_rank)).lower(),
+                str(compressed_lora_scope),
             )
             _log_vae_linear_cache_status(
                 model,
