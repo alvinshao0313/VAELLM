@@ -126,6 +126,47 @@ class _QuietProgressCallback(ProgressCallback if ProgressCallback is not None el
         return
 
 
+class _LoraDistillTokenStatsCallback(TrainerCallback if TrainerCallback is not None else object):
+    def __init__(self, *, trainer, logger):
+        self._trainer = trainer
+        self._logger = logger
+        self.window_start_step = None
+
+    def on_step_end(self, args, state, control, **kwargs):
+        logging_steps = getattr(state, "logging_steps", None)
+        if not isinstance(logging_steps, int) or logging_steps <= 0:
+            raise ValueError(
+                f"state.logging_steps must be a positive integer, got {logging_steps!r}."
+            )
+
+        global_step = int(getattr(state, "global_step", 0))
+        if self.window_start_step is None:
+            self.window_start_step = global_step
+
+        if global_step <= 0 or global_step % logging_steps != 0:
+            return
+
+        stats = self._trainer.distill_token_stats.consume_global(self._trainer.accelerator)
+        window_optimizer_steps = global_step - self.window_start_step + 1
+        self.window_start_step = global_step + 1
+
+        if stats is None:
+            return
+
+        if not bool(getattr(state, "is_world_process_zero", True)):
+            return
+
+        _log_lora_trainer_message_to_file_handlers(
+            self._logger,
+            "LoRA token stats: step=%s window_optimizer_steps=%d avg_prompt_tokens=%.4f avg_response_tokens=%.4f global_samples=%d",
+            str(global_step),
+            int(window_optimizer_steps),
+            float(stats.avg_prompt_tokens_per_sample),
+            float(stats.avg_response_tokens_per_sample),
+            int(stats.global_samples),
+        )
+
+
 def _log_lora_trainer_message_to_file_handlers(logger, message: str, *args) -> None:
     record = logger.makeRecord(
         logger.name,
@@ -626,7 +667,11 @@ def _build_lora_trainer(
             distill_hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
         )
-        return _replace_progress_log_callback(trainer)
+        trainer = _replace_progress_log_callback(trainer)
+        trainer.add_callback(
+            _LoraDistillTokenStatsCallback(trainer=trainer, logger=logger)
+        )
+        return trainer
     trainer = SFTTrainer(**trainer_kwargs)
     return _replace_progress_log_callback(trainer)
 

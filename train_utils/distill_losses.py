@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import MutableMapping, Optional
 
 import math
@@ -36,22 +37,47 @@ def is_eakld_top_loss(value: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class DistillTokenRegions:
+    response_mask: torch.Tensor
+    prompt_mask: torch.Tensor
+
+
+def _validate_distill_mask_shape(
+    *,
+    expected_shape: tuple[int, ...],
+    tensor: torch.Tensor,
+    tensor_name: str,
+) -> None:
+    if tuple(int(dim) for dim in tensor.shape) != expected_shape:
+        raise ValueError(
+            f"mask shape mismatch: expected {expected_shape}, got {tuple(tensor.shape)}"
+        )
+
+
+def _apply_causal_shift(source_weights: torch.Tensor) -> torch.Tensor:
+    expected_shape = tuple(int(dim) for dim in source_weights.shape)
+    device = source_weights.device
+    causal_mask = torch.zeros(
+        expected_shape,
+        dtype=torch.float32,
+        device=device,
+    )
+    sequence_length = int(expected_shape[1])
+    if sequence_length > 1:
+        causal_mask[:, :-1] = source_weights[:, 1:]
+    return causal_mask
+
+
 def build_distill_token_mask(
     *,
     labels: Optional[torch.Tensor],
     attention_mask: Optional[torch.Tensor],
     reference_logits: torch.Tensor,
-    prompt_kd_weight: float = 0.0,
 ) -> torch.Tensor:
     if reference_logits.ndim < 3:
         raise ValueError(
             f"reference_logits must have shape [B, L, V], got ndim={reference_logits.ndim}"
-        )
-
-    resolved_prompt_kd_weight = float(prompt_kd_weight)
-    if resolved_prompt_kd_weight < 0:
-        raise ValueError(
-            f"prompt_kd_weight must be >= 0, got {resolved_prompt_kd_weight}"
         )
 
     expected_shape = tuple(int(dim) for dim in reference_logits.shape[:2])
@@ -59,38 +85,19 @@ def build_distill_token_mask(
     source_weights: Optional[torch.Tensor] = None
 
     if isinstance(labels, torch.Tensor):
-        if tuple(int(dim) for dim in labels.shape) != expected_shape:
-            raise ValueError(
-                f"mask shape mismatch: expected {expected_shape}, got {tuple(labels.shape)}"
-            )
+        _validate_distill_mask_shape(
+            expected_shape=expected_shape,
+            tensor=labels,
+            tensor_name="labels",
+        )
         labels = labels.to(device=device)
-
-        if resolved_prompt_kd_weight == 0.0:
-            source_weights = labels.ne(-100).to(dtype=torch.float32)
-        else:
-            response_validity = labels.ne(-100)
-            prompt_validity = labels.eq(-100)
-
-            if isinstance(attention_mask, torch.Tensor):
-                if tuple(int(dim) for dim in attention_mask.shape) != expected_shape:
-                    raise ValueError(
-                        f"mask shape mismatch: expected {expected_shape}, got {tuple(attention_mask.shape)}"
-                    )
-                attention_validity = attention_mask.to(
-                    device=device,
-                    dtype=torch.bool,
-                ).ne(0)
-                response_validity = response_validity & attention_validity
-                prompt_validity = prompt_validity & attention_validity
-
-            source_weights = response_validity.to(dtype=torch.float32) + (
-                prompt_validity.to(dtype=torch.float32) * resolved_prompt_kd_weight
-            )
+        source_weights = labels.ne(-100).to(dtype=torch.float32)
     elif isinstance(attention_mask, torch.Tensor):
-        if tuple(int(dim) for dim in attention_mask.shape) != expected_shape:
-            raise ValueError(
-                f"mask shape mismatch: expected {expected_shape}, got {tuple(attention_mask.shape)}"
-            )
+        _validate_distill_mask_shape(
+            expected_shape=expected_shape,
+            tensor=attention_mask,
+            tensor_name="attention_mask",
+        )
         source_weights = attention_mask.to(device=device, dtype=torch.bool).ne(0).to(
             dtype=torch.float32
         )
@@ -101,15 +108,55 @@ def build_distill_token_mask(
             device=device,
         )
 
-    causal_mask = torch.zeros(
-        expected_shape,
-        dtype=torch.float32,
-        device=device,
+    return _apply_causal_shift(source_weights)
+
+
+def build_distill_token_regions(
+    *,
+    labels: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    reference_logits: torch.Tensor,
+) -> DistillTokenRegions:
+    response_mask = build_distill_token_mask(
+        labels=labels,
+        attention_mask=attention_mask,
+        reference_logits=reference_logits,
     )
-    sequence_length = int(expected_shape[1])
-    if sequence_length > 1:
-        causal_mask[:, :-1] = source_weights[:, 1:]
-    return causal_mask
+    expected_shape = tuple(int(dim) for dim in reference_logits.shape[:2])
+    device = reference_logits.device
+
+    if isinstance(labels, torch.Tensor):
+        _validate_distill_mask_shape(
+            expected_shape=expected_shape,
+            tensor=labels,
+            tensor_name="labels",
+        )
+        labels = labels.to(device=device)
+        prompt_validity = labels.eq(-100)
+        if isinstance(attention_mask, torch.Tensor):
+            _validate_distill_mask_shape(
+                expected_shape=expected_shape,
+                tensor=attention_mask,
+                tensor_name="attention_mask",
+            )
+            attention_validity = attention_mask.to(
+                device=device,
+                dtype=torch.bool,
+            ).ne(0)
+            prompt_validity = prompt_validity & attention_validity
+        prompt_source = prompt_validity.to(dtype=torch.float32)
+        prompt_mask = _apply_causal_shift(prompt_source)
+    else:
+        prompt_mask = torch.zeros(
+            expected_shape,
+            dtype=torch.float32,
+            device=device,
+        )
+
+    return DistillTokenRegions(
+        response_mask=response_mask,
+        prompt_mask=prompt_mask,
+    )
 
 
 def _default_token_mask(reference: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:

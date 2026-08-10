@@ -339,30 +339,42 @@ class VAEE2EPromptKdWeightArgsTest(unittest.TestCase):
 
 
 class VAEE2ETrainerPromptKdMaskHelperTest(unittest.TestCase):
-    def test_private_helper_forwards_prompt_kd_weight(self):
+    def test_private_helper_forwards_regions_without_prompt_kd_weight(self):
         from compressed_e2e_fintuning.trainer import VAEDecoderE2ETrainer
+        from train_utils.distill_losses import DistillTokenRegions
 
         trainer = VAEDecoderE2ETrainer.__new__(VAEDecoderE2ETrainer)
+        # prompt_kd_weight must NOT be forwarded into mask/region construction.
         trainer.prompt_kd_weight = 0.1
         labels = torch.tensor([[-100, -100, 3, 7]], dtype=torch.long)
         attention_mask = torch.ones_like(labels)
         reference_logits = torch.zeros(1, 4, 8, dtype=torch.float32)
         inputs = {"labels": labels, "attention_mask": attention_mask}
-        sentinel = torch.tensor([[0.1, 1.0, 1.0, 0.0]], dtype=torch.float32)
+
+        sentinel_response = torch.tensor([[0.0, 1.0, 1.0, 0.0]], dtype=torch.float32)
+        sentinel_prompt = torch.tensor([[1.0, 1.0, 0.0, 0.0]], dtype=torch.float32)
+        sentinel_regions = DistillTokenRegions(
+            response_mask=sentinel_response,
+            prompt_mask=sentinel_prompt,
+        )
 
         with mock.patch(
-            "compressed_e2e_fintuning.trainer.build_distill_token_mask",
-            return_value=sentinel,
+            "compressed_e2e_fintuning.trainer.build_distill_token_regions",
+            return_value=sentinel_regions,
         ) as mocked:
-            actual = trainer._build_distill_token_mask(inputs, reference_logits)
+            actual = trainer._build_distill_token_regions(inputs, reference_logits)
 
-        self.assertIs(actual, sentinel)
+        self.assertIs(actual, sentinel_regions)
         mocked.assert_called_once_with(
             labels=labels,
             attention_mask=attention_mask,
             reference_logits=reference_logits,
-            prompt_kd_weight=0.1,
         )
+        # The helper must not thread prompt_kd_weight into region construction.
+        forwarded_kwargs = mocked.call_args.kwargs
+        self.assertNotIn("prompt_kd_weight", forwarded_kwargs)
+        self.assertIs(actual.response_mask, sentinel_response)
+        self.assertIs(actual.prompt_mask, sentinel_prompt)
 
 
 class VAEE2EHiddenLossArgsTest(unittest.TestCase):

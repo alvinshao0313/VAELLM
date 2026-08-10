@@ -198,7 +198,7 @@
 | `--distill_loss_type` | `default=eakld` | LoRA loss 类型（含 `eakld` / `eakld_kd` / `kd_top_*` 等） | after-category override |
 | `--distill_eakld_confidence_k` | `16` | EAKLD 熵归一化 K（非 vocab top-k） | 全局 |
 | `--distill_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
-| `--distill_prompt_kd_weight` | `default=0.0` | LoRA 蒸馏中 prompt token 的 KD 相对权重 | after-category override；`>=0`；response target 固定 1.0；`0.0` 与当前 response-target-only KD 完全一致；`0.05` 表示 prompt 相对 response 权重为 5%；`1.0` 表示所有有效 next-token 位置等权；只作用于 logit KD，不改变 CE / hidden loss；padding 与最后一个无 next-token 的 logits 始终权重 0，EOS target 仍按 response 计入；EAKLD 的 entropy/gamma 与 KL 共用同一 weighted mask |
+| `--distill_prompt_kd_weight` | `default=0.0` | LoRA logit KD 的 prompt-region 组合系数 | after-category override；`>=0`；`0.0` 为 response-target-only；`L_logit = L_response + w * L_prompt`，详见 §6.11.1；只作用于 logit KD，不改变 CE / hidden loss |
 | `--distill_hidden_alignment_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权全层；`linear_depth` 后层权重线性增大并归一到平均权重为 1；`adaptive` 默认选 cosine 最低的 3 层；`adaptive_top_<K>` 仅对 teacher 相邻层变化最大的 K 层计算对齐损失 |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 `remaining_lora` 支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
 | `--distill_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 `--distill_after_category=remaining_lora` 支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
@@ -402,33 +402,49 @@
 
 ### 6.11.1 Prompt KD weighting（`--distill_prompt_kd_weight`）
 
-`--distill_prompt_kd_weight` 只调整 teacher-student logit KD 的 token 权重，不改变 CE、hidden-state alignment 或 pre-MLP hidden alignment。
+`--distill_prompt_kd_weight` 只调整 teacher-student logit KD 的组合方式，不改变 CE、hidden-state alignment 或 pre-MLP hidden alignment。
 
-权重语义（causal LM 中 `logits[:, t]` 预测位置 `t+1` 的 token，因此先在 target 位置定义权重，再左移一位到 logits 位置）：
+logit KD 按 **region** 分别计算 token 均值，再线性组合：
 
-- `labels[j] != -100` 且非 padding：response / supervised target，权重 **1.0**（固定，不可配置）。
-- `labels[j] == -100` 且非 padding：prompt / context target，权重 **`prompt_kd_weight`**。
-- padding（`attention_mask[j] == 0`）：权重 **0**。
-- 序列最后一个 logits 无 next-token target：权重 **0**。
-- 预测 EOS 的 logits 仍属于 response target，权重 **1.0**。
+```text
+L_logit = L_response + prompt_kd_weight * L_prompt
+```
 
-取值含义：
+- `L_response`：只在 response region（`labels != -100` 且非 padding；causal LM 下再 shift 到 logits 位置）上，对 per-token KD 做 token 均值。
+- `L_prompt`：只在 prompt region（`labels == -100` 且非 padding；同样 shift 到 logits 位置）上，**独立**做 token 均值。
+- `prompt_kd_weight=0.0` 时 `L_logit = L_response`，与 response-target-only KD 完全一致。
+
+**取值含义**：系数作用于 **region 均值**，与 prompt/response token 数量比无关。例如 `0.03` 表示 prompt-region 均值以系数 0.03 加入总 logit KD；`1.0` 表示两个 region 均值等系数相加；`>1.0` 允许实验。
 
 | 值 | 行为 |
 |---|---|
-| `0.0`（默认） | 与当前实现完全一致：只对 response target 做 KD |
-| `0.05` | prompt token 的 KD 相对权重为 response 的 5% |
-| `1.0` | 所有有效 next-token 位置等权 |
-| `>1.0` | 允许实验；prompt 权重可高于 response |
+| `0.0`（默认） | 只对 response region 做 logit KD |
+| `0.03` | `L_logit = L_response + 0.03 * L_prompt` |
+| `1.0` | `L_logit = L_response + L_prompt` |
 
-EAKLD 的 teacher entropy、gamma 与 KL 项共用同一 weighted mask，归一化为 `sum(token_loss * mask) / sum(mask)`。
+EAKLD（含 `eakld_kd`、`*eakld_top*` 等变体）在 response / prompt region 上 **分别** 计算 teacher entropy 与 gamma，再各自得到 region 均值后按上式组合。现有 `eakld/*` 训练日志 telemetry 仍只反映 **response region** 的 EAKLD 统计，不包含 prompt region。
 
-以下数值仅作实验示例，**不是**推荐最优值或已验证结论：
+padding 与序列最后一个无 next-token 的 logits 不计入任一 region。预测 EOS 的 logits 仍属于 response region。
+
+以下数值仅作实验示例，**不是**推荐最优值，也**未**经对照实验验证下游收益：
 
 ```bash
---distill_prompt_kd_weight default=0.0,after:q_proj=0.05
+--distill_prompt_kd_weight default=0.0,after:q_proj=0.03
 --distill_prompt_kd_weight default=0.0,after:q_proj=0.1
 ```
+
+### 6.11.2 LoRA token telemetry
+
+LoRA 蒸馏日志会周期性输出 `LoRA token stats:` 行，报告当前 regular logging window 内的平均 prompt/response token 数。
+
+计数规则（**不是** causal KD mask 计数）：
+
+- 直接统计 truncation 后 `labels` 与 `attention_mask` 上的非 padding 位置。
+- prompt token：`attention_mask != 0` 且 `labels == -100`。
+- response token：`attention_mask != 0` 且 `labels != -100`（含 EOS）。
+- 不做 causal shift；例如 `labels=[-100,-100,-100,A,B,EOS]` 的一个样本计 prompt=3、response=3。
+
+窗口内所有 gradient accumulation micro-batch 与 DDP rank 的计数先求 global sum，再除以 global sample 数得到 per-sample 均值。输出字段：`step`、`window_optimizer_steps`、`avg_prompt_tokens`、`avg_response_tokens`、`global_samples`。
 
 ### 6.12 `normalize_weight`
 

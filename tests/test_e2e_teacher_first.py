@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from compressed_e2e_fintuning.trainer import VAEDecoderE2ETrainer
+from train_utils.distill_losses import compute_teacher_entropy_mean_and_gamma
 from train_utils.train_args import TrainingArguments
 
 
@@ -98,6 +99,7 @@ def _build_trainer(
     loss_type: str,
     hidden_loss_weight: float,
     hidden_layer_weighting: str = "adaptive_top_2",
+    prompt_kd_weight: float = 0.0,
 ):
     events: list[str] = []
     teacher = _TinyCausalLM(role="teacher", events=events)
@@ -122,6 +124,7 @@ def _build_trainer(
         teacher_model=teacher,
         hidden_loss_weight=hidden_loss_weight,
         hidden_layer_weighting=hidden_layer_weighting,
+        prompt_kd_weight=prompt_kd_weight,
         eakld_confidence_k=16,
         teacher_output_offload="cpu",
         teacher_output_pin_memory=False,
@@ -419,3 +422,115 @@ def test_eakld_telemetry_weighted_accumulator_and_reset(tmp_path):
     second = {}
     trainer.log(second)
     assert "eakld/gamma_reverse_mean" not in second
+
+
+def _inputs_with_prompt_prefix() -> dict[str, torch.Tensor]:
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    labels = input_ids.clone()
+    labels[:, :2] = -100
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": labels,
+    }
+
+
+def _install_counting_entropy_helper(monkeypatch):
+    calls: list[dict] = []
+
+    def counting_helper(teacher_logits, mask, *, confidence_k):
+        calls.append(
+            {
+                "logits_id": id(teacher_logits),
+                "mask": (mask.detach().clone() if torch.is_tensor(mask) else mask),
+                "confidence_k": int(confidence_k),
+            }
+        )
+        return compute_teacher_entropy_mean_and_gamma(
+            teacher_logits, mask, confidence_k=int(confidence_k)
+        )
+
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.trainer.compute_teacher_entropy_mean_and_gamma",
+        counting_helper,
+    )
+    return calls
+
+
+def test_cpu_teacher_targets_zero_prompt_weight_response_only(tmp_path, monkeypatch):
+    calls = _install_counting_entropy_helper(monkeypatch)
+    trainer, student, _teacher, _events = _build_trainer(
+        tmp_path,
+        loss_type="eakld",
+        hidden_loss_weight=0.0,
+        prompt_kd_weight=0.0,
+    )
+    inputs = _inputs_with_prompt_prefix()
+    loss = trainer.compute_loss(student, inputs)
+    target = trainer._active_teacher_targets
+    assert target is not None
+    # Response scalars populated.
+    assert target.eakld_gamma_cpu is not None
+    assert target.teacher_entropy_mean_cpu is not None
+    assert target.teacher_valid_token_count_cpu is not None
+    assert target.teacher_entropy_mean_cpu.device.type == "cpu"
+    assert target.teacher_entropy_mean_cpu.dtype == torch.float32
+    assert target.teacher_valid_token_count_cpu.ndim == 0
+    # Prompt scalars absent.
+    assert target.eakld_prompt_gamma_cpu is None
+    assert target.teacher_prompt_entropy_mean_cpu is None
+    assert target.teacher_prompt_valid_token_count_cpu is None
+    # Entropy/gamma helper called exactly once (response region only).
+    assert len(calls) == 1
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_cpu_teacher_targets_positive_prompt_weight_both_regions(tmp_path, monkeypatch):
+    calls = _install_counting_entropy_helper(monkeypatch)
+    trainer, student, _teacher, _events = _build_trainer(
+        tmp_path,
+        loss_type="eakld",
+        hidden_loss_weight=0.0,
+        prompt_kd_weight=0.5,
+    )
+    inputs = _inputs_with_prompt_prefix()
+    loss = trainer.compute_loss(student, inputs)
+    target = trainer._active_teacher_targets
+    assert target is not None
+    # Both scalar sets populated.
+    assert target.eakld_gamma_cpu is not None
+    assert target.teacher_entropy_mean_cpu is not None
+    assert target.teacher_valid_token_count_cpu is not None
+    assert target.eakld_prompt_gamma_cpu is not None
+    assert target.teacher_prompt_entropy_mean_cpu is not None
+    assert target.teacher_prompt_valid_token_count_cpu is not None
+    for scalar in (
+        target.eakld_prompt_gamma_cpu,
+        target.teacher_prompt_entropy_mean_cpu,
+        target.teacher_prompt_valid_token_count_cpu,
+    ):
+        assert scalar.device.type == "cpu"
+        assert scalar.dtype == torch.float32
+        assert scalar.ndim == 0
+    # Helper called exactly twice with distinct binary masks.
+    assert len(calls) == 2
+    mask_a = calls[0]["mask"]
+    mask_b = calls[1]["mask"]
+    assert torch.is_tensor(mask_a) and torch.is_tensor(mask_b)
+    assert not torch.equal(mask_a, mask_b)
+    # Each valid count equals its region-mask sum.
+    assert float(target.teacher_valid_token_count_cpu) == pytest.approx(
+        float(mask_a.sum())
+    )
+    assert float(target.teacher_prompt_valid_token_count_cpu) == pytest.approx(
+        float(mask_b.sum())
+    )
+    # Both calls reused the same single CPU copy of teacher logits.
+    assert calls[0]["logits_id"] == calls[1]["logits_id"]
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()

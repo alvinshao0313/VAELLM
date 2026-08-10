@@ -16,6 +16,9 @@ class TeacherTargetBatch:
     eakld_gamma_cpu: Optional[torch.Tensor] = None
     teacher_entropy_mean_cpu: Optional[torch.Tensor] = None
     teacher_valid_token_count_cpu: Optional[torch.Tensor] = None
+    eakld_prompt_gamma_cpu: Optional[torch.Tensor] = None
+    teacher_prompt_entropy_mean_cpu: Optional[torch.Tensor] = None
+    teacher_prompt_valid_token_count_cpu: Optional[torch.Tensor] = None
     hidden_cpu_by_layer: Dict[int, torch.Tensor] = field(default_factory=dict)
     hidden_layer_indices: Tuple[int, ...] = ()
     num_hidden_layers: int = 0
@@ -25,6 +28,9 @@ class TeacherTargetBatch:
         self.eakld_gamma_cpu = None
         self.teacher_entropy_mean_cpu = None
         self.teacher_valid_token_count_cpu = None
+        self.eakld_prompt_gamma_cpu = None
+        self.teacher_prompt_entropy_mean_cpu = None
+        self.teacher_prompt_valid_token_count_cpu = None
         self.hidden_cpu_by_layer.clear()
         self.hidden_layer_indices = ()
         self.num_hidden_layers = 0

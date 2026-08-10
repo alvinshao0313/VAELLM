@@ -26,6 +26,7 @@ from train_utils.lora_training import (
     compute_distill_pre_mlp_hidden_alignment_loss,
     parse_distill_hidden_alignment_layer_weighting,
 )
+from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.train_args import TrainingArguments, create_optimizer
 
 
@@ -325,9 +326,10 @@ def test_cpu_offload_eakld_one_step_trainer_smoke(tmp_path, monkeypatch) -> None
 
     assert not torch.equal(student.lm_head.weight.detach(), before)
     assert trainer._active_teacher_targets is None
-    # Entropy/gamma computed once when building CPU targets — not recomputed
-    # via a second full-vocab softmax during the offloaded loss path.
-    assert entropy_calls["n"] == 1
+    # Entropy/gamma computed twice when building CPU targets (response + prompt
+    # regions) for positive prompt weight — not recomputed via a second
+    # full-vocab softmax during the offloaded loss path.
+    assert entropy_calls["n"] == 2
 
     logs: dict = {}
     trainer.log(logs)
@@ -354,6 +356,7 @@ def _build_pre_mlp_trainer(
     trainer.distill_hif4_act_controller = None
     trainer.teacher_param_snapshots = []
     trainer.accelerator = None
+    trainer.distill_token_stats = DistillTokenStatsAccumulator()
     return trainer
 
 

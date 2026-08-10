@@ -670,107 +670,71 @@ def test_distill_mask_exactly_matches_next_label_validity() -> None:
     assert torch.equal(actual, expected)
 
 
-def test_distill_mask_prompt_weight_zero_is_exact_current_behavior() -> None:
+def _build_distill_regions(
+    *,
+    labels: torch.Tensor | None,
+    attention_mask: torch.Tensor | None,
+    reference_logits: torch.Tensor,
+) -> distill_losses.DistillTokenRegions:
+    return distill_losses.build_distill_token_regions(
+        labels=labels,
+        attention_mask=attention_mask,
+        reference_logits=reference_logits,
+    )
+
+
+def test_distill_regions_single_turn_splits_prompt_and_response() -> None:
     reference_logits = torch.zeros(1, 6, 11)
     labels = torch.tensor([[-100, -100, -100, 10, 11, 2]], dtype=torch.long)
     attention_mask = torch.ones(1, 6, dtype=torch.long)
 
-    omitted = distill_losses.build_distill_token_mask(
+    regions = _build_distill_regions(
         labels=labels,
         attention_mask=attention_mask,
         reference_logits=reference_logits,
     )
-    explicit_zero = distill_losses.build_distill_token_mask(
-        labels=labels,
-        attention_mask=attention_mask,
-        reference_logits=reference_logits,
-        prompt_kd_weight=0.0,
-    )
 
-    expected = torch.tensor([[0, 0, 1, 1, 1, 0]], dtype=torch.float32)
-    assert torch.equal(omitted, explicit_zero)
-    assert torch.equal(omitted, expected)
+    expected_response = torch.tensor([[0, 0, 1, 1, 1, 0]], dtype=torch.float32)
+    expected_prompt = torch.tensor([[1, 1, 0, 0, 0, 0]], dtype=torch.float32)
+    assert torch.equal(regions.response_mask, expected_response)
+    assert torch.equal(regions.prompt_mask, expected_prompt)
 
 
-def test_distill_mask_assigns_fractional_prompt_weights_after_causal_shift() -> None:
-    reference_logits = torch.zeros(1, 6, 11)
-    labels = torch.tensor([[-100, -100, -100, 10, 11, 2]], dtype=torch.long)
-    attention_mask = torch.ones(1, 6, dtype=torch.long)
-
-    actual = distill_losses.build_distill_token_mask(
-        labels=labels,
-        attention_mask=attention_mask,
-        reference_logits=reference_logits,
-        prompt_kd_weight=0.1,
-    )
-
-    expected = torch.tensor([[0.1, 0.1, 1, 1, 1, 0]], dtype=torch.float32)
-    assert torch.equal(actual, expected)
-
-
-def test_distill_mask_padding_excludes_prompt_weight() -> None:
+def test_distill_regions_padding_excludes_prompt_and_response() -> None:
     reference_logits = torch.zeros(1, 6, 11)
     labels = torch.tensor([[-100, -100, 10, 2, -100, -100]], dtype=torch.long)
     attention_mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.long)
 
-    actual = distill_losses.build_distill_token_mask(
+    regions = _build_distill_regions(
         labels=labels,
         attention_mask=attention_mask,
         reference_logits=reference_logits,
-        prompt_kd_weight=0.1,
     )
 
-    expected = torch.tensor([[0.1, 1, 1, 0, 0, 0]], dtype=torch.float32)
-    assert torch.equal(actual, expected)
+    expected_response = torch.tensor([[0, 1, 1, 0, 0, 0]], dtype=torch.float32)
+    expected_prompt = torch.tensor([[1, 0, 0, 0, 0, 0]], dtype=torch.float32)
+    assert torch.equal(regions.response_mask, expected_response)
+    assert torch.equal(regions.prompt_mask, expected_prompt)
 
 
-def test_distill_mask_prompt_weight_one_equals_shifted_attention_validity() -> None:
-    reference_logits = torch.zeros(2, 5, 11)
-    labels = torch.tensor(
-        [
-            [-100, -100, 10, 11, 2],
-            [-100, 20, 21, 22, 2],
-        ],
-        dtype=torch.long,
-    )
-    attention_mask = torch.tensor(
-        [
-            [1, 1, 1, 1, 1],
-            [1, 1, 1, 0, 0],
-        ],
-        dtype=torch.long,
-    )
-
-    actual = distill_losses.build_distill_token_mask(
-        labels=labels,
-        attention_mask=attention_mask,
-        reference_logits=reference_logits,
-        prompt_kd_weight=1.0,
-    )
-
-    attention_validity = attention_mask.ne(0).to(dtype=torch.float32)
-    expected = torch.zeros_like(actual)
-    expected[:, :-1] = attention_validity[:, 1:]
-    assert torch.equal(actual, expected)
-
-
-def test_distill_mask_interleaved_prompt_tokens_use_prompt_weight() -> None:
+def test_distill_regions_interleaved_prompt_and_response() -> None:
     reference_logits = torch.zeros(1, 5, 11)
     labels = torch.tensor([[-100, 10, -100, 11, 2]], dtype=torch.long)
     attention_mask = torch.ones(1, 5, dtype=torch.long)
 
-    actual = distill_losses.build_distill_token_mask(
+    regions = _build_distill_regions(
         labels=labels,
         attention_mask=attention_mask,
         reference_logits=reference_logits,
-        prompt_kd_weight=0.1,
     )
 
-    expected = torch.tensor([[1.0, 0.1, 1.0, 1.0, 0.0]], dtype=torch.float32)
-    assert torch.equal(actual, expected)
+    expected_response = torch.tensor([[1, 0, 1, 1, 0]], dtype=torch.float32)
+    expected_prompt = torch.tensor([[0, 1, 0, 0, 0]], dtype=torch.float32)
+    assert torch.equal(regions.response_mask, expected_response)
+    assert torch.equal(regions.prompt_mask, expected_prompt)
 
 
-def test_distill_mask_labels_none_ignores_prompt_kd_weight() -> None:
+def test_distill_regions_labels_none_keeps_response_and_zero_prompt() -> None:
     reference_logits = torch.zeros(2, 5, 7)
     attention_mask = torch.tensor(
         [
@@ -780,181 +744,69 @@ def test_distill_mask_labels_none_ignores_prompt_kd_weight() -> None:
         dtype=torch.long,
     )
 
-    without_weight = distill_losses.build_distill_token_mask(
+    regions = _build_distill_regions(
         labels=None,
         attention_mask=attention_mask,
         reference_logits=reference_logits,
     )
-    with_weight = distill_losses.build_distill_token_mask(
+    expected_response = distill_losses.build_distill_token_mask(
         labels=None,
         attention_mask=attention_mask,
         reference_logits=reference_logits,
-        prompt_kd_weight=0.1,
     )
+    expected_prompt = torch.zeros(2, 5, dtype=torch.float32)
 
-    expected = torch.tensor(
-        [
-            [1, 1, 0, 0, 0],
-            [1, 1, 1, 1, 0],
-        ],
-        dtype=torch.float32,
-    )
-    assert torch.equal(without_weight, with_weight)
-    assert torch.equal(with_weight, expected)
+    assert torch.equal(regions.response_mask, expected_response)
+    assert torch.equal(regions.prompt_mask, expected_prompt)
 
     reference_logits_no_metadata = torch.zeros(2, 4, 9)
-    without_metadata = distill_losses.build_distill_token_mask(
+    regions_no_metadata = _build_distill_regions(
         labels=None,
         attention_mask=None,
         reference_logits=reference_logits_no_metadata,
     )
-    with_metadata_weight = distill_losses.build_distill_token_mask(
+    expected_response_no_metadata = distill_losses.build_distill_token_mask(
         labels=None,
         attention_mask=None,
         reference_logits=reference_logits_no_metadata,
-        prompt_kd_weight=0.1,
     )
+    expected_prompt_no_metadata = torch.zeros(2, 4, dtype=torch.float32)
 
-    expected_no_metadata = torch.tensor(
+    assert torch.equal(regions_no_metadata.response_mask, expected_response_no_metadata)
+    assert torch.equal(regions_no_metadata.prompt_mask, expected_prompt_no_metadata)
+
+
+def test_distill_regions_masks_are_binary_disjoint_with_zero_final() -> None:
+    reference_logits = torch.zeros(2, 6, 11)
+    labels = torch.tensor(
         [
-            [1, 1, 1, 0],
-            [1, 1, 1, 0],
+            [-100, -100, -100, 10, 11, 2],
+            [-100, 10, -100, 11, 2, -100],
         ],
-        dtype=torch.float32,
+        dtype=torch.long,
     )
-    assert torch.equal(without_metadata, with_metadata_weight)
-    assert torch.equal(with_metadata_weight, expected_no_metadata)
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0],
+        ],
+        dtype=torch.long,
+    )
 
-
-def test_distill_mask_rejects_negative_prompt_kd_weight() -> None:
-    reference_logits = torch.zeros(1, 4, 7)
-    labels = torch.tensor([[-100, 10, 11, 2]], dtype=torch.long)
-    attention_mask = torch.ones(1, 4, dtype=torch.long)
-
-    with pytest.raises(ValueError, match="prompt_kd_weight"):
-        distill_losses.build_distill_token_mask(
-            labels=labels,
-            attention_mask=attention_mask,
-            reference_logits=reference_logits,
-            prompt_kd_weight=-0.1,
-        )
-
-
-def test_distill_mask_accepts_prompt_kd_weight_above_one() -> None:
-    reference_logits = torch.zeros(1, 4, 7)
-    labels = torch.tensor([[-100, -100, -100, 2]], dtype=torch.long)
-    attention_mask = torch.ones(1, 4, dtype=torch.long)
-
-    actual = distill_losses.build_distill_token_mask(
+    regions = _build_distill_regions(
         labels=labels,
         attention_mask=attention_mask,
         reference_logits=reference_logits,
-        prompt_kd_weight=2.0,
     )
 
-    expected = torch.tensor([[2.0, 2.0, 1.0, 0.0]], dtype=torch.float32)
-    assert torch.equal(actual, expected)
+    for mask in (regions.response_mask, regions.prompt_mask):
+        assert mask.dtype == torch.float32
+        assert mask.device == reference_logits.device
+        assert mask.shape == reference_logits.shape[:2]
+        assert torch.all((mask == 0.0) | (mask == 1.0))
+        assert torch.all(mask[:, -1] == 0.0)
 
-
-def test_forward_kl_gradient_respects_fractional_prompt_weights() -> None:
-    torch.manual_seed(42)
-    labels = torch.tensor([[-100, -100, 10, 11, 2]], dtype=torch.long)
-    attention_mask = torch.ones(1, 5, dtype=torch.long)
-    teacher_logits = torch.randn(1, 5, 13)
-
-    student_zero = torch.randn(1, 5, 13, requires_grad=True)
-    mask_zero = distill_losses.build_distill_token_mask(
-        labels=labels,
-        attention_mask=attention_mask,
-        reference_logits=student_zero,
-        prompt_kd_weight=0.0,
-    )
-    loss_zero = distill_losses.compute_forward_kl_loss(
-        student_logits=student_zero,
-        teacher_logits=teacher_logits,
-        mask=mask_zero,
-        temperature=1.0,
-    )
-    loss_zero.backward()
-    grad_zero = student_zero.grad.abs().sum(dim=-1).squeeze(0)
-    assert grad_zero[0].item() == pytest.approx(0.0, abs=0.0)
-    assert grad_zero[1].item() > 0.0
-    assert grad_zero[2].item() > 0.0
-    assert grad_zero[3].item() > 0.0
-    assert grad_zero[4].item() == pytest.approx(0.0, abs=0.0)
-
-    student_positive = torch.randn(1, 5, 13, requires_grad=True)
-    mask_positive = distill_losses.build_distill_token_mask(
-        labels=labels,
-        attention_mask=attention_mask,
-        reference_logits=student_positive,
-        prompt_kd_weight=0.1,
-    )
-    loss_positive = distill_losses.compute_forward_kl_loss(
-        student_logits=student_positive,
-        teacher_logits=teacher_logits,
-        mask=mask_positive,
-        temperature=1.0,
-    )
-    loss_positive.backward()
-    grad_positive = student_positive.grad.abs().sum(dim=-1).squeeze(0)
-    assert grad_positive[0].item() > 0.0
-    assert grad_positive[1].item() > 0.0
-    assert grad_positive[2].item() > 0.0
-    assert grad_positive[3].item() > 0.0
-    assert grad_positive[4].item() == pytest.approx(0.0, abs=0.0)
-
-    labels_padded = torch.tensor([[-100, -100, 10, 2, -100]], dtype=torch.long)
-    attention_padded = torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long)
-    student_padded = torch.randn(1, 5, 13, requires_grad=True)
-    mask_padded = distill_losses.build_distill_token_mask(
-        labels=labels_padded,
-        attention_mask=attention_padded,
-        reference_logits=student_padded,
-        prompt_kd_weight=0.1,
-    )
-    loss_padded = distill_losses.compute_forward_kl_loss(
-        student_logits=student_padded,
-        teacher_logits=teacher_logits,
-        mask=mask_padded,
-        temperature=1.0,
-    )
-    loss_padded.backward()
-    grad_padded = student_padded.grad.abs().sum(dim=-1).squeeze(0)
-    assert grad_padded[3].item() == pytest.approx(0.0, abs=0.0)
-    assert grad_padded[4].item() == pytest.approx(0.0, abs=0.0)
-
-
-def test_forward_kl_loss_matches_manual_fractional_weighted_mean() -> None:
-    torch.manual_seed(99)
-    student_logits = torch.randn(1, 6, 17, requires_grad=True)
-    teacher_logits = torch.randn(1, 6, 17)
-    labels = torch.tensor([[-100, -100, -100, 10, 11, 2]], dtype=torch.long)
-    attention_mask = torch.ones(1, 6, dtype=torch.long)
-
-    mask = distill_losses.build_distill_token_mask(
-        labels=labels,
-        attention_mask=attention_mask,
-        reference_logits=student_logits,
-        prompt_kd_weight=0.1,
-    )
-
-    actual = distill_losses.compute_forward_kl_loss(
-        student_logits=student_logits,
-        teacher_logits=teacher_logits,
-        mask=mask,
-        temperature=1.0,
-    )
-
-    temp = 1.0
-    student_scaled = student_logits.detach().float() / temp
-    teacher_scaled = teacher_logits.detach().float() / temp
-    student_log_prob = F.log_softmax(student_scaled, dim=-1)
-    teacher_prob = F.softmax(teacher_scaled, dim=-1)
-    token_kl = F.kl_div(student_log_prob, teacher_prob, reduction="none").sum(dim=-1)
-    expected = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
-
-    assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    assert torch.all((regions.response_mask + regions.prompt_mask) <= 1.0)
 
 
 @pytest.mark.parametrize("sequence_chunk_size", [1, 2, 5])
@@ -1379,3 +1231,779 @@ def test_offloaded_teacher_dense_loss_rejects_non_eakld() -> None:
                 eakld_confidence_k=16,
             sequence_chunk_size=2,
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2: region-level prompt KD dispatch tests
+# ---------------------------------------------------------------------------
+
+EAKLD_TELEMETRY_KEYS = {
+    "teacher_entropy_mean",
+    "gamma_reverse",
+    "lambda_forward",
+    "forward_kl",
+    "reverse_kl",
+    "eakld_total",
+    "valid_tokens",
+}
+
+
+def _region_kl_reference(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    temperature: float,
+    weight: float,
+) -> torch.Tensor:
+    response = distill_losses.compute_forward_kl_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        mask=response_mask,
+        temperature=temperature,
+    )
+    prompt = distill_losses.compute_forward_kl_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        mask=prompt_mask,
+        temperature=temperature,
+    )
+    return response + weight * prompt
+
+
+def test_forward_kl_region_combination_matches_manual_means() -> None:
+    torch.manual_seed(301)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    prompt_mask = torch.tensor(
+        [[1, 1, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]], dtype=torch.float32
+    )
+    weight = 0.03
+
+    actual = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+    )
+    expected = _region_kl_reference(
+        student_logits=student,
+        teacher_logits=teacher,
+        response_mask=response_mask,
+        prompt_mask=prompt_mask,
+        temperature=1.0,
+        weight=weight,
+    )
+    assert torch.allclose(actual, expected.detach(), rtol=1e-6, atol=1e-6)
+
+
+def test_forward_kl_prompt_region_mean_invariant_to_prompt_repetition() -> None:
+    """Prompt-region mean must not change when prompt tokens are repeated.
+
+    This distinguishes the region-normalized formula (each region divides by its
+    own token count) from a shared weighted-denominator formula. The response
+    region has non-empty tokens whose per-token KL differs from the prompt
+    region's per-token KL, so the old shared-denominator loss would drift as the
+    prompt length P changes, while the new region-normalized loss stays constant.
+    """
+    torch.manual_seed(302)
+    vocab = 17
+    # Distinct logits for response vs prompt positions so per-token KL differs
+    # between the two regions.
+    response_student = torch.randn(1, 1, vocab, dtype=torch.float32) * 2.0
+    response_teacher = torch.randn(1, 1, vocab, dtype=torch.float32) * 2.0
+    prompt_student = torch.randn(1, 1, vocab, dtype=torch.float32) * 0.5
+    prompt_teacher = torch.randn(1, 1, vocab, dtype=torch.float32) * 0.5
+    n_response = 2
+    short_n_prompt = 3
+    long_n_prompt = 30
+
+    def _build(n_prompt):
+        resp_s = response_student.expand(1, n_response, vocab).clone()
+        resp_t = response_teacher.expand(1, n_response, vocab).clone()
+        prom_s = prompt_student.expand(1, n_prompt, vocab).clone()
+        prom_t = prompt_teacher.expand(1, n_prompt, vocab).clone()
+        student = torch.cat([resp_s, prom_s], dim=1).requires_grad_(True)
+        teacher = torch.cat([resp_t, prom_t], dim=1)
+        response_mask = torch.cat(
+            [torch.ones(1, n_response), torch.zeros(1, n_prompt)], dim=1
+        ).to(dtype=torch.float32)
+        prompt_mask = torch.cat(
+            [torch.zeros(1, n_response), torch.ones(1, n_prompt)], dim=1
+        ).to(dtype=torch.float32)
+        return student, teacher, response_mask, prompt_mask
+
+    short_student, short_teacher, short_response, short_prompt_mask = _build(
+        short_n_prompt
+    )
+    long_student, long_teacher, long_response, long_prompt_mask = _build(
+        long_n_prompt
+    )
+
+    weight = 0.03
+    short_loss = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=short_student,
+        teacher_logits=short_teacher,
+        mask=short_response,
+        temperature=1.0,
+        prompt_mask=short_prompt_mask,
+        prompt_kd_weight=weight,
+    )
+    long_loss = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=long_student,
+        teacher_logits=long_teacher,
+        mask=long_response,
+        temperature=1.0,
+        prompt_mask=long_prompt_mask,
+        prompt_kd_weight=weight,
+    )
+
+    # New region-normalized loss is invariant to prompt length P.
+    assert torch.isfinite(short_loss)
+    assert torch.isfinite(long_loss)
+    assert torch.allclose(short_loss, long_loss, rtol=1e-6, atol=1e-6)
+
+    # And it equals response_mean + w * prompt_mean computed independently.
+    response_mean = distill_losses.compute_forward_kl_loss(
+        student_logits=short_student,
+        teacher_logits=short_teacher,
+        mask=short_response,
+        temperature=1.0,
+    )
+    prompt_mean = distill_losses.compute_forward_kl_loss(
+        student_logits=short_student,
+        teacher_logits=short_teacher,
+        mask=short_prompt_mask,
+        temperature=1.0,
+    )
+    expected = response_mean + weight * prompt_mean
+    assert torch.allclose(short_loss, expected.detach(), rtol=1e-6, atol=1e-6)
+
+    # Sanity check: the old shared-denominator formula WOULD change with P.
+    def _old_shared_denominator(student, teacher, response_mask, prompt_mask, w):
+        log_p = F.log_softmax(student.float(), dim=-1)
+        t_p = F.softmax(teacher.float(), dim=-1)
+        token_kl = F.kl_div(log_p, t_p, reduction="none").sum(dim=-1)
+        weighted_mask = response_mask + w * prompt_mask
+        denom = weighted_mask.sum().clamp_min(1.0)
+        return (token_kl * weighted_mask).sum() / denom
+
+    old_short = _old_shared_denominator(
+        short_student, short_teacher, short_response, short_prompt_mask, weight
+    )
+    old_long = _old_shared_denominator(
+        long_student, long_teacher, long_response, long_prompt_mask, weight
+    )
+    assert not torch.allclose(old_short, old_long, rtol=1e-4, atol=1e-4)
+
+
+def test_zero_prompt_weight_matches_response_only_value_and_gradient() -> None:
+    torch.manual_seed(303)
+    student_base = torch.randn(2, 6, 19, dtype=torch.float32)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    prompt_mask = torch.tensor(
+        [[1, 1, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]], dtype=torch.float32
+    )
+
+    response_only_student = student_base.detach().clone().requires_grad_(True)
+    response_only = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=response_only_student,
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+    )
+    response_only.backward()
+    response_only_grad = response_only_student.grad.detach().clone()
+
+    region_student = student_base.detach().clone().requires_grad_(True)
+    region = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=region_student,
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=0.0,
+    )
+    region.backward()
+    region_grad = region_student.grad.detach().clone()
+
+    assert torch.allclose(region, response_only.detach(), rtol=1e-6, atol=1e-7)
+    assert torch.allclose(region_grad, response_only_grad, rtol=1e-6, atol=1e-7)
+
+
+def test_empty_prompt_mask_with_positive_weight_contributes_zero() -> None:
+    torch.manual_seed(304)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    empty_prompt = torch.zeros(2, 6, dtype=torch.float32)
+
+    loss = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+        prompt_mask=empty_prompt,
+        prompt_kd_weight=0.03,
+    )
+    response_only = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=student.detach().clone().requires_grad_(True),
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+    )
+    assert torch.isfinite(loss)
+    assert torch.allclose(loss, response_only.detach(), rtol=1e-6, atol=1e-7)
+
+
+def test_empty_response_mask_leaves_only_weighted_prompt_loss_kl() -> None:
+    torch.manual_seed(305)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    empty_response = torch.zeros(2, 6, dtype=torch.float32)
+    prompt_mask = torch.tensor(
+        [[1, 1, 0, 0, 0, 0], [0, 1, 1, 0, 0, 0]], dtype=torch.float32
+    )
+    weight = 0.03
+
+    loss = compute_dense_loss_from_logits(
+        loss_type="kl",
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=empty_response,
+        temperature=1.0,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+    )
+    prompt_only = distill_losses.compute_forward_kl_loss(
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=prompt_mask,
+        temperature=1.0,
+    )
+    assert torch.isfinite(loss)
+    assert torch.allclose(loss, (weight * prompt_only).detach(), rtol=1e-6, atol=1e-7)
+
+
+def test_empty_response_mask_leaves_only_weighted_prompt_loss_eakld() -> None:
+    torch.manual_seed(306)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    empty_response = torch.zeros(2, 6, dtype=torch.float32)
+    prompt_mask = torch.tensor(
+        [[1, 1, 0, 0, 0, 0], [0, 1, 1, 0, 0, 0]], dtype=torch.float32
+    )
+    weight = 0.03
+
+    loss = compute_dense_loss_from_logits(
+        loss_type="eakld",
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=empty_response,
+        temperature=1.0,
+        eakld_confidence_k=16,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+    )
+    prompt_only = distill_losses.compute_eakld(
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=prompt_mask,
+        temperature=1.0,
+        confidence_k=16,
+        telemetry_out=None,
+    )
+    assert torch.isfinite(loss)
+    assert torch.allclose(loss, (weight * prompt_only).detach(), rtol=1e-5, atol=1e-6)
+
+
+def test_empty_prompt_mask_eakld_positive_weight_remains_finite() -> None:
+    torch.manual_seed(307)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    empty_prompt = torch.zeros(2, 6, dtype=torch.float32)
+
+    loss = compute_dense_loss_from_logits(
+        loss_type="eakld",
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+        eakld_confidence_k=16,
+        prompt_mask=empty_prompt,
+        prompt_kd_weight=0.03,
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+
+
+def test_negative_prompt_weight_is_error() -> None:
+    student = torch.randn(2, 4, 7, requires_grad=True)
+    teacher = torch.randn(2, 4, 7)
+    mask = torch.ones(2, 4)
+    prompt_mask = torch.ones(2, 4)
+    with pytest.raises(ValueError, match="prompt_kd_weight must be >= 0.0"):
+        compute_dense_loss_from_logits(
+            loss_type="kl",
+            student_logits=student,
+            teacher_logits=teacher,
+            mask=mask,
+            temperature=1.0,
+            prompt_mask=prompt_mask,
+            prompt_kd_weight=-0.01,
+        )
+
+
+def test_positive_weight_without_prompt_mask_is_error() -> None:
+    student = torch.randn(2, 4, 7, requires_grad=True)
+    teacher = torch.randn(2, 4, 7)
+    mask = torch.ones(2, 4)
+    with pytest.raises(ValueError, match="prompt_kd_weight > 0 requires prompt_mask"):
+        compute_dense_loss_from_logits(
+            loss_type="kl",
+            student_logits=student,
+            teacher_logits=teacher,
+            mask=mask,
+            temperature=1.0,
+            prompt_kd_weight=0.03,
+        )
+
+
+def test_kd_ce_not_double_counted_across_regions() -> None:
+    torch.manual_seed(308)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    prompt_mask = torch.tensor(
+        [[1, 1, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]], dtype=torch.float32
+    )
+    alpha = 0.5
+    weight = 0.03
+
+    ce_tensor = torch.tensor(1000.0, dtype=torch.float32, requires_grad=True)
+    loss = compute_dense_loss_from_logits(
+        loss_type="kd",
+        student_logits=student,
+        teacher_logits=teacher,
+        ce_loss=ce_tensor,
+        mask=response_mask,
+        temperature=1.0,
+        alpha=alpha,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+    )
+    loss.backward()
+    # CE appears exactly once: gradient of loss w.r.t. ce_tensor is (1 - alpha).
+    assert ce_tensor.grad is not None
+    assert torch.allclose(ce_tensor.grad, torch.tensor(1.0 - alpha), rtol=1e-6, atol=1e-7)
+
+
+def test_eakld_prompt_call_does_not_overwrite_response_telemetry() -> None:
+    torch.manual_seed(309)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 6, 19, dtype=torch.float32)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    prompt_mask = torch.tensor(
+        [[1, 1, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]], dtype=torch.float32
+    )
+
+    telemetry: dict[str, torch.Tensor] = {}
+    loss = compute_dense_loss_from_logits(
+        loss_type="eakld",
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+        eakld_confidence_k=16,
+        telemetry_out=telemetry,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=0.03,
+    )
+    loss.backward()
+
+    # Telemetry must reflect the response-region EAKLD only.
+    response_only_telemetry: dict[str, torch.Tensor] = {}
+    distill_losses.compute_eakld(
+        student_logits=student.detach().clone().requires_grad_(True),
+        teacher_logits=teacher,
+        mask=response_mask,
+        temperature=1.0,
+        confidence_k=16,
+        telemetry_out=response_only_telemetry,
+    )
+    assert set(telemetry) == EAKLD_TELEMETRY_KEYS
+    for key in EAKLD_TELEMETRY_KEYS:
+        assert torch.allclose(
+            telemetry[key], response_only_telemetry[key], rtol=1e-6, atol=1e-6
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 5: dense-vs-offload equality with positive prompt weight
+# ---------------------------------------------------------------------------
+
+def _prompt_region_scalar_fixtures(
+    *,
+    seed: int,
+    batch: int,
+    seq_len: int,
+    vocab: int,
+):
+    torch.manual_seed(seed)
+    teacher_logits = torch.randn(batch, seq_len, vocab, dtype=torch.float32)
+    student_base = torch.randn(batch, seq_len, vocab, dtype=torch.float32)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )[:batch, :seq_len]
+    prompt_mask = torch.tensor(
+        [[1, 1, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]], dtype=torch.float32
+    )[:batch, :seq_len]
+
+    (
+        resp_entropy,
+        resp_gamma,
+        resp_valid,
+    ) = distill_losses.compute_teacher_entropy_mean_and_gamma(
+        teacher_logits, response_mask, confidence_k=16
+    )
+    (
+        prompt_entropy,
+        prompt_gamma,
+        prompt_valid,
+    ) = distill_losses.compute_teacher_entropy_mean_and_gamma(
+        teacher_logits, prompt_mask, confidence_k=16
+    )
+    return (
+        student_base,
+        teacher_logits,
+        response_mask,
+        prompt_mask,
+        resp_gamma.detach().cpu(),
+        resp_entropy.detach().cpu(),
+        resp_valid.detach().cpu(),
+        prompt_gamma.detach().cpu(),
+        prompt_entropy.detach().cpu(),
+        prompt_valid.detach().cpu(),
+    )
+
+
+@pytest.mark.parametrize("sequence_chunk_size", [1, 2, 3])
+def test_offloaded_eakld_positive_prompt_weight_matches_dense_value_and_gradient(
+    sequence_chunk_size: int,
+) -> None:
+    weight = 0.07
+    (
+        student_base,
+        teacher_logits,
+        response_mask,
+        prompt_mask,
+        resp_gamma_cpu,
+        resp_entropy_cpu,
+        resp_valid_cpu,
+        prompt_gamma_cpu,
+        prompt_entropy_cpu,
+        prompt_valid_cpu,
+    ) = _prompt_region_scalar_fixtures(
+        seed=401, batch=2, seq_len=6, vocab=23
+    )
+
+    dense_student = student_base.detach().clone().requires_grad_(True)
+    dense_loss = compute_dense_loss_from_logits(
+        loss_type="eakld",
+        student_logits=dense_student,
+        teacher_logits=teacher_logits,
+        mask=response_mask,
+        temperature=1.3,
+        eakld_confidence_k=16,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+    )
+    dense_grad = torch.autograd.grad(dense_loss, dense_student)[0]
+
+    offload_student = student_base.detach().clone().requires_grad_(True)
+    offload_loss = compute_dense_loss_from_offloaded_teacher(
+        loss_type="eakld",
+        student_logits=offload_student,
+        teacher_logits_cpu=teacher_logits.cpu(),
+        teacher_gamma_cpu=resp_gamma_cpu,
+        teacher_entropy_mean_cpu=resp_entropy_cpu,
+        teacher_valid_token_count_cpu=resp_valid_cpu,
+        mask=response_mask,
+        temperature=1.3,
+        eakld_confidence_k=16,
+        sequence_chunk_size=sequence_chunk_size,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+        teacher_prompt_gamma_cpu=prompt_gamma_cpu,
+        teacher_prompt_entropy_mean_cpu=prompt_entropy_cpu,
+        teacher_prompt_valid_token_count_cpu=prompt_valid_cpu,
+    )
+    offload_grad = torch.autograd.grad(offload_loss, offload_student)[0]
+
+    assert torch.allclose(offload_loss, dense_loss.detach(), rtol=5e-6, atol=5e-6)
+    assert torch.allclose(offload_grad, dense_grad, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("sequence_chunk_size", [1, 3, 8])
+def test_offloaded_eakld_topk_positive_prompt_weight_matches_dense_value_and_gradient(
+    sequence_chunk_size: int,
+) -> None:
+    weight = 0.11
+    (
+        student_base,
+        teacher_logits,
+        response_mask,
+        prompt_mask,
+        resp_gamma_cpu,
+        resp_entropy_cpu,
+        resp_valid_cpu,
+        prompt_gamma_cpu,
+        prompt_entropy_cpu,
+        prompt_valid_cpu,
+    ) = _prompt_region_scalar_fixtures(
+        seed=402, batch=2, seq_len=6, vocab=29
+    )
+
+    dense_student = student_base.detach().clone().requires_grad_(True)
+    dense_loss = compute_dense_loss_from_logits(
+        loss_type="eakld_top_7",
+        student_logits=dense_student,
+        teacher_logits=teacher_logits,
+        mask=response_mask,
+        temperature=0.9,
+        eakld_confidence_k=16,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+    )
+    dense_grad = torch.autograd.grad(dense_loss, dense_student)[0]
+
+    offload_student = student_base.detach().clone().requires_grad_(True)
+    offload_loss = compute_dense_loss_from_offloaded_teacher(
+        loss_type="eakld_top_7",
+        student_logits=offload_student,
+        teacher_logits_cpu=teacher_logits.cpu(),
+        teacher_gamma_cpu=resp_gamma_cpu,
+        teacher_entropy_mean_cpu=resp_entropy_cpu,
+        teacher_valid_token_count_cpu=resp_valid_cpu,
+        mask=response_mask,
+        temperature=0.9,
+        eakld_confidence_k=16,
+        sequence_chunk_size=sequence_chunk_size,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+        teacher_prompt_gamma_cpu=prompt_gamma_cpu,
+        teacher_prompt_entropy_mean_cpu=prompt_entropy_cpu,
+        teacher_prompt_valid_token_count_cpu=prompt_valid_cpu,
+    )
+    offload_grad = torch.autograd.grad(offload_loss, offload_student)[0]
+
+    assert torch.allclose(offload_loss, dense_loss.detach(), rtol=5e-6, atol=5e-6)
+    assert torch.allclose(offload_grad, dense_grad, rtol=1e-5, atol=1e-5)
+
+
+def test_offloaded_zero_prompt_weight_matches_response_only_value_and_gradient() -> None:
+    """Zero weight: prompt scalar fields unnecessary; matches response-only."""
+    (
+        student_base,
+        teacher_logits,
+        response_mask,
+        prompt_mask,
+        resp_gamma_cpu,
+        resp_entropy_cpu,
+        resp_valid_cpu,
+        _prompt_gamma_cpu,
+        _prompt_entropy_cpu,
+        _prompt_valid_cpu,
+    ) = _prompt_region_scalar_fixtures(
+        seed=403, batch=2, seq_len=6, vocab=23
+    )
+
+    response_only_student = student_base.detach().clone().requires_grad_(True)
+    response_only = compute_dense_loss_from_offloaded_teacher(
+        loss_type="eakld",
+        student_logits=response_only_student,
+        teacher_logits_cpu=teacher_logits.cpu(),
+        teacher_gamma_cpu=resp_gamma_cpu,
+        teacher_entropy_mean_cpu=resp_entropy_cpu,
+        teacher_valid_token_count_cpu=resp_valid_cpu,
+        mask=response_mask,
+        temperature=1.3,
+        eakld_confidence_k=16,
+        sequence_chunk_size=2,
+    )
+    response_only.backward()
+    response_only_grad = response_only_student.grad.detach().clone()
+
+    region_student = student_base.detach().clone().requires_grad_(True)
+    region = compute_dense_loss_from_offloaded_teacher(
+        loss_type="eakld",
+        student_logits=region_student,
+        teacher_logits_cpu=teacher_logits.cpu(),
+        teacher_gamma_cpu=resp_gamma_cpu,
+        teacher_entropy_mean_cpu=resp_entropy_cpu,
+        teacher_valid_token_count_cpu=resp_valid_cpu,
+        mask=response_mask,
+        temperature=1.3,
+        eakld_confidence_k=16,
+        sequence_chunk_size=2,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=0.0,
+    )
+    region.backward()
+    region_grad = region_student.grad.detach().clone()
+
+    assert torch.allclose(region, response_only.detach(), rtol=1e-6, atol=1e-7)
+    assert torch.allclose(region_grad, response_only_grad, rtol=1e-6, atol=1e-7)
+
+
+def test_offloaded_empty_prompt_mask_positive_weight_remains_finite() -> None:
+    """Empty prompt mask + positive weight + scalars computed on empty mask."""
+    torch.manual_seed(404)
+    teacher_logits = torch.randn(2, 6, 19, dtype=torch.float32)
+    student = torch.randn(2, 6, 19, dtype=torch.float32, requires_grad=True)
+    response_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    empty_prompt = torch.zeros(2, 6, dtype=torch.float32)
+
+    (
+        resp_entropy,
+        resp_gamma,
+        resp_valid,
+    ) = distill_losses.compute_teacher_entropy_mean_and_gamma(
+        teacher_logits, response_mask, confidence_k=16
+    )
+    (
+        prompt_entropy,
+        prompt_gamma,
+        prompt_valid,
+    ) = distill_losses.compute_teacher_entropy_mean_and_gamma(
+        teacher_logits, empty_prompt, confidence_k=16
+    )
+
+    loss = compute_dense_loss_from_offloaded_teacher(
+        loss_type="eakld",
+        student_logits=student,
+        teacher_logits_cpu=teacher_logits.cpu(),
+        teacher_gamma_cpu=resp_gamma.detach().cpu(),
+        teacher_entropy_mean_cpu=resp_entropy.detach().cpu(),
+        teacher_valid_token_count_cpu=resp_valid.detach().cpu(),
+        mask=response_mask,
+        temperature=1.0,
+        eakld_confidence_k=16,
+        sequence_chunk_size=2,
+        prompt_mask=empty_prompt,
+        prompt_kd_weight=0.03,
+        teacher_prompt_gamma_cpu=prompt_gamma.detach().cpu(),
+        teacher_prompt_entropy_mean_cpu=prompt_entropy.detach().cpu(),
+        teacher_prompt_valid_token_count_cpu=prompt_valid.detach().cpu(),
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+
+
+def test_offloaded_positive_weight_without_prompt_scalars_is_error() -> None:
+    torch.manual_seed(405)
+    student = torch.randn(2, 4, 11, dtype=torch.float32, requires_grad=True)
+    teacher = torch.randn(2, 4, 11, dtype=torch.float32)
+    mask = torch.ones(2, 4, dtype=torch.float32)
+    prompt_mask = torch.ones(2, 4, dtype=torch.float32)
+    gamma_cpu = distill_losses.compute_teacher_entropy_mean_and_gamma(
+        teacher, mask, confidence_k=16
+    )[1].detach().cpu()
+
+    with pytest.raises(
+        ValueError,
+        match="prompt_kd_weight > 0 requires teacher_prompt_gamma_cpu",
+    ):
+        compute_dense_loss_from_offloaded_teacher(
+            loss_type="eakld",
+            student_logits=student,
+            teacher_logits_cpu=teacher.cpu(),
+            teacher_gamma_cpu=gamma_cpu,
+            teacher_entropy_mean_cpu=None,
+            teacher_valid_token_count_cpu=None,
+            mask=mask,
+            temperature=1.0,
+            eakld_confidence_k=16,
+            sequence_chunk_size=2,
+            prompt_mask=prompt_mask,
+            prompt_kd_weight=0.03,
+        )
+
+
+def test_offloaded_eakld_kd_positive_prompt_weight_mixes_ce_once() -> None:
+    """eakld_kd mixes CE exactly once after regional EAKLD combination."""
+    weight = 0.07
+    alpha = 0.4
+    (
+        student_base,
+        teacher_logits,
+        response_mask,
+        prompt_mask,
+        resp_gamma_cpu,
+        resp_entropy_cpu,
+        resp_valid_cpu,
+        prompt_gamma_cpu,
+        prompt_entropy_cpu,
+        prompt_valid_cpu,
+    ) = _prompt_region_scalar_fixtures(
+        seed=406, batch=2, seq_len=6, vocab=23
+    )
+
+    ce_tensor = torch.tensor(1000.0, dtype=torch.float32, requires_grad=True)
+    offload_student = student_base.detach().clone().requires_grad_(True)
+    loss = compute_dense_loss_from_offloaded_teacher(
+        loss_type="eakld_kd",
+        student_logits=offload_student,
+        teacher_logits_cpu=teacher_logits.cpu(),
+        teacher_gamma_cpu=resp_gamma_cpu,
+        teacher_entropy_mean_cpu=resp_entropy_cpu,
+        teacher_valid_token_count_cpu=resp_valid_cpu,
+        ce_loss=ce_tensor,
+        mask=response_mask,
+        temperature=1.3,
+        alpha=alpha,
+        eakld_confidence_k=16,
+        sequence_chunk_size=2,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=weight,
+        teacher_prompt_gamma_cpu=prompt_gamma_cpu,
+        teacher_prompt_entropy_mean_cpu=prompt_entropy_cpu,
+        teacher_prompt_valid_token_count_cpu=prompt_valid_cpu,
+    )
+    loss.backward()
+    assert ce_tensor.grad is not None
+    assert torch.allclose(
+        ce_tensor.grad, torch.tensor(1.0 - alpha), rtol=1e-6, atol=1e-7
+    )
+

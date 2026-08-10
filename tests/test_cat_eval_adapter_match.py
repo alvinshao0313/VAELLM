@@ -19,6 +19,7 @@ from train_utils.lora_training import (
     compute_distill_pre_mlp_hidden_alignment_loss,
     parse_distill_hidden_alignment_layer_weighting,
 )
+from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 
 
 class CatEvalAdapterMatchTest(unittest.TestCase):
@@ -298,6 +299,9 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
             def __init__(self, **kwargs):
                 captured_kwargs.update(kwargs)
 
+            def add_callback(self, callback):
+                pass
+
         class FakeSFTTrainer:
             def __init__(self, **_kwargs):
                 raise AssertionError("SFTTrainer should not be selected when pre-MLP hidden loss is enabled.")
@@ -445,6 +449,7 @@ def _build_pre_mlp_trainer(
     trainer.distill_hif4_act_controller = None
     trainer.teacher_param_snapshots = []
     trainer.accelerator = None
+    trainer.distill_token_stats = DistillTokenStatsAccumulator()
     return trainer
 
 
@@ -558,6 +563,202 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
         self.assertEqual(model.output_hidden_states_calls, [False, False])
         self.assertEqual(capture_mock.call_count, 0)
         self.assertTrue(torch.isfinite(loss).item())
+
+
+def _build_distill_trainer(
+    *,
+    loss_type: str,
+    prompt_kd_weight: float,
+    temperature: float = 1.0,
+    loss_alpha: float = 0.5,
+    eakld_confidence_k: int = 16,
+) -> CustomSFTTrainer:
+    trainer = CustomSFTTrainer.__new__(CustomSFTTrainer)
+    trainer.args = SimpleNamespace(bf16=False, fp16=False)
+    trainer.loss_type = loss_type
+    trainer.temperature = float(temperature)
+    trainer.loss_alpha = float(loss_alpha)
+    trainer.hidden_loss_weight = 0.0
+    trainer.pre_mlp_hidden_loss_weight = 0.0
+    trainer.prompt_kd_weight = float(prompt_kd_weight)
+    trainer.hidden_alignment_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
+        "uniform"
+    )
+    trainer.eakld_confidence_k = int(eakld_confidence_k)
+    trainer.teacher_logits_cpu_staging = False
+    trainer.distill_hif4_act_controller = None
+    trainer.teacher_param_snapshots = []
+    trainer.accelerator = None
+    trainer.distill_token_stats = DistillTokenStatsAccumulator()
+    return trainer
+
+
+def _distill_inputs() -> dict:
+    # positions:  0   1   2  3  4  5
+    # labels:   -100 -100 3  4  5  6  (prompt prefix at 0-1)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+    labels = torch.tensor([[-100, -100, 3, 4, 5, 6]], dtype=torch.long)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": labels,
+    }
+
+
+class CatDistillRegionNormalizedLossTest(unittest.TestCase):
+    def test_eakld_positive_prompt_weight_calls_criterion_twice_with_different_masks(self):
+        from train_utils import lora_training
+        from train_utils.distill_losses import compute_eakld
+
+        model = _PreMlpFakeCausalLM()
+        trainer = _build_distill_trainer(loss_type="eakld", prompt_kd_weight=0.1)
+        inputs = _distill_inputs()
+
+        captured_masks: list = []
+        original = compute_eakld
+
+        def recording(*, student_logits, teacher_logits, mask, **kwargs):
+            captured_masks.append(mask)
+            return original(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                mask=mask,
+                **kwargs,
+            )
+
+        with patch.object(lora_training, "compute_eakld", side_effect=recording):
+            loss = trainer.compute_loss(model, inputs)
+
+        self.assertEqual(len(captured_masks), 2)
+        response_mask, prompt_mask = captured_masks
+        self.assertFalse(torch.equal(response_mask, prompt_mask))
+        self.assertGreater(float(response_mask.sum().item()), 0.0)
+        self.assertGreater(float(prompt_mask.sum().item()), 0.0)
+        # Regions are disjoint.
+        self.assertTrue(bool((response_mask + prompt_mask).max().item() <= 1.0))
+        self.assertTrue(torch.isfinite(loss).item())
+
+    def test_eakld_zero_prompt_weight_calls_criterion_once_on_response(self):
+        from train_utils import lora_training
+        from train_utils.distill_losses import compute_eakld
+
+        model = _PreMlpFakeCausalLM()
+        trainer = _build_distill_trainer(loss_type="eakld", prompt_kd_weight=0.0)
+        inputs = _distill_inputs()
+
+        captured_masks: list = []
+        original = compute_eakld
+
+        def recording(*, student_logits, teacher_logits, mask, **kwargs):
+            captured_masks.append(mask)
+            return original(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                mask=mask,
+                **kwargs,
+            )
+
+        with patch.object(lora_training, "compute_eakld", side_effect=recording):
+            loss = trainer.compute_loss(model, inputs)
+
+        self.assertEqual(len(captured_masks), 1)
+        self.assertGreater(float(captured_masks[0].sum().item()), 0.0)
+        self.assertTrue(torch.isfinite(loss).item())
+
+    def test_kl_region_combination_matches_manual_means(self):
+        from train_utils.distill_losses import (
+            build_distill_token_regions,
+            compute_forward_kl_loss,
+        )
+
+        model = _PreMlpFakeCausalLM()
+        weight = 0.1
+        trainer = _build_distill_trainer(loss_type="kl", prompt_kd_weight=weight)
+        inputs = _distill_inputs()
+        loss = trainer.compute_loss(model, inputs)
+
+        # Recompute teacher/student logits with the same temp_scale toggles.
+        with torch.no_grad():
+            model.temp_scale.set_temporary(False)
+            teacher_logits = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            ).logits
+            model.temp_scale.set_temporary(True)
+            student_logits = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            ).logits
+
+        regions = build_distill_token_regions(
+            labels=inputs["labels"],
+            attention_mask=inputs["attention_mask"],
+            reference_logits=student_logits,
+        )
+        expected = compute_forward_kl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=regions.response_mask,
+            temperature=1.0,
+        ) + weight * compute_forward_kl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=regions.prompt_mask,
+            temperature=1.0,
+        )
+        self.assertTrue(torch.allclose(loss, expected.detach(), rtol=1e-5, atol=1e-6))
+
+    def test_zero_prompt_weight_matches_response_only_value(self):
+        from train_utils.distill_losses import (
+            build_distill_token_regions,
+            compute_forward_kl_loss,
+        )
+
+        model = _PreMlpFakeCausalLM()
+        trainer_zero = _build_distill_trainer(loss_type="kl", prompt_kd_weight=0.0)
+        inputs = _distill_inputs()
+        loss_zero = trainer_zero.compute_loss(model, inputs)
+
+        with torch.no_grad():
+            model.temp_scale.set_temporary(False)
+            teacher_logits = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            ).logits
+            model.temp_scale.set_temporary(True)
+            student_logits = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            ).logits
+        regions = build_distill_token_regions(
+            labels=inputs["labels"],
+            attention_mask=inputs["attention_mask"],
+            reference_logits=student_logits,
+        )
+        expected = compute_forward_kl_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            mask=regions.response_mask,
+            temperature=1.0,
+        )
+        self.assertTrue(torch.allclose(loss_zero, expected.detach(), rtol=1e-5, atol=1e-6))
+
+    def test_kd_ce_counted_once_across_regions(self):
+        from train_utils import lora_training
+
+        model = _PreMlpFakeCausalLM()
+        trainer = _build_distill_trainer(
+            loss_type="kd", prompt_kd_weight=0.1, loss_alpha=0.5
+        )
+        inputs = _distill_inputs()
+        loss = trainer.compute_loss(model, inputs)
+        self.assertTrue(torch.isfinite(loss).item())
+        # CE (outputs["loss"]) is mixed once with alpha=0.5; the regional KD
+        # scalar is built from response + weight*prompt before the single mix.
+        # We assert finiteness and that gradient flows to the student scale.
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+        self.assertIsNotNone(model.temp_scale.scale.grad)
 
 
 if __name__ == "__main__":

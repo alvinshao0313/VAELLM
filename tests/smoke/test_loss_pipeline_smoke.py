@@ -16,7 +16,7 @@ from e2e_common.dense_loss import (
 )
 from train_utils import distill_losses
 from train_utils.block_distill import _attention_map_kl_chunk_losses
-from train_utils.distill_losses import build_distill_token_mask
+from train_utils.distill_losses import build_distill_token_regions
 
 
 EAKLD_TELEMETRY_KEYS = {
@@ -75,16 +75,18 @@ def _make_tiny_logits_and_labels(
 
 def test_dense_dispatcher_loss_pipeline_smoke() -> None:
     student_base, teacher_logits, labels, attention_mask = _make_tiny_logits_and_labels()
-    mask = build_distill_token_mask(
+    regions = build_distill_token_regions(
         labels=labels,
         attention_mask=attention_mask,
         reference_logits=student_base,
-        prompt_kd_weight=0.1,
     )
+    mask = regions.response_mask
+    prompt_mask = regions.prompt_mask
     assert mask.shape == (2, 6)
     assert float(mask.sum().item()) > 0.0
-    assert bool(((mask > 0.0) & (mask < 1.0)).any().item())
-    zero_weight_positions = mask.eq(0)
+    assert float(prompt_mask.sum().item()) > 0.0
+    # Positions outside both regions must receive zero gradient.
+    neither_region = mask.eq(0) & prompt_mask.eq(0)
 
     for loss_type in DENSE_LOSS_TYPES:
         student_logits = student_base.detach().clone().requires_grad_(True)
@@ -97,6 +99,8 @@ def test_dense_dispatcher_loss_pipeline_smoke() -> None:
             temperature=1.0,
             eakld_confidence_k=16,
             telemetry_out=telemetry if loss_type.startswith("eakld") else None,
+            prompt_mask=prompt_mask,
+            prompt_kd_weight=0.03,
         )
         assert loss.ndim == 0
         assert torch.isfinite(loss)
@@ -105,8 +109,8 @@ def test_dense_dispatcher_loss_pipeline_smoke() -> None:
         assert student_logits.grad is not None
         assert torch.isfinite(student_logits.grad).all()
         assert torch.equal(
-            student_logits.grad[zero_weight_positions],
-            torch.zeros_like(student_logits.grad[zero_weight_positions]),
+            student_logits.grad[neither_region],
+            torch.zeros_like(student_logits.grad[neither_region]),
         )
         assert teacher_logits.grad is None
         assert not teacher_logits.requires_grad
@@ -123,13 +127,14 @@ def test_offload_cpu_eakld_dispatcher_smoke() -> None:
     student_base, teacher_logits, labels, attention_mask = _make_tiny_logits_and_labels(
         seed=21,
     )
-    mask = build_distill_token_mask(
+    regions = build_distill_token_regions(
         labels=labels,
         attention_mask=attention_mask,
         reference_logits=student_base,
-        prompt_kd_weight=0.1,
     )
-    assert bool(((mask > 0.0) & (mask < 1.0)).any().item())
+    mask = regions.response_mask
+    prompt_mask = regions.prompt_mask
+    assert float(prompt_mask.sum().item()) > 0.0
     entropy_mean, gamma, valid_count = (
         distill_losses.compute_teacher_entropy_mean_and_gamma(
             teacher_logits,

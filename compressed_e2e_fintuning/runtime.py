@@ -67,6 +67,7 @@ from compressed_e2e_fintuning.trainables import (
     validate_selected_low_rank_scope,
 )
 from compressed_e2e_fintuning.trainer import (
+    E2EDistillTokenStatsCallback,
     E2ETrainerLogCallback,
     VAEDecoderE2ETrainer,
     replace_progress_log_callback,
@@ -1039,6 +1040,7 @@ def run(args, hf_args, training_args):
         callbacks=trainer_callbacks,
     )
     replace_progress_log_callback(trainer)
+    trainer.add_callback(E2EDistillTokenStatsCallback(trainer=trainer, logger=log))
     if eval_after_save_callback is not None:
         eval_after_save_callback.bind_trainer(trainer)
     try:

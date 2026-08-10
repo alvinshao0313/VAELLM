@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from train_utils.distill_losses import (
-    build_distill_token_mask,
+    build_distill_token_regions,
     compute_dual_kl_loss,
     compute_dual_kl_topk_loss,
     compute_dual_rkl_loss,
@@ -23,6 +23,7 @@ from train_utils.distill_losses import (
     is_eakld_top_loss,
     parse_eakld_top_k,
 )
+from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.hif4_act import Hif4ActController
 
 try:
@@ -574,6 +575,7 @@ else:
             self.teacher_logits_cpu_staging = bool(teacher_logits_cpu_staging)
             self.distill_hif4_act_controller = distill_hif4_act_controller
             self.teacher_param_snapshots = list(teacher_param_snapshots or [])
+            self.distill_token_stats = DistillTokenStatsAccumulator()
 
         def _teacher_logits_staging_dtype(self) -> torch.dtype:
             if bool(getattr(self.args, "bf16", False)):
@@ -602,6 +604,12 @@ else:
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
             args = self.args
             loss_type = self.loss_type
+            if bool(getattr(model, "training", False)):
+                original_labels = inputs.get("labels")
+                if isinstance(original_labels, torch.Tensor):
+                    self.distill_token_stats.update(
+                        original_labels, inputs.get("attention_mask")
+                    )
             hidden_loss_enabled = float(self.hidden_loss_weight) > 0.0
             pre_mlp_hidden_loss_enabled = float(self.pre_mlp_hidden_loss_weight) > 0.0
             pre_mlp_reference_hidden_required = bool(
@@ -747,13 +755,19 @@ else:
                     loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
                 return loss
 
-            def build_token_mask(reference_logits):
-                return build_distill_token_mask(
+            def build_token_regions(reference_logits):
+                return build_distill_token_regions(
                     labels=full_inputs.get("labels"),
                     attention_mask=full_inputs.get("attention_mask"),
                     reference_logits=reference_logits,
-                    prompt_kd_weight=self.prompt_kd_weight,
                 )
+
+            def combine_region_loss(loss_for_mask, regions):
+                response_loss = loss_for_mask(regions.response_mask)
+                if self.prompt_kd_weight == 0.0:
+                    return response_loss
+                prompt_loss = loss_for_mask(regions.prompt_mask)
+                return response_loss + self.prompt_kd_weight * prompt_loss
 
             try:
                 if loss_type in {"origin", "sft"}:
@@ -786,12 +800,15 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_reverse_kl_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        temperature=float(self.temperature),
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_reverse_kl_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            temperature=float(self.temperature),
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -803,11 +820,14 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_dual_rkl_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_dual_rkl_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -819,12 +839,15 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_forward_kl_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        temperature=float(self.temperature),
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_forward_kl_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            temperature=float(self.temperature),
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -837,13 +860,16 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_rkl_topk(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        k=k,
-                        temperature=float(self.temperature),
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_rkl_topk(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            k=k,
+                            temperature=float(self.temperature),
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -856,12 +882,15 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_dual_rkl_topk_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        k=k,
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_dual_rkl_topk_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            k=k,
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -874,13 +903,16 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_kl_topk(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        k=k,
-                        temperature=float(self.temperature),
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_kl_topk(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            k=k,
+                            temperature=float(self.temperature),
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -895,13 +927,16 @@ else:
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
-                    token_mask = build_token_mask(logits)
-                    distill_loss = compute_kl_topk(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        k=k,
-                        temperature=float(T),
+                    regions = build_token_regions(logits)
+                    distill_loss = combine_region_loss(
+                        lambda mask: compute_kl_topk(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            k=k,
+                            temperature=float(T),
+                        ),
+                        regions,
                     )
                     # T² is already applied inside compute_kl_topk.
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
@@ -915,11 +950,14 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_masked_logit_mse_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_masked_logit_mse_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -933,12 +971,15 @@ else:
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
-                    token_mask = build_token_mask(logits)
-                    distill_loss = compute_forward_kl_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        temperature=float(T),
+                    regions = build_token_regions(logits)
+                    distill_loss = combine_region_loss(
+                        lambda mask: compute_forward_kl_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            temperature=float(T),
+                        ),
+                        regions,
                     )
                     # T² is already applied inside compute_forward_kl_loss.
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
@@ -952,11 +993,14 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_dual_kl_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_dual_kl_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -969,12 +1013,15 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_dual_kl_topk_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        k=k,
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_dual_kl_topk_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            k=k,
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -988,12 +1035,15 @@ else:
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     ori_loss = outputs["loss"]
-                    token_mask = build_token_mask(logits)
-                    distill_loss = compute_dual_kl_topk_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        k=k,
+                    regions = build_token_regions(logits)
+                    distill_loss = combine_region_loss(
+                        lambda mask: compute_dual_kl_topk_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            k=k,
+                        ),
+                        regions,
                     )
                     alpha = self.loss_alpha
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
@@ -1008,11 +1058,14 @@ else:
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     ori_loss = outputs["loss"]
-                    token_mask = build_token_mask(logits)
-                    distill_loss = compute_dual_kl_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
+                    regions = build_token_regions(logits)
+                    distill_loss = combine_region_loss(
+                        lambda mask: compute_dual_kl_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                        ),
+                        regions,
                     )
                     alpha = self.loss_alpha
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
@@ -1027,14 +1080,17 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_eakld_topk(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        k=k,
-                        temperature=float(self.temperature),
-                        confidence_k=int(self.eakld_confidence_k),
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_eakld_topk(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            k=k,
+                            temperature=float(self.temperature),
+                            confidence_k=int(self.eakld_confidence_k),
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -1046,13 +1102,16 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_token_mask(logits)
-                    loss = compute_eakld(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        temperature=float(self.temperature),
-                        confidence_k=int(self.eakld_confidence_k),
+                    regions = build_token_regions(logits)
+                    loss = combine_region_loss(
+                        lambda mask: compute_eakld(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            temperature=float(self.temperature),
+                            confidence_k=int(self.eakld_confidence_k),
+                        ),
+                        regions,
                     )
                     loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
                     return (loss, outputs) if return_outputs else loss
@@ -1066,13 +1125,16 @@ else:
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
-                    token_mask = build_token_mask(logits)
-                    distill_loss = compute_entropy_aware_kl_loss(
-                        student_logits=logits,
-                        teacher_logits=teacher_logits,
-                        mask=token_mask,
-                        temperature=float(T),
-                        confidence_k=int(self.eakld_confidence_k),
+                    regions = build_token_regions(logits)
+                    distill_loss = combine_region_loss(
+                        lambda mask: compute_entropy_aware_kl_loss(
+                            student_logits=logits,
+                            teacher_logits=teacher_logits,
+                            mask=mask,
+                            temperature=float(T),
+                            confidence_k=int(self.eakld_confidence_k),
+                        ),
+                        regions,
                     )
                     # T² is already applied inside compute_eakld.
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha

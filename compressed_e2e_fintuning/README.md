@@ -40,30 +40,46 @@
 --prompt_kd_weight 0.0
 ```
 
-`prompt_kd_weight=0.0`（默认）与当前行为完全一致：只对 response target 做 logit KD。response target 权重固定为 1.0，不可单独配置。
+`prompt_kd_weight=0.0`（默认）与当前行为完全一致：只对 response region 做 logit KD。
 
-取值含义：
+logit KD 按 **region** 分别计算 token 均值，再线性组合：
 
-- `0.0`：response-target-only KD（当前默认行为）
-- `0.05`：prompt token 的 KD 相对权重为 response 的 5%
-- `1.0`：所有有效 next-token 位置等权
+```text
+L_logit = L_response + prompt_kd_weight * L_prompt
+```
+
+- `L_response`：response region（`labels != -100` 且非 padding；causal shift 到 logits 位置）上的 per-token KD token 均值。
+- `L_prompt`：prompt region（`labels == -100` 且非 padding；同样 shift）上**独立**计算的 token 均值。
+
+**取值含义**：系数作用于 **region 均值**，与 prompt/response token 数量比无关。例如 `0.03` 表示 prompt-region 均值以系数 0.03 加入总 logit KD；`1.0` 表示两个 region 均值等系数相加。
 
 该权重**只**作用于 teacher-student logit KD（含 EAKLD / forward KL 等），**不**改变 CE 或 `--hidden_loss_weight` 对应的 hidden-state alignment。
 
-mask 规则：
+EAKLD 在 response / prompt region 上**分别**计算 teacher entropy 与 gamma，再各自得到 region 均值后按上式组合。现有 `eakld/*` 训练日志 telemetry 仍只反映 **response region** 的 EAKLD 统计。
 
-- padding 与序列最后一个无 next-token 的 logits 始终排除（权重 0）
-- 预测 EOS 的 logits 仍按 response target 计入（权重 1.0）
-- EAKLD 的 teacher entropy、gamma 与 KL 项共用同一 weighted mask
+padding 与序列最后一个无 next-token 的 logits 不计入任一 region。预测 EOS 的 logits 仍属于 response region。
 
 `--dataset_task mcqa` 不支持 `prompt_kd_weight != 0`。
 
-以下数值仅作实验示例，**不是**推荐最优值或已验证结论：
+以下数值仅作实验示例，**不是**推荐最优值，也**未**经对照实验验证下游收益：
 
 ```bash
---prompt_kd_weight 0.05
+--prompt_kd_weight 0.03
 --prompt_kd_weight 0.1
 ```
+
+## Token telemetry
+
+E2E 训练日志会周期性输出 `E2E token stats:` 行，语义与类别蒸馏的 `LoRA token stats:` 一致（仅日志前缀不同）。
+
+计数规则（**不是** causal KD mask 计数）：
+
+- 直接统计 truncation 后 `labels` 与 `attention_mask` 上的非 padding 位置。
+- prompt token：`attention_mask != 0` 且 `labels == -100`。
+- response token：`attention_mask != 0` 且 `labels != -100`（含 EOS）。
+- 不做 causal shift；例如 `labels=[-100,-100,-100,A,B,EOS]` 的一个样本计 prompt=3、response=3。
+
+每个 regular logging window 内，所有 gradient accumulation micro-batch 与 DDP rank 的计数先求 global sum，再除以 global sample 数得到 per-sample 均值。输出字段：`step`、`window_optimizer_steps`、`avg_prompt_tokens`、`avg_response_tokens`、`global_samples`。
 
 ## 1. `decoder`
 

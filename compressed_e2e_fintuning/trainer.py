@@ -25,7 +25,8 @@ from e2e_common.dense_loss import (
     get_output_logits,
 )
 from train_utils.distill_losses import (
-    build_distill_token_mask,
+    DistillTokenRegions,
+    build_distill_token_regions,
     compute_teacher_entropy_mean_and_gamma,
     is_eakld_top_loss,
 )
@@ -39,6 +40,7 @@ _EAKLD_WEIGHTED_KEYS = (
     "reverse_kl",
     "eakld_total",
 )
+from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.lora_training import (
     build_distill_hidden_layer_weights,
     compute_distill_hidden_alignment_loss,
@@ -98,6 +100,73 @@ class E2ETrainerLogCallback(TrainerCallback):
 class _QuietProgressCallback(ProgressCallback if ProgressCallback is not None else object):
     def on_log(self, args, state, control, logs=None, **kwargs):
         return
+
+
+class E2EDistillTokenStatsCallback(TrainerCallback):
+    """Mirror _LoraDistillTokenStatsCallback for VAEDecoderE2ETrainer.
+
+    Same boundary / window_start_step / reduce-before-rank0 / resume semantics
+    as category distillation; only the log prefix differs ("E2E token stats").
+    """
+
+    def __init__(self, *, trainer, logger):
+        self._trainer = trainer
+        self._logger = logger
+        self.window_start_step = None
+
+    def on_step_end(self, args, state, control, **kwargs):
+        logging_steps = getattr(state, "logging_steps", None)
+        if not isinstance(logging_steps, int) or logging_steps <= 0:
+            raise ValueError(
+                f"state.logging_steps must be a positive integer, got {logging_steps!r}."
+            )
+
+        global_step = int(getattr(state, "global_step", 0))
+        if self.window_start_step is None:
+            self.window_start_step = global_step
+
+        if global_step <= 0 or global_step % logging_steps != 0:
+            return
+
+        # Reduce across ranks before checking rank0 so all ranks participate in
+        # the collective; only rank0 writes the resulting log line.
+        stats = self._trainer.distill_token_stats.consume_global(self._trainer.accelerator)
+        window_optimizer_steps = global_step - self.window_start_step + 1
+        self.window_start_step = global_step + 1
+
+        if stats is None:
+            return
+
+        if not bool(getattr(state, "is_world_process_zero", True)):
+            return
+
+        _log_e2e_trainer_message_to_file_handlers(
+            self._logger,
+            "E2E token stats: step=%s window_optimizer_steps=%d avg_prompt_tokens=%.4f avg_response_tokens=%.4f global_samples=%d",
+            str(global_step),
+            int(window_optimizer_steps),
+            float(stats.avg_prompt_tokens_per_sample),
+            float(stats.avg_response_tokens_per_sample),
+            int(stats.global_samples),
+        )
+
+
+def _log_e2e_trainer_message_to_file_handlers(logger, message: str, *args) -> None:
+    record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        fn="",
+        lno=0,
+        msg=message,
+        args=args,
+        exc_info=None,
+    )
+    for handler in list(getattr(logger, "handlers", [])):
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        if record.levelno < handler.level:
+            continue
+        handler.handle(record)
 
 
 def replace_progress_log_callback(trainer):
@@ -284,6 +353,8 @@ class VAEDecoderE2ETrainer(Trainer):
         self._eakld_telemetry_weight = 0.0
         self._eakld_gamma_zero_weight = 0.0
         self._eakld_gamma_one_weight = 0.0
+        # Logging-window token telemetry; consumed by E2EDistillTokenStatsCallback.
+        self.distill_token_stats = DistillTokenStatsAccumulator()
         super().__init__(*args, **kwargs)
         # Custom compute_loss returns token-mean losses. HF treats models with
         # forward(**kwargs) as accepting num_items_in_batch and then skips
@@ -399,16 +470,15 @@ class VAEDecoderE2ETrainer(Trainer):
         if targets is not None:
             targets.clear()
 
-    def _build_distill_token_mask(
+    def _build_distill_token_regions(
         self,
         inputs: Dict[str, torch.Tensor],
         reference_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        return build_distill_token_mask(
+    ) -> DistillTokenRegions:
+        return build_distill_token_regions(
             labels=inputs.get("labels"),
             attention_mask=inputs.get("attention_mask"),
             reference_logits=reference_logits,
-            prompt_kd_weight=self.prompt_kd_weight,
         )
 
     def _build_cpu_teacher_targets(
@@ -426,8 +496,7 @@ class VAEDecoderE2ETrainer(Trainer):
         targets = TeacherTargetBatch()
         teacher_outputs = None
         teacher_logits = None
-        gamma_mask = None
-        gamma = None
+        regions: Optional[DistillTokenRegions] = None
         try:
             teacher_inputs = dict(inputs)
             teacher_inputs.pop("labels", None)
@@ -455,17 +524,22 @@ class VAEDecoderE2ETrainer(Trainer):
             gamma_cpu = None
             entropy_mean_cpu = None
             valid_count_cpu = None
+            prompt_gamma_cpu = None
+            prompt_entropy_mean_cpu = None
+            prompt_valid_count_cpu = None
             if logits_required:
                 teacher_logits = get_output_logits(teacher_outputs)
-                gamma_mask = self._build_distill_token_mask(inputs, teacher_logits)
-                entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
-                    teacher_logits,
-                    gamma_mask,
-                    confidence_k=self.eakld_confidence_k,
-                )
+                regions = self._build_distill_token_regions(inputs, teacher_logits)
+                # Single CPU copy of full teacher logits, reused for both regions.
                 logits_cpu = copy_detached_tensor_to_cpu(
                     teacher_logits,
                     pin_memory=self.teacher_output_pin_memory,
+                )
+                # Always compute response-region scalars.
+                entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
+                    logits_cpu,
+                    regions.response_mask,
+                    confidence_k=self.eakld_confidence_k,
                 )
                 gamma_cpu = gamma.detach().reshape(()).to(device="cpu", dtype=torch.float32)
                 entropy_mean_cpu = entropy_mean.detach().reshape(()).to(
@@ -476,6 +550,29 @@ class VAEDecoderE2ETrainer(Trainer):
                     device="cpu",
                     dtype=torch.float32,
                 )
+                # Only compute prompt-region scalars when prompt weight is positive.
+                if self.prompt_kd_weight > 0.0:
+                    (
+                        prompt_entropy_mean,
+                        prompt_gamma,
+                        prompt_valid_count,
+                    ) = compute_teacher_entropy_mean_and_gamma(
+                        logits_cpu,
+                        regions.prompt_mask,
+                        confidence_k=self.eakld_confidence_k,
+                    )
+                    prompt_gamma_cpu = prompt_gamma.detach().reshape(()).to(
+                        device="cpu",
+                        dtype=torch.float32,
+                    )
+                    prompt_entropy_mean_cpu = prompt_entropy_mean.detach().reshape(()).to(
+                        device="cpu",
+                        dtype=torch.float32,
+                    )
+                    prompt_valid_count_cpu = prompt_valid_count.detach().reshape(()).to(
+                        device="cpu",
+                        dtype=torch.float32,
+                    )
 
             hidden_layer_indices: tuple = ()
             hidden_cpu_by_layer: Dict[int, torch.Tensor] = {}
@@ -485,17 +582,19 @@ class VAEDecoderE2ETrainer(Trainer):
                     raise RuntimeError("hidden_required=True but teacher hidden collector is missing.")
                 hidden_layer_indices, hidden_cpu_by_layer, num_hidden_layers = collector.finalize()
 
-            del teacher_outputs, teacher_logits, gamma_mask, gamma
+            del teacher_outputs, teacher_logits, regions
             teacher_outputs = None
             teacher_logits = None
-            gamma_mask = None
-            gamma = None
+            regions = None
 
             targets = TeacherTargetBatch(
                 logits_cpu=logits_cpu,
                 eakld_gamma_cpu=gamma_cpu,
                 teacher_entropy_mean_cpu=entropy_mean_cpu,
                 teacher_valid_token_count_cpu=valid_count_cpu,
+                eakld_prompt_gamma_cpu=prompt_gamma_cpu,
+                teacher_prompt_entropy_mean_cpu=prompt_entropy_mean_cpu,
+                teacher_prompt_valid_token_count_cpu=prompt_valid_count_cpu,
                 hidden_cpu_by_layer=dict(hidden_cpu_by_layer),
                 hidden_layer_indices=tuple(hidden_layer_indices),
                 num_hidden_layers=int(num_hidden_layers),
@@ -509,7 +608,7 @@ class VAEDecoderE2ETrainer(Trainer):
             return targets
         except Exception:
             targets.clear()
-            del teacher_outputs, teacher_logits, gamma_mask, gamma
+            del teacher_outputs, teacher_logits, regions
             raise
 
     def _compute_choice_kd_loss(self, model, inputs, return_outputs: bool):
@@ -604,18 +703,20 @@ class VAEDecoderE2ETrainer(Trainer):
         teacher_inputs.pop("num_items_in_batch", None)
         teacher_outputs = self._compute_teacher_outputs(teacher_inputs, output_hidden_states=hidden_loss_enabled)
         teacher_logits = get_output_logits(teacher_outputs).to(device=logits.device)
-        token_mask = self._build_distill_token_mask(inputs, logits)
+        regions = self._build_distill_token_regions(inputs, logits)
         telemetry: Dict[str, torch.Tensor] = {}
         distill_loss = compute_dense_loss_from_logits(
             loss_type=loss_type,
             student_logits=logits,
             teacher_logits=teacher_logits,
             ce_loss=ce_loss,
-            mask=token_mask,
+            mask=regions.response_mask,
             temperature=self.distill_temperature,
             alpha=self.distill_alpha,
             eakld_confidence_k=int(self.eakld_confidence_k),
             telemetry_out=telemetry,
+            prompt_mask=regions.prompt_mask,
+            prompt_kd_weight=self.prompt_kd_weight,
         )
         self._record_eakld_telemetry(telemetry)
         hidden_loss = None
@@ -695,7 +796,16 @@ class VAEDecoderE2ETrainer(Trainer):
                         "EAKLD-family loss requires teacher logits, gamma, and "
                         "entropy scalars on CPU."
                     )
-                token_mask = self._build_distill_token_mask(inputs, logits)
+                regions = self._build_distill_token_regions(inputs, logits)
+                if self.prompt_kd_weight > 0.0 and (
+                    targets.eakld_prompt_gamma_cpu is None
+                    or targets.teacher_prompt_entropy_mean_cpu is None
+                    or targets.teacher_prompt_valid_token_count_cpu is None
+                ):
+                    raise RuntimeError(
+                        "prompt_kd_weight > 0 requires prompt-region teacher "
+                        "scalars on CPU."
+                    )
                 telemetry: Dict[str, torch.Tensor] = {}
                 distill_loss = compute_dense_loss_from_offloaded_teacher(
                     loss_type=loss_type,
@@ -707,12 +817,21 @@ class VAEDecoderE2ETrainer(Trainer):
                         targets.teacher_valid_token_count_cpu
                     ),
                     ce_loss=ce_loss,
-                    mask=token_mask,
+                    mask=regions.response_mask,
                     temperature=self.distill_temperature,
                     alpha=self.distill_alpha,
-                            eakld_confidence_k=int(self.eakld_confidence_k),
+                    eakld_confidence_k=int(self.eakld_confidence_k),
                     sequence_chunk_size=int(self.teacher_output_chunk_tokens),
                     telemetry_out=telemetry,
+                    prompt_mask=regions.prompt_mask,
+                    prompt_kd_weight=self.prompt_kd_weight,
+                    teacher_prompt_gamma_cpu=targets.eakld_prompt_gamma_cpu,
+                    teacher_prompt_entropy_mean_cpu=(
+                        targets.teacher_prompt_entropy_mean_cpu
+                    ),
+                    teacher_prompt_valid_token_count_cpu=(
+                        targets.teacher_prompt_valid_token_count_cpu
+                    ),
                 )
                 self._record_eakld_telemetry(telemetry)
 
@@ -752,6 +871,15 @@ class VAEDecoderE2ETrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         del num_items_in_batch, kwargs
+        # Record token-window telemetry exactly once from original labels before
+        # dispatching to choice/dense/CPU paths. MCQA requests expose no
+        # ordinary rank-2 `labels`; skip them explicitly rather than fabricating.
+        if bool(getattr(model, "training", False)):
+            original_labels = inputs.get("labels")
+            if isinstance(original_labels, torch.Tensor):
+                self.distill_token_stats.update(
+                    original_labels, inputs.get("attention_mask")
+                )
         if "choice_input_ids" in inputs:
             return self._compute_choice_kd_loss(model, inputs, return_outputs=bool(return_outputs))
         if self.teacher_output_offload == "none":
