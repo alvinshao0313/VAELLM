@@ -41,44 +41,74 @@ def build_distill_token_mask(
     labels: Optional[torch.Tensor],
     attention_mask: Optional[torch.Tensor],
     reference_logits: torch.Tensor,
+    prompt_kd_weight: float = 0.0,
 ) -> torch.Tensor:
     if reference_logits.ndim < 3:
         raise ValueError(
             f"reference_logits must have shape [B, L, V], got ndim={reference_logits.ndim}"
         )
 
+    resolved_prompt_kd_weight = float(prompt_kd_weight)
+    if resolved_prompt_kd_weight < 0:
+        raise ValueError(
+            f"prompt_kd_weight must be >= 0, got {resolved_prompt_kd_weight}"
+        )
+
     expected_shape = tuple(int(dim) for dim in reference_logits.shape[:2])
-    source_validity: Optional[torch.Tensor] = None
+    device = reference_logits.device
+    source_weights: Optional[torch.Tensor] = None
 
     if isinstance(labels, torch.Tensor):
-        source_validity = labels.ne(-100)
-    elif isinstance(attention_mask, torch.Tensor):
-        source_validity = attention_mask.ne(0)
+        if tuple(int(dim) for dim in labels.shape) != expected_shape:
+            raise ValueError(
+                f"mask shape mismatch: expected {expected_shape}, got {tuple(labels.shape)}"
+            )
+        labels = labels.to(device=device)
 
-    if source_validity is None:
-        source_validity = torch.ones(
-            expected_shape,
-            dtype=torch.bool,
-            device=reference_logits.device,
+        if resolved_prompt_kd_weight == 0.0:
+            source_weights = labels.ne(-100).to(dtype=torch.float32)
+        else:
+            response_validity = labels.ne(-100)
+            prompt_validity = labels.eq(-100)
+
+            if isinstance(attention_mask, torch.Tensor):
+                if tuple(int(dim) for dim in attention_mask.shape) != expected_shape:
+                    raise ValueError(
+                        f"mask shape mismatch: expected {expected_shape}, got {tuple(attention_mask.shape)}"
+                    )
+                attention_validity = attention_mask.to(
+                    device=device,
+                    dtype=torch.bool,
+                ).ne(0)
+                response_validity = response_validity & attention_validity
+                prompt_validity = prompt_validity & attention_validity
+
+            source_weights = response_validity.to(dtype=torch.float32) + (
+                prompt_validity.to(dtype=torch.float32) * resolved_prompt_kd_weight
+            )
+    elif isinstance(attention_mask, torch.Tensor):
+        if tuple(int(dim) for dim in attention_mask.shape) != expected_shape:
+            raise ValueError(
+                f"mask shape mismatch: expected {expected_shape}, got {tuple(attention_mask.shape)}"
+            )
+        source_weights = attention_mask.to(device=device, dtype=torch.bool).ne(0).to(
+            dtype=torch.float32
         )
     else:
-        if tuple(int(dim) for dim in source_validity.shape) != expected_shape:
-            raise ValueError(
-                f"mask shape mismatch: expected {expected_shape}, got {tuple(source_validity.shape)}"
-            )
-        source_validity = source_validity.to(
-            device=reference_logits.device,
-            dtype=torch.bool,
+        source_weights = torch.ones(
+            expected_shape,
+            dtype=torch.float32,
+            device=device,
         )
 
     causal_mask = torch.zeros(
         expected_shape,
         dtype=torch.float32,
-        device=reference_logits.device,
+        device=device,
     )
     sequence_length = int(expected_shape[1])
     if sequence_length > 1:
-        causal_mask[:, :-1] = source_validity[:, 1:].to(dtype=torch.float32)
+        causal_mask[:, :-1] = source_weights[:, 1:]
     return causal_mask
 
 

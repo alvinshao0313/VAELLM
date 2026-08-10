@@ -74,6 +74,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
+    --prompt_kd_weight 0.0 \
     --hidden_loss_weight 0.1 \
     --hidden_layer_weighting adaptive_top_3 \
     --teacher_output_offload cpu \
@@ -130,6 +131,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
+    --prompt_kd_weight 0.0 \
     --hidden_loss_weight 0.01 \
     --hidden_layer_weighting adaptive_top_3 \
     --teacher_output_offload cpu \

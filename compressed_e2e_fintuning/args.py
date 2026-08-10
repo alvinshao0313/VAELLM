@@ -50,6 +50,7 @@ class VAEDecoderE2EArguments:
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
     hidden_loss_weight: float = 0.0
+    prompt_kd_weight: float = 0.0
     eakld_confidence_k: int = 16
     hidden_layer_weighting: str = "uniform"
     teacher_output_offload: str = "none"
@@ -120,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--distill_alpha", type=float, default=0.5)
     parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
+    parser.add_argument("--prompt_kd_weight", type=float, default=0.0)
     parser.add_argument("--eakld_confidence_k", type=int, default=16)
     parser.add_argument("--hidden_layer_weighting", type=str, default="uniform")
     parser.add_argument("--teacher_output_offload", type=str, default="none")
@@ -273,12 +275,19 @@ def validate_args(
             parser.error("--dataset_task mcqa requires --loss_type choice_kd or choice_kd_ce.")
         if float(args.hidden_loss_weight) > 0.0:
             parser.error("--dataset_task mcqa does not support --hidden_loss_weight > 0.")
+        if float(args.prompt_kd_weight) != 0.0:
+            parser.error(
+                "--dataset_task mcqa does not support --prompt_kd_weight != 0 "
+                "(choice KD has no token mask)."
+            )
     if float(args.distill_temperature) <= 0.0:
         parser.error("--distill_temperature must be > 0.")
     if not (0.0 <= float(args.distill_alpha) <= 1.0):
         parser.error("--distill_alpha must satisfy 0 <= alpha <= 1.")
     if float(args.hidden_loss_weight) < 0.0:
         parser.error("--hidden_loss_weight must be >= 0.")
+    if float(args.prompt_kd_weight) < 0.0:
+        parser.error("--prompt_kd_weight must be >= 0.")
     if int(args.eakld_confidence_k) < 2:
         parser.error("--eakld_confidence_k must be >= 2.")
     try:

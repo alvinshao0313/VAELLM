@@ -32,6 +32,39 @@
 
 这个损失会额外保存 teacher/student hidden states，长序列训练时显存压力会增加。
 
+## Prompt KD weighting
+
+可选参数：
+
+```bash
+--prompt_kd_weight 0.0
+```
+
+`prompt_kd_weight=0.0`（默认）与当前行为完全一致：只对 response target 做 logit KD。response target 权重固定为 1.0，不可单独配置。
+
+取值含义：
+
+- `0.0`：response-target-only KD（当前默认行为）
+- `0.05`：prompt token 的 KD 相对权重为 response 的 5%
+- `1.0`：所有有效 next-token 位置等权
+
+该权重**只**作用于 teacher-student logit KD（含 EAKLD / forward KL 等），**不**改变 CE 或 `--hidden_loss_weight` 对应的 hidden-state alignment。
+
+mask 规则：
+
+- padding 与序列最后一个无 next-token 的 logits 始终排除（权重 0）
+- 预测 EOS 的 logits 仍按 response target 计入（权重 1.0）
+- EAKLD 的 teacher entropy、gamma 与 KL 项共用同一 weighted mask
+
+`--dataset_task mcqa` 不支持 `prompt_kd_weight != 0`。
+
+以下数值仅作实验示例，**不是**推荐最优值或已验证结论：
+
+```bash
+--prompt_kd_weight 0.05
+--prompt_kd_weight 0.1
+```
+
 ## 1. `decoder`
 
 只训练 VAELinear 的 decoder。

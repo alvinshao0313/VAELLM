@@ -977,6 +977,10 @@ def run(args, hf_args, training_args):
         str(getattr(args, "hidden_layer_weighting", "uniform")),
     )
     log.info(
+        "Prompt KD weight config: prompt_kd_weight=%.6f response_kd_weight=1.0",
+        float(getattr(args, "prompt_kd_weight", 0.0)),
+    )
+    log.info(
         "Teacher output config: offload=%s pin_memory=%s chunk_tokens=%d "
         "teacher_weight_offload=false",
         str(args.teacher_output_offload),
@@ -1024,6 +1028,7 @@ def run(args, hf_args, training_args):
         distill_temperature=args.distill_temperature,
         distill_alpha=args.distill_alpha,
         hidden_loss_weight=float(args.hidden_loss_weight),
+        prompt_kd_weight=float(args.prompt_kd_weight),
         hidden_layer_weighting=str(args.hidden_layer_weighting),
         teacher_output_offload=str(args.teacher_output_offload),
         teacher_output_pin_memory=bool(args.teacher_output_pin_memory),

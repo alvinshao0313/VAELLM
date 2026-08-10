@@ -52,7 +52,8 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_log_every "default=10" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
-  --distill_loss_type "default=eakld_top_100" \
+  --distill_prompt_kd_weight "default=0.03" \
+  --distill_loss_type "default=kl_top_100" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
   --distill_hidden_loss_weight "default=0.1" \

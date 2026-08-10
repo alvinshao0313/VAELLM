@@ -2584,6 +2584,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         (cat_args.distill_loss_type, "--distill_loss_type"),
         (cat_args.distill_hidden_loss_weight, "--distill_hidden_loss_weight"),
         (cat_args.distill_pre_mlp_hidden_loss_weight, "--distill_pre_mlp_hidden_loss_weight"),
+        (cat_args.distill_prompt_kd_weight, "--distill_prompt_kd_weight"),
         (cat_args.lora_use_dora, "--lora_use_dora"),
     )
     for table, arg_name in distill_tables:

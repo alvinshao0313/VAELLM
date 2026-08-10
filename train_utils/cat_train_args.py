@@ -117,6 +117,7 @@ class NormalizedCatArgs:
     distill_loss_type: OverrideTable[str]
     distill_hidden_loss_weight: OverrideTable[float]
     distill_pre_mlp_hidden_loss_weight: OverrideTable[float]
+    distill_prompt_kd_weight: OverrideTable[float]
     distill_hidden_alignment_layer_weighting: str
     distill_eakld_confidence_k: int
     lora_use_dora: OverrideTable[bool]
@@ -211,6 +212,7 @@ class ResolvedDistillRuntimeConfig:
     loss_type: str
     hidden_loss_weight: float
     pre_mlp_hidden_loss_weight: float
+    prompt_kd_weight: float
     hidden_alignment_layer_weighting: str
     eakld_confidence_k: int
     use_dora: bool
@@ -695,6 +697,12 @@ _DISTILL_PRE_MLP_HIDDEN_LOSS_WEIGHT_SPEC = _make_override_spec(
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=0.0,after:o_proj=0.01",
 )
+_DISTILL_PROMPT_KD_WEIGHT_SPEC = _make_override_spec(
+    arg_name="--distill_prompt_kd_weight",
+    parse_value=lambda raw: _parse_nonnegative_float_text(raw, arg_name="--distill_prompt_kd_weight"),
+    allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=0.0,after:q_proj=0.05",
+)
 _LORA_USE_DORA_SPEC = _make_override_spec(
     arg_name="--lora_use_dora",
     parse_value=lambda raw: parse_bool_text(raw, arg_name="--lora_use_dora"),
@@ -853,6 +861,10 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         distill_pre_mlp_hidden_loss_weight=_parse_cat_override(
             raw_args.distill_pre_mlp_hidden_loss_weight,
             spec=_DISTILL_PRE_MLP_HIDDEN_LOSS_WEIGHT_SPEC,
+        ),
+        distill_prompt_kd_weight=_parse_cat_override(
+            raw_args.distill_prompt_kd_weight,
+            spec=_DISTILL_PROMPT_KD_WEIGHT_SPEC,
         ),
         distill_hidden_alignment_layer_weighting=parse_distill_hidden_alignment_layer_weighting(
             raw_args.distill_hidden_alignment_layer_weighting
@@ -1343,6 +1355,7 @@ def resolve_distill_runtime_config(cat_args: NormalizedCatArgs, after_category: 
         pre_mlp_hidden_loss_weight=float(
             resolve_after_category_value(cat_args.distill_pre_mlp_hidden_loss_weight, after_category)
         ),
+        prompt_kd_weight=float(resolve_after_category_value(cat_args.distill_prompt_kd_weight, after_category)),
         hidden_alignment_layer_weighting=str(cat_args.distill_hidden_alignment_layer_weighting),
         eakld_confidence_k=int(cat_args.distill_eakld_confidence_k),
         use_dora=bool(resolve_after_category_value(cat_args.lora_use_dora, after_category)),
@@ -1592,6 +1605,12 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         type=str,
         default="default=0.0",
         help=f"after_category 覆盖参数。示例：{_DISTILL_PRE_MLP_HIDDEN_LOSS_WEIGHT_SPEC.example}",
+    )
+    parser.add_argument(
+        "--distill_prompt_kd_weight",
+        type=str,
+        default="default=0.0",
+        help=f"after_category 覆盖参数。示例：{_DISTILL_PROMPT_KD_WEIGHT_SPEC.example}",
     )
     parser.add_argument(
         "--distill_hidden_alignment_layer_weighting",

@@ -542,6 +542,7 @@ else:
             loss_alpha: float = 0.5,
             hidden_loss_weight: float = 0.0,
             pre_mlp_hidden_loss_weight: float = 0.0,
+            prompt_kd_weight: float = 0.0,
             hidden_alignment_layer_weighting: str = "uniform",
             eakld_confidence_k: int = 16,
             teacher_logits_cpu_staging: bool = False,
@@ -561,6 +562,9 @@ else:
                 raise ValueError(
                     f"pre_mlp_hidden_loss_weight must be >= 0, got {self.pre_mlp_hidden_loss_weight}."
                 )
+            self.prompt_kd_weight = float(prompt_kd_weight)
+            if self.prompt_kd_weight < 0.0:
+                raise ValueError(f"prompt_kd_weight must be >= 0, got {self.prompt_kd_weight}.")
             self.hidden_alignment_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
                 hidden_alignment_layer_weighting
             )
@@ -743,6 +747,14 @@ else:
                     loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
                 return loss
 
+            def build_token_mask(reference_logits):
+                return build_distill_token_mask(
+                    labels=full_inputs.get("labels"),
+                    attention_mask=full_inputs.get("attention_mask"),
+                    reference_logits=reference_logits,
+                    prompt_kd_weight=self.prompt_kd_weight,
+                )
+
             try:
                 if loss_type in {"origin", "sft"}:
                     if hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
@@ -774,11 +786,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_reverse_kl_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -795,11 +803,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_dual_rkl_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -815,11 +819,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_forward_kl_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -837,11 +837,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_rkl_topk(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -860,11 +856,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_dual_rkl_topk_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -882,11 +874,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_kl_topk(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -907,11 +895,7 @@ else:
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     distill_loss = compute_kl_topk(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -931,11 +915,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_masked_logit_mse_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -953,11 +933,7 @@ else:
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     distill_loss = compute_forward_kl_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -976,11 +952,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_dual_kl_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -997,11 +969,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_dual_kl_topk_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -1020,11 +988,7 @@ else:
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     ori_loss = outputs["loss"]
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     distill_loss = compute_dual_kl_topk_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -1044,11 +1008,7 @@ else:
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     ori_loss = outputs["loss"]
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     distill_loss = compute_dual_kl_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -1067,11 +1027,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_eakld_topk(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -1090,11 +1046,7 @@ else:
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     loss = compute_eakld(
                         student_logits=logits,
                         teacher_logits=teacher_logits,
@@ -1114,11 +1066,7 @@ else:
                     teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
                     T, alpha = self.temperature, self.loss_alpha
                     ori_loss = outputs["loss"]
-                    token_mask = build_distill_token_mask(
-                        labels=full_inputs.get("labels"),
-                        attention_mask=full_inputs.get("attention_mask"),
-                        reference_logits=logits,
-                    )
+                    token_mask = build_token_mask(logits)
                     distill_loss = compute_entropy_aware_kl_loss(
                         student_logits=logits,
                         teacher_logits=teacher_logits,

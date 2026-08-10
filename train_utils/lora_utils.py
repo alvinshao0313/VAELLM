@@ -70,6 +70,7 @@ class _ResolvedDistillStageConfig:
     loss_type: str
     hidden_loss_weight: float
     pre_mlp_hidden_loss_weight: float
+    prompt_kd_weight: float
     hidden_alignment_layer_weighting: str
     eakld_confidence_k: int
     dataset: str
@@ -312,6 +313,7 @@ def _resolve_distill_stage_config(
         loss_type=str(runtime_cfg.loss_type),
         hidden_loss_weight=float(runtime_cfg.hidden_loss_weight),
         pre_mlp_hidden_loss_weight=float(runtime_cfg.pre_mlp_hidden_loss_weight),
+        prompt_kd_weight=float(runtime_cfg.prompt_kd_weight),
         hidden_alignment_layer_weighting=str(runtime_cfg.hidden_alignment_layer_weighting),
         eakld_confidence_k=int(runtime_cfg.eakld_confidence_k),
         dataset=str(getattr(cat_args, "distill_dataset", "")).strip().lower(),
@@ -438,11 +440,12 @@ def _log_lora_stage_start(
             int(cfg.seed),
         )
         logger.info(
-            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f hidden_loss_weight=%.6f pre_mlp_hidden_loss_weight=%.6f hidden_alignment_layer_weighting=%s",
+            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f hidden_loss_weight=%.6f pre_mlp_hidden_loss_weight=%.6f prompt_kd_weight=%.6f hidden_alignment_layer_weighting=%s",
             float(cfg.loss_alpha),
             float(cfg.temperature),
             float(cfg.hidden_loss_weight),
             float(cfg.pre_mlp_hidden_loss_weight),
+            float(cfg.prompt_kd_weight),
             str(cfg.hidden_alignment_layer_weighting),
         )
         return
@@ -614,6 +617,7 @@ def _build_lora_trainer(
             loss_alpha=float(cfg.loss_alpha),
             hidden_loss_weight=float(cfg.hidden_loss_weight),
             pre_mlp_hidden_loss_weight=float(cfg.pre_mlp_hidden_loss_weight),
+            prompt_kd_weight=float(cfg.prompt_kd_weight),
             hidden_alignment_layer_weighting=str(cfg.hidden_alignment_layer_weighting),
             eakld_confidence_k=int(cfg.eakld_confidence_k),
             teacher_logits_cpu_staging=bool(

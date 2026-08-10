@@ -83,6 +83,7 @@
 - `distill_loss_alpha`
 - `distill_loss_type`
 - `distill_hidden_loss_weight`
+- `distill_prompt_kd_weight`
 - `lora_use_dora`
 
 写法：
@@ -90,6 +91,7 @@
 ```bash
 --lora_rank default=8,after:q_proj=16
 --distill_steps default=50,after:q_proj=200
+--distill_prompt_kd_weight default=0.0,after:q_proj=0.05
 ```
 
 规则：
@@ -196,6 +198,7 @@
 | `--distill_loss_type` | `default=eakld` | LoRA loss 类型（含 `eakld` / `eakld_kd` / `kd_top_*` 等） | after-category override |
 | `--distill_eakld_confidence_k` | `16` | EAKLD 熵归一化 K（非 vocab top-k） | 全局 |
 | `--distill_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
+| `--distill_prompt_kd_weight` | `default=0.0` | LoRA 蒸馏中 prompt token 的 KD 相对权重 | after-category override；`>=0`；response target 固定 1.0；`0.0` 与当前 response-target-only KD 完全一致；`0.05` 表示 prompt 相对 response 权重为 5%；`1.0` 表示所有有效 next-token 位置等权；只作用于 logit KD，不改变 CE / hidden loss；padding 与最后一个无 next-token 的 logits 始终权重 0，EOS target 仍按 response 计入；EAKLD 的 entropy/gamma 与 KL 共用同一 weighted mask |
 | `--distill_hidden_alignment_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权全层；`linear_depth` 后层权重线性增大并归一到平均权重为 1；`adaptive` 默认选 cosine 最低的 3 层；`adaptive_top_<K>` 仅对 teacher 相邻层变化最大的 K 层计算对齐损失 |
 | `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 `remaining_lora` 支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
 | `--distill_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 `--distill_after_category=remaining_lora` 支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
@@ -396,6 +399,36 @@
 - `compressed_lora` / `both` 如果 `--lora_use_dora` 解析为 `true` 会直接报错；v1 不做 DoRA 到低秩补丁的近似 SVD。
 - `compressed_lora` / `decoder` / `both` 如果开启 `--distill_tune_final_norm` 或 `--distill_use_post_norm_head_linear` 会直接报错，避免每类后移动最终 logits 路径。
 - 最终普通 cat checkpoint 不保留 `PeftVAELinearProxy` / `CompressedSubspacePeftProxy`；保存前若仍有 proxy 残留会直接报错。
+
+### 6.11.1 Prompt KD weighting（`--distill_prompt_kd_weight`）
+
+`--distill_prompt_kd_weight` 只调整 teacher-student logit KD 的 token 权重，不改变 CE、hidden-state alignment 或 pre-MLP hidden alignment。
+
+权重语义（causal LM 中 `logits[:, t]` 预测位置 `t+1` 的 token，因此先在 target 位置定义权重，再左移一位到 logits 位置）：
+
+- `labels[j] != -100` 且非 padding：response / supervised target，权重 **1.0**（固定，不可配置）。
+- `labels[j] == -100` 且非 padding：prompt / context target，权重 **`prompt_kd_weight`**。
+- padding（`attention_mask[j] == 0`）：权重 **0**。
+- 序列最后一个 logits 无 next-token target：权重 **0**。
+- 预测 EOS 的 logits 仍属于 response target，权重 **1.0**。
+
+取值含义：
+
+| 值 | 行为 |
+|---|---|
+| `0.0`（默认） | 与当前实现完全一致：只对 response target 做 KD |
+| `0.05` | prompt token 的 KD 相对权重为 response 的 5% |
+| `1.0` | 所有有效 next-token 位置等权 |
+| `>1.0` | 允许实验；prompt 权重可高于 response |
+
+EAKLD 的 teacher entropy、gamma 与 KL 项共用同一 weighted mask，归一化为 `sum(token_loss * mask) / sum(mask)`。
+
+以下数值仅作实验示例，**不是**推荐最优值或已验证结论：
+
+```bash
+--distill_prompt_kd_weight default=0.0,after:q_proj=0.05
+--distill_prompt_kd_weight default=0.0,after:q_proj=0.1
+```
 
 ### 6.12 `normalize_weight`
 

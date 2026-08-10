@@ -231,6 +231,7 @@ class VAEDecoderE2ETrainer(Trainer):
         distill_temperature: float = 1.0,
         distill_alpha: float = 0.5,
         hidden_loss_weight: float = 0.0,
+        prompt_kd_weight: float = 0.0,
         eakld_confidence_k: int = 16,
         hidden_layer_weighting: str = "uniform",
         saved_tensor_offload=None,
@@ -247,6 +248,9 @@ class VAEDecoderE2ETrainer(Trainer):
         self.hidden_loss_weight = float(hidden_loss_weight)
         if self.hidden_loss_weight < 0.0:
             raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
+        self.prompt_kd_weight = float(prompt_kd_weight)
+        if self.prompt_kd_weight < 0.0:
+            raise ValueError(f"prompt_kd_weight must be >= 0, got {self.prompt_kd_weight}.")
         self.eakld_confidence_k = int(eakld_confidence_k)
         if self.eakld_confidence_k < 2:
             raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
@@ -395,6 +399,18 @@ class VAEDecoderE2ETrainer(Trainer):
         if targets is not None:
             targets.clear()
 
+    def _build_distill_token_mask(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        reference_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        return build_distill_token_mask(
+            labels=inputs.get("labels"),
+            attention_mask=inputs.get("attention_mask"),
+            reference_logits=reference_logits,
+            prompt_kd_weight=self.prompt_kd_weight,
+        )
+
     def _build_cpu_teacher_targets(
         self,
         *,
@@ -441,11 +457,7 @@ class VAEDecoderE2ETrainer(Trainer):
             valid_count_cpu = None
             if logits_required:
                 teacher_logits = get_output_logits(teacher_outputs)
-                gamma_mask = build_distill_token_mask(
-                    labels=inputs.get("labels"),
-                    attention_mask=inputs.get("attention_mask"),
-                    reference_logits=teacher_logits,
-                )
+                gamma_mask = self._build_distill_token_mask(inputs, teacher_logits)
                 entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
                     teacher_logits,
                     gamma_mask,
@@ -592,11 +604,7 @@ class VAEDecoderE2ETrainer(Trainer):
         teacher_inputs.pop("num_items_in_batch", None)
         teacher_outputs = self._compute_teacher_outputs(teacher_inputs, output_hidden_states=hidden_loss_enabled)
         teacher_logits = get_output_logits(teacher_outputs).to(device=logits.device)
-        token_mask = build_distill_token_mask(
-            labels=labels,
-            attention_mask=inputs.get("attention_mask"),
-            reference_logits=logits,
-        )
+        token_mask = self._build_distill_token_mask(inputs, logits)
         telemetry: Dict[str, torch.Tensor] = {}
         distill_loss = compute_dense_loss_from_logits(
             loss_type=loss_type,
@@ -687,11 +695,7 @@ class VAEDecoderE2ETrainer(Trainer):
                         "EAKLD-family loss requires teacher logits, gamma, and "
                         "entropy scalars on CPU."
                     )
-                token_mask = build_distill_token_mask(
-                    labels=labels,
-                    attention_mask=inputs.get("attention_mask"),
-                    reference_logits=logits,
-                )
+                token_mask = self._build_distill_token_mask(inputs, logits)
                 telemetry: Dict[str, torch.Tensor] = {}
                 distill_loss = compute_dense_loss_from_offloaded_teacher(
                     loss_type=loss_type,
