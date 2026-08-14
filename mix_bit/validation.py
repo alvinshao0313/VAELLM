@@ -14,6 +14,7 @@ from torch import nn
 from litebsq.vae_linear import VAELinear
 from mix_bit.assembler import (
     REFERENCE_LOGITS_FILENAME,
+    _clear_decoded_caches,
     _validate_allocation_payload,
     build_model_from_assignments,
     build_uniform_assignments,
@@ -664,6 +665,15 @@ def _measure_actual_kl(
     }
 
 
+def _offload_model_to_cpu(model: nn.Module) -> None:
+    """Drop decoded dense caches and move the live module off the eval GPU."""
+    _clear_decoded_caches(model)
+    model.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
 def _run_downstream_eval(
     *,
     mixed_model: nn.Module,
@@ -690,7 +700,8 @@ def _run_downstream_eval(
             seqlen=DOWNSTREAM_SEQLEN,
             limit=-1,
         )
-        # calculate_ppl uses model.device
+        # calculate_ppl uses model.device. HF models expose a read-only
+        # property; only assign when the attribute is missing.
         if not hasattr(model, "device"):
             try:
                 model.device = next(model.parameters()).device
@@ -726,7 +737,9 @@ def _run_downstream_eval(
             "compact": compact,
         }
 
+    _offload_model_to_cpu(mixed_model)
     baseline_result = _eval_one(baseline_model, "uniform_baseline")
+    _offload_model_to_cpu(baseline_model)
     mixed_result = _eval_one(mixed_model, "mixed_model")
     return {
         "lm_eval_version": lm_eval_version,
@@ -739,6 +752,119 @@ def _run_downstream_eval(
         "uniform_baseline": baseline_result,
         "mixed_model": mixed_result,
     }
+
+
+def _format_wiki_ppl(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):.4f}"
+
+
+def _wiki_ppl_from_eval_block(block: Mapping[str, Any] | None) -> Any:
+    if not isinstance(block, Mapping):
+        return None
+    compact = block.get("compact") if isinstance(block.get("compact"), Mapping) else {}
+    if compact.get("wiki_ppl") is not None:
+        return compact["wiki_ppl"]
+    ppl = block.get("ppl") if isinstance(block.get("ppl"), Mapping) else {}
+    return ppl.get("wiki_ppl")
+
+
+def _score_percent_from_row(row: Mapping[str, Any]) -> str:
+    score = row.get("score_percent")
+    if score is not None and str(score).strip() != "":
+        return str(score)
+    metric = row.get("metric")
+    if metric is None:
+        return "N/A"
+    return f"{float(metric) * 100:.2f}"
+
+
+def _summary_rows_from_eval_block(block: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    if not isinstance(block, Mapping):
+        return []
+    lm = block.get("lm_eval") if isinstance(block.get("lm_eval"), Mapping) else {}
+    rows = lm.get("summary_rows")
+    if isinstance(rows, list) and rows:
+        return [row for row in rows if isinstance(row, Mapping)]
+    metrics = lm.get("task_metrics")
+    if not isinstance(metrics, Mapping) or not metrics:
+        compact = block.get("compact") if isinstance(block.get("compact"), Mapping) else {}
+        metrics = (
+            compact.get("task_metrics")
+            if isinstance(compact.get("task_metrics"), Mapping)
+            else {}
+        )
+    keys = lm.get("task_metric_keys") if isinstance(lm.get("task_metric_keys"), Mapping) else {}
+    out: list[Mapping[str, Any]] = []
+    for task, metric in metrics.items():
+        out.append(
+            {
+                "task": str(task),
+                "metric_key": str(keys.get(task, "") or ""),
+                "metric": metric,
+                "score_percent": _score_percent_from_row({"metric": metric}),
+            }
+        )
+    return out
+
+
+def _render_downstream_md(downstream: Mapping[str, Any]) -> list[str]:
+    lines = [
+        "## Downstream",
+        "",
+        f"- skipped: `{downstream.get('skipped', False)}`",
+    ]
+    if downstream.get("skipped"):
+        lines.append("")
+        return lines
+    tasks = downstream.get("tasks") or []
+    if isinstance(tasks, str):
+        task_list = [item.strip() for item in tasks.split(",") if item.strip()]
+    else:
+        task_list = [str(item) for item in tasks]
+    lines.append(f"- tasks: `{','.join(task_list)}`")
+    if downstream.get("num_fewshot") is not None:
+        lines.append(f"- num_fewshot: `{downstream.get('num_fewshot')}`")
+    if downstream.get("seqlen") is not None:
+        lines.append(f"- seqlen: `{downstream.get('seqlen')}`")
+    lines.append("")
+    baseline = downstream.get("uniform_baseline")
+    mixed = downstream.get("mixed_model")
+    lines.extend(
+        [
+            "| metric | baseline | mix |",
+            "| --- | ---: | ---: |",
+            (
+                f"| wiki_ppl | {_format_wiki_ppl(_wiki_ppl_from_eval_block(baseline))} "
+                f"| {_format_wiki_ppl(_wiki_ppl_from_eval_block(mixed))} |"
+            ),
+        ]
+    )
+    baseline_rows = {
+        str(row.get("task")): row for row in _summary_rows_from_eval_block(baseline)
+    }
+    mixed_rows = {
+        str(row.get("task")): row for row in _summary_rows_from_eval_block(mixed)
+    }
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in [*task_list, *mixed_rows, *baseline_rows]:
+        if name in seen or name == "":
+            continue
+        seen.add(name)
+        ordered.append(name)
+    for task in ordered:
+        baseline_row = baseline_rows.get(task) or {}
+        mixed_row = mixed_rows.get(task) or {}
+        metric_key = mixed_row.get("metric_key") or baseline_row.get("metric_key") or ""
+        label = f"{task} ({metric_key})" if metric_key else task
+        lines.append(
+            f"| {label} | {_score_percent_from_row(baseline_row)} "
+            f"| {_score_percent_from_row(mixed_row)} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _render_validation_md(report: Mapping[str, Any]) -> str:
@@ -771,18 +897,7 @@ def _render_validation_md(report: Mapping[str, Any]) -> str:
         "",
     ]
     if "downstream" in report:
-        lines.extend(
-            [
-                "## Downstream",
-                "",
-                f"- skipped: `{report['downstream'].get('skipped', False)}`",
-            ]
-        )
-        if not report["downstream"].get("skipped"):
-            lines.append(
-                f"- tasks: `{','.join(report['downstream'].get('tasks', []))}`"
-            )
-        lines.append("")
+        lines.extend(_render_downstream_md(report["downstream"]))
     return "\n".join(lines) + "\n"
 
 
@@ -925,6 +1040,10 @@ def validate_mixed_model(
         strict=True,
     )
     try:
+        # get_qwen3() constructs FlashAttention-2 models on CPU; map_location only
+        # remaps torch.load tensors. load_state_dict copies into CPU parameters.
+        # Move before the first forward (save/reload logits).
+        model.to(device)
         # Re-check after load for live module original_weight / adapter leaks.
         _reject_forbidden_checkpoint_payload(
             meta=meta, state_keys=list(model.state_dict().keys())
@@ -997,6 +1116,7 @@ def validate_mixed_model(
             baseline_assignments = build_uniform_assignments(
                 pool_index, str(resolved.config.candidate_space.baseline_mode)
             )
+            _offload_model_to_cpu(model)
             baseline_model = build_model_from_assignments(
                 resolved=resolved,
                 inventory=inventory,

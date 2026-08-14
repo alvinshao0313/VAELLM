@@ -14,7 +14,9 @@ from mix_bit.schema import resolve_run_config, sha256_file
 from mix_bit.solver import (
     derive_allocation_dir,
     load_cost_table_for_solve,
+    parse_exclude_modes,
     solve_mixed_bit_allocation,
+    with_excluded_modes,
     write_allocation_outputs,
 )
 
@@ -56,6 +58,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Accept a time-limited feasible solution that is not proven globally optimal",
     )
+    parser.add_argument(
+        "--exclude_modes",
+        default=None,
+        help=(
+            "Comma-separated candidate mode names to drop from the MILP. "
+            "The full cost table is still loaded and hash-checked; excluded "
+            "modes are only removed from the search space."
+        ),
+    )
     return parser
 
 
@@ -90,12 +101,17 @@ def main(argv: list[str] | None = None) -> int:
         expected_hashes=expected_hashes,
     )
 
+    excluded_modes = parse_exclude_modes(args.exclude_modes)
+    space, rows = with_excluded_modes(
+        resolved.config.candidate_space, rows, excluded_modes
+    )
+
     # Prefer meta target if present via candidate space; CLI always uses space target.
-    target = float(resolved.config.candidate_space.target_average_bit)
+    target = float(space.target_average_bit)
     result = solve_mixed_bit_allocation(
         rows,
         inventory=inventory,
-        candidate_space=resolved.config.candidate_space,
+        candidate_space=space,
         target_average_bit=target,
         time_limit_sec=args.time_limit,
         allow_suboptimal=bool(args.allow_suboptimal),
@@ -127,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         "metric_name": meta.get("metric_name"),
         "teacher_topk": meta.get("teacher_topk"),
         "baseline_kl_mean": meta.get("baseline_kl_mean"),
+        "excluded_modes": list(excluded_modes),
     }
     paths = write_allocation_outputs(
         result,
@@ -144,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"achieved_average_bit={result.achieved_average_bit}")
     print(f"used_bit_units={result.used_bit_units}")
     print(f"budget_bit_units={result.budget_bit_units}")
+    if excluded_modes:
+        print(f"excluded_modes={','.join(excluded_modes)}")
     return 0 if result.is_globally_optimal or args.allow_suboptimal else 1
 
 

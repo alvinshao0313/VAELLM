@@ -544,3 +544,122 @@ def test_incomplete_or_wrong_provenance_cost_table_is_rejected(tmp_path: Path):
     assert payload["is_globally_optimal"] is True
     assert payload["objective_delta_kl"] == pytest.approx(result.objective_delta_kl)
     assert len(payload["entries"]) == len(inv.targets)
+    assert "excluded_modes" not in payload
+
+
+def test_parse_exclude_modes_rejects_duplicates():
+    from mix_bit.solver import parse_exclude_modes
+
+    assert parse_exclude_modes(None) == ()
+    assert parse_exclude_modes("b16d32s2") == ("b16d32s2",)
+    assert parse_exclude_modes(" b16d32s2 , b24d32s2 ") == ("b16d32s2", "b24d32s2")
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_exclude_modes("b16d32s2,b16d32s2")
+
+
+def test_with_excluded_modes_rejects_baseline_and_unknown():
+    from mix_bit.solver import with_excluded_modes
+
+    space = _space()
+    inv = _inventory([_target("m0", param_count=16)])
+    costs = {
+        ("m0", "b16d32s2"): -1.0,
+        ("m0", "b32d32s2"): 0.0,
+        ("m0", "b48d32s2"): 1.0,
+    }
+    rows = _cost_map(inv, space, costs)
+    with pytest.raises(ValueError, match="baseline_mode"):
+        with_excluded_modes(space, rows, ["b32d32s2"])
+    with pytest.raises(ValueError, match="not in candidate space"):
+        with_excluded_modes(space, rows, ["missing_mode"])
+
+
+def test_excluding_1bit_never_selects_it_and_meets_budget():
+    from mix_bit.solver import solve_mixed_bit_allocation, with_excluded_modes
+
+    space = _space()
+    inv = _inventory(
+        [
+            _target("m0", param_count=100),
+            _target("m1", category="k_proj", block=1, param_count=100),
+        ]
+    )
+    costs = {
+        ("m0", "b16d32s2"): -10.0,
+        ("m0", "b32d32s2"): 0.0,
+        ("m0", "b48d32s2"): -0.1,
+        ("m1", "b16d32s2"): -10.0,
+        ("m1", "b32d32s2"): 0.0,
+        ("m1", "b48d32s2"): 0.2,
+    }
+    rows = _cost_map(inv, space, costs)
+    full = solve_mixed_bit_allocation(
+        rows, inventory=inv, candidate_space=space, target_average_bit=2.0
+    )
+    assert any(entry.mode == "b16d32s2" for entry in full.entries)
+
+    filtered_space, filtered_rows = with_excluded_modes(space, rows, ["b16d32s2"])
+    assert all(row.mode != "b16d32s2" for row in filtered_rows)
+    result = solve_mixed_bit_allocation(
+        filtered_rows,
+        inventory=inv,
+        candidate_space=filtered_space,
+        target_average_bit=2.0,
+    )
+    assert all(entry.mode != "b16d32s2" for entry in result.entries)
+    assert result.is_globally_optimal is True
+    assert result.used_bit_units <= result.budget_bit_units
+    assert result.achieved_average_bit <= 2.0 + 1e-12
+
+
+def test_write_allocation_records_excluded_modes(tmp_path: Path):
+    from mix_bit.solver import (
+        solve_mixed_bit_allocation,
+        with_excluded_modes,
+        write_allocation_outputs,
+    )
+
+    space = _space()
+    inv = _inventory(
+        [
+            _target("m0", param_count=16),
+            _target("m1", category="k_proj", block=1, param_count=16),
+        ]
+    )
+    costs = {}
+    for target in inv.targets:
+        costs[(target.module_name, "b16d32s2")] = -1.0
+        costs[(target.module_name, "b32d32s2")] = 0.0
+        costs[(target.module_name, "b48d32s2")] = 1.0
+    rows = _cost_map(inv, space, costs)
+    filtered_space, filtered_rows = with_excluded_modes(space, rows, ["b16d32s2"])
+    result = solve_mixed_bit_allocation(
+        filtered_rows,
+        inventory=inv,
+        candidate_space=filtered_space,
+        target_average_bit=2.0,
+    )
+    paths = write_allocation_outputs(
+        result,
+        output_dir=tmp_path / "allocation",
+        model_id=inv.model_id,
+        run_id="toy_run",
+        provenance={
+            "run_config_sha256": "run-sha",
+            "model_inventory_sha256": inv.fingerprint_sha256,
+            "candidate_manifest_sha256": "manifest-sha",
+            "candidate_space_sha256": "space-sha",
+            "cost_table_sha256": "a" * 64,
+            "cost_table_meta_sha256": "b" * 64,
+            "kl_mode": "teacher_topk",
+            "metric_name": "forward_kl_teacher_topk_renorm",
+            "teacher_topk": 256,
+            "baseline_kl_mean": 1.23,
+            "excluded_modes": ["b16d32s2"],
+        },
+    )
+    payload = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
+    assert payload["excluded_modes"] == ["b16d32s2"]
+    markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
+    assert "excluded_modes: b16d32s2" in markdown
+    assert all(entry["mode"] != "b16d32s2" for entry in payload["entries"])

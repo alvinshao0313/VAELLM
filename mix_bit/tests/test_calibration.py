@@ -507,6 +507,31 @@ def test_tokenizer_fingerprint_v2_backend_path_wins_over_get_vocab():
     assert compute_tokenizer_config_sha256(tok_a) == compute_tokenizer_config_sha256(tok_b)
 
 
+def test_tokenizer_fingerprint_v2_empty_extra_special_tokens_matches_missing():
+    """HF save_pretrained injects extra_special_tokens={} into tokenizer_config.json.
+
+    Hub configs often omit the key; after local reload it appears as {}. That must
+    not change the content fingerprint. Non-empty mappings remain content.
+    """
+    tok_missing = FakeTokenizer()
+    tok_empty = FakeTokenizer()
+    tok_empty.init_kwargs = dict(tok_missing.init_kwargs)
+    tok_empty.init_kwargs["extra_special_tokens"] = {}
+    assert "extra_special_tokens" not in tok_missing.init_kwargs
+    assert compute_tokenizer_config_sha256(tok_missing) == compute_tokenizer_config_sha256(
+        tok_empty
+    )
+    payload_empty = build_tokenizer_fingerprint_payload(tok_empty)
+    assert "extra_special_tokens" not in payload_empty["content"]["stable_init_kwargs"]
+
+    tok_nonempty = FakeTokenizer()
+    tok_nonempty.init_kwargs = dict(tok_missing.init_kwargs)
+    tok_nonempty.init_kwargs["extra_special_tokens"] = {"image": "<image>"}
+    assert compute_tokenizer_config_sha256(tok_missing) != compute_tokenizer_config_sha256(
+        tok_nonempty
+    )
+
+
 def test_calibration_manifest_records_tokenizer_fingerprint_v2(tmp_path: Path):
     source = tmp_path / "src.jsonl"
     _write_jsonl(source, [{"text": f"s{i}"} for i in range(10)])

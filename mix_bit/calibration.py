@@ -301,6 +301,11 @@ def _normalize_json_value(value: Any) -> Any:
     return {"unsupported_type": type(value).__name__}
 
 
+def _is_empty_extra_special_tokens(value: Any) -> bool:
+    """HF save_pretrained writes extra_special_tokens={} even when hub omitted the key."""
+    return value in (None, {}, [])
+
+
 def _stable_init_kwargs(tokenizer: Any) -> dict[str, Any]:
     init_kwargs = getattr(tokenizer, "init_kwargs", None)
     if not isinstance(init_kwargs, dict):
@@ -309,7 +314,10 @@ def _stable_init_kwargs(tokenizer: Any) -> dict[str, Any]:
     for key, value in init_kwargs.items():
         if key in TOKENIZER_INIT_KWARGS_EXCLUDED:
             continue
-        stable[key] = _normalize_json_value(value)
+        normalized = _normalize_json_value(value)
+        if key == "extra_special_tokens" and _is_empty_extra_special_tokens(normalized):
+            continue
+        stable[key] = normalized
     return stable
 
 

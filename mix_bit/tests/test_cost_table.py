@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1575,6 +1576,65 @@ def test_evaluate_student_per_sample_kl_source_does_not_cpu_full_logits():
 
 import queue as _queue_mod
 import threading as _threading_mod
+
+
+def test_process_start_inherits_requested_cuda_visibility_and_restores_parent(monkeypatch):
+    from mix_bit import cost_table
+
+    seen: list[str | None] = []
+
+    class _RecordingProc:
+        def start(self) -> None:
+            seen.append(os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    cost_table._start_process_on_physical_gpu(_RecordingProc(), "3")
+
+    assert seen == ["3"]
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") == "6,7"
+
+
+def test_process_start_removes_temporary_cuda_visibility_when_parent_had_none(monkeypatch):
+    from mix_bit import cost_table
+
+    seen: list[str | None] = []
+
+    class _RecordingProc:
+        def start(self) -> None:
+            seen.append(os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    cost_table._start_process_on_physical_gpu(_RecordingProc(), "2")
+
+    assert seen == ["2"]
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+def test_isolated_cuda_init_rejects_more_than_one_visible_device(monkeypatch):
+    from mix_bit import cost_table
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    with pytest.raises(RuntimeError, match="exactly one device"):
+        cost_table._initialize_isolated_cuda_device(physical_gpu="3")
+
+
+def test_isolated_cuda_init_uses_logical_cuda_zero(monkeypatch):
+    from mix_bit import cost_table
+
+    selected: list[int] = []
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda idx: selected.append(int(idx)))
+
+    device, visible_count = cost_table._initialize_isolated_cuda_device(physical_gpu="2")
+
+    assert device == "cuda:0"
+    assert visible_count == 1
+    assert selected == [0]
 
 
 class _FakeProc:

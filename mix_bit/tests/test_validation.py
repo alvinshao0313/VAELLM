@@ -845,6 +845,44 @@ def test_save_reload_logits_are_close_with_fixed_tolerance(validation_world):
     assert ref_path.is_file()
 
 
+def test_validate_mixed_model_moves_reloaded_model_to_device_before_save_reload(
+    validation_world, monkeypatch
+):
+    """Qwen3 is constructed on CPU with flash_attention_2; map_location only
+    affects torch.load. The live module must be moved before the first forward.
+    """
+    from mix_bit import validation as validation_mod
+
+    seen = {"to_before_save_reload": False, "save_reload": False}
+    real_load = validation_mod.load_model_checkpoint
+
+    def _load(*args, **kwargs):
+        model, meta, result = real_load(*args, **kwargs)
+        orig_to = model.to
+
+        def _to(*to_args, **to_kwargs):
+            if not seen["save_reload"]:
+                seen["to_before_save_reload"] = True
+            return orig_to(*to_args, **to_kwargs)
+
+        model.to = _to
+        return model, meta, result
+
+    monkeypatch.setattr(validation_mod, "load_model_checkpoint", _load)
+
+    real_srl = validation_mod.validate_save_reload_logits
+
+    def _srl(*, model, mixed_model_dir):
+        seen["save_reload"] = True
+        return real_srl(model=model, mixed_model_dir=mixed_model_dir)
+
+    monkeypatch.setattr(validation_mod, "validate_save_reload_logits", _srl)
+
+    _run_validate(validation_world)
+    assert seen["save_reload"] is True
+    assert seen["to_before_save_reload"] is True
+
+
 def test_predicted_and_actual_kl_are_reported_separately(validation_world):
     report = _run_validate(validation_world)
     kl = report["kl"]
@@ -1027,6 +1065,153 @@ def test_downstream_metrics_are_not_written_into_allocation_or_objective(validat
     assert "boolq" not in alloc
 
 
+def test_downstream_eval_offloads_idle_model_before_evaluating_the_other(monkeypatch):
+    from mix_bit.validation import _run_downstream_eval
+
+    events: list[tuple] = []
+
+    class NamedModel(nn.Module):
+        def __init__(self, name: str):
+            super().__init__()
+            self._eval_name = name
+            self.weight = nn.Parameter(torch.zeros(2, 2))
+
+        def to(self, *args, **kwargs):
+            target = args[0] if args else kwargs.get("device")
+            events.append((self._eval_name, "to", str(target)))
+            return super().to(*args, **kwargs)
+
+    mixed = NamedModel("mixed")
+    baseline = NamedModel("baseline")
+
+    def _fake_ppl(model, args):
+        events.append((model._eval_name, "ppl"))
+        return {"wiki_ppl": 1.0, "seqlen": 8, "nsamples": 1}
+
+    def _fake_lm(model, tokenizer, args):
+        events.append((model._eval_name, "lm"))
+        return {"results": {}}
+
+    monkeypatch.setattr("mix_bit.validation.calculate_ppl", _fake_ppl)
+    monkeypatch.setattr("mix_bit.validation.run_lm_eval", _fake_lm)
+
+    resolved = SimpleNamespace(
+        config=SimpleNamespace(model_profile=SimpleNamespace(model_path="toy"))
+    )
+    _run_downstream_eval(
+        mixed_model=mixed,
+        baseline_model=baseline,
+        resolved=resolved,
+        device="cpu",
+        lm_batch_size=1,
+        access_token=None,
+        tokenizer=object(),
+    )
+
+    baseline_ppl = events.index(("baseline", "ppl"))
+    mixed_ppl = events.index(("mixed", "ppl"))
+    mixed_cpu_before_baseline = [
+        i for i, event in enumerate(events) if event == ("mixed", "to", "cpu") and i < baseline_ppl
+    ]
+    baseline_cpu_before_mixed = [
+        i
+        for i, event in enumerate(events)
+        if event == ("baseline", "to", "cpu") and i < mixed_ppl
+    ]
+    assert mixed_cpu_before_baseline, events
+    assert baseline_cpu_before_mixed, events
+
+
+def test_downstream_eval_does_not_assign_readonly_hf_device_property(monkeypatch):
+    from mix_bit.validation import _run_downstream_eval
+
+    class HFLikeModel(nn.Module):
+        def __init__(self, name: str):
+            super().__init__()
+            self._eval_name = name
+            self.weight = nn.Parameter(torch.zeros(2, 2))
+
+        @property
+        def device(self):
+            return next(self.parameters()).device
+
+    def _fake_ppl(model, args):
+        assert model.device == torch.device("cpu")
+        return {"wiki_ppl": 1.0, "seqlen": 8, "nsamples": 1}
+
+    monkeypatch.setattr("mix_bit.validation.calculate_ppl", _fake_ppl)
+    monkeypatch.setattr("mix_bit.validation.run_lm_eval", lambda *_a, **_k: {"results": {}})
+
+    resolved = SimpleNamespace(
+        config=SimpleNamespace(model_profile=SimpleNamespace(model_path="toy"))
+    )
+    _run_downstream_eval(
+        mixed_model=HFLikeModel("mixed"),
+        baseline_model=HFLikeModel("baseline"),
+        resolved=resolved,
+        device="cpu",
+        lm_batch_size=1,
+        access_token=None,
+        tokenizer=object(),
+    )
+
+
+def test_validate_offloads_mixed_model_after_kl_before_building_baseline(
+    validation_world, monkeypatch
+):
+    from mix_bit import validation as validation_mod
+
+    to_after_kl: list[str] = []
+    kl_finished = {"value": False}
+    mixed_holder: dict[str, Any] = {}
+
+    real_load = validation_mod.load_model_checkpoint
+
+    def _load(*args, **kwargs):
+        model, meta, result = real_load(*args, **kwargs)
+        orig_to = model.to
+
+        def _to(*to_args, **to_kwargs):
+            if kl_finished["value"]:
+                target = to_args[0] if to_args else to_kwargs.get("device")
+                to_after_kl.append(str(target))
+            return orig_to(*to_args, **to_kwargs)
+
+        model.to = _to
+        mixed_holder["model"] = model
+        return model, meta, result
+
+    monkeypatch.setattr(validation_mod, "load_model_checkpoint", _load)
+
+    real_kl = validation_mod._measure_actual_kl
+
+    def _kl(*args, **kwargs):
+        result = real_kl(*args, **kwargs)
+        kl_finished["value"] = True
+        return result
+
+    monkeypatch.setattr(validation_mod, "_measure_actual_kl", _kl)
+
+    built = {"value": False}
+    real_build = validation_mod.build_model_from_assignments
+
+    def _build(*args, **kwargs):
+        built["value"] = True
+        assert "cpu" in to_after_kl, to_after_kl
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(validation_mod, "build_model_from_assignments", _build)
+    monkeypatch.setattr(
+        validation_mod,
+        "calculate_ppl",
+        lambda *_a, **_k: {"wiki_ppl": 1.0, "seqlen": 8, "nsamples": 1},
+    )
+    monkeypatch.setattr(validation_mod, "run_lm_eval", lambda *_a, **_k: {"results": {}})
+
+    _run_validate(validation_world, skip_downstream_eval=False)
+    assert built["value"] is True
+
+
 # --- Tokenizer fingerprint v2 validation tests (Task 9 Step 4) ---
 
 def test_validation_reports_tokenizer_fingerprint_section(validation_world):
@@ -1065,3 +1250,69 @@ def test_validation_fails_when_final_tokenizer_file_missing(validation_world):
     (out / "tiny_tokenizer.json").unlink()
     with pytest.raises(ValueError, match="tokenizer|local"):
         _run_validate(validation_world)
+
+
+def test_render_validation_md_includes_baseline_and_mix_scores():
+    from mix_bit.validation import _render_validation_md
+
+    md = _render_validation_md(
+        {
+            "passed": True,
+            "mixed_model_dir": "/tmp/final_model",
+            "kl": {"kl_mode": "teacher_topk"},
+            "budget": {
+                "used_bit_units": 1,
+                "budget_bit_units": 2,
+                "achieved_average_bit": 1.5,
+            },
+            "save_reload": {"passed": True, "max_abs_error": 0.0, "max_rel_error": 0.0},
+            "downstream": {
+                "skipped": False,
+                "tasks": ["boolq", "rte"],
+                "num_fewshot": 0,
+                "seqlen": 2048,
+                "uniform_baseline": {
+                    "compact": {"wiki_ppl": 10307.0400390625},
+                    "lm_eval": {
+                        "summary_rows": [
+                            {
+                                "task": "boolq",
+                                "metric_key": "acc,none",
+                                "metric": 0.3804281345565749,
+                                "score_percent": "38.04",
+                            },
+                            {
+                                "task": "rte",
+                                "metric_key": "acc,none",
+                                "metric": 0.45126353790613716,
+                                "score_percent": "45.13",
+                            },
+                        ]
+                    },
+                },
+                "mixed_model": {
+                    "compact": {"wiki_ppl": 447173.5625},
+                    "lm_eval": {
+                        "summary_rows": [
+                            {
+                                "task": "boolq",
+                                "metric_key": "acc,none",
+                                "metric": 0.46819571865443427,
+                                "score_percent": "46.82",
+                            },
+                            {
+                                "task": "rte",
+                                "metric_key": "acc,none",
+                                "metric": 0.4657039711191336,
+                                "score_percent": "46.57",
+                            },
+                        ]
+                    },
+                },
+            },
+        }
+    )
+    assert "| metric | baseline | mix |" in md
+    assert "| wiki_ppl | 10307.0400 | 447173.5625 |" in md
+    assert "| boolq (acc,none) | 38.04 | 46.82 |" in md
+    assert "| rte (acc,none) | 45.13 | 46.57 |" in md

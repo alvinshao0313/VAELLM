@@ -248,6 +248,53 @@ def validate_cost_rows_for_solve(
     return seen
 
 
+def parse_exclude_modes(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    parts = tuple(item.strip() for item in str(raw).split(",") if item.strip())
+    if len(parts) != len(set(parts)):
+        raise ValueError(f"duplicate exclude_modes: {parts}")
+    return parts
+
+
+def with_excluded_modes(
+    space: CandidateSpaceConfig,
+    rows: Sequence[CostRow],
+    exclude_modes: Sequence[str],
+) -> tuple[CandidateSpaceConfig, list[CostRow]]:
+    """Drop named modes from the MILP while keeping the loaded cost table intact.
+
+    The original cost table must still be complete for the unfiltered candidate
+    space (provenance / hash checks happen before this call). Exclusion only
+    shrinks the search space.
+    """
+    exclude = tuple(str(name).strip() for name in exclude_modes if str(name).strip())
+    if not exclude:
+        return space, list(rows)
+    if len(exclude) != len(set(exclude)):
+        raise ValueError(f"duplicate exclude_modes: {exclude}")
+    names = {mode.name for mode in space.modes}
+    unknown = [name for name in exclude if name not in names]
+    if unknown:
+        raise ValueError(f"exclude_modes not in candidate space: {unknown}")
+    excluded = set(exclude)
+    if space.baseline_mode in excluded:
+        raise ValueError(
+            f"cannot exclude baseline_mode {space.baseline_mode!r}"
+        )
+    kept_modes = tuple(mode for mode in space.modes if mode.name not in excluded)
+    if len(kept_modes) < 2:
+        raise ValueError("candidate space must keep at least two modes after exclusion")
+    filtered_space = CandidateSpaceConfig(
+        candidate_space_id=space.candidate_space_id,
+        baseline_mode=space.baseline_mode,
+        target_average_bit=space.target_average_bit,
+        modes=kept_modes,
+    )
+    filtered_rows = [row for row in rows if row.mode not in excluded]
+    return filtered_space, filtered_rows
+
+
 def load_cost_table_for_solve(
     cost_table_path: str | Path,
     cost_table_meta_path: str | Path,
@@ -608,6 +655,9 @@ def allocation_result_to_dict(
         "cost_table_meta_sha256": provenance.get("cost_table_meta_sha256"),
         "entries": [asdict(e) for e in result.entries],
     }
+    excluded = provenance.get("excluded_modes")
+    if excluded:
+        payload["excluded_modes"] = list(excluded)
     return payload
 
 
@@ -639,12 +689,19 @@ def _build_allocation_markdown(payload: Mapping[str, Any]) -> str:
         f"- objective_delta_kl: {payload['objective_delta_kl']}",
         f"- achieved_average_bit: {payload['achieved_average_bit']}",
         f"- target_average_bit: {payload['target_average_bit']}",
-        f"- used_bit_units: {payload['used_bit_units']}",
-        f"- budget_bit_units: {payload['budget_bit_units']}",
-        f"- budget_slack_bit_units: {payload['budget_slack_bit_units']}",
-        "",
-        "## Unweighted mode counts",
     ]
+    excluded = payload.get("excluded_modes")
+    if excluded:
+        lines.append(f"- excluded_modes: {', '.join(str(m) for m in excluded)}")
+    lines.extend(
+        [
+            f"- used_bit_units: {payload['used_bit_units']}",
+            f"- budget_bit_units: {payload['budget_bit_units']}",
+            f"- budget_slack_bit_units: {payload['budget_slack_bit_units']}",
+            "",
+            "## Unweighted mode counts",
+        ]
+    )
     for mode, count in sorted(mode_counts.items()):
         lines.append(f"- {mode}: {count}")
     lines.append("")

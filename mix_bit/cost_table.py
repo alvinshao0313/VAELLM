@@ -42,6 +42,54 @@ RESULT_QUEUE_POLL_SECONDS = 1.0
 WORKER_JOIN_TIMEOUT_SECONDS = 30.0
 
 
+def _start_process_on_physical_gpu(process: mp.Process, physical_gpu: str) -> None:
+    """Start a spawned process with CUDA visibility fixed before interpreter bootstrap.
+
+    With the ``spawn`` start method, the child imports the main module before entering
+    the target function. This project imports ``torch`` through the cost-search module
+    graph, so changing ``CUDA_VISIBLE_DEVICES`` only inside the target function is too
+    late to guarantee the requested physical-GPU mapping. Set it around ``start()`` so
+    the child inherits the intended visibility from process creation onward, then
+    restore the parent environment immediately.
+    """
+    gpu = str(physical_gpu).strip()
+    if not gpu:
+        raise ValueError("physical_gpu must be non-empty")
+    previous = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    try:
+        process.start()
+    finally:
+        if previous is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = previous
+
+
+def _initialize_isolated_cuda_device(*, physical_gpu: str) -> tuple[str, int]:
+    """Initialize one spawned CUDA process and verify spawn-time isolation."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return "cpu", 0
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible != str(physical_gpu):
+        raise RuntimeError(
+            "Spawned CUDA process visibility mismatch before initialization: "
+            f"physical_gpu={physical_gpu!r} CUDA_VISIBLE_DEVICES={visible!r}"
+        )
+    visible_count = int(torch.cuda.device_count())
+    if visible_count != 1:
+        raise RuntimeError(
+            "Spawned CUDA process must see exactly one device after GPU isolation; "
+            f"physical_gpu={physical_gpu!r} CUDA_VISIBLE_DEVICES={visible!r} "
+            f"torch.cuda.device_count()={visible_count}"
+        )
+    torch.cuda.set_device(0)
+    return "cuda:0", visible_count
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
@@ -551,14 +599,9 @@ def _wait_for_workers_ready(
 def _baseline_init_process_main(init_args: dict[str, Any]) -> None:
     """Single-GPU spawn helper: materialize baseline_per_sample.npz before workers."""
     physical_gpu = str(init_args["physical_gpu"])
-    os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu
     result_queue: mp.Queue = init_args["result_queue"]
     try:
-        import torch
-
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        if device.startswith("cuda"):
-            torch.cuda.set_device(0)
+        device, _ = _initialize_isolated_cuda_device(physical_gpu=physical_gpu)
 
         from mix_bit.checkpoint_pool import build_candidate_pool_index_from_manifest
         from mix_bit.model_inventory import load_model_inventory
@@ -639,7 +682,7 @@ def _ensure_baseline_per_sample_spawn(
         "access_token": access_token,
     }
     proc = ctx_mp.Process(target=_baseline_init_process_main, args=(init_args,), daemon=True)
-    proc.start()
+    _start_process_on_physical_gpu(proc, first_gpu)
     msg = _wait_for_single_process_message(
         process=proc,
         result_queue=result_queue,
@@ -654,26 +697,18 @@ def _ensure_baseline_per_sample_spawn(
 
 
 def _worker_process_main(worker_args: dict[str, Any]) -> None:
-    """Spawn entry: set CUDA device, load resident models, process jobs from queue."""
+    """Spawn entry: verify CUDA isolation, load resident models, process queued jobs."""
     physical_gpu = str(worker_args["physical_gpu"])
     logical_id = int(worker_args["logical_id"])
-    os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu
 
     job_queue: mp.Queue = worker_args["job_queue"]
     result_queue: mp.Queue = worker_args["result_queue"]
     cost_run_root = Path(worker_args["cost_run_root"])
     log_path = cost_run_root / "worker_logs" / f"gpu_{physical_gpu}.jsonl"
 
-    device = "cuda:0"
     try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.set_device(0)
-            logical_device = str(torch.cuda.current_device())
-        else:
-            device = "cpu"
-            logical_device = "cpu"
+        device, visible_count = _initialize_isolated_cuda_device(physical_gpu=physical_gpu)
+        logical_device = "0" if device.startswith("cuda") else "cpu"
         _append_worker_log(
             log_path,
             {
@@ -681,6 +716,7 @@ def _worker_process_main(worker_args: dict[str, Any]) -> None:
                 "physical_gpu": physical_gpu,
                 "logical_id": logical_id,
                 "logical_device": logical_device,
+                "visible_device_count": visible_count,
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             },
         )
@@ -907,7 +943,7 @@ def run_cost_search_scheduler(
             "baseline_per_sample_path": str(baseline_path),
         }
         proc = ctx_mp.Process(target=_worker_process_main, args=(worker_args,), daemon=True)
-        proc.start()
+        _start_process_on_physical_gpu(proc, gpu)
         processes.append(proc)
 
     pending_iter = iter(pending)

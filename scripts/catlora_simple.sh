@@ -106,7 +106,7 @@ python tools/cat_train.py \
   --eval_ppl "false" \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
-  --outlier_protect_mode "residual_sparse" \
+  --outlier_protect_mode "channel" \
   --outlier_mlp_rank_metric "none" \
   --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
