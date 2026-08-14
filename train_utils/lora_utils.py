@@ -621,9 +621,19 @@ def _build_lora_trainer(
         if tokenizer is None:
             raise ValueError("Lazy tokenized distill dataset requires tokenizer.")
         trainer_kwargs["processing_class"] = tokenizer
+        dynamic_padding = bool(
+            getattr(training_args, "distill_dynamic_padding", False)
+        )
         trainer_kwargs["data_collator"] = build_edgerazor_data_collator(
             tokenizer,
             max_seq_len=max_seq_len,
+            dynamic_padding=dynamic_padding,
+        )
+        logger.info(
+            "LoRA: distill padding mode=%s max_seq_len=%d pad_to_multiple_of=%s",
+            "dynamic" if dynamic_padding else "fixed",
+            int(max_seq_len),
+            "8" if dynamic_padding else "none",
         )
     elif tokenizer is not None and _distill_dataset_uses_edgerazor_messages(cfg.dataset):
         if DataCollatorForCompletionOnlyLM is None:

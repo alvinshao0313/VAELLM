@@ -341,6 +341,135 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
         self.assertEqual(captured_kwargs["prompt_kd_weight"], 0.0)
         self.assertEqual(captured_kwargs["hidden_alignment_layer_weighting"], "uniform")
 
+    def test_lazy_distill_forwards_dynamic_padding_to_shared_collator(self):
+        captured_kwargs = {}
+        logged_messages = []
+        tokenizer = object()
+        sentinel_collator = object()
+
+        class FakeCustomTrainer:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+            def add_callback(self, _callback):
+                return None
+
+        cfg = SimpleNamespace(
+            loss_type="sft",
+            temperature=1.0,
+            loss_alpha=0.5,
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.01,
+            prompt_kd_weight=0.0,
+            hidden_alignment_layer_weighting="uniform",
+            eakld_confidence_k=16,
+        )
+        training_args = SimpleNamespace(
+            distill_model_max_length=128,
+            distill_dynamic_padding=True,
+        )
+        logger = SimpleNamespace(
+            info=lambda message, *args: logged_messages.append(
+                message % args if args else message
+            )
+        )
+
+        with patch.object(lora_utils, "CustomSFTTrainer", FakeCustomTrainer), patch.object(
+            lora_utils,
+            "build_edgerazor_data_collator",
+            return_value=sentinel_collator,
+        ) as mock_collator:
+            trainer = lora_utils._build_lora_trainer(
+                model=object(),
+                train_ds=[],
+                eval_ds=None,
+                sft_args=object(),
+                training_args=training_args,
+                logger=logger,
+                lora_config=None,
+                cfg=cfg,
+                hif4_act_controller=None,
+                teacher_param_snapshots=[],
+                tokenizer=tokenizer,
+                train_is_iterable=False,
+                use_lazy_tokenized_dataset=True,
+            )
+
+        self.assertIsInstance(trainer, FakeCustomTrainer)
+        mock_collator.assert_called_once_with(
+            tokenizer,
+            max_seq_len=128,
+            dynamic_padding=True,
+        )
+        self.assertIs(captured_kwargs["data_collator"], sentinel_collator)
+        self.assertIn(
+            "LoRA: distill padding mode=dynamic max_seq_len=128 pad_to_multiple_of=8",
+            logged_messages,
+        )
+
+    def test_lazy_distill_defaults_to_fixed_padding_when_flag_missing(self):
+        captured_kwargs = {}
+        logged_messages = []
+        tokenizer = object()
+        sentinel_collator = object()
+
+        class FakeCustomTrainer:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+            def add_callback(self, _callback):
+                return None
+
+        cfg = SimpleNamespace(
+            loss_type="sft",
+            temperature=1.0,
+            loss_alpha=0.5,
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.01,
+            prompt_kd_weight=0.0,
+            hidden_alignment_layer_weighting="uniform",
+            eakld_confidence_k=16,
+        )
+        training_args = SimpleNamespace(distill_model_max_length=128)
+        logger = SimpleNamespace(
+            info=lambda message, *args: logged_messages.append(
+                message % args if args else message
+            )
+        )
+
+        with patch.object(lora_utils, "CustomSFTTrainer", FakeCustomTrainer), patch.object(
+            lora_utils,
+            "build_edgerazor_data_collator",
+            return_value=sentinel_collator,
+        ) as mock_collator:
+            trainer = lora_utils._build_lora_trainer(
+                model=object(),
+                train_ds=[],
+                eval_ds=None,
+                sft_args=object(),
+                training_args=training_args,
+                logger=logger,
+                lora_config=None,
+                cfg=cfg,
+                hif4_act_controller=None,
+                teacher_param_snapshots=[],
+                tokenizer=tokenizer,
+                train_is_iterable=False,
+                use_lazy_tokenized_dataset=True,
+            )
+
+        self.assertIsInstance(trainer, FakeCustomTrainer)
+        mock_collator.assert_called_once_with(
+            tokenizer,
+            max_seq_len=128,
+            dynamic_padding=False,
+        )
+        self.assertIs(captured_kwargs["data_collator"], sentinel_collator)
+        self.assertIn(
+            "LoRA: distill padding mode=fixed max_seq_len=128 pad_to_multiple_of=none",
+            logged_messages,
+        )
+
 
 class _FakeOutput:
     def __init__(self, **kwargs):

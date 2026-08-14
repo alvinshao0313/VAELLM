@@ -273,6 +273,34 @@ class DatasetMixArgsTest(unittest.TestCase):
                         ]
                     )
 
+    def test_parse_args_dynamic_padding_defaults_false(self):
+        e2e_args, _hf_args, _training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--max_steps",
+                "1",
+            ]
+        )
+        self.assertFalse(e2e_args.dynamic_padding)
+
+    def test_parse_args_accepts_dynamic_padding_true(self):
+        e2e_args, _hf_args, _training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--dynamic_padding",
+                "true",
+                "--max_steps",
+                "1",
+            ]
+        )
+        self.assertTrue(e2e_args.dynamic_padding)
+
 
 class VAEE2EPromptKdWeightArgsTest(unittest.TestCase):
     def _parse_with_checkpoint(self, extra_args, *, dataset_mix="openorca=1.0"):
@@ -1200,6 +1228,75 @@ class DistillDataTest(unittest.TestCase):
                     seqlen=4,
                     seed=7,
                 )
+
+
+def test_e2e_sft_dynamic_padding_forwards_to_shared_collator():
+    from compressed_e2e_fintuning import runtime as e2e_runtime
+
+    tokenizer = object()
+    sentinel = object()
+    with mock.patch.object(
+        e2e_runtime,
+        "build_edgerazor_data_collator",
+        return_value=sentinel,
+    ) as mock_collator:
+        result = e2e_runtime._build_training_data_collator(
+            tokenizer=tokenizer,
+            dataset_task="sft",
+            block_size=1024,
+            dynamic_padding=True,
+        )
+    mock_collator.assert_called_once_with(
+        tokenizer,
+        max_seq_len=1024,
+        dynamic_padding=True,
+    )
+    assert result is sentinel
+
+
+def test_e2e_lm_fixed_padding_forwards_false():
+    from compressed_e2e_fintuning import runtime as e2e_runtime
+
+    tokenizer = object()
+    sentinel = object()
+    with mock.patch.object(
+        e2e_runtime,
+        "build_edgerazor_data_collator",
+        return_value=sentinel,
+    ) as mock_collator:
+        result = e2e_runtime._build_training_data_collator(
+            tokenizer=tokenizer,
+            dataset_task="lm",
+            block_size=1024,
+            dynamic_padding=False,
+        )
+    mock_collator.assert_called_once_with(
+        tokenizer,
+        max_seq_len=1024,
+        dynamic_padding=False,
+    )
+    assert result is sentinel
+
+
+def test_e2e_mcqa_ignores_dynamic_padding_and_keeps_default_collator():
+    from transformers import default_data_collator
+
+    from compressed_e2e_fintuning import runtime as e2e_runtime
+
+    tokenizer = object()
+    with mock.patch.object(
+        e2e_runtime,
+        "build_edgerazor_data_collator",
+    ) as mock_collator:
+        result = e2e_runtime._build_training_data_collator(
+            tokenizer=tokenizer,
+            dataset_task="mcqa",
+            block_size=1024,
+            dynamic_padding=True,
+        )
+    mock_collator.assert_not_called()
+    assert result is default_data_collator
+
 
 if __name__ == "__main__":
     unittest.main()

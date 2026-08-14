@@ -40,6 +40,7 @@ python -m compressed_e2e_fintuning.main \
   --eakld_confidence_k 16 \
   --distill_temperature 1.0 \
   --distill_alpha 0.5 \
+  --dynamic_padding true \
   --model_max_length "8192" \
   --decoder_layers "${DECODER_LAYERS:-0-35}" \
   --target_modules all \

@@ -80,6 +80,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --teacher_output_offload cpu \
     --teacher_output_pin_memory true \
     --teacher_output_chunk_tokens 8 \
+    --dynamic_padding true \
     --model_max_length "1024" \
     --decoder_layers 0-35 \
     --target_modules all \
@@ -137,6 +138,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --teacher_output_offload cpu \
     --teacher_output_pin_memory true \
     --teacher_output_chunk_tokens 8 \
+    --dynamic_padding true \
     --model_max_length "1024" \
     --decoder_layers 0-35 \
     --target_modules all \

@@ -12,6 +12,17 @@
 
 三种模式都使用同一套数据、loss、评估和保存流程；差别只在训练哪些参数。
 
+## Dynamic padding
+
+可选参数：
+
+```bash
+--dynamic_padding false   # 默认：pad 到 --model_max_length
+--dynamic_padding true    # pad 到本 micro-batch 最长样本，再向上对齐到 8 的倍数
+```
+
+`--model_max_length` 始终是单样本截断上限。仅对 `dataset_task=sft/lm` 的 shared sequence collator 生效；`mcqa` 不受影响。
+
 ## Hidden-state 对齐
 
 可选参数：

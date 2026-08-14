@@ -89,6 +89,7 @@ class VAEDecoderE2EArguments:
     train_file: Optional[str] = None
     text_field: str = "text"
     max_train_samples: Optional[int] = None
+    dynamic_padding: bool = False
     save_tokenizer: bool = True
     decoder_layer_ids: Optional[List[int]] = field(default=None, init=False)
     target_module_names: Optional[List[str]] = field(default=None, init=False)
@@ -200,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_file", type=str, default=None)
     parser.add_argument("--text_field", type=str, default="text")
     parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument(
+        "--dynamic_padding",
+        type=lambda v: _parse_bool_like(v, arg_name="--dynamic_padding"),
+        default=False,
+    )
     parser.add_argument("--save_tokenizer", type=lambda v: _parse_bool_like(v, arg_name="--save_tokenizer"), default=True)
     return parser
 

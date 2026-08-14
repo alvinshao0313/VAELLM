@@ -74,6 +74,23 @@ from compressed_e2e_fintuning.trainer import (
 )
 
 
+def _build_training_data_collator(
+    *,
+    tokenizer,
+    dataset_task: str,
+    block_size: int,
+    dynamic_padding: bool,
+):
+    resolved_task = str(dataset_task).strip().lower()
+    if resolved_task == "mcqa":
+        return default_data_collator
+    return build_edgerazor_data_collator(
+        tokenizer,
+        max_seq_len=int(block_size),
+        dynamic_padding=bool(dynamic_padding),
+    )
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -948,12 +965,20 @@ def run(args, hf_args, training_args):
     if bool(data_info.get("lazy_iterable", False)):
         training_args.group_by_length = False
     dataset_task = str(data_info.get("dataset_task", "lm")).strip().lower()
+    data_collator = _build_training_data_collator(
+        tokenizer=tokenizer,
+        dataset_task=dataset_task,
+        block_size=int(data_info["block_size"]),
+        dynamic_padding=bool(args.dynamic_padding),
+    )
     if dataset_task == "mcqa":
-        data_collator = default_data_collator
+        log.info("Training padding: mode=mcqa_default_collator")
     else:
-        data_collator = build_edgerazor_data_collator(
-            tokenizer,
-            max_seq_len=int(data_info["block_size"]),
+        log.info(
+            "Training padding: mode=%s max_seq_len=%d pad_to_multiple_of=%s",
+            "dynamic" if bool(args.dynamic_padding) else "fixed",
+            int(data_info["block_size"]),
+            "8" if bool(args.dynamic_padding) else "none",
         )
     log.info(
         "Prepared datasets: train=%s eval=%s block_size=%d lazy_iterable=%s dataloader_num_workers=%d",

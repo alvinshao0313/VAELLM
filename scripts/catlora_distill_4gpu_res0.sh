@@ -72,6 +72,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_warmup_ratio "0.05" \
   --distill_group_by_length "false" \
   --distill_lr_scheduler_type "cosine" \
+  --distill_dynamic_padding "true" \
   --distill_model_max_length "1024" \
   --fp16 "false" \
   --bf16 "true" \

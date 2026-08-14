@@ -145,6 +145,14 @@ MAX_SAMPLES=100 MAX_SAMPLES_PER_TASK=10 bash scripts/download_distill_dataset.sh
 
 Cat 蒸馏序列长度由 `--distill_model_max_length` 控制（脚本中常见 4096 或 8192）。
 
+### Truncation vs padding
+
+- **Per-sample truncation**：`encode_edgerazor_messages_record()` / `encode_text_lm_record()` 在 collator 之前把单样本有效 token 截到配置的 max length（Cat：`--distill_model_max_length`；E2E：`--model_max_length`）。
+- **Batch collation padding**：由共享 `build_edgerazor_data_collator()` 完成。
+  - 固定模式（默认）：pad 到配置的 max length。
+  - 动态模式（`--distill_dynamic_padding true` / `--dynamic_padding true`）：pad 到本 micro-batch 最长样本，再向上对齐到 8 的倍数。
+- 新增 padding 位置固定满足：`input_ids=pad_token_id`、`attention_mask=0`、`labels=-100`，因此不进入 CE/KD/hidden alignment/token telemetry 的有效区域。
+
 ## LongBench 说明
 
 `longbench` 使用 `THUDM/LongBench` 各子任务 test split 转成 `messages`。这部分与 LongBench eval 存在分布重叠，文档中仅作 eval-aware 微调用途。

@@ -40,13 +40,36 @@ def default_dataloader_num_workers() -> int:
     return 16
 
 
-def build_edgerazor_data_collator(tokenizer, *, max_seq_len: int):
+def build_edgerazor_data_collator(
+    tokenizer,
+    *,
+    max_seq_len: int,
+    dynamic_padding: bool = False,
+):
     from transformers import DataCollatorForSeq2Seq
+
+    max_seq_len = int(max_seq_len)
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}.")
+
+    if bool(dynamic_padding):
+        if max_seq_len % 8 != 0:
+            raise ValueError(
+                "dynamic padding requires max_seq_len to be divisible by 8, "
+                f"got {max_seq_len}."
+            )
+        return DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            padding="longest",
+            pad_to_multiple_of=8,
+            label_pad_token_id=IGNORE_ID,
+            return_tensors="pt",
+        )
 
     return DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         padding="max_length",
-        max_length=int(max_seq_len),
+        max_length=max_seq_len,
         label_pad_token_id=IGNORE_ID,
         return_tensors="pt",
     )

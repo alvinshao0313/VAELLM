@@ -147,6 +147,16 @@ class CatTrainHFTrainingArguments:
         default=2048,
         metadata={"help": "Maximum sequence length used by the after-category distill trainer."},
     )
+    distill_dynamic_padding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use per-micro-batch longest-sequence padding rounded up to a multiple "
+                "of 8 for category distillation. distill_model_max_length remains the "
+                "per-sample truncation ceiling."
+            )
+        },
+    )
     distill_gradient_accumulation_steps: int = field(default=1)
     distill_optim: str = field(default="paged_adamw_8bit")
     distill_max_grad_norm: float = field(default=0.3)
