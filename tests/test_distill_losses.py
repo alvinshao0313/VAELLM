@@ -1207,30 +1207,214 @@ def test_offloaded_teacher_dense_loss_finite_backward(loss_type: str) -> None:
         assert torch.isfinite(ce_loss.grad)
 
 
-def test_offloaded_teacher_dense_loss_rejects_non_eakld() -> None:
+# ---------------------------------------------------------------------------
+# CPU offload dense distillation: legacy-vs-offload math/gradient parity
+# ---------------------------------------------------------------------------
+
+CPU_OFFLOAD_DENSE_DISTILL_LOSS_TYPES = (
+    "kl",
+    "rkl",
+    "dual_rkl",
+    "mse",
+    "kd",
+    "kd_top",
+    "kd_top_7",
+    "dual_kd_top",
+    "dual_kd_top_7",
+    "dual_kl",
+    "dual_kd",
+    "eakld",
+    "eakld_kd",
+    "eakld_top",
+    "eakld_top_7",
+    "eakld_topk",
+    "eakld_topk_7",
+    "r_kl_top",
+    "r_kl_top_7",
+    "dual_r_kl_top",
+    "dual_r_kl_top_7",
+    "kl_top",
+    "kl_top_7",
+    "kl_top_1000",
+    "dual_kl_top",
+    "dual_kl_top_7",
+)
+
+
+def _is_ce_blended_dense_loss(loss_type: str) -> bool:
+    return (
+        loss_type == "kd"
+        or loss_type.startswith("kd_top")
+        or loss_type == "dual_kd"
+        or loss_type.startswith("dual_kd_top")
+        or loss_type == "eakld_kd"
+    )
+
+
+def _is_eakld_family_loss(loss_type: str) -> bool:
+    return loss_type in {"eakld", "eakld_kd"} or distill_losses.is_eakld_top_loss(
+        loss_type
+    )
+
+
+def _ce_surrogate_from_student(student_logits: torch.Tensor) -> torch.Tensor:
+    return (student_logits * student_logits).mean()
+
+
+def _cpu_offload_dense_parity_tensors() -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    torch.manual_seed(501)
+    teacher_logits = torch.randn(2, 6, 17, dtype=torch.float32)
+    student_base = torch.randn(2, 6, 17, dtype=torch.float32)
+    # sequence_chunk_size=2 → chunks [0:2], [2:4], [4:6].
+    # Chunk 0 is all-zero for response; chunk 1 is all-zero for prompt.
+    response_mask = torch.tensor(
+        [
+            [0, 0, 1, 1, 1, 0],
+            [0, 0, 1, 1, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+    prompt_mask = torch.tensor(
+        [
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+    return student_base, teacher_logits, response_mask, prompt_mask
+
+
+def _cpu_offload_eakld_metadata(
+    *,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+    prompt_mask: torch.Tensor,
+) -> dict[str, torch.Tensor | None]:
+    (
+        resp_entropy,
+        resp_gamma,
+        resp_valid,
+    ) = distill_losses.compute_teacher_entropy_mean_and_gamma(
+        teacher_logits,
+        response_mask,
+        confidence_k=16,
+    )
+    (
+        prompt_entropy,
+        prompt_gamma,
+        prompt_valid,
+    ) = distill_losses.compute_teacher_entropy_mean_and_gamma(
+        teacher_logits,
+        prompt_mask,
+        confidence_k=16,
+    )
+    return {
+        "teacher_gamma_cpu": resp_gamma.detach().cpu(),
+        "teacher_entropy_mean_cpu": resp_entropy.detach().cpu(),
+        "teacher_valid_token_count_cpu": resp_valid.detach().cpu(),
+        "teacher_prompt_gamma_cpu": prompt_gamma.detach().cpu(),
+        "teacher_prompt_entropy_mean_cpu": prompt_entropy.detach().cpu(),
+        "teacher_prompt_valid_token_count_cpu": prompt_valid.detach().cpu(),
+    }
+
+
+@pytest.mark.parametrize("loss_type", CPU_OFFLOAD_DENSE_DISTILL_LOSS_TYPES)
+def test_cpu_offload_dense_loss_matches_legacy_value_and_gradient(
+    loss_type: str,
+) -> None:
+    student_base, teacher_logits, response_mask, prompt_mask = (
+        _cpu_offload_dense_parity_tensors()
+    )
+    legacy_student = student_base.detach().clone().requires_grad_(True)
+    offload_student = student_base.detach().clone().requires_grad_(True)
+
+    legacy_ce = None
+    offload_ce = None
+    if _is_ce_blended_dense_loss(loss_type):
+        legacy_ce = _ce_surrogate_from_student(legacy_student)
+        offload_ce = _ce_surrogate_from_student(offload_student)
+
+    if _is_eakld_family_loss(loss_type):
+        eakld_metadata = _cpu_offload_eakld_metadata(
+            teacher_logits=teacher_logits,
+            response_mask=response_mask,
+            prompt_mask=prompt_mask,
+        )
+    else:
+        eakld_metadata = {
+            "teacher_gamma_cpu": None,
+            "teacher_entropy_mean_cpu": None,
+            "teacher_valid_token_count_cpu": None,
+            "teacher_prompt_gamma_cpu": None,
+            "teacher_prompt_entropy_mean_cpu": None,
+            "teacher_prompt_valid_token_count_cpu": None,
+        }
+
+    legacy_loss = compute_dense_loss_from_logits(
+        loss_type=loss_type,
+        student_logits=legacy_student,
+        teacher_logits=teacher_logits,
+        ce_loss=legacy_ce,
+        mask=response_mask,
+        temperature=1.3,
+        alpha=0.4,
+        eakld_confidence_k=16,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=0.03,
+    )
+    offload_loss = compute_dense_loss_from_offloaded_teacher(
+        loss_type=loss_type,
+        student_logits=offload_student,
+        teacher_logits_cpu=teacher_logits.cpu(),
+        ce_loss=offload_ce,
+        mask=response_mask,
+        temperature=1.3,
+        alpha=0.4,
+        eakld_confidence_k=16,
+        sequence_chunk_size=2,
+        prompt_mask=prompt_mask,
+        prompt_kd_weight=0.03,
+        **eakld_metadata,
+    )
+
+    torch.testing.assert_close(offload_loss, legacy_loss, atol=2e-6, rtol=2e-5)
+    legacy_loss.backward()
+    offload_loss.backward()
+    assert legacy_student.grad is not None
+    assert offload_student.grad is not None
+    torch.testing.assert_close(
+        offload_student.grad,
+        legacy_student.grad,
+        atol=3e-6,
+        rtol=3e-5,
+    )
+
+
+def test_offloaded_teacher_dense_loss_supports_kl_top_1000_without_eakld_metadata() -> None:
     torch.manual_seed(213)
     student_logits = torch.randn(2, 4, 17, dtype=torch.float32, requires_grad=True)
     teacher_logits_cpu = torch.randn(2, 4, 17, dtype=torch.float32)
-    teacher_gamma_cpu = torch.tensor(0.5, dtype=torch.float32)
     mask = torch.ones(2, 4, dtype=torch.float32)
 
-    with pytest.raises(
-        ValueError,
-        match="teacher_output_offload=cpu supports only EAKLD-family losses.",
-    ):
-        compute_dense_loss_from_offloaded_teacher(
-            loss_type="kl",
-            student_logits=student_logits,
-            teacher_logits_cpu=teacher_logits_cpu,
-            teacher_gamma_cpu=teacher_gamma_cpu,
-            teacher_entropy_mean_cpu=None,
-            teacher_valid_token_count_cpu=None,
-            mask=mask,
-            temperature=1.0,
-            alpha=0.5,
-                eakld_confidence_k=16,
-            sequence_chunk_size=2,
-        )
+    loss = compute_dense_loss_from_offloaded_teacher(
+        loss_type="kl_top_1000",
+        student_logits=student_logits,
+        teacher_logits_cpu=teacher_logits_cpu,
+        mask=mask,
+        temperature=1.0,
+        alpha=0.5,
+        sequence_chunk_size=2,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import MutableMapping, Optional
+from typing import Callable, MutableMapping, Optional
 
 import math
 
@@ -691,11 +691,10 @@ def compute_dual_rkl_topk_loss(
     return (token_kl * mask_fp32).sum() / denom
 
 
-def _validate_cpu_teacher_distill_inputs(
+def _validate_cpu_teacher_logits_inputs(
     *,
     student_logits: torch.Tensor,
     teacher_logits_cpu: torch.Tensor,
-    gamma: torch.Tensor,
     sequence_chunk_size: int,
 ) -> None:
     if student_logits.ndim != 3:
@@ -719,8 +718,85 @@ def _validate_cpu_teacher_distill_inputs(
         raise ValueError(
             f"sequence_chunk_size must be >= 1, got {sequence_chunk_size}."
         )
-    if not torch.is_tensor(gamma) or int(gamma.numel()) != 1:
-        raise ValueError("gamma must be a scalar tensor.")
+
+
+def _make_checkpointed_token_mean_chunk_forward(
+    *,
+    teacher_logits_cpu: torch.Tensor,
+    start: int,
+    end: int,
+    mask_chunk: torch.Tensor,
+    valid_count: torch.Tensor,
+    chunk_loss_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+):
+    fixed_start = int(start)
+    fixed_end = int(end)
+
+    def chunk_forward(active_student_chunk: torch.Tensor) -> torch.Tensor:
+        teacher_chunk = copy_teacher_logit_chunk_to_device(
+            teacher_logits_cpu,
+            start=fixed_start,
+            end=fixed_end,
+            target_device=active_student_chunk.device,
+        )
+        chunk_mean = chunk_loss_fn(active_student_chunk, teacher_chunk, mask_chunk)
+        if not torch.is_tensor(chunk_mean) or int(chunk_mean.numel()) != 1:
+            raise ValueError("chunk_loss_fn must return a scalar tensor.")
+        return chunk_mean.reshape(()) * valid_count
+
+    return chunk_forward
+
+
+def compute_chunked_token_mean_from_cpu_teacher_logits(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits_cpu: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    sequence_chunk_size: int,
+    chunk_loss_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    _validate_cpu_teacher_logits_inputs(
+        student_logits=student_logits,
+        teacher_logits_cpu=teacher_logits_cpu,
+        sequence_chunk_size=sequence_chunk_size,
+    )
+    resolved_mask = _default_token_mask(student_logits, mask)
+    denominator = resolved_mask.sum().clamp_min(1.0)
+    chunk_numerators = []
+
+    for start, end in iter_token_chunk_ranges(
+        int(student_logits.shape[1]),
+        int(sequence_chunk_size),
+    ):
+        student_chunk = student_logits[:, start:end, :]
+        mask_chunk = resolved_mask[:, start:end]
+        valid_count = mask_chunk.sum()
+        chunk_forward = _make_checkpointed_token_mean_chunk_forward(
+            teacher_logits_cpu=teacher_logits_cpu,
+            start=start,
+            end=end,
+            mask_chunk=mask_chunk,
+            valid_count=valid_count,
+            chunk_loss_fn=chunk_loss_fn,
+        )
+        if torch.is_grad_enabled() and student_chunk.requires_grad:
+            chunk_numerator = torch_checkpoint.checkpoint(
+                chunk_forward,
+                student_chunk,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            chunk_numerator = chunk_forward(student_chunk)
+        chunk_numerators.append(
+            torch.where(
+                valid_count.eq(0),
+                chunk_numerator.new_zeros(()),
+                chunk_numerator,
+            )
+        )
+
+    return torch.stack(chunk_numerators, dim=0).sum() / denominator
 
 
 def _full_eakld_chunk_sums(
@@ -870,12 +946,13 @@ def _compute_eakld_from_cpu_teacher_logits_impl(
     teacher_valid_token_count: Optional[torch.Tensor] = None,
     telemetry_out: Optional[MutableMapping[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    _validate_cpu_teacher_distill_inputs(
+    _validate_cpu_teacher_logits_inputs(
         student_logits=student_logits,
         teacher_logits_cpu=teacher_logits_cpu,
-        gamma=gamma,
         sequence_chunk_size=sequence_chunk_size,
     )
+    if not torch.is_tensor(gamma) or int(gamma.numel()) != 1:
+        raise ValueError("gamma must be a scalar tensor.")
     if k is not None and int(k) < 1:
         raise ValueError(f"k must be >= 1, got {k}.")
     if telemetry_out is not None:

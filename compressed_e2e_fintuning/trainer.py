@@ -286,11 +286,6 @@ def compute_choice_kd_loss_from_scores(
     return ce_loss * (1.0 - alpha) + kd_loss * alpha
 
 
-def _is_cpu_offload_supported_loss(loss_type: str) -> bool:
-    norm = str(loss_type or "").strip().lower()
-    return norm in {"sft", "origin", "eakld", "eakld_kd"} or is_eakld_top_loss(norm)
-
-
 class VAEDecoderE2ETrainer(Trainer):
     def __init__(
         self,
@@ -487,6 +482,7 @@ class VAEDecoderE2ETrainer(Trainer):
         inputs: Dict[str, torch.Tensor],
         logits_required: bool,
         hidden_required: bool,
+        eakld_metadata_required: bool,
     ) -> TeacherTargetBatch:
         if self._active_teacher_targets is not None:
             raise RuntimeError(
@@ -529,50 +525,49 @@ class VAEDecoderE2ETrainer(Trainer):
             prompt_valid_count_cpu = None
             if logits_required:
                 teacher_logits = get_output_logits(teacher_outputs)
-                regions = self._build_distill_token_regions(inputs, teacher_logits)
-                # Single CPU copy of full teacher logits, reused for both regions.
+                # Single CPU copy of full teacher logits, reused for EAKLD metadata.
                 logits_cpu = copy_detached_tensor_to_cpu(
                     teacher_logits,
                     pin_memory=self.teacher_output_pin_memory,
                 )
-                # Always compute response-region scalars.
-                entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
-                    logits_cpu,
-                    regions.response_mask,
-                    confidence_k=self.eakld_confidence_k,
-                )
-                gamma_cpu = gamma.detach().reshape(()).to(device="cpu", dtype=torch.float32)
-                entropy_mean_cpu = entropy_mean.detach().reshape(()).to(
-                    device="cpu",
-                    dtype=torch.float32,
-                )
-                valid_count_cpu = valid_count.detach().reshape(()).to(
-                    device="cpu",
-                    dtype=torch.float32,
-                )
-                # Only compute prompt-region scalars when prompt weight is positive.
-                if self.prompt_kd_weight > 0.0:
-                    (
-                        prompt_entropy_mean,
-                        prompt_gamma,
-                        prompt_valid_count,
-                    ) = compute_teacher_entropy_mean_and_gamma(
+                if eakld_metadata_required:
+                    regions = self._build_distill_token_regions(inputs, teacher_logits)
+                    entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
                         logits_cpu,
-                        regions.prompt_mask,
+                        regions.response_mask,
                         confidence_k=self.eakld_confidence_k,
                     )
-                    prompt_gamma_cpu = prompt_gamma.detach().reshape(()).to(
+                    gamma_cpu = gamma.detach().reshape(()).to(device="cpu", dtype=torch.float32)
+                    entropy_mean_cpu = entropy_mean.detach().reshape(()).to(
                         device="cpu",
                         dtype=torch.float32,
                     )
-                    prompt_entropy_mean_cpu = prompt_entropy_mean.detach().reshape(()).to(
+                    valid_count_cpu = valid_count.detach().reshape(()).to(
                         device="cpu",
                         dtype=torch.float32,
                     )
-                    prompt_valid_count_cpu = prompt_valid_count.detach().reshape(()).to(
-                        device="cpu",
-                        dtype=torch.float32,
-                    )
+                    if self.prompt_kd_weight > 0.0:
+                        (
+                            prompt_entropy_mean,
+                            prompt_gamma,
+                            prompt_valid_count,
+                        ) = compute_teacher_entropy_mean_and_gamma(
+                            logits_cpu,
+                            regions.prompt_mask,
+                            confidence_k=self.eakld_confidence_k,
+                        )
+                        prompt_gamma_cpu = prompt_gamma.detach().reshape(()).to(
+                            device="cpu",
+                            dtype=torch.float32,
+                        )
+                        prompt_entropy_mean_cpu = prompt_entropy_mean.detach().reshape(()).to(
+                            device="cpu",
+                            dtype=torch.float32,
+                        )
+                        prompt_valid_count_cpu = prompt_valid_count.detach().reshape(()).to(
+                            device="cpu",
+                            dtype=torch.float32,
+                        )
 
             hidden_layer_indices: tuple = ()
             hidden_cpu_by_layer: Dict[int, torch.Tensor] = {}
@@ -736,12 +731,11 @@ class VAEDecoderE2ETrainer(Trainer):
         loss_type = self.loss_type
         hidden_required = float(self.hidden_loss_weight) > 0.0
         logits_required = loss_type not in {"sft", "origin"}
+        eakld_metadata_required = (
+            loss_type in {"eakld", "eakld_kd"}
+            or is_eakld_top_loss(loss_type)
+        )
         needs_teacher = hidden_required or logits_required
-
-        if not _is_cpu_offload_supported_loss(loss_type):
-            raise ValueError(
-                "teacher_output_offload=cpu supports only sft/origin hidden alignment and EAKLD-family losses."
-            )
 
         labels = inputs.get("labels")
         student_inputs = dict(inputs)
@@ -755,6 +749,7 @@ class VAEDecoderE2ETrainer(Trainer):
                     inputs=inputs,
                     logits_required=logits_required,
                     hidden_required=hidden_required,
+                    eakld_metadata_required=eakld_metadata_required,
                 )
 
             student_collector_ctx = (
@@ -785,10 +780,12 @@ class VAEDecoderE2ETrainer(Trainer):
                     raise RuntimeError("sft/origin must not cache teacher logits.")
                 distill_loss = ce_loss
             else:
-                if (
-                    targets is None
-                    or targets.logits_cpu is None
-                    or targets.eakld_gamma_cpu is None
+                if targets is None or targets.logits_cpu is None:
+                    raise RuntimeError(
+                        "Dense distillation with teacher_output_offload=cpu requires teacher logits on CPU."
+                    )
+                if eakld_metadata_required and (
+                    targets.eakld_gamma_cpu is None
                     or targets.teacher_entropy_mean_cpu is None
                     or targets.teacher_valid_token_count_cpu is None
                 ):
@@ -797,7 +794,7 @@ class VAEDecoderE2ETrainer(Trainer):
                         "entropy scalars on CPU."
                     )
                 regions = self._build_distill_token_regions(inputs, logits)
-                if self.prompt_kd_weight > 0.0 and (
+                if eakld_metadata_required and self.prompt_kd_weight > 0.0 and (
                     targets.eakld_prompt_gamma_cpu is None
                     or targets.teacher_prompt_entropy_mean_cpu is None
                     or targets.teacher_prompt_valid_token_count_cpu is None
@@ -822,7 +819,7 @@ class VAEDecoderE2ETrainer(Trainer):
                     alpha=self.distill_alpha,
                     eakld_confidence_k=int(self.eakld_confidence_k),
                     sequence_chunk_size=int(self.teacher_output_chunk_tokens),
-                    telemetry_out=telemetry,
+                    telemetry_out=telemetry if eakld_metadata_required else None,
                     prompt_mask=regions.prompt_mask,
                     prompt_kd_weight=self.prompt_kd_weight,
                     teacher_prompt_gamma_cpu=targets.eakld_prompt_gamma_cpu,
@@ -833,7 +830,8 @@ class VAEDecoderE2ETrainer(Trainer):
                         targets.teacher_prompt_valid_token_count_cpu
                     ),
                 )
-                self._record_eakld_telemetry(telemetry)
+                if eakld_metadata_required:
+                    self._record_eakld_telemetry(telemetry)
 
             hidden_loss = None
             loss = distill_loss

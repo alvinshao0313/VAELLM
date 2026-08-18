@@ -100,6 +100,7 @@ def _build_trainer(
     hidden_loss_weight: float,
     hidden_layer_weighting: str = "adaptive_top_2",
     prompt_kd_weight: float = 0.0,
+    teacher_output_offload: str = "cpu",
 ):
     events: list[str] = []
     teacher = _TinyCausalLM(role="teacher", events=events)
@@ -126,7 +127,7 @@ def _build_trainer(
         hidden_layer_weighting=hidden_layer_weighting,
         prompt_kd_weight=prompt_kd_weight,
         eakld_confidence_k=16,
-        teacher_output_offload="cpu",
+        teacher_output_offload=teacher_output_offload,
         teacher_output_pin_memory=False,
         teacher_output_chunk_tokens=2,
     )
@@ -142,6 +143,25 @@ def _inputs() -> dict[str, torch.Tensor]:
         "attention_mask": torch.ones_like(input_ids),
         "labels": input_ids.clone(),
     }
+
+
+def _assert_eakld_metadata_none(targets) -> None:
+    assert targets.eakld_gamma_cpu is None
+    assert targets.teacher_entropy_mean_cpu is None
+    assert targets.teacher_valid_token_count_cpu is None
+    assert targets.eakld_prompt_gamma_cpu is None
+    assert targets.teacher_prompt_entropy_mean_cpu is None
+    assert targets.teacher_prompt_valid_token_count_cpu is None
+
+
+def _assert_student_has_finite_trainable_grad(student) -> None:
+    finite_grads = [
+        parameter.grad
+        for parameter in student.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert finite_grads
+    assert all(torch.isfinite(grad).all() for grad in finite_grads)
 
 
 @pytest.fixture(autouse=True)
@@ -280,22 +300,26 @@ def test_cpu_sft_hidden_positive_teacher_first_no_logits_cache(tmp_path):
         trainer._release_active_teacher_targets()
 
 
-def test_unsupported_kl_raises_before_student_forward(tmp_path):
-    trainer, student, _teacher, events = _build_trainer(
+def test_cpu_kl_top_1000_teacher_before_student_and_backward(tmp_path):
+    trainer, student, teacher, events = _build_trainer(
         tmp_path,
-        loss_type="kl",
+        loss_type="kl_top_1000",
         hidden_loss_weight=0.0,
     )
+    del teacher
     inputs = _inputs()
-    with pytest.raises(
-        ValueError,
-        match=(
-            "teacher_output_offload=cpu supports only sft/origin hidden alignment "
-            "and EAKLD-family losses."
-        ),
-    ):
-        trainer.compute_loss(student, inputs)
-    assert events == []
+    loss = trainer.compute_loss(student, inputs)
+    assert events == ["teacher_forward", "student_forward"]
+    assert trainer._active_teacher_targets is not None
+    assert trainer._active_teacher_targets.logits_cpu is not None
+    assert trainer._active_teacher_targets.logits_cpu.device.type == "cpu"
+    _assert_eakld_metadata_none(trainer._active_teacher_targets)
+    assert torch.isfinite(loss)
+    try:
+        loss.backward()
+        _assert_student_has_finite_trainable_grad(student)
+    finally:
+        trainer._release_active_teacher_targets()
     assert trainer._active_teacher_targets is None
 
 
@@ -457,6 +481,26 @@ def _install_counting_entropy_helper(monkeypatch):
     return calls
 
 
+def _install_counting_copy_helper(monkeypatch):
+    copy_calls = {"count": 0}
+    original_copy = (
+        __import__(
+            "compressed_e2e_fintuning.trainer",
+            fromlist=["copy_detached_tensor_to_cpu"],
+        ).copy_detached_tensor_to_cpu
+    )
+
+    def counting_copy(tensor, *, pin_memory):
+        copy_calls["count"] += 1
+        return original_copy(tensor, pin_memory=pin_memory)
+
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.trainer.copy_detached_tensor_to_cpu",
+        counting_copy,
+    )
+    return copy_calls
+
+
 def test_cpu_teacher_targets_zero_prompt_weight_response_only(tmp_path, monkeypatch):
     calls = _install_counting_entropy_helper(monkeypatch)
     trainer, student, _teacher, _events = _build_trainer(
@@ -534,3 +578,169 @@ def test_cpu_teacher_targets_positive_prompt_weight_both_regions(tmp_path, monke
         loss.backward()
     finally:
         trainer._release_active_teacher_targets()
+
+
+CPU_OFFLOAD_DENSE_DISTILL_LOSS_TYPES = (
+    "kl",
+    "rkl",
+    "dual_rkl",
+    "mse",
+    "kd",
+    "kd_top",
+    "kd_top_7",
+    "dual_kd_top",
+    "dual_kd_top_7",
+    "dual_kl",
+    "dual_kd",
+    "eakld",
+    "eakld_kd",
+    "eakld_top",
+    "eakld_top_7",
+    "eakld_topk",
+    "eakld_topk_7",
+    "r_kl_top",
+    "r_kl_top_7",
+    "dual_r_kl_top",
+    "dual_r_kl_top_7",
+    "kl_top",
+    "kl_top_7",
+    "kl_top_1000",
+    "dual_kl_top",
+    "dual_kl_top_7",
+)
+
+
+@pytest.mark.parametrize("loss_type", CPU_OFFLOAD_DENSE_DISTILL_LOSS_TYPES)
+def test_cpu_offload_all_dense_distillation_losses_backward(tmp_path, loss_type):
+    trainer, student, _teacher, events = _build_trainer(
+        tmp_path,
+        loss_type=loss_type,
+        hidden_loss_weight=0.0,
+        prompt_kd_weight=0.03,
+        teacher_output_offload="cpu",
+    )
+    inputs = _inputs()
+    loss = trainer.compute_loss(student, inputs)
+    assert events == ["teacher_forward", "student_forward"]
+    assert torch.isfinite(loss)
+    try:
+        loss.backward()
+        _assert_student_has_finite_trainable_grad(student)
+    finally:
+        trainer._release_active_teacher_targets()
+    assert trainer._active_teacher_targets is None
+
+
+def test_cpu_kl_top_1000_skips_eakld_metadata_and_copies_logits_once(
+    tmp_path, monkeypatch
+):
+    entropy_calls = _install_counting_entropy_helper(monkeypatch)
+    copy_calls = _install_counting_copy_helper(monkeypatch)
+    trainer, student, _teacher, _events = _build_trainer(
+        tmp_path,
+        loss_type="kl_top_1000",
+        hidden_loss_weight=0.0,
+        prompt_kd_weight=0.03,
+    )
+    inputs = _inputs_with_prompt_prefix()
+    loss = trainer.compute_loss(student, inputs)
+    target = trainer._active_teacher_targets
+    assert target is not None
+    assert target.logits_cpu is not None
+    _assert_eakld_metadata_none(target)
+    assert len(entropy_calls) == 0
+    assert copy_calls["count"] == 1
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_cpu_kl_top_1000_adaptive_top_2_hidden_collectors(tmp_path):
+    trainer, student, teacher, _events = _build_trainer(
+        tmp_path,
+        loss_type="kl_top_1000",
+        hidden_loss_weight=0.1,
+        hidden_layer_weighting="adaptive_top_2",
+        prompt_kd_weight=0.03,
+    )
+    inputs = _inputs()
+    loss = trainer.compute_loss(student, inputs)
+    assert teacher.output_hidden_states_calls == [False]
+    assert student.output_hidden_states_calls == [False]
+    stats = trainer._last_teacher_target_stats
+    assert int(stats["hidden_layer_count"]) == 2
+    assert len(stats["hidden_layer_indices"]) == 2
+    assert int(stats["num_hidden_layers"]) == 4
+    targets = trainer._active_teacher_targets
+    assert targets is not None
+    assert len(targets.hidden_layer_indices) == 2
+    assert len(targets.hidden_cpu_by_layer) == 2
+    assert targets.logits_cpu is not None
+    _assert_eakld_metadata_none(targets)
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_training_step_clears_active_teacher_targets_kl_top_1000(tmp_path):
+    trainer, student, _teacher, _events = _build_trainer(
+        tmp_path,
+        loss_type="kl_top_1000",
+        hidden_loss_weight=0.1,
+    )
+    inputs = _inputs()
+    loss = trainer.training_step(student, inputs)
+    assert torch.is_tensor(loss)
+    assert torch.isfinite(loss)
+    assert trainer._active_teacher_targets is None
+
+
+def test_cpu_kl_top_1000_legacy_vs_cpu_trainer_parity(tmp_path):
+    seed = 20260817
+
+    def _seeded_trainer(output_dir, *, teacher_output_offload: str):
+        torch.manual_seed(seed)
+        return _build_trainer(
+            output_dir,
+            loss_type="kl_top_1000",
+            hidden_loss_weight=0.0,
+            prompt_kd_weight=0.03,
+            teacher_output_offload=teacher_output_offload,
+        )
+
+    cpu_trainer, cpu_student, cpu_teacher, _cpu_events = _seeded_trainer(
+        tmp_path / "cpu",
+        teacher_output_offload="cpu",
+    )
+    none_trainer, none_student, none_teacher, _none_events = _seeded_trainer(
+        tmp_path / "none",
+        teacher_output_offload="none",
+    )
+    for left, right in zip(
+        cpu_student.parameters(), none_student.parameters(), strict=True
+    ):
+        torch.testing.assert_close(left, right)
+    for left, right in zip(
+        cpu_teacher.parameters(), none_teacher.parameters(), strict=True
+    ):
+        torch.testing.assert_close(left, right)
+
+    inputs = _inputs()
+    try:
+        cpu_loss = cpu_trainer.compute_loss(cpu_student, inputs)
+        none_loss = none_trainer.compute_loss(none_student, inputs)
+        torch.testing.assert_close(cpu_loss, none_loss, atol=2e-6, rtol=2e-5)
+        cpu_loss.backward()
+        none_loss.backward()
+        assert cpu_student.lm_head.weight.grad is not None
+        assert none_student.lm_head.weight.grad is not None
+        torch.testing.assert_close(
+            cpu_student.lm_head.weight.grad,
+            none_student.lm_head.weight.grad,
+            atol=3e-6,
+            rtol=3e-5,
+        )
+    finally:
+        cpu_trainer._release_active_teacher_targets()

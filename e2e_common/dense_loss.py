@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from train_utils.distill_losses import (
+    compute_chunked_token_mean_from_cpu_teacher_logits,
     compute_dual_kl_loss,
     compute_dual_kl_topk_loss,
     compute_dual_rkl_loss,
@@ -86,6 +87,35 @@ def _combine_region_loss(
     if weight == 0.0 or prompt_mask is None:
         return response_loss
     return response_loss + weight * prompt_loss_fn()
+
+
+def _is_eakld_family_loss(loss_type: str) -> bool:
+    norm = str(loss_type or "").strip().lower()
+    return norm in {"eakld", "eakld_kd"} or is_eakld_top_loss(norm)
+
+
+def _offloaded_region_loss_type(loss_type: str) -> str:
+    norm = str(loss_type or "").strip().lower()
+    if norm == "kd":
+        return "kl"
+    if norm.startswith("kd_top"):
+        return "kl_top" + norm[len("kd_top"):]
+    if norm == "dual_kd":
+        return "dual_kl"
+    if norm.startswith("dual_kd_top"):
+        return "dual_kl_top" + norm[len("dual_kd_top"):]
+    return norm
+
+
+def _is_ce_blended_dense_loss(loss_type: str) -> bool:
+    norm = str(loss_type or "").strip().lower()
+    return (
+        norm == "kd"
+        or norm.startswith("kd_top")
+        or norm == "dual_kd"
+        or norm.startswith("dual_kd_top")
+        or norm == "eakld_kd"
+    )
 
 
 def compute_dense_loss_from_logits(
@@ -451,14 +481,51 @@ def compute_dense_loss_from_logits(
     )
 
 
+def _compute_offloaded_non_eakld_region_loss(
+    *,
+    loss_type: str,
+    student_logits: torch.Tensor,
+    teacher_logits_cpu: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    temperature: float,
+    sequence_chunk_size: int,
+) -> torch.Tensor:
+    region_loss_type = _offloaded_region_loss_type(loss_type)
+
+    def chunk_loss_fn(
+        student_chunk: torch.Tensor,
+        teacher_chunk: torch.Tensor,
+        mask_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        return compute_dense_loss_from_logits(
+            loss_type=region_loss_type,
+            student_logits=student_chunk,
+            teacher_logits=teacher_chunk,
+            ce_loss=None,
+            mask=mask_chunk,
+            temperature=temperature,
+            prompt_mask=None,
+            prompt_kd_weight=0,
+            telemetry_out=None,
+        )
+
+    return compute_chunked_token_mean_from_cpu_teacher_logits(
+        student_logits=student_logits,
+        teacher_logits_cpu=teacher_logits_cpu,
+        mask=mask,
+        sequence_chunk_size=sequence_chunk_size,
+        chunk_loss_fn=chunk_loss_fn,
+    )
+
+
 def compute_dense_loss_from_offloaded_teacher(
     *,
     loss_type: str,
     student_logits: torch.Tensor,
     teacher_logits_cpu: torch.Tensor,
-    teacher_gamma_cpu: torch.Tensor,
-    teacher_entropy_mean_cpu: Optional[torch.Tensor],
-    teacher_valid_token_count_cpu: Optional[torch.Tensor],
+    teacher_gamma_cpu: Optional[torch.Tensor] = None,
+    teacher_entropy_mean_cpu: Optional[torch.Tensor] = None,
+    teacher_valid_token_count_cpu: Optional[torch.Tensor] = None,
     ce_loss: Optional[torch.Tensor] = None,
     mask: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
@@ -475,38 +542,49 @@ def compute_dense_loss_from_offloaded_teacher(
     weight = _validate_prompt_weight(
         prompt_mask=prompt_mask, prompt_kd_weight=prompt_kd_weight
     )
-    if weight > 0.0 and (
-        teacher_prompt_gamma_cpu is None
-        or teacher_prompt_entropy_mean_cpu is None
-        or teacher_prompt_valid_token_count_cpu is None
-    ):
-        raise ValueError(
-            "prompt_kd_weight > 0 requires teacher_prompt_gamma_cpu, "
-            "teacher_prompt_entropy_mean_cpu, and "
-            "teacher_prompt_valid_token_count_cpu."
-        )
     norm = str(loss_type or "").strip().lower()
-    if int(eakld_confidence_k) < 2:
-        raise ValueError("eakld_confidence_k must be >= 2.")
-
+    is_eakld = _is_eakld_family_loss(norm)
     temperature = float(temperature)
     alpha_f = float(alpha)
     chunk_size = int(sequence_chunk_size)
 
-    def _response_eakld() -> torch.Tensor:
-        if norm == "eakld" or norm == "eakld_kd":
-            return compute_eakld_from_cpu_teacher_logits(
-                student_logits=student_logits,
-                teacher_logits_cpu=teacher_logits_cpu,
-                mask=mask,
-                gamma=teacher_gamma_cpu,
-                temperature=temperature,
-                sequence_chunk_size=chunk_size,
-                teacher_entropy_mean=teacher_entropy_mean_cpu,
-                teacher_valid_token_count=teacher_valid_token_count_cpu,
-                telemetry_out=telemetry_out,
+    if is_eakld:
+        if teacher_gamma_cpu is None:
+            raise ValueError("EAKLD-family loss requires teacher_gamma_cpu.")
+        if telemetry_out is not None and (
+            teacher_entropy_mean_cpu is None
+            or teacher_valid_token_count_cpu is None
+        ):
+            raise ValueError(
+                "EAKLD-family telemetry requires teacher_entropy_mean_cpu and "
+                "teacher_valid_token_count_cpu."
             )
-        if is_eakld_top_loss(norm):
+        if weight > 0.0 and (
+            teacher_prompt_gamma_cpu is None
+            or teacher_prompt_entropy_mean_cpu is None
+            or teacher_prompt_valid_token_count_cpu is None
+        ):
+            raise ValueError(
+                "prompt_kd_weight > 0 requires teacher_prompt_gamma_cpu, "
+                "teacher_prompt_entropy_mean_cpu, and "
+                "teacher_prompt_valid_token_count_cpu."
+            )
+        if int(eakld_confidence_k) < 2:
+            raise ValueError("eakld_confidence_k must be >= 2.")
+
+        def _response_eakld() -> torch.Tensor:
+            if norm == "eakld" or norm == "eakld_kd":
+                return compute_eakld_from_cpu_teacher_logits(
+                    student_logits=student_logits,
+                    teacher_logits_cpu=teacher_logits_cpu,
+                    mask=mask,
+                    gamma=teacher_gamma_cpu,
+                    temperature=temperature,
+                    sequence_chunk_size=chunk_size,
+                    teacher_entropy_mean=teacher_entropy_mean_cpu,
+                    teacher_valid_token_count=teacher_valid_token_count_cpu,
+                    telemetry_out=telemetry_out,
+                )
             k = parse_eakld_top_k(norm, default_k=1000)
             return compute_eakld_topk_from_cpu_teacher_logits(
                 student_logits=student_logits,
@@ -520,50 +598,73 @@ def compute_dense_loss_from_offloaded_teacher(
                 teacher_valid_token_count=teacher_valid_token_count_cpu,
                 telemetry_out=telemetry_out,
             )
-        raise ValueError(
-            "teacher_output_offload=cpu supports only EAKLD-family losses."
-        )
 
-    def _prompt_eakld() -> torch.Tensor:
-        # Uses precomputed prompt-region gamma; does not overwrite response
-        # telemetry (telemetry_out=None) and does not recompute gamma from
-        # teacher_logits_cpu.
-        if norm == "eakld" or norm == "eakld_kd":
-            return compute_eakld_from_cpu_teacher_logits(
+        def _prompt_eakld() -> torch.Tensor:
+            # Uses precomputed prompt-region gamma; does not overwrite response
+            # telemetry (telemetry_out=None) and does not recompute gamma from
+            # teacher_logits_cpu.
+            if norm == "eakld" or norm == "eakld_kd":
+                return compute_eakld_from_cpu_teacher_logits(
+                    student_logits=student_logits,
+                    teacher_logits_cpu=teacher_logits_cpu,
+                    mask=prompt_mask,
+                    gamma=teacher_prompt_gamma_cpu,
+                    temperature=temperature,
+                    sequence_chunk_size=chunk_size,
+                    teacher_entropy_mean=None,
+                    teacher_valid_token_count=None,
+                    telemetry_out=None,
+                )
+            k = parse_eakld_top_k(norm, default_k=1000)
+            return compute_eakld_topk_from_cpu_teacher_logits(
                 student_logits=student_logits,
                 teacher_logits_cpu=teacher_logits_cpu,
                 mask=prompt_mask,
                 gamma=teacher_prompt_gamma_cpu,
+                k=k,
                 temperature=temperature,
                 sequence_chunk_size=chunk_size,
                 teacher_entropy_mean=None,
                 teacher_valid_token_count=None,
                 telemetry_out=None,
             )
-        k = parse_eakld_top_k(norm, default_k=1000)
-        return compute_eakld_topk_from_cpu_teacher_logits(
+
+        eakld_response = _response_eakld()
+        eakld_region = _combine_region_loss(
+            response_loss=eakld_response,
+            prompt_loss_fn=_prompt_eakld,
+            prompt_mask=prompt_mask,
+            weight=weight,
+        )
+        if norm != "eakld_kd":
+            return eakld_region
+        if ce_loss is None:
+            raise ValueError("loss_type=eakld_kd requires ce_loss.")
+        return ce_loss * (1.0 - alpha_f) + eakld_region * alpha_f
+
+    response_loss = _compute_offloaded_non_eakld_region_loss(
+        loss_type=norm,
+        student_logits=student_logits,
+        teacher_logits_cpu=teacher_logits_cpu,
+        mask=mask,
+        temperature=temperature,
+        sequence_chunk_size=chunk_size,
+    )
+    region_loss = _combine_region_loss(
+        response_loss=response_loss,
+        prompt_loss_fn=lambda: _compute_offloaded_non_eakld_region_loss(
+            loss_type=norm,
             student_logits=student_logits,
             teacher_logits_cpu=teacher_logits_cpu,
             mask=prompt_mask,
-            gamma=teacher_prompt_gamma_cpu,
-            k=k,
             temperature=temperature,
             sequence_chunk_size=chunk_size,
-            teacher_entropy_mean=None,
-            teacher_valid_token_count=None,
-            telemetry_out=None,
-        )
-
-    eakld_response = _response_eakld()
-    eakld_region = _combine_region_loss(
-        response_loss=eakld_response,
-        prompt_loss_fn=_prompt_eakld,
+        ),
         prompt_mask=prompt_mask,
         weight=weight,
     )
-
-    if norm != "eakld_kd":
-        return eakld_region
-    if ce_loss is None:
-        raise ValueError("loss_type=eakld_kd requires ce_loss.")
-    return ce_loss * (1.0 - alpha_f) + eakld_region * alpha_f
+    if _is_ce_blended_dense_loss(norm):
+        if ce_loss is None:
+            raise ValueError(f"loss_type={norm} requires ce_loss.")
+        return ce_loss * (1.0 - alpha_f) + region_loss * alpha_f
+    return region_loss
