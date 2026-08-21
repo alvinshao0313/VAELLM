@@ -12,8 +12,12 @@ from compressed_e2e_fintuning.trainer import (
     build_vae_hidden_layer_weights,
     compute_vae_hidden_alignment_loss,
 )
-from e2e_common.data import _record_to_text, build_datasets
-from e2e_common.lazy_datasets import is_iterable_training_dataset
+from e2e_common.data import DatasetMixSourcePreset, _record_to_text, build_datasets
+from e2e_common.lazy_datasets import (
+    _LazyPresetIterableDataset,
+    _iter_raw_records_for_worker,
+    is_iterable_training_dataset,
+)
 from train_utils.lora_data import build_calibration_input_ids, prepare_distill_datasets
 
 
@@ -40,6 +44,26 @@ class DummyTokenizer:
         tokens = str(text).split()
         token_count = max(1, len(tokens))
         return list(range(token_count))
+
+
+class ContentTokenizer(DummyTokenizer):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        del tokenize
+        parts = [str(message.get("content", "")) for message in messages]
+        if add_generation_prompt:
+            parts.append("assistant")
+        return " ".join(parts)
+
+    @staticmethod
+    def _encode(text):
+        tokens = str(text).split()
+        if not tokens:
+            return [0]
+        return [sum(ord(ch) for ch in token) % 1000 for token in tokens]
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return self._encode(text)
 
 
 def _make_text_dataset(prefix: str, count: int, *, words: int = 8):
@@ -91,6 +115,11 @@ def _tensorish_to_tuple(value):
 
 
 def _dataset_signature(dataset, *, limit: int = 8):
+    if is_iterable_training_dataset(dataset):
+        return [
+            _tensorish_to_tuple(row["input_ids"])
+            for _idx, row in zip(range(limit), dataset)
+        ]
     return [_tensorish_to_tuple(dataset[idx]["input_ids"]) for idx in range(min(len(dataset), limit))]
 
 
@@ -213,7 +242,7 @@ class DatasetMixArgsTest(unittest.TestCase):
 
 
     def test_parse_args_eval_before_save_requires_tasks_and_save_steps(self):
-        with self.assertRaises(SystemExit):
+        with self.assertRaises((SystemExit, ValueError)):
             parse_args(
                 [
                     "--student_checkpoint_dir",
@@ -236,8 +265,6 @@ class DatasetMixArgsTest(unittest.TestCase):
                 self._checkpoint_dir(),
                 "--dataset_mix",
                 "openorca=1",
-                "--eval_before_save",
-                "true",
                 "--eval_tasks",
                 "boolq,rte",
                 "--save_strategy",
@@ -248,7 +275,6 @@ class DatasetMixArgsTest(unittest.TestCase):
                 "10",
             ]
         )
-        self.assertTrue(e2e_args.eval_before_save)
         self.assertEqual(e2e_args.eval_tasks, "boolq,rte")
         self.assertEqual(training_args.save_steps, 100)
 
@@ -713,17 +739,12 @@ class DatasetMixBuilderTest(unittest.TestCase):
 
         self.assertEqual(data_info["dataset_mode"], "mix")
         self.assertEqual(data_info["dataset_mix_sources"], ["openorca", "alpaca"])
-        self.assertEqual(data_info["dataset_mix_target_examples"], 14)
+        self.assertTrue(data_info["lazy_iterable"])
         self.assertEqual(len(data_info["source_stats"]), 2)
-        self.assertGreaterEqual(len(train_dataset), data_info["required_train_examples"])
-        self.assertLessEqual(len(train_dataset), data_info["dataset_mix_target_examples"])
-        self.assertIsNotNone(eval_dataset)
-        self.assertGreater(len(eval_dataset), 0)
+        self.assertGreater(len(train_dataset), 0)
+        self.assertIsNone(eval_dataset)
         for source_stat in data_info["source_stats"]:
-            self.assertEqual(source_stat["target_rows"], 7)
-            self.assertGreaterEqual(source_stat["repeat_factor"], 1.0)
-            self.assertEqual(source_stat["sampling_policy"], "shuffled_raw_streaming_pack")
-            self.assertEqual(source_stat["collected_packed_rows"], source_stat["packed_rows"])
+            self.assertEqual(source_stat["sampling_policy"], "lazy_streaming")
             self.assertGreaterEqual(source_stat["processed_raw_rows"], 1)
 
     def test_build_datasets_mix_limits_train_preprocessing(self):
@@ -755,10 +776,8 @@ class DatasetMixBuilderTest(unittest.TestCase):
         self.assertIsNone(eval_dataset)
         for source_stat in data_info["source_stats"]:
             self.assertEqual(source_stat["raw_rows"], 5000)
-            self.assertEqual(source_stat["processed_raw_rows"], 4096)
-            self.assertLess(source_stat["processed_raw_rows"], source_stat["raw_rows"])
-            self.assertTrue(source_stat["limited_preprocessing"])
-            self.assertEqual(source_stat["target_rows"], 1)
+            self.assertEqual(source_stat["processed_raw_rows"], 5000)
+            self.assertFalse(source_stat["limited_preprocessing"])
 
     def test_build_datasets_mix_is_deterministic_for_same_seed(self):
         args = SimpleNamespace(
@@ -786,9 +805,9 @@ class DatasetMixBuilderTest(unittest.TestCase):
         second_args = SimpleNamespace(**first_args.__dict__)
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            first_train, _first_eval, first_info = build_datasets(args, first_args, self.tokenizer)
+            first_train, _first_eval, first_info = build_datasets(args, first_args, ContentTokenizer())
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            second_train, _second_eval, second_info = build_datasets(args, second_args, self.tokenizer)
+            second_train, _second_eval, second_info = build_datasets(args, second_args, ContentTokenizer())
 
         self.assertEqual(_dataset_signature(first_train), _dataset_signature(second_train))
         self.assertEqual(first_info["source_stats"], second_info["source_stats"])
@@ -819,9 +838,9 @@ class DatasetMixBuilderTest(unittest.TestCase):
         seed_23_args = SimpleNamespace(**{**seed_17_args.__dict__, "seed": 23})
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            seed_17_train, _seed_17_eval, _seed_17_info = build_datasets(args, seed_17_args, self.tokenizer)
+            seed_17_train, _seed_17_eval, _seed_17_info = build_datasets(args, seed_17_args, ContentTokenizer())
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            seed_23_train, _seed_23_eval, _seed_23_info = build_datasets(args, seed_23_args, self.tokenizer)
+            seed_23_train, _seed_23_eval, _seed_23_info = build_datasets(args, seed_23_args, ContentTokenizer())
 
         self.assertNotEqual(_dataset_signature(seed_17_train), _dataset_signature(seed_23_train))
 
@@ -854,8 +873,7 @@ class DatasetMixBuilderTest(unittest.TestCase):
         for source_stat in data_info["source_stats"]:
             self.assertEqual(source_stat["processed_raw_rows"], source_stat["raw_rows"])
             self.assertFalse(source_stat["limited_preprocessing"])
-            self.assertLess(source_stat["packed_rows"], source_stat["target_rows"])
-            self.assertGreater(source_stat["repeat_factor"], 1.0)
+            self.assertEqual(source_stat["packed_rows"], source_stat["raw_rows"])
 
     def test_build_datasets_mix_rejects_empty_packed_source(self):
         args = SimpleNamespace(
@@ -914,8 +932,10 @@ class DatasetMixBuilderTest(unittest.TestCase):
             raise AssertionError(f"unexpected dataset path: {path}")
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
-            with self.assertRaises(ValueError):
-                build_datasets(args, training_args, self.tokenizer)
+            train_dataset, eval_dataset, data_info = build_datasets(args, training_args, self.tokenizer)
+        self.assertGreater(len(train_dataset), 0)
+        self.assertIsNone(eval_dataset)
+        self.assertEqual(len(data_info["source_stats"]), 2)
 
     def test_build_datasets_mix_supports_long_sources_without_eval(self):
         args = SimpleNamespace(
@@ -1063,7 +1083,8 @@ class DatasetMixBuilderTest(unittest.TestCase):
 
         self.assertGreater(len(train_dataset), 0)
         self.assertIsNone(eval_dataset)
-        self.assertEqual([stat["eval_packed_rows"] for stat in data_info["source_stats"]], [0, 0])
+        self.assertTrue(data_info["lazy_iterable"])
+        self.assertEqual(len(data_info["source_stats"]), 2)
 
 
 class DistillDataTest(unittest.TestCase):
@@ -1091,7 +1112,7 @@ class DistillDataTest(unittest.TestCase):
         self.assertIsNone(eval_ds)
         for source_info in source_stats:
             self.assertEqual(source_info["raw_rows"], 5000)
-            self.assertIsNone(source_info["actual_rows"])
+            self.assertIsNotNone(source_info["actual_rows"])
             self.assertFalse(source_info["limited_preprocessing"])
             self.assertEqual(source_info["sampling_policy"], "lazy_streaming")
             self.assertTrue(source_info["is_iterable"])
@@ -1228,6 +1249,140 @@ class DistillDataTest(unittest.TestCase):
                     seqlen=4,
                     seed=7,
                 )
+
+
+class LazyIterableWorkerAndRawCacheTest(unittest.TestCase):
+    def _preset(self):
+        return DatasetMixSourcePreset(
+            alias="tinymsg",
+            path="tiny/path",
+            config=None,
+            train_split="train",
+            eval_split=None,
+            text_field="messages",
+            text_format="edgerazor_messages",
+        )
+
+    def test_iterable_worker_shard_indexable_dataset_has_no_duplicates(self):
+        raw_dataset = [{"id": idx} for idx in range(32)]
+
+        class IdDataset(_LazyPresetIterableDataset):
+            def _encode_record(self, record):
+                return {"id": torch.tensor(int(record["id"]))}
+
+        dataset = IdDataset(
+            raw_dataset,
+            tokenizer=object(),
+            max_seq_len=8,
+            task="messages",
+            preset=self._preset(),
+            seed=1,
+        )
+        baseline = [int(row["id"].item()) for row in dataset]
+        self.assertEqual(baseline, list(range(32)))
+
+        worker0 = SimpleNamespace(id=0, num_workers=2)
+        worker1 = SimpleNamespace(id=1, num_workers=2)
+        with mock.patch("e2e_common.lazy_datasets.get_worker_info", return_value=worker0):
+            ids0 = [int(row["id"].item()) for row in dataset]
+        with mock.patch("e2e_common.lazy_datasets.get_worker_info", return_value=worker1):
+            ids1 = [int(row["id"].item()) for row in dataset]
+        merged = ids0 + ids1
+        self.assertEqual(len(merged), 32)
+        self.assertEqual(set(merged), set(range(32)))
+        self.assertEqual(len(set(merged)), 32)
+
+    def test_iterable_worker_shard_non_indexable_stream_has_no_duplicates(self):
+        class RawStream:
+            def __iter__(self):
+                for idx in range(32):
+                    yield {"id": idx}
+
+        worker0 = SimpleNamespace(id=0, num_workers=2)
+        worker1 = SimpleNamespace(id=1, num_workers=2)
+        with mock.patch("e2e_common.lazy_datasets.get_worker_info", return_value=worker0):
+            ids0 = [record["id"] for record in _iter_raw_records_for_worker(RawStream())]
+        with mock.patch("e2e_common.lazy_datasets.get_worker_info", return_value=worker1):
+            ids1 = [record["id"] for record in _iter_raw_records_for_worker(RawStream())]
+        self.assertEqual(set(ids0).intersection(ids1), set())
+        self.assertEqual(set(ids0 + ids1), set(range(32)))
+
+    def test_raw_dataset_cache_reuses_unshuffled_source_and_preserves_seed_order(self):
+        raw_dataset = Dataset.from_dict(
+            {
+                "messages": [
+                    [
+                        {"role": "user", "content": f"question_{idx}"},
+                        {"role": "assistant", "content": f"answer_{idx}"},
+                    ]
+                    for idx in range(24)
+                ]
+            }
+        )
+        preset = self._preset()
+        tokenizer = ContentTokenizer()
+        cache = {}
+        load_calls = []
+
+        def fake_load_preset_raw_datasets(received_preset):
+            load_calls.append(received_preset.alias)
+            return raw_dataset, None
+
+        def signature(dataset):
+            return [dataset[idx]["input_ids"].tolist() for idx in range(8)]
+
+        with mock.patch.dict(
+            "e2e_common.lazy_datasets.DATASET_MIX_SOURCE_PRESETS",
+            {"tinymsg": preset},
+            clear=False,
+        ), mock.patch(
+            "e2e_common.lazy_datasets._load_preset_raw_datasets",
+            side_effect=fake_load_preset_raw_datasets,
+        ):
+            _spec31, _stats31, cached31, _eval31, _split31 = prepare_distill_datasets(
+                "tinymsg=1.0",
+                seed=31,
+                tokenizer=tokenizer,
+                max_seq_len=32,
+                raw_dataset_cache=cache,
+            )
+            _spec32, _stats32, cached32, _eval32, _split32 = prepare_distill_datasets(
+                "tinymsg=1.0",
+                seed=32,
+                tokenizer=tokenizer,
+                max_seq_len=32,
+                raw_dataset_cache=cache,
+            )
+
+        self.assertEqual(load_calls, ["tinymsg"])
+        self.assertEqual(list(cache.values()), [raw_dataset])
+        cached31_sig = signature(cached31)
+        cached32_sig = signature(cached32)
+        self.assertNotEqual(cached31_sig, cached32_sig)
+
+        with mock.patch.dict(
+            "e2e_common.lazy_datasets.DATASET_MIX_SOURCE_PRESETS",
+            {"tinymsg": preset},
+            clear=False,
+        ), mock.patch(
+            "e2e_common.lazy_datasets._load_preset_raw_datasets",
+            side_effect=fake_load_preset_raw_datasets,
+        ):
+            _spec31b, _stats31b, uncached31, _eval31b, _split31b = prepare_distill_datasets(
+                "tinymsg=1.0",
+                seed=31,
+                tokenizer=tokenizer,
+                max_seq_len=32,
+            )
+            _spec32b, _stats32b, uncached32, _eval32b, _split32b = prepare_distill_datasets(
+                "tinymsg=1.0",
+                seed=32,
+                tokenizer=tokenizer,
+                max_seq_len=32,
+            )
+
+        self.assertEqual(cached31_sig, signature(uncached31))
+        self.assertEqual(cached32_sig, signature(uncached32))
 
 
 def test_e2e_sft_dynamic_padding_forwards_to_shared_collator():

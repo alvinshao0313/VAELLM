@@ -31,6 +31,7 @@ def prepare_distill_datasets(
     cache_dir: Optional[str] = None,
     tokenizer=None,
     max_seq_len: int = 2048,
+    raw_dataset_cache=None,
 ):
     del cache_dir
     ensure_distill_dataset_stack_available()
@@ -47,6 +48,7 @@ def prepare_distill_datasets(
         tokenizer=tokenizer,
         max_seq_len=int(max_seq_len),
         seed=int(seed),
+        raw_dataset_cache=raw_dataset_cache,
     )
     for source_info in source_stats:
         source_info["is_iterable"] = bool(is_iterable)

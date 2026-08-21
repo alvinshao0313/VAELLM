@@ -81,6 +81,12 @@ class _ResolvedDistillStageConfig:
 
 
 @dataclass(frozen=True)
+class RemainingLoraFinetuneResult:
+    model: nn.Module
+    did_train: bool
+
+
+@dataclass(frozen=True)
 class _ExtraTrainableModule:
     name: str
     module: nn.Module
@@ -609,7 +615,6 @@ def _build_lora_trainer(
     sft_args,
     training_args,
     logger,
-    lora_config,
     cfg: _ResolvedDistillStageConfig,
     hif4_act_controller,
     teacher_param_snapshots,
@@ -661,8 +666,6 @@ def _build_lora_trainer(
         trainer_kwargs["dataset_text_field"] = "text"
         trainer_kwargs["max_seq_length"] = max_seq_len
     del train_is_iterable
-    if lora_config is not None:
-        trainer_kwargs["peft_config"] = lora_config
 
     resolved_lora_loss = str(cfg.loss_type).strip().lower()
     hidden_loss_enabled = float(cfg.hidden_loss_weight) > 0.0
@@ -744,7 +747,7 @@ def lora_finetune_remaining_categories(
     logger,
     lora_round_idx: Optional[int] = None,
     after_category: Optional[str] = None,
-) -> nn.Module:
+) -> RemainingLoraFinetuneResult:
     cfg = _resolve_distill_stage_config(
         cat_args=cat_args,
         training_args=training_args,
@@ -753,20 +756,20 @@ def lora_finetune_remaining_categories(
     )
     has_extra_trainables = bool(cfg.distill_tune_final_norm) or bool(cfg.distill_use_post_norm_head_linear)
     if cfg.steps <= 0:
-        return model
+        return RemainingLoraFinetuneResult(model=model, did_train=False)
     if not remaining_categories and not has_extra_trainables:
-        return model
+        return RemainingLoraFinetuneResult(model=model, did_train=False)
     _ensure_lora_stack_available()
 
     if not target_names and not has_extra_trainables:
         logger.info("LoRA: 没有可微调的剩余 Linear，跳过。")
-        return model
+        return RemainingLoraFinetuneResult(model=model, did_train=False)
 
     previous_use_cache = _freeze_model_for_lora(model, device=cfg.device, logger=logger)
     try:
         extra_modules = _collect_extra_trainable_modules(model, cfg=cfg, logger=logger)
         teacher_param_snapshots = _snapshot_extra_trainable_params(extra_modules)
-        model, lora_config, unique_target_names = create_lora_adapters(
+        model, _lora_config, unique_target_names = create_lora_adapters(
             model,
             target_names=target_names,
             rank=cfg.rank,
@@ -775,11 +778,11 @@ def lora_finetune_remaining_categories(
             use_dora=cfg.use_dora,
         )
         extra_trainable_names = _enable_extra_trainable_params(extra_modules)
-        if lora_config is None:
+        if _lora_config is None:
             logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
             if not extra_trainable_names:
                 logger.info("LoRA: 没有额外可训练参数，跳过。")
-                return model
+                return RemainingLoraFinetuneResult(model=model, did_train=False)
 
         resolved_lora_loss = str(cfg.loss_type).strip().lower()
         use_custom_trainer = (
@@ -799,11 +802,16 @@ def lora_finetune_remaining_categories(
 
         _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
         tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
+        raw_dataset_cache = getattr(vae_args, "_cached_remaining_lora_raw_datasets", None)
+        if not isinstance(raw_dataset_cache, dict):
+            raw_dataset_cache = {}
+            setattr(vae_args, "_cached_remaining_lora_raw_datasets", raw_dataset_cache)
         dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
             cfg.dataset,
             seed=cfg.seed,
             tokenizer=tokenizer,
             max_seq_len=int(getattr(training_args, "distill_model_max_length", 2048)),
+            raw_dataset_cache=raw_dataset_cache,
         )
         train_is_iterable = is_iterable_training_dataset(train_ds)
         train_len = dataset_length_or_none(train_ds)
@@ -827,7 +835,7 @@ def lora_finetune_remaining_categories(
         if train_len == 0:
             logger.warning("LoRA: 数据集为空，跳过。")
             model, _merged_count = merge_all_lora(model)
-            return model
+            return RemainingLoraFinetuneResult(model=model, did_train=False)
 
         sft_args = _build_sft_args(
             cat_args=cat_args,
@@ -844,7 +852,6 @@ def lora_finetune_remaining_categories(
             sft_args=sft_args,
             training_args=training_args,
             logger=logger,
-            lora_config=lora_config,
             cfg=cfg,
             hif4_act_controller=hif4_act_controller,
             teacher_param_snapshots=teacher_param_snapshots,
@@ -857,6 +864,6 @@ def lora_finetune_remaining_categories(
             hif4_act_controller=hif4_act_controller,
             logger=logger,
         )
-        return model
+        return RemainingLoraFinetuneResult(model=model, did_train=True)
     finally:
         _restore_model_use_cache(model, previous_use_cache, logger=logger)

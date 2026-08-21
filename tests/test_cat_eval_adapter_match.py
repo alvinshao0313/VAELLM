@@ -13,6 +13,10 @@ from train_utils import lora_utils
 from train_utils.cat_train_args import process_cat_train_args, resolve_distill_runtime_config
 from train_utils.lora_training import (
     CustomSFTTrainer,
+    LoraConfig,
+    PeftModel,
+    TaskType,
+    _swap_teacher_snapshot_params,
     build_distill_hidden_layer_weights,
     capture_pre_mlp_hiddens,
     compute_distill_hidden_alignment_loss,
@@ -328,7 +332,6 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
                 sft_args=object(),
                 training_args=training_args,
                 logger=SimpleNamespace(info=lambda *args, **kwargs: None),
-                lora_config=None,
                 cfg=cfg,
                 hif4_act_controller=None,
                 teacher_param_snapshots=[],
@@ -340,6 +343,7 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
         self.assertEqual(captured_kwargs["pre_mlp_hidden_loss_weight"], 0.01)
         self.assertEqual(captured_kwargs["prompt_kd_weight"], 0.0)
         self.assertEqual(captured_kwargs["hidden_alignment_layer_weighting"], "uniform")
+        self.assertNotIn("peft_config", captured_kwargs)
 
     def test_lazy_distill_forwards_dynamic_padding_to_shared_collator(self):
         captured_kwargs = {}
@@ -386,7 +390,6 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
                 sft_args=object(),
                 training_args=training_args,
                 logger=logger,
-                lora_config=None,
                 cfg=cfg,
                 hif4_act_controller=None,
                 teacher_param_snapshots=[],
@@ -449,7 +452,6 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
                 sft_args=object(),
                 training_args=training_args,
                 logger=logger,
-                lora_config=None,
                 cfg=cfg,
                 hif4_act_controller=None,
                 teacher_param_snapshots=[],
@@ -518,6 +520,11 @@ class _PreMlpFakeCausalLM(nn.Module):
         self.model = _PreMlpBackbone(hidden_size, num_layers)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.temp_scale = _TempScale()
+        self.config = SimpleNamespace(
+            model_type="qwen2",
+            use_return_dict=True,
+            tie_word_embeddings=False,
+        )
         self.output_hidden_states_calls: list[bool] = []
         self.last_hidden_states = None
         self.num_layers = num_layers
@@ -554,6 +561,9 @@ class _PreMlpFakeCausalLM(nn.Module):
             hidden_states=packed_hidden_states,
         )
 
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        return {"input_ids": input_ids, **kwargs}
+
 
 def _build_pre_mlp_trainer(
     *,
@@ -577,9 +587,18 @@ def _build_pre_mlp_trainer(
     trainer.teacher_logits_cpu_staging = False
     trainer.distill_hif4_act_controller = None
     trainer.teacher_param_snapshots = []
+    trainer._teacher_param_restore_buffers = []
     trainer.accelerator = None
     trainer.distill_token_stats = DistillTokenStatsAccumulator()
     return trainer
+
+
+class _FakeAccelerator:
+    def __init__(self, unwrapped_model):
+        self.unwrapped_model = unwrapped_model
+
+    def unwrap_model(self, _model):
+        return self.unwrapped_model
 
 
 def _pre_mlp_inputs() -> dict[str, torch.Tensor]:
@@ -692,6 +711,103 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
         self.assertEqual(model.output_hidden_states_calls, [False, False])
         self.assertEqual(capture_mock.call_count, 0)
         self.assertTrue(torch.isfinite(loss).item())
+
+    @unittest.skipIf(LoraConfig is None or PeftModel is None, "peft is not installed")
+    def test_peft_model_pre_mlp_capture_uses_base_model_layers(self):
+        raw_model = _PreMlpFakeCausalLM()
+        peft_model = lora_utils.create_lora_adapters(
+            raw_model,
+            target_names=["mlp"],
+            rank=2,
+            alpha=4,
+            dropout=0.0,
+            use_dora=False,
+        )[0]
+        self.assertIsInstance(peft_model, PeftModel)
+        self.assertNotIsInstance(peft_model.get_base_model(), PeftModel)
+        trainer = _build_pre_mlp_trainer(
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.25,
+            hidden_alignment_layer_weighting="uniform",
+        )
+        trainer.accelerator = _FakeAccelerator(peft_model)
+        inputs = _pre_mlp_inputs()
+
+        with patch(
+            "train_utils.lora_training.compute_distill_pre_mlp_hidden_alignment_loss",
+            wraps=compute_distill_pre_mlp_hidden_alignment_loss,
+        ) as pre_mlp_mock:
+            loss = trainer.compute_loss(peft_model, inputs)
+
+        self.assertTrue(torch.isfinite(loss).item())
+        pre_kwargs = pre_mlp_mock.call_args.kwargs
+        self.assertEqual(len(pre_kwargs["teacher_pre_mlp_hiddens"]), raw_model.num_layers)
+        self.assertEqual(len(pre_kwargs["student_pre_mlp_hiddens"]), raw_model.num_layers)
+
+    @unittest.skipIf(LoraConfig is None or PeftModel is None, "peft is not installed")
+    def test_teacher_adapter_off_student_adapter_on_and_backward(self):
+        raw_model = _PreMlpFakeCausalLM()
+        peft_model = lora_utils.create_lora_adapters(
+            raw_model,
+            target_names=["mlp"],
+            rank=2,
+            alpha=4,
+            dropout=0.0,
+            use_dora=False,
+        )[0]
+        for name, module in peft_model.named_modules():
+            if name.endswith("lora_B.default"):
+                nn.init.constant_(module.weight, 0.25)
+        inputs = _pre_mlp_inputs()
+        with torch.no_grad():
+            with peft_model.disable_adapter():
+                base_logits = peft_model.get_base_model()(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                ).logits
+                adapter_off_logits = peft_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                ).logits
+            adapter_on_logits = peft_model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            ).logits
+        self.assertTrue(torch.allclose(adapter_off_logits, base_logits))
+        self.assertFalse(torch.allclose(adapter_on_logits, adapter_off_logits))
+
+        trainer = _build_pre_mlp_trainer(
+            hidden_loss_weight=0.0,
+            pre_mlp_hidden_loss_weight=0.25,
+            hidden_alignment_layer_weighting="uniform",
+            loss_type="kl_top_2",
+        )
+        trainer.accelerator = _FakeAccelerator(peft_model)
+        loss = trainer.compute_loss(peft_model, inputs)
+        self.assertTrue(torch.isfinite(loss).item())
+        peft_model.zero_grad(set_to_none=True)
+        loss.backward()
+        lora_grads = [
+            param.grad
+            for name, param in peft_model.named_parameters()
+            if "lora_" in name and param.requires_grad
+        ]
+        self.assertTrue(lora_grads)
+        self.assertTrue(any(grad is not None and torch.isfinite(grad).all() for grad in lora_grads))
+
+    def test_swap_teacher_snapshot_params_reuses_restore_buffer(self):
+        param = nn.Parameter(torch.tensor([1.0, 2.0]))
+        snapshot = torch.tensor([7.0, 8.0])
+        restore = torch.empty_like(param)
+        with _swap_teacher_snapshot_params([(param, snapshot)], [restore]):
+            self.assertTrue(torch.equal(param.detach(), snapshot))
+        self.assertTrue(torch.equal(param.detach(), torch.tensor([1.0, 2.0])))
+
+        with torch.no_grad():
+            param.copy_(torch.tensor([3.0, 4.0]))
+        with _swap_teacher_snapshot_params([(param, snapshot)], [restore]):
+            self.assertTrue(torch.equal(param.detach(), snapshot))
+        self.assertTrue(torch.equal(param.detach(), torch.tensor([3.0, 4.0])))
 
 
 def _build_distill_trainer(

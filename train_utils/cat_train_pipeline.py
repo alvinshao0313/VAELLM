@@ -3241,15 +3241,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
 
                 if (
                     inline_distributed
-                    and int(distill_result.trained_target_count) > 0
+                    and bool(distill_result.did_train)
                     and bool(cat_args.save_model)
                 ):
-                    from e2e_common.post_norm_head import fuse_post_norm_head_linear
                     from e2e_common.compressed_subspace_lora import iter_named_compressed_subspace_peft_proxies
                     from e2e_common.peft_proxy import iter_named_peft_vae_proxies
                     from litebsq.vae_linear import clear_model_vae_linear_cache
 
-                    fuse_post_norm_head_linear(model)
                     leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
                     leftover_subspace_proxies = [
                         name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
@@ -3263,14 +3261,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     distill_distributed_barrier()
 
                 if (
-                    int(distill_result.trained_target_count) > 0
+                    bool(distill_result.did_train)
                     and bool(cat_args.save_model)
                     and (not inline_distributed or is_distill_main_process())
                 ):
                     if str(cat) not in completed_distill_categories:
                         completed_distill_categories.append(str(cat))
                     from transformers import AutoTokenizer
-                    from e2e_common.post_norm_head import fuse_post_norm_head_linear
                     from e2e_common.compressed_subspace_lora import (
                         iter_named_compressed_subspace_peft_proxies,
                     )
@@ -3281,9 +3278,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     tok = AutoTokenizer.from_pretrained(
                         vae_args.model_path, use_fast=True, token=hf_args.access_token
                     )
-                    fused_post_norm_head = fuse_post_norm_head_linear(model)
-                    if fused_post_norm_head:
-                        log.info("After-category save: fused post_norm_linear into lm_head.weight.")
                     leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
                     leftover_subspace_proxies = [
                         name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
@@ -3314,7 +3308,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         unload_vae_original_weights=False,
                     )
                     log.info("Saved after-category model to %s", save_paths["output_dir"])
-                if inline_distributed and int(distill_result.trained_target_count) > 0 and bool(cat_args.save_model):
+                if inline_distributed and bool(distill_result.did_train) and bool(cat_args.save_model):
                     distill_distributed_barrier()
 
                 if run_this_category_eval:
@@ -3336,6 +3330,14 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 model.to("cpu")
                 torch.cuda.empty_cache()
                 distill_distributed_barrier()
+
+        from e2e_common.post_norm_head import fuse_post_norm_head_linear
+
+        fused_post_norm_head = fuse_post_norm_head_linear(model)
+        if fused_post_norm_head and (not inline_distributed or is_distill_main_process()):
+            log.info("Finalized post_norm_linear into lm_head.weight before final evaluation/save.")
+        if inline_distributed:
+            distill_distributed_barrier()
 
         if run_category_eval:
             log.info("所有类别训练完成后最终评估...")
@@ -3371,16 +3373,12 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             if not cat_args.convert:
                 raise ValueError("--save_model requires --convert")
             from transformers import AutoTokenizer
-            from e2e_common.post_norm_head import fuse_post_norm_head_linear
             from e2e_common.compressed_subspace_lora import (
                 iter_named_compressed_subspace_peft_proxies,
             )
             from e2e_common.peft_proxy import iter_named_peft_vae_proxies
             from litebsq.vae_linear import clear_model_vae_linear_cache
 
-            fused_post_norm_head = fuse_post_norm_head_linear(model)
-            if fused_post_norm_head and (not inline_distributed or is_distill_main_process()):
-                log.info("Final save: fused post_norm_linear into lm_head.weight.")
             leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
             leftover_subspace_proxies = [
                 name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)

@@ -21,6 +21,7 @@ from litebsq.bitpack import (
 )
 from litebsq.vae_linear import VAELinear
 from tools.convert_cat_checkpoint_to_bitpack import convert_checkpoint
+from e2e_common.post_norm_head import LMHeadWithPostNormLinear, ensure_post_norm_head_linear
 from train_utils.model_checkpoint_io import (
     _build_distributed_run_output_dir,
     _collect_vae_linear_specs,
@@ -53,6 +54,15 @@ class _DummyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(4, 4, bias=False)
+
+
+class _TinyLmHeadModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lm_head = nn.Linear(3, 5, bias=False)
+
+    def forward(self, hidden_states):
+        return self.lm_head(hidden_states)
 
 
 def _make_decoder(latent_dim: int, codebook_dim: int) -> Decoder:
@@ -190,6 +200,57 @@ class DistributedRunOutputDirTest(unittest.TestCase):
                 got = _build_distributed_run_output_dir(tmpdir, "model")
 
         self.assertEqual(got, shared_run_dir)
+
+
+class PostNormHeadCheckpointTest(unittest.TestCase):
+    def test_post_norm_head_wrapper_round_trip(self):
+        model = _TinyLmHeadModel()
+        ensure_post_norm_head_linear(model)
+        with torch.no_grad():
+            model.lm_head.lm_head.weight.copy_(torch.arange(15, dtype=torch.float32).view(5, 3) / 10.0)
+            model.lm_head.post_norm_linear.weight.copy_(
+                torch.tensor(
+                    [
+                        [1.0, 0.2, 0.0],
+                        [0.0, 0.7, 0.1],
+                        [0.3, 0.0, 1.2],
+                    ],
+                    dtype=torch.float32,
+                )
+            )
+        inputs = torch.randn(2, 4, 3)
+        expected_logits = model(inputs).detach().clone()
+        expected_base = model.lm_head.lm_head.weight.detach().clone()
+        expected_post = model.lm_head.post_norm_linear.weight.detach().clone()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_model_checkpoint(model, tmpdir, save_config=False)
+            with open(os.path.join(tmpdir, "checkpoint_meta.json"), "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            self.assertIs(meta["post_norm_head_linear"], True)
+
+            restored_model = _TinyLmHeadModel()
+            restored_model, _meta, _ = load_checkpoint_into_model(restored_model, tmpdir)
+
+        self.assertIsInstance(restored_model.lm_head, LMHeadWithPostNormLinear)
+        self.assertTrue(torch.equal(restored_model.lm_head.lm_head.weight, expected_base))
+        self.assertTrue(torch.equal(restored_model.lm_head.post_norm_linear.weight, expected_post))
+        self.assertTrue(torch.allclose(restored_model(inputs), expected_logits))
+
+    def test_save_model_checkpoint_does_not_mutate_live_post_norm_head(self):
+        model = _TinyLmHeadModel()
+        ensure_post_norm_head_linear(model)
+        lm_head_id = id(model.lm_head)
+        base_weight = model.lm_head.lm_head.weight.detach().clone()
+        post_weight = model.lm_head.post_norm_linear.weight.detach().clone()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_model_checkpoint(model, tmpdir, save_config=False)
+
+        self.assertIsInstance(model.lm_head, LMHeadWithPostNormLinear)
+        self.assertEqual(id(model.lm_head), lm_head_id)
+        self.assertTrue(torch.equal(model.lm_head.lm_head.weight, base_weight))
+        self.assertTrue(torch.equal(model.lm_head.post_norm_linear.weight, post_weight))
 
 
 class BitpackUtilityTest(unittest.TestCase):

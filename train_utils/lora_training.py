@@ -452,14 +452,30 @@ def compute_distill_pre_mlp_hidden_alignment_loss(
 
 @contextmanager
 def capture_pre_mlp_hiddens(model: nn.Module):
-    qwen_model = getattr(model, "model", None)
-    layers = getattr(qwen_model, "layers", None)
+    modules = _resolve_pre_mlp_capture_modules(model)
+    with _capture_pre_mlp_hiddens_from_modules(modules) as captured:
+        yield captured
+
+
+def _unwrap_accelerator_model(model: nn.Module, accelerator) -> nn.Module:
+    if accelerator is None:
+        return model
+    return accelerator.unwrap_model(model)
+
+
+def _resolve_peft_and_base_model(unwrapped_model: nn.Module):
+    if PeftModel is not None and isinstance(unwrapped_model, PeftModel):
+        return unwrapped_model, unwrapped_model.get_base_model()
+    return None, unwrapped_model
+
+
+def _resolve_pre_mlp_capture_modules(base_model: nn.Module) -> Tuple[nn.Module, ...]:
+    backbone = getattr(base_model, "model", None)
+    layers = getattr(backbone, "layers", None)
     if layers is None:
         raise ValueError("pre-MLP hidden alignment requires model.model.layers.")
 
-    captured: List[torch.Tensor] = []
-    handles = []
-
+    modules: List[nn.Module] = []
     for layer_idx, layer in enumerate(layers):
         module = getattr(layer, "post_attention_layernorm", None)
         if not isinstance(module, nn.Module):
@@ -467,6 +483,18 @@ def capture_pre_mlp_hiddens(model: nn.Module):
                 "pre-MLP hidden alignment requires every model.model.layers[*] "
                 f"to expose post_attention_layernorm; missing at layer {layer_idx}."
             )
+        modules.append(module)
+    if not modules:
+        raise ValueError("pre-MLP hidden alignment requires at least one model.model.layers entry.")
+    return tuple(modules)
+
+
+@contextmanager
+def _capture_pre_mlp_hiddens_from_modules(modules: Sequence[nn.Module]):
+    captured: List[torch.Tensor] = []
+    handles = []
+
+    for layer_idx, module in enumerate(modules):
 
         def hook(_module, inputs, _layer_idx=layer_idx):
             if not inputs:
@@ -483,6 +511,26 @@ def capture_pre_mlp_hiddens(model: nn.Module):
     finally:
         for handle in handles:
             handle.remove()
+
+
+@contextmanager
+def _swap_teacher_snapshot_params(
+    snapshots: Sequence[Tuple[nn.Parameter, torch.Tensor]],
+    restore_buffers: Sequence[torch.Tensor],
+):
+    if len(snapshots) != len(restore_buffers):
+        raise ValueError(
+            "teacher snapshot restore buffer count must match snapshot count: "
+            f"{len(restore_buffers)} vs {len(snapshots)}."
+        )
+    try:
+        for (param, snapshot), restore in zip(snapshots, restore_buffers):
+            restore.copy_(param.detach())
+            param.data.copy_(snapshot)
+        yield
+    finally:
+        for (param, _snapshot), restore in zip(snapshots, restore_buffers):
+            param.data.copy_(restore)
 
 
 def ensure_lora_training_stack_available() -> None:
@@ -574,8 +622,56 @@ else:
                 raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
             self.teacher_logits_cpu_staging = bool(teacher_logits_cpu_staging)
             self.distill_hif4_act_controller = distill_hif4_act_controller
-            self.teacher_param_snapshots = list(teacher_param_snapshots or [])
+            self.teacher_param_snapshots = []
+            self._teacher_param_restore_buffers = []
+            for param, snapshot in list(teacher_param_snapshots or []):
+                if tuple(param.shape) != tuple(snapshot.shape):
+                    raise ValueError(
+                        "teacher snapshot shape must match parameter shape: "
+                        f"{tuple(snapshot.shape)} vs {tuple(param.shape)}."
+                    )
+                converted_snapshot = snapshot.detach().to(device=param.device, dtype=param.dtype).clone()
+                self.teacher_param_snapshots.append((param, converted_snapshot))
+                self._teacher_param_restore_buffers.append(torch.empty_like(param))
+            self._runtime_view_cache_key = None
+            self._runtime_view_cache = None
             self.distill_token_stats = DistillTokenStatsAccumulator()
+
+        def _resolve_runtime_view_cache(self, model, pre_mlp_hidden_loss_enabled: bool):
+            unwrapped_model = _unwrap_accelerator_model(
+                model,
+                getattr(self, "accelerator", None),
+            )
+            cache_key = id(unwrapped_model)
+            cache = (
+                getattr(self, "_runtime_view_cache", None)
+                if getattr(self, "_runtime_view_cache_key", None) == cache_key
+                else None
+            )
+            needs_pre_mlp = bool(pre_mlp_hidden_loss_enabled)
+            if cache is None or (needs_pre_mlp and cache.get("pre_mlp_capture_modules") is None):
+                peft_model_for_teacher, base_model_for_capture = _resolve_peft_and_base_model(
+                    unwrapped_model
+                )
+                pre_mlp_capture_modules = (
+                    _resolve_pre_mlp_capture_modules(base_model_for_capture)
+                    if needs_pre_mlp
+                    else None
+                )
+                cache = {
+                    "unwrapped_model": unwrapped_model,
+                    "peft_model_for_teacher": peft_model_for_teacher,
+                    "base_model_for_capture": base_model_for_capture,
+                    "temporary_modules": tuple(
+                        module
+                        for module in unwrapped_model.modules()
+                        if callable(getattr(module, "set_temporary", None))
+                    ),
+                    "pre_mlp_capture_modules": pre_mlp_capture_modules,
+                }
+                self._runtime_view_cache_key = cache_key
+                self._runtime_view_cache = cache
+            return cache
 
         def _teacher_logits_staging_dtype(self) -> torch.dtype:
             if bool(getattr(self.args, "bf16", False)):
@@ -637,18 +733,16 @@ else:
                 student_inputs.pop("labels", None)
             full_inputs = dict(inputs)
 
-            unwrapped_model = model
-            if getattr(self, "accelerator", None) is not None:
-                unwrapped_model = self.accelerator.unwrap_model(model)
-            temporary_modules = [
-                module
-                for module in unwrapped_model.modules()
-                if callable(getattr(module, "set_temporary", None))
-            ]
+            runtime_view = self._resolve_runtime_view_cache(
+                model,
+                pre_mlp_hidden_loss_enabled=pre_mlp_hidden_loss_enabled,
+            )
+            temporary_modules = runtime_view["temporary_modules"]
             previous_temporary = [getattr(module, "temporary", None) for module in temporary_modules]
             hif4_act_controller = self.distill_hif4_act_controller
             previous_hif4_enabled = bool(getattr(hif4_act_controller, "enabled", False))
-            peft_model_for_teacher = unwrapped_model if isinstance(unwrapped_model, PeftModel) else model
+            peft_model_for_teacher = runtime_view["peft_model_for_teacher"]
+            pre_mlp_capture_modules = runtime_view["pre_mlp_capture_modules"]
             teacher_pre_mlp_hiddens = None
             student_pre_mlp_hiddens = None
 
@@ -683,16 +777,11 @@ else:
                 if not self.teacher_param_snapshots:
                     yield
                     return
-
-                current_values: List[torch.Tensor] = []
-                try:
-                    for param, snapshot in self.teacher_param_snapshots:
-                        current_values.append(param.detach().clone())
-                        param.data.copy_(snapshot.to(device=param.device, dtype=param.dtype))
+                with _swap_teacher_snapshot_params(
+                    self.teacher_param_snapshots,
+                    self._teacher_param_restore_buffers,
+                ):
                     yield
-                finally:
-                    for (param, _snapshot), current in zip(self.teacher_param_snapshots, current_values):
-                        param.data.copy_(current.to(device=param.device, dtype=param.dtype))
 
             @torch.no_grad()
             def get_ori_outputs():
@@ -701,10 +790,14 @@ else:
                 set_hif4_act_enabled(False)
                 adapter_context = (
                     peft_model_for_teacher.disable_adapter()
-                    if hasattr(peft_model_for_teacher, "disable_adapter")
+                    if peft_model_for_teacher is not None
                     else nullcontext()
                 )
-                pre_mlp_context = capture_pre_mlp_hiddens(unwrapped_model) if pre_mlp_hidden_loss_enabled else nullcontext()
+                pre_mlp_context = (
+                    _capture_pre_mlp_hiddens_from_modules(pre_mlp_capture_modules)
+                    if pre_mlp_hidden_loss_enabled
+                    else nullcontext()
+                )
                 with adapter_context, teacher_param_context(), pre_mlp_context as captured_pre_mlp:
                     outputs = model(
                         **teacher_inputs,
@@ -716,7 +809,11 @@ else:
 
             def student_forward(model_inputs):
                 nonlocal student_pre_mlp_hiddens
-                pre_mlp_context = capture_pre_mlp_hiddens(unwrapped_model) if pre_mlp_hidden_loss_enabled else nullcontext()
+                pre_mlp_context = (
+                    _capture_pre_mlp_hiddens_from_modules(pre_mlp_capture_modules)
+                    if pre_mlp_hidden_loss_enabled
+                    else nullcontext()
+                )
                 with pre_mlp_context as captured_pre_mlp:
                     outputs = model(
                         **model_inputs,

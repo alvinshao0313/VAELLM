@@ -19,6 +19,10 @@ from litebsq.low_rank_scope import (
 from litebsq.misc import set_module_by_name
 from litebsq.llm_vae import Decoder
 from litebsq.vae_linear import VAELinear
+from e2e_common.post_norm_head import (
+    ensure_post_norm_head_linear,
+    has_post_norm_head_linear,
+)
 from rotation.model_utils import get_model
 
 
@@ -684,6 +688,7 @@ def save_model_checkpoint(
         "state_dict_file": STATE_DICT_FILENAME,
         "converted_module_count": len(vae_specs),
         "converted_modules": vae_specs,
+        "post_norm_head_linear": bool(has_post_norm_head_linear(model)),
     }
     if shared_protected_residual_decoder_specs:
         meta["shared_protected_residual_decoders"] = shared_protected_residual_decoder_specs
@@ -1448,6 +1453,8 @@ def load_checkpoint_into_model(
             shared_protected_residual_decoders=shared_protected_residual_decoders,
             preserve_original_weights_from_base=bool(preserve_original_weights_from_base),
         )
+    if bool(meta.get("post_norm_head_linear", False)):
+        ensure_post_norm_head_linear(model)
 
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(model_dir, state_dict_file)

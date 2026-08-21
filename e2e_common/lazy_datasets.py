@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 try:
     from datasets import Dataset as HFDataset
@@ -32,6 +32,7 @@ from e2e_common.data import (
 )
 
 IGNORE_ID = -100
+_SOURCE_INDEX_FIELD = "__vaellm_source_idx"
 
 RawDataset = Union["HFDataset", "HFIterableDataset"]
 
@@ -326,6 +327,25 @@ class LazySFTDataset(Dataset):
         }
 
 
+def _iter_raw_records_for_worker(raw_dataset):
+    worker_info = get_worker_info()
+    if worker_info is None:
+        yield from raw_dataset
+        return
+
+    worker_id = int(worker_info.id)
+    num_workers = int(worker_info.num_workers)
+
+    if hasattr(raw_dataset, "__len__") and hasattr(raw_dataset, "__getitem__"):
+        for index in range(worker_id, len(raw_dataset), num_workers):
+            yield raw_dataset[index]
+        return
+
+    for index, record in enumerate(raw_dataset):
+        if index % num_workers == worker_id:
+            yield record
+
+
 class _LazyPresetIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -337,6 +357,7 @@ class _LazyPresetIterableDataset(IterableDataset):
         preset: DatasetMixSourcePreset,
         seed: int,
         add_system_prompt: bool = False,
+        presets: Optional[Sequence[DatasetMixSourcePreset]] = None,
     ) -> None:
         super().__init__()
         self.raw_dataset = raw_dataset
@@ -344,12 +365,17 @@ class _LazyPresetIterableDataset(IterableDataset):
         self.max_seq_len = int(max_seq_len)
         self.task = str(task).strip().lower()
         self.preset = preset
+        self.presets = tuple(presets) if presets is not None else (preset,)
         self.seed = int(seed)
         self.add_system_prompt = bool(add_system_prompt)
 
     def _encode_record(self, record: Dict[str, object]) -> Dict[str, torch.Tensor]:
+        preset = self.preset
+        if _SOURCE_INDEX_FIELD in record:
+            source_idx = int(record.pop(_SOURCE_INDEX_FIELD))
+            preset = self.presets[source_idx]
         if self.task in {"messages", "sft"}:
-            if str(self.preset.text_format) == "edgerazor_messages":
+            if str(preset.text_format) == "edgerazor_messages":
                 return encode_edgerazor_messages_record(
                     record,
                     self.tokenizer,
@@ -358,9 +384,9 @@ class _LazyPresetIterableDataset(IterableDataset):
                 )
             from e2e_common.data import _record_to_sft_segments, _encode_sft_segments
 
-            segments = _record_to_sft_segments(record, text_format=str(self.preset.text_format))
+            segments = _record_to_sft_segments(record, text_format=str(preset.text_format))
             if segments is None:
-                raise ValueError(f"SFT record is not usable for format {self.preset.text_format!r}.")
+                raise ValueError(f"SFT record is not usable for format {preset.text_format!r}.")
             input_ids, attention_mask, labels = _encode_sft_segments(
                 segments,
                 self.tokenizer,
@@ -380,24 +406,29 @@ class _LazyPresetIterableDataset(IterableDataset):
                 record,
                 self.tokenizer,
                 max_seq_len=self.max_seq_len,
-                text_field=str(self.preset.text_field),
-                text_format=str(self.preset.text_format),
+                text_field=str(preset.text_field),
+                text_format=str(preset.text_format),
             )
         if self.task == "mcqa":
             return encode_mcqa_record(
                 record,
                 self.tokenizer,
                 max_seq_len=self.max_seq_len,
-                text_format=str(self.preset.text_format),
+                text_format=str(preset.text_format),
             )
         raise ValueError(f"Unsupported lazy dataset task: {self.task!r}")
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        for record in self.raw_dataset:
+        for record in _iter_raw_records_for_worker(self.raw_dataset):
             try:
                 yield self._encode_record(dict(record))
             except (ValueError, KeyError):
                 continue
+
+    def __len__(self) -> int:
+        if not hasattr(self.raw_dataset, "__len__"):
+            raise TypeError(f"{type(self.raw_dataset).__name__} does not expose __len__.")
+        return int(len(self.raw_dataset))
 
 
 def _normalize_weights(weights: Sequence[float]) -> List[float]:
@@ -422,6 +453,7 @@ def _build_source_stats(
         "raw_rows": int(raw_rows),
         "text_rows": int(raw_rows),
         "target_rows": int(raw_rows),
+        "packed_rows": int(raw_rows),
         "actual_rows": int(raw_rows),
         "processed_raw_rows": int(raw_rows),
         "limited_preprocessing": False,
@@ -429,10 +461,20 @@ def _build_source_stats(
     }
 
 
+def _raw_dataset_cache_key(preset: DatasetMixSourcePreset) -> tuple:
+    return (
+        str(preset.alias),
+        str(preset.path),
+        None if preset.config is None else str(preset.config),
+        str(preset.train_split),
+    )
+
+
 def _load_interleaved_raw_mix(
     dataset_mix_spec: str,
     *,
     seed: int,
+    raw_dataset_cache: Optional[Dict[tuple, RawDataset]] = None,
 ) -> Tuple[str, List[Dict[str, object]], RawDataset, List[DatasetMixSourcePreset], str]:
     if interleave_datasets is None:
         raise ImportError("未安装 datasets。请先安装：pip install datasets")
@@ -445,11 +487,18 @@ def _load_interleaved_raw_mix(
 
     for alias, weight in zip(sources, normalized_weights):
         preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
-        train_raw, _eval_raw = _load_preset_raw_datasets(preset)
+        cache_key = _raw_dataset_cache_key(preset)
+        if raw_dataset_cache is not None and cache_key in raw_dataset_cache:
+            train_raw = raw_dataset_cache[cache_key]
+        else:
+            train_raw, _eval_raw = _load_preset_raw_datasets(preset)
+            if raw_dataset_cache is not None:
+                raw_dataset_cache[cache_key] = train_raw
         raw_rows = int(len(train_raw))
         if raw_rows < 1:
             raise ValueError(f"Dataset mix source '{alias}' is empty.")
-        raw_datasets.append(train_raw.shuffle(seed=int(seed)))
+        shuffled = train_raw.shuffle(seed=int(seed))
+        raw_datasets.append(shuffled)
         source_stats.append(_build_source_stats(str(alias), preset, raw_rows, float(weight)))
         presets.append(preset)
         source_stats[-1]["weight"] = float(weight)
@@ -457,8 +506,24 @@ def _load_interleaved_raw_mix(
     if len(raw_datasets) == 1:
         return str(normalized_spec), source_stats, raw_datasets[0], presets, str(sources[0])
 
+    tagged_raw_datasets: List[RawDataset] = []
+    for source_idx, raw_dataset in enumerate(raw_datasets):
+        if hasattr(raw_dataset, "add_column"):
+            tagged_raw_datasets.append(
+                raw_dataset.add_column(_SOURCE_INDEX_FIELD, [int(source_idx)] * int(len(raw_dataset)))
+            )
+        else:
+            tagged_raw_datasets.append(
+                raw_dataset.map(
+                    lambda record, _source_idx=int(source_idx): {
+                        **record,
+                        _SOURCE_INDEX_FIELD: _source_idx,
+                    }
+                )
+            )
+
     mixed = interleave_datasets(
-        raw_datasets,
+        tagged_raw_datasets,
         probabilities=normalized_weights,
         seed=int(seed),
         stopping_strategy="all_exhausted",
@@ -474,10 +539,12 @@ def build_mixed_lazy_dataset(
     max_seq_len: int,
     seed: int,
     add_system_prompt: bool = False,
+    raw_dataset_cache: Optional[Dict[tuple, RawDataset]] = None,
 ) -> Tuple[str, List[Dict[str, object]], Union[Dataset, IterableDataset], bool]:
     normalized_spec, source_stats, raw_dataset, presets, mix_kind = _load_interleaved_raw_mix(
         dataset_mix_spec,
         seed=int(seed),
+        raw_dataset_cache=raw_dataset_cache,
     )
     task_norm = str(task).strip().lower()
     is_iterable = mix_kind == "mix" or isinstance(raw_dataset, HFIterableDataset)
@@ -517,11 +584,6 @@ def build_mixed_lazy_dataset(
             raise ValueError(f"Unsupported lazy dataset task: {task_norm!r}")
         return normalized_spec, source_stats, dataset, is_iterable
 
-    if len(set(str(preset.text_format) for preset in presets)) != 1:
-        raise ValueError(
-            "Weighted lazy mix with multiple text_format values is not supported in one iterable dataset. "
-            "Use a single-format mix or one source."
-        )
     preset = presets[0]
     dataset = _LazyPresetIterableDataset(
         raw_dataset,
@@ -529,6 +591,7 @@ def build_mixed_lazy_dataset(
         max_seq_len=int(max_seq_len),
         task=task_norm,
         preset=preset,
+        presets=presets,
         seed=int(seed),
         add_system_prompt=bool(add_system_prompt),
     )
@@ -541,6 +604,7 @@ def build_distill_lazy_dataset(
     tokenizer,
     max_seq_len: int,
     seed: int,
+    raw_dataset_cache: Optional[Dict[tuple, RawDataset]] = None,
 ) -> Tuple[str, List[Dict[str, object]], Union[Dataset, IterableDataset], bool]:
     return build_mixed_lazy_dataset(
         dataset_mix_spec,
@@ -549,6 +613,7 @@ def build_distill_lazy_dataset(
         max_seq_len=int(max_seq_len),
         seed=int(seed),
         add_system_prompt=False,
+        raw_dataset_cache=raw_dataset_cache,
     )
 
 
@@ -562,13 +627,14 @@ def build_single_file_lazy_dataset(
     text_format: str = "auto",
     max_train_samples: Optional[int] = None,
 ) -> Union[Dataset, IterableDataset]:
-    from datasets import DatasetDict, load_dataset
+    from datasets import DatasetDict
+    from e2e_common import data as data_module
 
     lower = str(train_file).strip().lower()
     if lower.endswith((".json", ".jsonl")):
-        raw = load_dataset("json", data_files={"train": str(train_file)})
+        raw = data_module.load_dataset("json", data_files={"train": str(train_file)})
     elif lower.endswith(".txt"):
-        raw = load_dataset("text", data_files={"train": str(train_file)})
+        raw = data_module.load_dataset("text", data_files={"train": str(train_file)})
     else:
         raise ValueError(f"Unsupported local dataset file extension: {train_file}")
 
