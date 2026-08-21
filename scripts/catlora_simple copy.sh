@@ -2,7 +2,7 @@
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=5
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -58,9 +58,9 @@ python tools/cat_train.py \
   --save_model \
   --convert_device "cuda" \
   --allow_tail_group "true" \
-  --target_categories "down_proj" \
-  --transpose_modules "down_proj" \
-  --skip_layers "35.down_proj" \
+  --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
+  --skip_layers "" \
   --linear_group_size "36" \
   --steps_per_category "default=10000" \
   --batch_size "8192" \
@@ -70,7 +70,7 @@ python tools/cat_train.py \
   --activation_calib_seed "31" \
   --activation_calib_device "" \
   --activation_calib_log_every "0" \
-  --codebook_bits "default=64" \
+  --codebook_bits "default=32" \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
   --base_ch "default=128" \
@@ -110,10 +110,6 @@ python tools/cat_train.py \
   --outlier_mlp_rank_metric "none" \
   --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
-  --outlier_protect_count "default=128" \
-  --outlier_rank_metric "channel_weight_actmean_abs" \
-  --outlier_protect_min_per_layer "0" \
-  --outlier_protect_axis "input" \
   --outlier_protect_channel_quant "none" \
   --outlier_residual_vae_decoder_share_scope "none" \
   --outlier_residual_vae_batch_multiplier "4" \
@@ -122,32 +118,36 @@ python tools/cat_train.py \
   --outlier_residual_vae_stages "default=1" \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_residual_top_p "default=0.0" \
+  --outlier_protect_count "default=0" \
+  --outlier_protect_min_per_layer "0" \
+  --outlier_protect_axis "input" \
+  --outlier_residual_top_p "default=0.01" \
+  --outlier_rank_metric "sparse_weight_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
-  --distill_after_category "none" \
+  --distill_after_category "remaining_lora" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --lora_rank "default=128" \
-  --lora_alpha "default=128" \
+  --lora_rank "default=12" \
+  --lora_alpha "default=24" \
   --lora_dropout "default=0.03" \
   --distill_steps "default=5000" \
-  --distill_batch_size "default=1" \
+  --distill_batch_size "default=4" \
   --distill_lr "default=1e-4" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
-  --distill_loss_type "default=eakld" \
+  --distill_loss_type "default=kl_top_100" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
-  --distill_hidden_loss_weight "default=0.01" \
+  --distill_hidden_loss_weight "default=0.1" \
   --distill_pre_mlp_hidden_loss_weight "default=0.0" \
   --distill_hidden_alignment_layer_weighting "linear_depth" \
-  --lora_use_dora "default=false" \
-  --distill_tune_final_norm "false" \
-  --distill_use_post_norm_head_linear "false" \
+  --lora_use_dora "default=true" \
+  --distill_tune_final_norm "true" \
+  --distill_use_post_norm_head_linear "true" \
   --distill_hif4_act "false" \
   --eval_hif4_act "false" \
   --distill_gradient_accumulation_steps "1" \
