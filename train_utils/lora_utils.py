@@ -582,6 +582,10 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
     )
     if train_is_iterable:
         training_kwargs["group_by_length"] = False
+        training_kwargs["accelerator_config"] = {
+                        "dispatch_batches": False,
+                        "split_batches": False,
+                        }
         if requested_group_by_length and logger is not None:
             logger.info(
                 "LoRA: dataset is iterable，已忽略 --distill_group_by_length=true。"
