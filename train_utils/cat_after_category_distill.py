@@ -476,8 +476,7 @@ def _run_compressed_category_distill(
     logger,
     lora_round_idx: int,
 ) -> AfterCategoryDistillResult:
-    skipped_round = int(lora_round_idx)
-    trained_round = int(lora_round_idx) + 1
+    next_round = int(lora_round_idx) + 1
     targets = collect_compressed_category_targets(model, category)
     module_names = [name for name, _module in targets]
     if not module_names:
@@ -486,7 +485,12 @@ def _run_compressed_category_distill(
             str(mode),
             str(category),
         )
-        return AfterCategoryDistillResult(model=model, next_lora_round_idx=skipped_round, trained_target_count=0)
+        return AfterCategoryDistillResult(
+            model=model,
+            next_lora_round_idx=next_round,
+            trained_target_count=0,
+            did_train=False,
+        )
 
     reset_completed = bool(getattr(cat_args, "distill_reset_completed", False))
     continue_from_low_rank = False
@@ -524,7 +528,10 @@ def _run_compressed_category_distill(
                     str(category),
                 )
                 return AfterCategoryDistillResult(
-                    model=model, next_lora_round_idx=skipped_round, trained_target_count=0
+                    model=model,
+                    next_lora_round_idx=next_round,
+                    trained_target_count=0,
+                    did_train=False,
                 )
             continue_from_low_rank = True
             logger.info(
@@ -549,7 +556,12 @@ def _run_compressed_category_distill(
             str(category),
             int(cfg.steps),
         )
-        return AfterCategoryDistillResult(model=model, next_lora_round_idx=skipped_round, trained_target_count=0)
+        return AfterCategoryDistillResult(
+            model=model,
+            next_lora_round_idx=next_round,
+            trained_target_count=0,
+            did_train=False,
+        )
 
     _ensure_lora_stack_available()
     _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
@@ -591,7 +603,12 @@ def _run_compressed_category_distill(
     _log_distill_dataset(logger, dataset_mix_spec, source_stats, train_len, train_is_iterable)
     if train_len == 0:
         _logger_warning(logger, "After-category distill: 数据集为空，跳过。")
-        return AfterCategoryDistillResult(model=model, next_lora_round_idx=skipped_round, trained_target_count=0)
+        return AfterCategoryDistillResult(
+            model=model,
+            next_lora_round_idx=next_round,
+            trained_target_count=0,
+            did_train=False,
+        )
 
     use_lora = mode in {"compressed_lora", "both"}
     use_decoder = mode in {"decoder", "both"}
@@ -799,7 +816,12 @@ def _run_compressed_category_distill(
                 )
             if not use_lora and not use_decoder:
                 logger.info("After-category distill: 没有可训练参数，跳过。")
-            return AfterCategoryDistillResult(model=model, next_lora_round_idx=skipped_round, trained_target_count=0)
+            return AfterCategoryDistillResult(
+                model=model,
+                next_lora_round_idx=next_round,
+                trained_target_count=0,
+                did_train=False,
+            )
 
         resolved_lora_loss = str(cfg.loss_type).strip().lower()
         use_custom_trainer = (
@@ -892,7 +914,7 @@ def _run_compressed_category_distill(
             )
         return AfterCategoryDistillResult(
             model=model,
-            next_lora_round_idx=trained_round,
+            next_lora_round_idx=next_round,
             trained_target_count=len(module_names),
             did_train=True,
         )

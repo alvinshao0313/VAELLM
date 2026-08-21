@@ -1,8 +1,10 @@
 import copy
 import logging
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import List
+from unittest import mock
 
 import torch
 from torch import nn
@@ -481,6 +483,55 @@ def test_subspace_route_calls_wrap_inject_not_materialize(monkeypatch):
     assert "ensure" not in calls
     assert "wrap_full" not in calls
     assert int(result.trained_target_count) == 0
+
+
+def test_compressed_no_target_skip_still_advances_round():
+    result = _run_compressed_category_distill(
+        model=_TinyCategoryModel({}),
+        category="down_proj",
+        mode="compressed_lora",
+        cat_args=SimpleNamespace(),
+        vae_args=SimpleNamespace(),
+        training_args=SimpleNamespace(bf16=False),
+        logger=logging.getLogger("test"),
+        lora_round_idx=4,
+    )
+
+    assert result.did_train is False
+    assert int(result.trained_target_count) == 0
+    assert int(result.next_lora_round_idx) == 5
+
+
+def test_compressed_steps_zero_skip_still_advances_round():
+    model = _TinyCategoryModel(
+        {
+            "down_proj": _build_vae_linear(
+                compressed_in_features=4,
+                low_rank_scope=LOW_RANK_SCOPE_FULL,
+            )
+        }
+    )
+    cfg = replace(_fake_cfg(), steps=0)
+    cat_args = SimpleNamespace(
+        compressed_lora_scope=LOW_RANK_SCOPE_FULL,
+        distill_reset_completed=False,
+    )
+
+    with mock.patch.object(cad, "_resolve_distill_stage_config", return_value=cfg):
+        result = _run_compressed_category_distill(
+            model=model,
+            category="down_proj",
+            mode="compressed_lora",
+            cat_args=cat_args,
+            vae_args=SimpleNamespace(),
+            training_args=SimpleNamespace(bf16=False),
+            logger=logging.getLogger("test"),
+            lora_round_idx=7,
+        )
+
+    assert result.did_train is False
+    assert int(result.trained_target_count) == 0
+    assert int(result.next_lora_round_idx) == 8
 
 
 def test_subspace_export_restores_bare_vae_linear_with_compressed_scope():
