@@ -471,7 +471,7 @@ def _log_lora_stage_start(
 ) -> None:
     if use_custom_trainer:
         logger.info(
-            "LoRA: 使用 CustomSFTTrainer 微调，after_category=%s，loss_type=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
+            "LoRA: 使用 CustomSFTTrainer 微调，after_category=%s，loss_type=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d,dataset=%d)",
             str(after_category),
             str(cfg.loss_type).strip().lower(),
             str(cfg.use_dora).lower(),
@@ -485,6 +485,7 @@ def _log_lora_stage_start(
             int(cfg.base_seed),
             int(cfg.round_idx),
             int(cfg.seed),
+            int(cfg.base_seed),
         )
         logger.info(
             "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f hidden_loss_weight=%.6f pre_mlp_hidden_loss_weight=%.6f prompt_kd_weight=%.6f hidden_alignment_layer_weighting=%s",
@@ -498,7 +499,7 @@ def _log_lora_stage_start(
         return
 
     logger.info(
-        "LoRA: 使用 SFTTrainer 微调，after_category=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d)",
+        "LoRA: 使用 SFTTrainer 微调，after_category=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d,dataset=%d)",
         str(after_category),
         str(cfg.use_dora).lower(),
         ",".join(remaining_categories),
@@ -511,6 +512,7 @@ def _log_lora_stage_start(
         int(cfg.base_seed),
         int(cfg.round_idx),
         int(cfg.seed),
+        int(cfg.base_seed),
     )
 
 
@@ -573,7 +575,7 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
         log_level_replica="error",
         save_strategy="no",
         seed=int(cfg.seed),
-        data_seed=int(cfg.seed),
+        data_seed=int(cfg.base_seed),
         full_determinism=bool(getattr(cat_args, "deterministic", False)),
         dataloader_num_workers=_resolve_distill_dataloader_num_workers(training_args),
         dataloader_pin_memory=True,
@@ -605,6 +607,76 @@ def _distill_dataset_uses_edgerazor_messages(dataset_mix_spec: str) -> bool:
         return False
     sources, _, _ = normalize_dataset_mix_spec(str(dataset_mix_spec))
     return any(str(alias) in VAELLM_EDGERAZOR_SFT_ALIASES for alias in sources)
+
+
+def _prepare_or_reuse_remaining_lora_distill_dataset(
+    *,
+    vae_args,
+    cfg: _ResolvedDistillStageConfig,
+    tokenizer,
+    training_args,
+    logger,
+):
+    max_seq_len = int(getattr(training_args, "distill_model_max_length", 2048))
+
+    dataset_cache = getattr(
+        vae_args,
+        "_cached_remaining_lora_distill_datasets",
+        None,
+    )
+    if not isinstance(dataset_cache, dict):
+        dataset_cache = {}
+        setattr(
+            vae_args,
+            "_cached_remaining_lora_distill_datasets",
+            dataset_cache,
+        )
+
+    raw_dataset_cache = getattr(
+        vae_args,
+        "_cached_remaining_lora_raw_datasets",
+        None,
+    )
+    if not isinstance(raw_dataset_cache, dict):
+        raw_dataset_cache = {}
+        setattr(
+            vae_args,
+            "_cached_remaining_lora_raw_datasets",
+            raw_dataset_cache,
+        )
+
+    dataset_cache_key = (
+        str(cfg.dataset),
+        int(max_seq_len),
+        int(cfg.base_seed),
+        id(tokenizer),
+    )
+
+    cached = dataset_cache.get(dataset_cache_key)
+    if cached is None:
+        cached = prepare_distill_datasets(
+            cfg.dataset,
+            seed=int(cfg.base_seed),
+            tokenizer=tokenizer,
+            max_seq_len=int(max_seq_len),
+            raw_dataset_cache=raw_dataset_cache,
+        )
+        dataset_cache[dataset_cache_key] = cached
+        logger.info(
+            "LoRA: prepared remaining_lora distill dataset cache "
+            "dataset_seed=%d max_seq_len=%d",
+            int(cfg.base_seed),
+            int(max_seq_len),
+        )
+    else:
+        logger.info(
+            "LoRA: reused remaining_lora distill dataset cache "
+            "dataset_seed=%d max_seq_len=%d",
+            int(cfg.base_seed),
+            int(max_seq_len),
+        )
+
+    return cached
 
 
 def _build_lora_trainer(
@@ -802,16 +874,18 @@ def lora_finetune_remaining_categories(
 
         _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
         tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
-        raw_dataset_cache = getattr(vae_args, "_cached_remaining_lora_raw_datasets", None)
-        if not isinstance(raw_dataset_cache, dict):
-            raw_dataset_cache = {}
-            setattr(vae_args, "_cached_remaining_lora_raw_datasets", raw_dataset_cache)
-        dataset_mix_spec, source_stats, train_ds, eval_ds, _eval_split = prepare_distill_datasets(
-            cfg.dataset,
-            seed=cfg.seed,
+        (
+            dataset_mix_spec,
+            source_stats,
+            train_ds,
+            eval_ds,
+            _eval_split,
+        ) = _prepare_or_reuse_remaining_lora_distill_dataset(
+            vae_args=vae_args,
+            cfg=cfg,
             tokenizer=tokenizer,
-            max_seq_len=int(getattr(training_args, "distill_model_max_length", 2048)),
-            raw_dataset_cache=raw_dataset_cache,
+            training_args=training_args,
+            logger=logger,
         )
         train_is_iterable = is_iterable_training_dataset(train_ds)
         train_len = dataset_length_or_none(train_ds)

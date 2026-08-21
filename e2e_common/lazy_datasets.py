@@ -8,17 +8,16 @@ from __future__ import annotations
 
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 try:
     from datasets import Dataset as HFDataset
     from datasets import IterableDataset as HFIterableDataset
-    from datasets import interleave_datasets
 except ImportError:
     HFDataset = None
     HFIterableDataset = None
-    interleave_datasets = None
 
 from e2e_common.data import (
     DATASET_MIX_SOURCE_PRESETS,
@@ -32,6 +31,7 @@ from e2e_common.data import (
 )
 
 IGNORE_ID = -100
+_INDEX_SCHEDULER_CHOICE_BATCH_SIZE = 1000
 
 RawDataset = Union["HFDataset", "HFIterableDataset"]
 
@@ -328,6 +328,17 @@ class LazySFTDataset(Dataset):
 
 def _iter_raw_records_for_worker(raw_dataset):
     worker_info = get_worker_info()
+
+    if hasattr(raw_dataset, "iter_worker"):
+        if worker_info is None:
+            yield from raw_dataset.iter_worker(worker_id=0, num_workers=1)
+        else:
+            yield from raw_dataset.iter_worker(
+                worker_id=int(worker_info.id),
+                num_workers=int(worker_info.num_workers),
+            )
+        return
+
     if worker_info is None:
         yield from raw_dataset
         return
@@ -434,6 +445,139 @@ def _normalize_weights(weights: Sequence[float]) -> List[float]:
     return [float(weight) / total for weight in weights]
 
 
+def _build_permutation_indices(length: int, *, seed: int) -> np.ndarray:
+    length = int(length)
+    if length < 1:
+        raise ValueError(f"Permutation length must be >= 1, got {length}.")
+
+    if length <= int(np.iinfo(np.int32).max):
+        dtype = np.int32
+    else:
+        dtype = np.int64
+
+    indices = np.arange(length, dtype=dtype)
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(indices)
+    indices.flags.writeable = False
+    return indices
+
+
+class _PermutedRawDatasetView(Dataset):
+    def __init__(self, raw_dataset, permutation: np.ndarray) -> None:
+        super().__init__()
+        self.raw_dataset = raw_dataset
+        self.permutation = permutation
+        if int(len(self.raw_dataset)) != int(len(self.permutation)):
+            raise ValueError(
+                f"Raw dataset length {len(self.raw_dataset)} does not match "
+                f"permutation length {len(self.permutation)}."
+            )
+
+    def __len__(self) -> int:
+        return int(len(self.permutation))
+
+    def __getitem__(self, index: int):
+        raw_index = int(self.permutation[int(index)])
+        return self.raw_dataset[raw_index]
+
+
+def _iter_random_source_indices(
+    *,
+    num_sources: int,
+    probabilities: Sequence[float],
+    seed: int,
+) -> Iterator[int]:
+    num_sources = int(num_sources)
+    if num_sources < 1:
+        raise ValueError("num_sources must be >= 1.")
+    if len(probabilities) != num_sources:
+        raise ValueError(
+            f"probabilities length {len(probabilities)} != num_sources {num_sources}."
+        )
+
+    probs = np.asarray([float(value) for value in probabilities], dtype=np.float64)
+    rng = np.random.default_rng(int(seed))
+
+    while True:
+        sampled = rng.choice(
+            num_sources,
+            size=_INDEX_SCHEDULER_CHOICE_BATCH_SIZE,
+            p=probs,
+        )
+        for source_idx in sampled:
+            yield int(source_idx)
+
+
+class _IndexedMixedRawStream:
+    def __init__(
+        self,
+        raw_datasets: Sequence[object],
+        permutations: Sequence[np.ndarray],
+        probabilities: Sequence[float],
+        *,
+        seed: int,
+    ) -> None:
+        self.raw_datasets = tuple(raw_datasets)
+        self.permutations = tuple(permutations)
+        self.probabilities = tuple(float(value) for value in probabilities)
+        self.seed = int(seed)
+
+        source_count = len(self.raw_datasets)
+        if source_count < 2:
+            raise ValueError("_IndexedMixedRawStream requires at least two sources.")
+        if len(self.permutations) != source_count:
+            raise ValueError("permutations/source count mismatch.")
+        if len(self.probabilities) != source_count:
+            raise ValueError("probabilities/source count mismatch.")
+        for raw_dataset, permutation in zip(self.raw_datasets, self.permutations):
+            if int(len(raw_dataset)) != int(len(permutation)):
+                raise ValueError("raw dataset/permutation length mismatch.")
+
+    def iter_worker(self, *, worker_id: int, num_workers: int):
+        worker_id = int(worker_id)
+        num_workers = int(num_workers)
+        if num_workers < 1:
+            raise ValueError(f"num_workers must be >= 1, got {num_workers}.")
+        if worker_id < 0 or worker_id >= num_workers:
+            raise ValueError(
+                f"worker_id must be in [0, {num_workers}), got {worker_id}."
+            )
+
+        source_count = len(self.raw_datasets)
+        cursors = [0 for _ in range(source_count)]
+        exhausted_once = [False for _ in range(source_count)]
+        exhausted_count = 0
+        global_position = 0
+
+        source_indices = _iter_random_source_indices(
+            num_sources=source_count,
+            probabilities=self.probabilities,
+            seed=self.seed,
+        )
+
+        while exhausted_count < source_count:
+            source_idx = next(source_indices)
+            permutation = self.permutations[source_idx]
+            cursor = int(cursors[source_idx])
+            raw_index = int(permutation[cursor])
+
+            cursor += 1
+            if cursor >= int(len(permutation)):
+                cursor = 0
+                if not exhausted_once[source_idx]:
+                    exhausted_once[source_idx] = True
+                    exhausted_count += 1
+            cursors[source_idx] = cursor
+
+            if global_position % num_workers == worker_id:
+                yield self.raw_datasets[source_idx][raw_index]
+
+            global_position += 1
+
+    def __iter__(self):
+        yield from self.iter_worker(worker_id=0, num_workers=1)
+
+
 def _build_source_stats(
     alias: str,
     preset: DatasetMixSourcePreset,
@@ -465,47 +609,64 @@ def _raw_dataset_cache_key(preset: DatasetMixSourcePreset) -> tuple:
     )
 
 
-def _load_interleaved_raw_mix(
+def _load_indexed_raw_mix(
     dataset_mix_spec: str,
     *,
     seed: int,
     raw_dataset_cache: Optional[Dict[tuple, RawDataset]] = None,
 ) -> Tuple[str, List[Dict[str, object]], RawDataset, List[DatasetMixSourcePreset], str]:
-    if interleave_datasets is None:
-        raise ImportError("未安装 datasets。请先安装：pip install datasets")
-
     sources, weights, normalized_spec = normalize_dataset_mix_spec(dataset_mix_spec)
     normalized_weights = _normalize_weights(weights)
+
     raw_datasets: List[RawDataset] = []
+    permutations: List[np.ndarray] = []
     source_stats: List[Dict[str, object]] = []
     presets: List[DatasetMixSourcePreset] = []
 
     for alias, weight in zip(sources, normalized_weights):
         preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
         cache_key = _raw_dataset_cache_key(preset)
+
         if raw_dataset_cache is not None and cache_key in raw_dataset_cache:
             train_raw = raw_dataset_cache[cache_key]
         else:
             train_raw, _eval_raw = _load_preset_raw_datasets(preset)
             if raw_dataset_cache is not None:
                 raw_dataset_cache[cache_key] = train_raw
+
+        if isinstance(train_raw, HFIterableDataset):
+            raise TypeError(
+                f"Indexed lazy scheduler requires a map-style dataset for source '{alias}', "
+                f"got {type(train_raw).__name__}."
+            )
+        if not hasattr(train_raw, "__len__") or not hasattr(train_raw, "__getitem__"):
+            raise TypeError(
+                f"Indexed lazy scheduler requires __len__ and __getitem__ for source '{alias}'."
+            )
+
         raw_rows = int(len(train_raw))
         if raw_rows < 1:
             raise ValueError(f"Dataset mix source '{alias}' is empty.")
-        shuffled = train_raw.shuffle(seed=int(seed))
-        raw_datasets.append(shuffled)
-        source_stats.append(_build_source_stats(str(alias), preset, raw_rows, float(weight)))
+
+        permutation = _build_permutation_indices(raw_rows, seed=int(seed))
+
+        raw_datasets.append(train_raw)
+        permutations.append(permutation)
+        source_stats.append(
+            _build_source_stats(str(alias), preset, raw_rows, float(weight))
+        )
         presets.append(preset)
         source_stats[-1]["weight"] = float(weight)
 
     if len(raw_datasets) == 1:
-        return str(normalized_spec), source_stats, raw_datasets[0], presets, str(sources[0])
+        view = _PermutedRawDatasetView(raw_datasets[0], permutations[0])
+        return str(normalized_spec), source_stats, view, presets, str(sources[0])
 
-    mixed = interleave_datasets(
+    mixed = _IndexedMixedRawStream(
         raw_datasets,
-        probabilities=normalized_weights,
+        permutations,
+        normalized_weights,
         seed=int(seed),
-        stopping_strategy="all_exhausted",
     )
     return str(normalized_spec), source_stats, mixed, presets, "mix"
 
@@ -520,7 +681,7 @@ def build_mixed_lazy_dataset(
     add_system_prompt: bool = False,
     raw_dataset_cache: Optional[Dict[tuple, RawDataset]] = None,
 ) -> Tuple[str, List[Dict[str, object]], Union[Dataset, IterableDataset], bool]:
-    normalized_spec, source_stats, raw_dataset, presets, mix_kind = _load_interleaved_raw_mix(
+    normalized_spec, source_stats, raw_dataset, presets, mix_kind = _load_indexed_raw_mix(
         dataset_mix_spec,
         seed=int(seed),
         raw_dataset_cache=raw_dataset_cache,
@@ -650,7 +811,7 @@ class LazyCalibrationTextStream:
     ) -> None:
         self.tokenizer = tokenizer
         self.seed = int(seed)
-        normalized_spec, _source_stats, raw_dataset, presets, _mix_kind = _load_interleaved_raw_mix(
+        normalized_spec, _source_stats, raw_dataset, presets, _mix_kind = _load_indexed_raw_mix(
             dataset_mix_spec,
             seed=int(seed),
         )
