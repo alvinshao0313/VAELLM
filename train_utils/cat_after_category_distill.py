@@ -923,6 +923,16 @@ def run_after_category_distill(
             target_categories=target_categories,
         )
         remaining_categories = list(dict.fromkeys(r.category for r in current_remaining_linears))
+        if not current_remaining_linears:
+            logger.info(
+                "After-category distill: mode=remaining_lora category=%s remaining_categories=empty target_count=0，跳过。",
+                str(category),
+            )
+            return AfterCategoryDistillResult(
+                model=model,
+                next_lora_round_idx=int(lora_round_idx),
+                trained_target_count=0,
+            )
         model = lora_finetune_remaining_categories(
             model=model,
             remaining_categories=remaining_categories,

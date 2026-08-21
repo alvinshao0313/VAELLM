@@ -72,9 +72,21 @@ from train_utils.cat_train_data import (
 # )
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.model_checkpoint_io import (
+    _build_distributed_run_output_dir,
     _build_run_output_dir,
     register_shared_protected_residual_decoder,
     save_model_checkpoint,
+)
+from train_utils.cat_inline_distributed import (
+    broadcast_group_vae_payload,
+    initialize_cat_payload_group,
+)
+from train_utils.lora_utils import (
+    distill_distributed_barrier,
+    distill_rank,
+    distill_world_size,
+    ensure_distill_process_group_initialized,
+    is_distill_main_process,
 )
 from train_utils.utils import (
     LinearRef,
@@ -2449,9 +2461,67 @@ def _train_group_vae_and_replace(
     )
 
 
+def _train_group_vae_and_replace_inline_distributed(
+    *,
+    model: nn.Module,
+    group_refs: Sequence[LinearRef],
+    group_tag: str,
+    inline_distributed: bool,
+    **vae_group_kwargs,
+) -> None:
+    """Run VAE on rank 0, then apply its broadcast payload on every rank."""
+    if not inline_distributed:
+        _train_group_vae_and_replace(
+            model=model,
+            group_refs=group_refs,
+            group_tag=group_tag,
+            **vae_group_kwargs,
+        )
+        return
+
+    rank = distill_rank()
+    if rank == 0:
+        log.info("Cat inline VAE train start: group=%s rank=0", group_tag)
+        payload = train_group_vae_payload(
+            model=model,
+            group_refs=group_refs,
+            group_tag=group_tag,
+            **vae_group_kwargs,
+        )
+    else:
+        payload = None
+        log.info("Cat inline VAE wait: group=%s rank=%d (no VAE training)", group_tag, rank)
+
+    if not bool(vae_group_kwargs["do_convert"]):
+        raise RuntimeError("Inline distributed CAT requires --convert.")
+    payload = broadcast_group_vae_payload(payload, src=0)
+    apply_group_vae_payload(
+        model=model,
+        group_refs=group_refs,
+        group_tag=group_tag,
+        payload=payload,
+        convert_device=(
+            str(vae_group_kwargs["convert_device"])
+            if rank == 0
+            else "cpu"
+        ),
+        skip_layer_keys=vae_group_kwargs.get("skip_layer_keys"),
+    )
+    distill_distributed_barrier()
+
+
 def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     global log
     distill_after_category = str(getattr(cat_args, "distill_after_category", "none")).strip().lower()
+    world_size = distill_world_size()
+    inline_distributed = world_size > 1
+    if inline_distributed:
+        if distill_after_category != "remaining_lora":
+            raise ValueError(
+                "WORLD_SIZE > 1 inline cat_train requires --distill_after_category=remaining_lora."
+            )
+        ensure_distill_process_group_initialized()
+        initialize_cat_payload_group()
     if bool(getattr(training_args, "distill_hif4_act", False)) and distill_after_category == "none":
         raise ValueError("--distill_hif4_act 仅在每类后蒸馏阶段生效，因此必须设置 --distill_after_category。")
     if distill_after_category != "none" and not bool(cat_args.convert):
@@ -2460,12 +2530,21 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     set_seed(cat_args.seed)
 
     os.makedirs(cat_args.output_dir, exist_ok=True)
-    run_output_dir = _build_run_output_dir(cat_args.output_dir, vae_args.model_path)
+    run_output_dir = (
+        _build_distributed_run_output_dir(cat_args.output_dir, vae_args.model_path)
+        if inline_distributed
+        else _build_run_output_dir(cat_args.output_dir, vae_args.model_path)
+    )
     os.environ["LOG_FILE"] = os.path.join(run_output_dir, "linear_by_category.log")
     log = get_logger("linear_by_category")
     cat_args.output_dir = run_output_dir
 
     log.info("Run output directory: %s", run_output_dir)
+    if inline_distributed and is_distill_main_process():
+        log.info(
+            "Cat inline distributed mode: world_size=%d, VAE rank=0, distill=remaining_lora",
+            world_size,
+        )
     if bool(getattr(cat_args, "distill_independent_categories", False)):
         log.warning(
             "--distill_independent_categories=true 仅对 cat checkpoint distill 生效；"
@@ -2662,7 +2741,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         or mlp_channel_protect_needs_activation
         or sort_needs_act
         or residual_sparse_needs_activation
-    ):
+    ) and (not inline_distributed or is_distill_main_process()):
         activation_dataset = str(cat_args.activation_calib_dataset).strip()
         if not activation_dataset:
             raise ValueError(
@@ -2732,6 +2811,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     if (
         is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
         and resolved_outlier_mode == "channel"
+        and (not inline_distributed or is_distill_main_process())
     ):
         mlp_protect_count = int(category_outlier_protect_count.get("gate_proj", 0))
         if mlp_protect_count > 0:
@@ -2866,14 +2946,17 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 token=hf_args.access_token,
             )
 
-        snapshot_path = _save_normalized_cat_train_snapshot(
-            run_output_dir=run_output_dir,
-            cat_args=cat_args,
-            vae_args=vae_args,
-            training_args=training_args,
-            resolved_category_cfgs=resolved_category_cfgs,
-        )
-        log.info("Saved normalized parameter snapshot: %s", snapshot_path)
+        if not inline_distributed or is_distill_main_process():
+            snapshot_path = _save_normalized_cat_train_snapshot(
+                run_output_dir=run_output_dir,
+                cat_args=cat_args,
+                vae_args=vae_args,
+                training_args=training_args,
+                resolved_category_cfgs=resolved_category_cfgs,
+            )
+            log.info("Saved normalized parameter snapshot: %s", snapshot_path)
+        if inline_distributed:
+            distill_distributed_barrier()
         lora_round_idx = 0
         completed_distill_categories: List[str] = []
         any_distill_after_overrides = any(table.is_override_enabled() for table, _ in distill_tables)
@@ -2948,7 +3031,11 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 category_protect_axis = mlp_protect_axis_for_category(cat)
 
             outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None
-            if resolved_outlier_mode == "channel" and int(cat_cfg.outlier_protect_count) > 0:
+            if (
+                resolved_outlier_mode == "channel"
+                and int(cat_cfg.outlier_protect_count) > 0
+                and (not inline_distributed or is_distill_main_process())
+            ):
                 if (
                     is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
                     and cat in MLP_CATEGORIES
@@ -3031,10 +3118,11 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     len(group_refs),
                     len(group_refs),
                 )
-                _train_group_vae_and_replace(
+                _train_group_vae_and_replace_inline_distributed(
                     model=model,
                     group_refs=group_refs,
                     group_tag=group_tag,
+                    inline_distributed=inline_distributed,
                     runtime_cfg=cat_cfg,
                     vae_args=vae_args,
                     training_args=training_args,
@@ -3121,7 +3209,40 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 )
                 model = distill_result.model
                 lora_round_idx = int(distill_result.next_lora_round_idx)
-                if int(distill_result.trained_target_count) > 0 and bool(cat_args.save_model):
+                if inline_distributed:
+                    model.to("cpu")
+                    torch.cuda.empty_cache()
+                    log.info("Cat inline distill complete: model moved to CPU on rank=%d", distill_rank())
+                    distill_distributed_barrier()
+
+                if (
+                    inline_distributed
+                    and int(distill_result.trained_target_count) > 0
+                    and bool(cat_args.save_model)
+                ):
+                    from e2e_common.post_norm_head import fuse_post_norm_head_linear
+                    from e2e_common.compressed_subspace_lora import iter_named_compressed_subspace_peft_proxies
+                    from e2e_common.peft_proxy import iter_named_peft_vae_proxies
+                    from litebsq.vae_linear import clear_model_vae_linear_cache
+
+                    fuse_post_norm_head_linear(model)
+                    leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
+                    leftover_subspace_proxies = [
+                        name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
+                    ]
+                    if leftover_proxies or leftover_subspace_proxies:
+                        raise RuntimeError(
+                            "After-category save found unexported PEFT proxy modules: "
+                            + ", ".join(leftover_proxies + leftover_subspace_proxies)
+                        )
+                    clear_model_vae_linear_cache(model)
+                    distill_distributed_barrier()
+
+                if (
+                    int(distill_result.trained_target_count) > 0
+                    and bool(cat_args.save_model)
+                    and (not inline_distributed or is_distill_main_process())
+                ):
                     if str(cat) not in completed_distill_categories:
                         completed_distill_categories.append(str(cat))
                     from transformers import AutoTokenizer
@@ -3169,6 +3290,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         unload_vae_original_weights=False,
                     )
                     log.info("Saved after-category model to %s", save_paths["output_dir"])
+                if inline_distributed and int(distill_result.trained_target_count) > 0 and bool(cat_args.save_model):
+                    distill_distributed_barrier()
 
                 if run_this_category_eval:
                     log.info("每类后蒸馏后评估...")
@@ -3185,6 +3308,10 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         tokenizer=eval_tokenizer,
                         run_output_dir=run_output_dir,
                     )
+            if inline_distributed:
+                model.to("cpu")
+                torch.cuda.empty_cache()
+                distill_distributed_barrier()
 
         if run_category_eval:
             log.info("所有类别训练完成后最终评估...")
@@ -3202,17 +3329,20 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 run_output_dir=run_output_dir,
             )
         if cat_args.save_candidate_artifact:
-            from mix_bit.candidate_artifact import save_candidate_artifact_from_model
-
             if not cat_args.convert:
                 raise ValueError("--save_candidate_artifact requires --convert")
-            save_paths = save_candidate_artifact_from_model(
-                model=model,
-                trial_spec_path=str(cat_args.candidate_artifact_spec),
-                output_dir=str(cat_args.candidate_artifact_output_dir),
-                source_run_dir=str(run_output_dir),
-            )
-            log.info("Saved candidate artifact to %s", save_paths["output_dir"])
+            if not inline_distributed or is_distill_main_process():
+                from mix_bit.candidate_artifact import save_candidate_artifact_from_model
+
+                save_paths = save_candidate_artifact_from_model(
+                    model=model,
+                    trial_spec_path=str(cat_args.candidate_artifact_spec),
+                    output_dir=str(cat_args.candidate_artifact_output_dir),
+                    source_run_dir=str(run_output_dir),
+                )
+                log.info("Saved candidate artifact to %s", save_paths["output_dir"])
+            if inline_distributed:
+                distill_distributed_barrier()
         elif cat_args.save_model:
             if not cat_args.convert:
                 raise ValueError("--save_model requires --convert")
@@ -3224,10 +3354,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             from e2e_common.peft_proxy import iter_named_peft_vae_proxies
             from litebsq.vae_linear import clear_model_vae_linear_cache
 
-            model_out = os.path.join(run_output_dir, "final_model")
-            tok = AutoTokenizer.from_pretrained(vae_args.model_path, use_fast=True, token=hf_args.access_token)
             fused_post_norm_head = fuse_post_norm_head_linear(model)
-            if fused_post_norm_head:
+            if fused_post_norm_head and (not inline_distributed or is_distill_main_process()):
                 log.info("Final save: fused post_norm_linear into lm_head.weight.")
             leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
             leftover_subspace_proxies = [
@@ -3239,17 +3367,27 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     + ", ".join(leftover_proxies + leftover_subspace_proxies)
                 )
             cleared = clear_model_vae_linear_cache(model)
-            log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
-            save_paths = save_model_checkpoint(
-                model,
-                model_out,
-                base_model_path=vae_args.model_path,
-                tokenizer=tok,
-                save_config=True,
-                extra_meta={"stage": "final"},
-                unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
-            )
-            log.info("Saved final model to %s", save_paths["output_dir"])
+            if not inline_distributed or is_distill_main_process():
+                log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
+            if inline_distributed:
+                distill_distributed_barrier()
+            if not inline_distributed or is_distill_main_process():
+                model_out = os.path.join(run_output_dir, "final_model")
+                tok = AutoTokenizer.from_pretrained(
+                    vae_args.model_path, use_fast=True, token=hf_args.access_token
+                )
+                save_paths = save_model_checkpoint(
+                    model,
+                    model_out,
+                    base_model_path=vae_args.model_path,
+                    tokenizer=tok,
+                    save_config=True,
+                    extra_meta={"stage": "final"},
+                    unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
+                )
+                log.info("Saved final model to %s", save_paths["output_dir"])
+            if inline_distributed:
+                distill_distributed_barrier()
     finally:
         # 排序代码，已关闭：sort_executor 始终为 None。
         pass

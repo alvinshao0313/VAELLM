@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 SEED="${SEED:-0}"
 export PYTHONHASHSEED="${SEED}"
@@ -13,14 +13,14 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
 MAX_STEPS="${MAX_STEPS:-20000}"
-STUDENT_CKPT="${STUDENT_CKPT:-.result/catlora_distill/res0-bf16-protect-channel-vae/cat_distill_best/final_model}"
+STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora_distill/res0-bf16-protect-channel-vae2/Qwen_Qwen3-8B_20260817_002419/final_model}"
 # 用 ${VAR-default}：仅在未设置时填默认；允许 EVAL_TASKS="" 关闭最终 lm-eval。
 EVAL_TASKS="${EVAL_TASKS-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
-PARALLEL_MODE="${PARALLEL_MODE:-layer_mp}"   # layer_mp | dp
-NPROC="${NPROC:-4}"
-EVAL_AFTER_SAVE="${EVAL_AFTER_SAVE:-false}"
+PARALLEL_MODE="${PARALLEL_MODE:-dp}"   # layer_mp | dp
+NPROC="${NPROC:-8}"
+EVAL_AFTER_SAVE="${EVAL_AFTER_SAVE:-true}"
 # 分卡 lm-eval（尤其 mmlu）gather 等待；对齐 catlora_distill_4gpu_res0.sh
 export DISTILL_NCCL_TIMEOUT_SEC="${DISTILL_NCCL_TIMEOUT_SEC:-10800}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-10800}"
@@ -65,17 +65,17 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --full_determinism "${FULL_DETERMINISM}" \
     --gradient_checkpointing true \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
-    --run_root_dir .result/compressed_e2e_fintuning \
+    --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning \
     --finetune_mode both \
     --parallel_mode dp \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
     --dataset_task sft \
-    --loss_type eakld \
+    --loss_type kl_top_1000 \
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
     --prompt_kd_weight 0.0 \
-    --hidden_loss_weight 0.1 \
+    --hidden_loss_weight 0.0 \
     --hidden_layer_weighting adaptive_top_3 \
     --teacher_output_offload cpu \
     --teacher_output_pin_memory true \
@@ -86,8 +86,8 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --target_modules all \
     --parallel_stage_decode true \
     --vae_decoder_checkpoint true \
-    --tune_final_norm false \
-    --use_post_norm_head_linear false \
+    --tune_final_norm true \
+    --use_post_norm_head_linear true \
     --vae_tune_bias false \
     --offload_mode none \
     --eval_after_save "${EVAL_AFTER_SAVE}" \
@@ -103,12 +103,12 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --save_tokenizer true \
     --bf16 true \
     --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 2 \
-    --learning_rate 1e-5 \
+    --gradient_accumulation_steps 1 \
+    --learning_rate 3e-6 \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \
     --weight_decay 0.0001 \
-    --max_grad_norm 1.5 \
+    --max_grad_norm 15.0 \
     --logging_steps 10 \
     --eval_strategy no \
     --save_strategy steps \
@@ -123,17 +123,17 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --full_determinism "${FULL_DETERMINISM}" \
     --gradient_checkpointing true \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
-    --run_root_dir .result/compressed_e2e_fintuning \
+    --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning \
     --finetune_mode both \
     --parallel_mode layer_mp \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
     --dataset_task sft \
-    --loss_type eakld_top_100 \
+    --loss_type kl_top_1000 \
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
     --prompt_kd_weight 0.0 \
-    --hidden_loss_weight 0.01 \
+    --hidden_loss_weight 0.0 \
     --hidden_layer_weighting adaptive_top_3 \
     --teacher_output_offload cpu \
     --teacher_output_pin_memory true \
@@ -162,12 +162,12 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --save_tokenizer true \
     --bf16 true \
     --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 2 \
-    --learning_rate 1e-5 \
+    --gradient_accumulation_steps 1 \
+    --learning_rate 3e-6 \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \
     --weight_decay 0.0001 \
-    --max_grad_norm 1.5 \
+    --max_grad_norm 15.0 \
     --logging_steps 10 \
     --eval_strategy no \
     --save_strategy steps \

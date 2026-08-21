@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -19,10 +19,10 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 # --distill_independent_categories false：前缀累积压缩状态；true：每类独立（已完成类恢复未压缩）
 # edgerazor 配比：
   # --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.py \
+torchrun --standalone --nproc_per_node=8 tools/cat_distill_from_vae_checkpoint.py \
   --model_path "Qwen/Qwen3-8B" \
-  --resume_from_checkpoint ".result/catlora/res0-bf16-protect-channel-vae/final_model" \
-  --output_dir "./.result/catlora_distill/res0-bf16-protect-channel-vae" \
+  --resume_from_checkpoint "/root/data/ckpts/result/catlora/Qwen_Qwen3-8B_20260724_190531/final_model_down4bit_merged" \
+  --output_dir "/root/data/ckpts/result/catlora_distill/res0-bf16-protect-channel-vae" \
   --seed "33" \
   --deterministic "true" \
   --train_device "cuda" \
@@ -42,21 +42,21 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_reset_completed "true" \
   --distill_independent_categories "false" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --lora_rank "default=8,after:gate_proj=32,after:up_proj=32,after:down_proj=32" \
-  --lora_alpha "default=8,after:gate_proj=32,after:up_proj=32,after:down_proj=32" \
+  --lora_rank "default=4,after:gate_proj=4,after:up_proj=4,after:down_proj=4" \
+  --lora_alpha "default=8,after:gate_proj=8,after:up_proj=8,after:down_proj=8" \
   --lora_dropout "default=0.03" \
-  --distill_steps "default=2000" \
+  --distill_steps "default=3000,after:down_proj=5000" \
   --distill_batch_size "default=4" \
   --distill_lr "default=2e-5" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=10" \
   --distill_temperature "default=1.0" \
   --distill_loss_alpha "default=0.5" \
-  --distill_prompt_kd_weight "default=0.03" \
+  --distill_prompt_kd_weight "default=0.001" \
   --distill_loss_type "default=kl_top_100" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
-  --distill_hidden_loss_weight "default=0.1" \
+  --distill_hidden_loss_weight "default=0.3" \
   --distill_pre_mlp_hidden_loss_weight "default=0.0" \
   --distill_hidden_alignment_layer_weighting "adaptive_top_3" \
   --lora_use_dora "default=false" \
@@ -64,16 +64,16 @@ torchrun --standalone --nproc_per_node=4 tools/cat_distill_from_vae_checkpoint.p
   --distill_use_post_norm_head_linear "false" \
   --distill_hif4_act "false" \
   --eval_hif4_act "false" \
-  --distill_gradient_accumulation_steps "4" \
+  --distill_gradient_accumulation_steps "1" \
   --distill_gradient_checkpointing "true" \
   --distill_gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --distill_optim "adamw_torch" \
-  --distill_max_grad_norm "1.5" \
+  --distill_max_grad_norm "3.33" \
   --distill_warmup_ratio "0.05" \
   --distill_group_by_length "false" \
   --distill_lr_scheduler_type "cosine" \
-  --distill_dynamic_padding "true" \
   --distill_model_max_length "1024" \
+  --distill_dynamic_padding "true" \
   --fp16 "false" \
   --bf16 "true" \
   "$@"

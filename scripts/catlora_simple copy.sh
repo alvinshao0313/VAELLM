@@ -2,7 +2,24 @@
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=5
+DISTILL_GPUS="${DISTILL_GPUS:-0,1,2,3,4,5,6,7}"
+if [[ ! "${DISTILL_GPUS}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+  echo "DISTILL_GPUS must be non-negative integers separated by commas, without spaces (for example: 5,6,7,8). Got: ${DISTILL_GPUS@Q}" >&2
+  exit 2
+fi
+IFS=',' read -r -a DISTILL_GPU_LIST <<< "${DISTILL_GPUS}"
+declare -A DISTILL_GPU_SEEN=()
+for DISTILL_GPU in "${DISTILL_GPU_LIST[@]}"; do
+  if [[ -n "${DISTILL_GPU_SEEN[${DISTILL_GPU}]:-}" ]]; then
+    echo "DISTILL_GPUS must not contain duplicate GPU ids. Got: ${DISTILL_GPUS}" >&2
+    exit 2
+  fi
+  DISTILL_GPU_SEEN["${DISTILL_GPU}"]=1
+done
+NPROC_PER_NODE="${#DISTILL_GPU_LIST[@]}"
+export CUDA_VISIBLE_DEVICES="${DISTILL_GPUS}"
+export DISTILL_NCCL_TIMEOUT_SEC=10800
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 export PYTHONHASHSEED=31
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TOKENIZERS_PARALLELISM=false
@@ -48,7 +65,7 @@ export HF_DATASETS_OFFLINE=1
 # 蒸馏数据：先运行 bash scripts/prepare_vaellm_edgerazor_data.sh，见 docs/edgerazor_dataset.md
   # --unload_vae_original_weights_on_final_save \
 
-python tools/cat_train.py \
+torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
   --output_dir "./.result/catlora" \
   --seed "31" \
@@ -70,7 +87,7 @@ python tools/cat_train.py \
   --activation_calib_seed "31" \
   --activation_calib_device "" \
   --activation_calib_log_every "0" \
-  --codebook_bits "default=32" \
+  --codebook_bits "default=32,cat:down_proj=64" \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
   --base_ch "default=128" \
@@ -107,10 +124,14 @@ python tools/cat_train.py \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --ppl_limit "-1" \
   --outlier_protect_mode "channel" \
+  --outlier_rank_metric "channel_weight_actmean_abs" \
   --outlier_mlp_rank_metric "none" \
   --outlier_mlp_fuse_weights "1,1,1" \
   --outlier_channel_scope "layer" \
-  --outlier_protect_channel_quant "none" \
+  --outlier_protect_min_per_layer "0" \
+  --outlier_protect_channel_quant "int8" \
+  --outlier_protect_axis "input" \
+  --outlier_protect_count "default=32,cat:down_proj=128" \
   --outlier_residual_vae_decoder_share_scope "none" \
   --outlier_residual_vae_batch_multiplier "4" \
   --outlier_residual_vae_steps "1500" \
@@ -118,11 +139,7 @@ python tools/cat_train.py \
   --outlier_residual_vae_stages "default=1" \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_protect_count "default=0" \
-  --outlier_protect_min_per_layer "0" \
-  --outlier_protect_axis "input" \
   --outlier_residual_top_p "default=0.01" \
-  --outlier_rank_metric "sparse_weight_abs" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
@@ -143,7 +160,7 @@ python tools/cat_train.py \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
   --distill_hidden_loss_weight "default=0.1" \
-  --distill_pre_mlp_hidden_loss_weight "default=0.0" \
+  --distill_pre_mlp_hidden_loss_weight "default=0.01" \
   --distill_hidden_alignment_layer_weighting "linear_depth" \
   --lora_use_dora "default=true" \
   --distill_tune_final_norm "true" \

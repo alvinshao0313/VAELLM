@@ -583,6 +583,14 @@ def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig
         training_kwargs["ddp_find_unused_parameters"] = True
         if logger is not None:
             logger.info("LoRA: DDP find_unused_parameters=True（仅当前类参数可训）。")
+            grad_acc = int(getattr(training_args, "distill_gradient_accumulation_steps", 1))
+            logger.info(
+                "LoRA: per_device_batch=%d world_size=%d grad_acc=%d effective_global_batch=%d",
+                int(cfg.batch_size),
+                int(distill_world_size()),
+                grad_acc,
+                int(cfg.batch_size) * int(distill_world_size()) * grad_acc,
+            )
     return TrainingArguments(**training_kwargs)
 
 
