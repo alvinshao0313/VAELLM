@@ -78,6 +78,7 @@ from train_utils.model_checkpoint_io import (
     save_model_checkpoint,
 )
 from train_utils.cat_inline_distributed import (
+    _resolve_cat_inline_vae_wait_timeout_sec,
     broadcast_group_vae_payload,
     initialize_cat_payload_group,
 )
@@ -2482,11 +2483,19 @@ def _train_group_vae_and_replace_inline_distributed(
     rank = distill_rank()
     if rank == 0:
         log.info("Cat inline VAE train start: group=%s rank=0", group_tag)
+        vae_started_at = time.perf_counter()
         payload = train_group_vae_payload(
             model=model,
             group_refs=group_refs,
             group_tag=group_tag,
             **vae_group_kwargs,
+        )
+        vae_elapsed_sec = time.perf_counter() - vae_started_at
+        log.info(
+            "Cat inline VAE train complete: group=%s rank=0 elapsed_sec=%.1f elapsed_min=%.2f",
+            group_tag,
+            vae_elapsed_sec,
+            vae_elapsed_sec / 60.0,
         )
     else:
         payload = None
@@ -2494,7 +2503,22 @@ def _train_group_vae_and_replace_inline_distributed(
 
     if not bool(vae_group_kwargs["do_convert"]):
         raise RuntimeError("Inline distributed CAT requires --convert.")
+    if rank == 0:
+        timeout_sec = _resolve_cat_inline_vae_wait_timeout_sec()
+        log.info(
+            "Cat inline VAE payload sync start: group=%s timeout_sec=%d",
+            group_tag,
+            timeout_sec,
+        )
+    sync_started_at = time.perf_counter()
     payload = broadcast_group_vae_payload(payload, src=0)
+    sync_elapsed_sec = time.perf_counter() - sync_started_at
+    if rank == 0:
+        log.info(
+            "Cat inline VAE payload sync complete: group=%s elapsed_sec=%.1f",
+            group_tag,
+            sync_elapsed_sec,
+        )
     apply_group_vae_payload(
         model=model,
         group_refs=group_refs,

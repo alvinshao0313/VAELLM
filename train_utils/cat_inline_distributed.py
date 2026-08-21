@@ -1,6 +1,8 @@
 """CPU payload transport primitives for inline CAT distributed training."""
 
 import io
+import os
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 import torch
@@ -17,6 +19,23 @@ _TRANSPORT_BOOL_MARKER = "__cat_inline_transport_bool__"
 _PAYLOAD_GROUP = None
 
 
+def _resolve_cat_inline_vae_wait_timeout_sec() -> int:
+    raw = os.environ.get("CAT_INLINE_VAE_WAIT_TIMEOUT_SEC", "7200")
+    try:
+        timeout_sec = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "CAT_INLINE_VAE_WAIT_TIMEOUT_SEC must be a positive integer number of seconds, "
+            f"got {raw!r}."
+        ) from exc
+    if timeout_sec <= 0:
+        raise ValueError(
+            "CAT_INLINE_VAE_WAIT_TIMEOUT_SEC must be > 0, "
+            f"got {timeout_sec}."
+        )
+    return timeout_sec
+
+
 def initialize_cat_payload_group():
     """Create and cache the world-wide Gloo group used only for CPU payload bytes."""
     global _PAYLOAD_GROUP
@@ -24,7 +43,11 @@ def initialize_cat_payload_group():
         return None
     ensure_distill_process_group_initialized()
     if _PAYLOAD_GROUP is None:
-        _PAYLOAD_GROUP = torch.distributed.new_group(backend="gloo")
+        timeout_sec = _resolve_cat_inline_vae_wait_timeout_sec()
+        _PAYLOAD_GROUP = torch.distributed.new_group(
+            backend="gloo",
+            timeout=timedelta(seconds=timeout_sec),
+        )
     return _PAYLOAD_GROUP
 
 

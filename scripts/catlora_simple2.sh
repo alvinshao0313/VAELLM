@@ -67,7 +67,7 @@ export HF_DATASETS_OFFLINE=1
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
-  --output_dir "./.result/catlora" \
+  --output_dir "/root/data/ckpts/result/catlora" \
   --seed "31" \
   --deterministic "true" \
   --train_device "cuda" \
@@ -131,7 +131,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --outlier_protect_min_per_layer "0" \
   --outlier_protect_channel_quant "int8" \
   --outlier_protect_axis "input" \
-  --outlier_protect_count "default=32,cat:down_proj=128" \
+  --outlier_protect_count "default=32,cat:o_proj=64,cat:down_proj=256" \
   --outlier_residual_vae_decoder_share_scope "none" \
   --outlier_residual_vae_batch_multiplier "4" \
   --outlier_residual_vae_steps "1500" \
@@ -139,7 +139,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --outlier_residual_vae_stages "default=1" \
   --outlier_residual_vae_codebook_bits "default=4" \
   --outlier_residual_vae_codebook_dim "default=8" \
-  --outlier_residual_top_p "default=0.01" \
+  --outlier_residual_top_p "default=0.0" \
   --outlier_residual_min_abs "0.0" \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
@@ -174,7 +174,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --distill_max_grad_norm "1.3" \
   --distill_warmup_ratio "0.1" \
   --distill_group_by_length "true" \
-  --distill_lr_scheduler_type "constant_with_warmup" \
+  --distill_lr_scheduler_type "cosine" \
   --distill_model_max_length "8192" \
   --fp16 "false" \
   --bf16 "true" \
