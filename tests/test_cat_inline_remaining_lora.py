@@ -5,6 +5,7 @@ from unittest import mock
 from torch import nn
 
 from train_utils.cat_after_category_distill import run_after_category_distill
+from train_utils.cat_arg_overrides import OverrideTable
 from train_utils.lora_utils import RemainingLoraFinetuneResult
 from train_utils.utils import collect_linears
 
@@ -49,13 +50,36 @@ class CatInlineRemainingLoraTests(unittest.TestCase):
             self.assertEqual(list(dict.fromkeys(ref.category for ref in remaining)), expected[category])
 
     def _args(self, *, final_norm: bool, post_norm: bool, steps="default=1"):
+        def table(name, value):
+            return OverrideTable(arg_name=name, allowed_selectors=("default", "after"), has_default=True, default=value)
+
         cat_args = SimpleNamespace(
             distill_after_category="remaining_lora",
             distill_tune_final_norm=bool(final_norm),
             distill_use_post_norm_head_linear=bool(post_norm),
-            distill_steps=steps,
+            seed=42,
+            train_device="cpu",
+            distill_dataset="openorca=1.0",
+            lora_rank=table("lora_rank", 2),
+            lora_alpha=table("lora_alpha", 4),
+            lora_dropout=table("lora_dropout", 0.0),
+            lora_use_dora=table("lora_use_dora", False),
+            distill_steps=table("distill_steps", int(str(steps).split("=")[-1])),
+            distill_batch_size=table("distill_batch_size", 1),
+            distill_lr=table("distill_lr", 1e-4),
+            distill_decoder_lr=table("distill_decoder_lr", None),
+            distill_weight_decay=table("distill_weight_decay", 0.0),
+            distill_log_every=table("distill_log_every", 1),
+            distill_temperature=table("distill_temperature", 1.0),
+            distill_loss_alpha=table("distill_loss_alpha", 1.0),
+            distill_loss_type=table("distill_loss_type", "sft"),
+            distill_hidden_loss_weight=table("distill_hidden_loss_weight", 0.0),
+            distill_pre_mlp_hidden_loss_weight=table("distill_pre_mlp_hidden_loss_weight", 0.0),
+            distill_prompt_kd_weight=table("distill_prompt_kd_weight", 0.0),
+            distill_hidden_alignment_layer_weighting="uniform",
+            distill_eakld_confidence_k=0,
         )
-        training_args = SimpleNamespace()
+        training_args = SimpleNamespace(distill_hif4_act=False, distill_teacher_model_offload="none")
         vae_args = SimpleNamespace()
         return cat_args, vae_args, training_args
 
@@ -89,6 +113,9 @@ class CatInlineRemainingLoraTests(unittest.TestCase):
         self.assertTrue(result.did_train)
         self.assertEqual(result.trained_target_count, 0)
         self.assertEqual(result.next_lora_round_idx, 7)
+        self.assertEqual(result.distill_meta["mode"], "remaining_lora")
+        self.assertTrue(result.distill_meta["did_train"])
+        self.assertEqual(result.distill_meta["remaining_lora_target_count"], 0)
 
     def test_down_without_extra_trainables_still_skips_when_remaining_linears_empty(self):
         model = _TinyModel()
@@ -117,6 +144,9 @@ class CatInlineRemainingLoraTests(unittest.TestCase):
         self.assertFalse(result.did_train)
         self.assertEqual(result.trained_target_count, 0)
         self.assertEqual(result.next_lora_round_idx, 6)
+        self.assertEqual(result.distill_meta["mode"], "remaining_lora")
+        self.assertFalse(result.distill_meta["did_train"])
+        self.assertEqual(result.distill_meta["newly_compressed_target_count"], 0)
 
     def test_steps_zero_result_does_not_increment_round(self):
         model = _TinyModel()
@@ -143,3 +173,4 @@ class CatInlineRemainingLoraTests(unittest.TestCase):
 
         self.assertFalse(result.did_train)
         self.assertEqual(result.next_lora_round_idx, 0)
+        self.assertEqual(result.distill_meta["did_train"], False)

@@ -588,20 +588,16 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.eval_linear_mse:
         logger.info("Loading reference model for linear MSE comparison...")
-        from rotation.model_utils import get_model
+        from train_utils.base_reference import load_frozen_base_reference_model
         from train_utils.eval_utils import evaluate_vae_linear_mse
 
         ref_path = args.ref_model_path or base_model_path
-        ref_model = None
-        try:
-            ref_model = get_model(ref_path, args.access_token)
-            logger.info("Reference model loaded from %s", ref_path)
-        except Exception as e:
-            logger.warning(
-                "Failed to load reference model from %s (%s). Will fallback to checkpoint original weights if available.",
-                ref_path,
-                e,
-            )
+        ref_model = load_frozen_base_reference_model(
+            ref_path,
+            access_token=args.access_token,
+            device="cpu",
+        )
+        logger.info("Reference model loaded from %s", ref_path)
 
         linear_result = evaluate_vae_linear_mse(
             model=model,

@@ -26,6 +26,7 @@ from litebsq.low_rank_scope import (
 )
 from litebsq.vae_linear import VAELinear
 from train_utils import cat_after_category_distill as cad
+from train_utils.cat_arg_overrides import OverrideTable
 from train_utils.cat_after_category_distill import (
     _run_compressed_category_distill,
     _validate_existing_model_low_rank_scope,
@@ -108,7 +109,50 @@ class _TinyCategoryModel(nn.Module):
             self.layers[name] = module
 
 
-def _fake_cfg(*, rank: int = 2) -> _ResolvedDistillStageConfig:
+def _override(name: str, value):
+    return OverrideTable(
+        arg_name=name,
+        allowed_selectors=("default", "after"),
+        has_default=True,
+        default=value,
+    )
+
+
+def _cat_args_for_compressed(*, scope=LOW_RANK_SCOPE_FULL):
+    return SimpleNamespace(
+        compressed_lora_scope=scope,
+        distill_reset_completed=False,
+        seed=0,
+        distill_dataset="dummy",
+        train_device="cpu",
+        lora_rank=_override("lora_rank", 2),
+        lora_alpha=_override("lora_alpha", 2.0),
+        lora_dropout=_override("lora_dropout", 0.0),
+        lora_use_dora=_override("lora_use_dora", False),
+        distill_steps=_override("distill_steps", 1),
+        distill_batch_size=_override("distill_batch_size", 1),
+        distill_lr=_override("distill_lr", 1e-4),
+        distill_decoder_lr=_override("distill_decoder_lr", None),
+        distill_weight_decay=_override("distill_weight_decay", 0.0),
+        distill_log_every=_override("distill_log_every", 1),
+        distill_temperature=_override("distill_temperature", 1.0),
+        distill_loss_alpha=_override("distill_loss_alpha", 1.0),
+        distill_loss_type=_override("distill_loss_type", "sft"),
+        distill_hidden_loss_weight=_override("distill_hidden_loss_weight", 0.0),
+        distill_pre_mlp_hidden_loss_weight=_override("distill_pre_mlp_hidden_loss_weight", 0.0),
+        distill_prompt_kd_weight=_override("distill_prompt_kd_weight", 0.0),
+        distill_hidden_alignment_layer_weighting="uniform",
+        distill_eakld_confidence_k=16,
+    )
+
+
+def _fake_cfg(
+    *,
+    rank: int = 2,
+    steps: int = 1,
+    lr: float = 1e-4,
+    decoder_lr=None,
+) -> _ResolvedDistillStageConfig:
     return _ResolvedDistillStageConfig(
         device="cpu",
         base_seed=0,
@@ -117,9 +161,10 @@ def _fake_cfg(*, rank: int = 2) -> _ResolvedDistillStageConfig:
         rank=int(rank),
         alpha=float(rank),
         dropout=0.0,
-        steps=1,
+        steps=int(steps),
         batch_size=1,
-        lr=1e-4,
+        lr=float(lr),
+        decoder_lr=decoder_lr,
         weight_decay=0.0,
         log_every=1,
         temperature=1.0,
@@ -162,8 +207,8 @@ def _patch_distill_pre_train(monkeypatch, *, calls: List[str]):
         lambda *args, **kwargs: {"total": 0, "warmed": 0, "skipped": 0, "failed": 0},
     )
     monkeypatch.setattr(cad, "_set_proxy_decoder_adapter_mode", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cad, "_enable_compressed_trainable_params", lambda *args, **kwargs: [])
-    monkeypatch.setattr(cad, "_enable_subspace_compressed_trainable_params", lambda *args, **kwargs: [])
+    monkeypatch.setattr(cad, "_enable_compressed_lora_params_only", lambda *args, **kwargs: [])
+    monkeypatch.setattr(cad, "_enable_subspace_compressed_lora_params_only", lambda *args, **kwargs: [])
     monkeypatch.setattr(cad, "_unwrap_peft_proxies_without_export", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
         cad,
@@ -337,10 +382,7 @@ class CatCompressedLoraScopeGuardTests(unittest.TestCase):
                 ),
             }
         )
-        cat_args = SimpleNamespace(
-            compressed_lora_scope=LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
-            distill_reset_completed=False,
-        )
+        cat_args = _cat_args_for_compressed(scope=LOW_RANK_SCOPE_COMPRESSED_SUBSPACE)
         with self.assertRaisesRegex(ValueError, "Existing model low-rank scope"):
             _run_compressed_category_distill(
                 model=model,
@@ -369,10 +411,7 @@ class CatCompressedLoraScopeGuardTests(unittest.TestCase):
                 ),
             }
         )
-        cat_args = SimpleNamespace(
-            compressed_lora_scope=LOW_RANK_SCOPE_FULL,
-            distill_reset_completed=False,
-        )
+        cat_args = _cat_args_for_compressed(scope=LOW_RANK_SCOPE_FULL)
         with self.assertRaisesRegex(ValueError, "Existing model low-rank scope"):
             _run_compressed_category_distill(
                 model=model,
@@ -424,13 +463,7 @@ def test_full_route_calls_materialize_not_subspace(monkeypatch):
             )
         }
     )
-    cat_args = SimpleNamespace(
-        compressed_lora_scope=LOW_RANK_SCOPE_FULL,
-        distill_reset_completed=False,
-        seed=0,
-        distill_dataset="dummy",
-        train_device="cpu",
-    )
+    cat_args = _cat_args_for_compressed(scope=LOW_RANK_SCOPE_FULL)
     result = _run_compressed_category_distill(
         model=model,
         category="down_proj",
@@ -460,13 +493,7 @@ def test_subspace_route_calls_wrap_inject_not_materialize(monkeypatch):
             )
         }
     )
-    cat_args = SimpleNamespace(
-        compressed_lora_scope=LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
-        distill_reset_completed=False,
-        seed=0,
-        distill_dataset="dummy",
-        train_device="cpu",
-    )
+    cat_args = _cat_args_for_compressed(scope=LOW_RANK_SCOPE_COMPRESSED_SUBSPACE)
     result = _run_compressed_category_distill(
         model=model,
         category="down_proj",
@@ -485,12 +512,12 @@ def test_subspace_route_calls_wrap_inject_not_materialize(monkeypatch):
     assert int(result.trained_target_count) == 0
 
 
-def test_compressed_no_target_skip_still_advances_round():
+def test_compressed_no_target_skip_does_not_advance_round():
     result = _run_compressed_category_distill(
         model=_TinyCategoryModel({}),
         category="down_proj",
         mode="compressed_lora",
-        cat_args=SimpleNamespace(),
+        cat_args=_cat_args_for_compressed(),
         vae_args=SimpleNamespace(),
         training_args=SimpleNamespace(bf16=False),
         logger=logging.getLogger("test"),
@@ -499,10 +526,11 @@ def test_compressed_no_target_skip_still_advances_round():
 
     assert result.did_train is False
     assert int(result.trained_target_count) == 0
-    assert int(result.next_lora_round_idx) == 5
+    assert int(result.next_lora_round_idx) == 4
+    assert result.distill_meta["newly_compressed_target_count"] == 0
 
 
-def test_compressed_steps_zero_skip_still_advances_round():
+def test_compressed_steps_zero_skip_does_not_advance_round():
     model = _TinyCategoryModel(
         {
             "down_proj": _build_vae_linear(
@@ -531,7 +559,195 @@ def test_compressed_steps_zero_skip_still_advances_round():
 
     assert result.did_train is False
     assert int(result.trained_target_count) == 0
-    assert int(result.next_lora_round_idx) == 8
+    assert int(result.next_lora_round_idx) == 7
+
+
+def test_inline_compressed_mode_preserves_newly_compressed_count_when_steps_zero():
+    model = _TinyCategoryModel(
+        {
+            "down_proj": _build_vae_linear(
+                compressed_in_features=4,
+                low_rank_scope=LOW_RANK_SCOPE_FULL,
+            )
+        }
+    )
+    cfg = _fake_cfg(steps=0)
+    with mock.patch.object(cad, "_resolve_distill_stage_config", return_value=cfg):
+        result = _run_compressed_category_distill(
+            model=model,
+            category="down_proj",
+            mode="compressed_lora",
+            cat_args=_cat_args_for_compressed(),
+            vae_args=SimpleNamespace(),
+            training_args=SimpleNamespace(bf16=False),
+            logger=logging.getLogger("test"),
+            lora_round_idx=7,
+            newly_compressed_target_count=7,
+        )
+
+    assert result.did_train is False
+    assert int(result.trained_target_count) == 7
+    assert int(result.next_lora_round_idx) == 7
+    assert result.distill_meta["newly_compressed_target_count"] == 7
+
+
+def test_checkpoint_compressed_mode_count_remains_zero():
+    model = _TinyCategoryModel(
+        {
+            "down_proj": _build_vae_linear(
+                compressed_in_features=4,
+                low_rank_scope=LOW_RANK_SCOPE_FULL,
+            )
+        }
+    )
+    cfg = _fake_cfg(steps=0)
+    with mock.patch.object(cad, "_resolve_distill_stage_config", return_value=cfg):
+        result = _run_compressed_category_distill(
+            model=model,
+            category="down_proj",
+            mode="compressed_lora",
+            cat_args=_cat_args_for_compressed(),
+            vae_args=SimpleNamespace(),
+            training_args=SimpleNamespace(bf16=False),
+            logger=logging.getLogger("test"),
+            lora_round_idx=7,
+            newly_compressed_target_count=0,
+        )
+
+    assert int(result.trained_target_count) == 0
+    assert result.distill_meta["newly_compressed_target_count"] == 0
+
+
+def _patch_decoder_train(monkeypatch, *, cfg, captured):
+    monkeypatch.setattr(cad, "_resolve_distill_stage_config", lambda **_kwargs: cfg)
+    monkeypatch.setattr(cad, "_ensure_lora_stack_available", lambda: None)
+    monkeypatch.setattr(cad, "_ensure_lora_tokenizer_ready", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        cad,
+        "prepare_distill_datasets",
+        lambda *_args, **_kwargs: ("mix", [], [{"input_ids": [1]}], None, None),
+    )
+    monkeypatch.setattr(cad, "is_iterable_training_dataset", lambda _ds: False)
+    monkeypatch.setattr(cad, "dataset_length_or_none", lambda _ds: 1)
+    monkeypatch.setattr(cad, "_freeze_model_for_lora", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cad, "_restore_model_use_cache", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cad,
+        "prime_named_vae_linear_cache",
+        lambda *args, **kwargs: {"total": 0, "warmed": 0, "skipped": 0, "failed": 0},
+    )
+    monkeypatch.setattr(cad, "_build_sft_args", lambda **_kwargs: object())
+
+    class FakeTrainer:
+        def __init__(self, model, decoder_params, decoder_lr):
+            self.model = model
+            self.optimizer = SimpleNamespace(
+                param_groups=[
+                    {
+                        "lr": decoder_lr,
+                        "weight_decay": 0.0,
+                        "params": list(decoder_params),
+                    }
+                ]
+            )
+
+    def fake_build_lora_trainer(**kwargs):
+        captured["decoder_lr"] = kwargs["decoder_lr"]
+        captured["decoder_param_count"] = len(list(kwargs["decoder_params"]))
+        trainer = FakeTrainer(kwargs["model"], kwargs["decoder_params"], kwargs["decoder_lr"])
+        captured["optimizer_group_lr"] = trainer.optimizer.param_groups[0]["lr"]
+        captured["optimizer_group_weight_decay"] = trainer.optimizer.param_groups[0]["weight_decay"]
+        return trainer
+
+    monkeypatch.setattr(cad, "_build_lora_trainer", fake_build_lora_trainer)
+    monkeypatch.setattr(cad, "_train_without_merging_peft_adapters", lambda trainer, **_kwargs: trainer.model)
+
+
+def test_decoder_metadata_uses_explicit_decoder_lr(monkeypatch):
+    captured = {}
+    cfg = _fake_cfg(lr=2e-5, decoder_lr=5e-5)
+    _patch_decoder_train(monkeypatch, cfg=cfg, captured=captured)
+    model = _TinyCategoryModel(
+        {
+            "down_proj": _build_vae_linear(
+                compressed_in_features=4,
+                low_rank_scope=LOW_RANK_SCOPE_FULL,
+            )
+        }
+    )
+
+    result = _run_compressed_category_distill(
+        model=model,
+        category="down_proj",
+        mode="decoder",
+        cat_args=_cat_args_for_compressed(),
+        vae_args=SimpleNamespace(_cached_lora_tokenizer=object()),
+        training_args=SimpleNamespace(bf16=False, distill_model_max_length=32),
+        logger=logging.getLogger("test"),
+        lora_round_idx=0,
+    )
+
+    assert captured["decoder_param_count"] > 0
+    assert captured["decoder_lr"] == 5e-5
+    assert captured["optimizer_group_lr"] == 5e-5
+    assert captured["optimizer_group_weight_decay"] == 0.0
+    assert result.distill_meta["resolved_distill_lr"] == 2e-5
+    assert result.distill_meta["resolved_decoder_lr"] == 5e-5
+    assert result.distill_meta["decoder_weight_decay"] == 0.0
+
+
+def test_decoder_metadata_inherits_distill_lr(monkeypatch):
+    captured = {}
+    cfg = _fake_cfg(lr=2e-5, decoder_lr=None)
+    _patch_decoder_train(monkeypatch, cfg=cfg, captured=captured)
+    model = _TinyCategoryModel(
+        {
+            "down_proj": _build_vae_linear(
+                compressed_in_features=4,
+                low_rank_scope=LOW_RANK_SCOPE_FULL,
+            )
+        }
+    )
+
+    result = _run_compressed_category_distill(
+        model=model,
+        category="down_proj",
+        mode="decoder",
+        cat_args=_cat_args_for_compressed(),
+        vae_args=SimpleNamespace(_cached_lora_tokenizer=object()),
+        training_args=SimpleNamespace(bf16=False, distill_model_max_length=32),
+        logger=logging.getLogger("test"),
+        lora_round_idx=0,
+    )
+
+    assert captured["decoder_lr"] == 2e-5
+    assert result.distill_meta["resolved_decoder_lr"] == 2e-5
+
+
+def test_no_decoder_group_metadata_is_null():
+    model = _TinyCategoryModel(
+        {
+            "down_proj": _build_vae_linear(
+                compressed_in_features=4,
+                low_rank_scope=LOW_RANK_SCOPE_FULL,
+            )
+        }
+    )
+    cfg = _fake_cfg(steps=0, lr=2e-5, decoder_lr=5e-5)
+    with mock.patch.object(cad, "_resolve_distill_stage_config", return_value=cfg):
+        result = _run_compressed_category_distill(
+            model=model,
+            category="down_proj",
+            mode="compressed_lora",
+            cat_args=_cat_args_for_compressed(),
+            vae_args=SimpleNamespace(),
+            training_args=SimpleNamespace(bf16=False),
+            logger=logging.getLogger("test"),
+            lora_round_idx=0,
+        )
+
+    assert result.distill_meta["resolved_decoder_lr"] is None
+    assert result.distill_meta["decoder_weight_decay"] is None
 
 
 def test_subspace_export_restores_bare_vae_linear_with_compressed_scope():

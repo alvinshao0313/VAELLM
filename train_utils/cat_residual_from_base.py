@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from e2e_common.peft_proxy import PeftVAELinearProxy
+from litebsq.misc import set_module_by_name
 from litebsq.sparse_residual import (
     SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED,
     SPARSE_RESIDUAL_FORMAT_COO_FP16,
@@ -25,6 +26,12 @@ from train_utils.activation_utils import collect_activation_stats_for_linears
 from train_utils.cat_data_prep import compute_channel_rank_score, select_outlier_channel_indices_from_scores
 from train_utils.cat_train_args import ResolvedCategoryRuntimeConfig
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
+from train_utils.cat_train_runtime import normalize_cat_runtime_vae_original_state
+from train_utils.base_reference import (
+    clone_frozen_linear_from_reference,
+    get_reference_module,
+    load_frozen_base_reference_model,
+)
 from train_utils.cat_train_pipeline import (
     _resolve_train_dtype,
     _train_protected_residual_vae_payload,
@@ -106,6 +113,12 @@ class _RuntimeVAETarget:
     base_layer: VAELinear
 
 
+@dataclass
+class _ResidualFromBaseResidency:
+    stashed_vae_modules: Dict[str, nn.Module] = field(default_factory=dict)
+    reference_dense_linears: Dict[str, nn.Linear] = field(default_factory=dict)
+
+
 def _str_to_bool(value: object) -> bool:
     return _parse_bool_like(value, arg_name="bool")
 
@@ -177,7 +190,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_after_residual", type=_str_to_bool, default=True)
     parser.add_argument("--bf16", type=_str_to_bool, default=True)
     parser.add_argument("--fp16", type=_str_to_bool, default=False)
-    parser.add_argument("--unload_vae_original_weights_on_save", action="store_true")
 
     parser.add_argument("--codebook_bits", type=int, default=32)
     parser.add_argument("--codebook_dim", type=int, default=0)
@@ -530,68 +542,130 @@ def _iter_runtime_vae_targets(model: nn.Module) -> List[_RuntimeVAETarget]:
     return targets
 
 
-def _set_residual_from_base_active_categories(
+def _get_or_create_residual_reference_linear(
+    *,
+    reference_model: nn.Module,
+    name: str,
+    residency: _ResidualFromBaseResidency,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> nn.Linear:
+    existing = residency.reference_dense_linears.get(name)
+    if existing is not None:
+        existing.to(device=device, dtype=dtype)
+        existing.requires_grad_(False)
+        existing.eval()
+        return existing
+    clone = clone_frozen_linear_from_reference(
+        reference_model,
+        name,
+        device=device,
+        dtype=dtype,
+    )
+    residency.reference_dense_linears[name] = clone
+    return clone
+
+
+def _get_module_by_name(model: nn.Module, name: str) -> nn.Module:
+    return get_reference_module(model, name)
+
+
+def _apply_residual_from_base_residency(
     *,
     model: nn.Module,
+    reference_model: nn.Module,
+    residency: _ResidualFromBaseResidency,
     active_categories: Sequence[str],
+    device: torch.device,
+    dtype: torch.dtype,
     logger,
 ) -> List[NamedVAELinearTarget]:
     active_set = {str(category) for category in active_categories}
     prewarm_targets: List[NamedVAELinearTarget] = []
-    missing_original: List[str] = []
-    compressed_count = 0
-    original_count = 0
+    inactive_reference = 0
+    active_vae = 0
+    managed_names = {
+        target.name: target.category
+        for target in _iter_runtime_vae_targets(model)
+    }
+    managed_names.update({name: str(name).rsplit(".", 1)[-1] for name in residency.stashed_vae_modules})
+    managed_names.update({name: str(name).rsplit(".", 1)[-1] for name in residency.reference_dense_linears})
 
-    for target in _iter_runtime_vae_targets(model):
-        active = target.category in active_set
-        if callable(getattr(target.module, "set_temporary", None)):
-            target.module.set_temporary(active)
+    for name, category in sorted(managed_names.items()):
+        module = _get_module_by_name(model, name)
+        if str(category) in active_set:
+            if isinstance(module, nn.Linear):
+                if name not in residency.stashed_vae_modules:
+                    raise RuntimeError(f"{name}: active residual-from-base category missing stashed VAELinear.")
+                vae_module = residency.stashed_vae_modules.pop(name)
+                set_module_by_name(model, name, vae_module)
+                module = vae_module
+            if not isinstance(module, (VAELinear, PeftVAELinearProxy)):
+                raise TypeError(f"{name}: expected active VAELinear, got {type(module)}.")
+            base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+            base_layer.clear_decoded_weight_cache()
+            module.to(device)
+            prewarm_targets.append(NamedVAELinearTarget(name=name, base_layer=base_layer))
+            active_vae += 1
         else:
-            target.base_layer.set_temporary(active)
-        target.base_layer.clear_decoded_weight_cache()
-
-        use_original = bool(getattr(target.base_layer, "always_use_original", False)) or not bool(
-            getattr(target.base_layer, "temporary", True)
-        )
-        if use_original:
-            original_count += 1
-            if getattr(target.base_layer, "original_weight", None) is None:
-                missing_original.append(target.name)
-        else:
-            compressed_count += 1
-        if active:
-            prewarm_targets.append(NamedVAELinearTarget(name=target.name, base_layer=target.base_layer))
-
-    if missing_original:
-        raise RuntimeError(
-            "Original-weight path requested but original_weight is missing for: "
-            + ", ".join(missing_original)
-        )
+            if isinstance(module, (VAELinear, PeftVAELinearProxy)):
+                base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+                base_layer.clear_decoded_weight_cache()
+                module.to("cpu")
+                residency.stashed_vae_modules[name] = module
+            elif isinstance(module, nn.Linear):
+                reference = _get_or_create_residual_reference_linear(
+                    reference_model=reference_model,
+                    name=name,
+                    residency=residency,
+                    device=device,
+                    dtype=dtype,
+                )
+                if module is not reference:
+                    raise TypeError(f"{name}: live nn.Linear is not the managed reference clone.")
+                inactive_reference += 1
+                continue
+            else:
+                raise TypeError(f"{name}: expected inactive VAELinear or reference nn.Linear, got {type(module)}.")
+            reference = _get_or_create_residual_reference_linear(
+                reference_model=reference_model,
+                name=name,
+                residency=residency,
+                device=device,
+                dtype=dtype,
+            )
+            set_module_by_name(model, name, reference)
+            inactive_reference += 1
     logger.info(
-        "residual-from-base active categories=%s compressed_targets=%d original_targets=%d",
+        "residual-from-base active categories=%s active_vae=%d inactive_reference_linear=%d stashed_vae=%d reference_clone_cache_size=%d",
         ",".join(str(category) for category in active_categories),
-        int(compressed_count),
-        int(original_count),
+        int(active_vae),
+        int(inactive_reference),
+        int(len(residency.stashed_vae_modules)),
+        int(len(residency.reference_dense_linears)),
     )
     return prewarm_targets
 
 
-def _set_all_residual_from_base_vae_active(*, model: nn.Module, logger) -> None:
-    categories: List[str] = []
-    seen = set()
-    for target in _iter_runtime_vae_targets(model):
-        if target.category in seen:
-            continue
-        seen.add(target.category)
-        categories.append(target.category)
-    _set_residual_from_base_active_categories(
-        model=model,
-        active_categories=categories,
-        logger=logger,
-    )
+def _restore_all_residual_from_base_vae(
+    *,
+    model: nn.Module,
+    residency: _ResidualFromBaseResidency,
+    logger,
+) -> None:
+    restored = 0
+    for name, module in list(residency.stashed_vae_modules.items()):
+        base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+        base_layer.clear_decoded_weight_cache()
+        set_module_by_name(model, name, module)
+        del residency.stashed_vae_modules[name]
+        restored += 1
+    for reference in residency.reference_dense_linears.values():
+        reference.to("cpu")
     cleared = clear_model_vae_linear_cache(model)
     logger.info(
-        "residual-from-base save state: restored all VAELinear targets to compressed branch; cleared_caches=%d",
+        "residual-from-base save state: restored all VAELinear targets; restored=%d cleared_caches=%d",
+        int(restored),
         int(cleared),
     )
 
@@ -600,14 +674,20 @@ def _prewarm_active_residual_categories(
     *,
     category: str,
     model: nn.Module,
+    reference_model: nn.Module,
+    residency: _ResidualFromBaseResidency,
     active_categories: Sequence[str],
     args: argparse.Namespace,
     logger,
     stage: str,
 ) -> Dict[str, int]:
-    prewarm_targets = _set_residual_from_base_active_categories(
+    prewarm_targets = _apply_residual_from_base_residency(
         model=model,
+        reference_model=reference_model,
+        residency=residency,
         active_categories=active_categories,
+        device=torch.device(str(args.train_device)),
+        dtype=_resolve_train_dtype(args),
         logger=logger,
     )
     stats = prime_named_vae_linear_cache(
@@ -781,22 +861,22 @@ def _decode_base_reconstruction(target: _ResidualTarget) -> torch.Tensor:
     return reconstructed
 
 
-def _original_weight(target: _ResidualTarget) -> torch.Tensor:
-    original = getattr(target.module, "original_weight", None)
-    if not isinstance(original, torch.Tensor):
-        raise ValueError(
-            f"{target.name}: original_weight is missing. Load the checkpoint with original model weights."
-        )
+def _reference_weight(reference_model: nn.Module, target: _ResidualTarget) -> torch.Tensor:
+    reference_module = get_reference_module(reference_model, target.name)
+    if not isinstance(reference_module, nn.Linear):
+        raise TypeError(f"{target.name}: reference module is not nn.Linear, got {type(reference_module)}.")
+    original = reference_module.weight
     expected = (int(target.module.out_features), int(target.module.in_features))
     if tuple(original.shape) != expected:
         raise ValueError(
-            f"{target.name}: original_weight shape mismatch, got {tuple(original.shape)}, expected {expected}."
+            f"{target.name}: reference weight shape mismatch, got {tuple(original.shape)}, expected {expected}."
         )
     return original.detach().to(device="cpu", dtype=torch.float32).contiguous()
 
 
 def _select_channel_plan(
     *,
+    reference_model: nn.Module,
     targets: Sequence[_ResidualTarget],
     residual_by_name: Dict[str, torch.Tensor],
     args: argparse.Namespace,
@@ -809,7 +889,7 @@ def _select_channel_plan(
         stats = act_stats.get(target.name, {})
         scores_by_name[target.name] = compute_channel_rank_score(
             metric=metric,
-            weight=_original_weight(target),
+            weight=_reference_weight(reference_model, target),
             residual=residual_by_name[target.name],
             act_max=stats.get("max"),
             act_mean=stats.get("abs_mean"),
@@ -924,6 +1004,7 @@ def _install_sparse_residual_payload(module: VAELinear, payload: Optional[Dict[s
 def _process_channel_residual_vae_category(
     *,
     model: nn.Module,
+    reference_model: nn.Module,
     category: str,
     targets: Sequence[_ResidualTarget],
     residual_by_name: Dict[str, torch.Tensor],
@@ -945,6 +1026,7 @@ def _process_channel_residual_vae_category(
         int(runtime_cfg.outlier_residual_vae_codebook_dim),
     )
     plan, score_summary = _select_channel_plan(
+        reference_model=reference_model,
         targets=targets,
         residual_by_name=residual_by_name,
         args=args,
@@ -1091,6 +1173,7 @@ def _process_channel_residual_vae_category(
 
 def _process_sparse_category(
     *,
+    reference_model: nn.Module,
     category: str,
     targets: Sequence[_ResidualTarget],
     reconstructed_by_name: Dict[str, torch.Tensor],
@@ -1117,7 +1200,7 @@ def _process_sparse_category(
             block_shape = get_default_block_shape_for_index_bits(int(args.outlier_residual_index_bits))
         payload, nnz, storage = build_sparse_residual_payload(
             linear_name=target.name,
-            original_weight=_original_weight(target),
+            target_weight=_reference_weight(reference_model, target),
             reconstructed_weight=reconstructed_by_name[target.name],
             activation_weight=activation_weight,
             activation_mean=activation_mean,
@@ -1235,14 +1318,22 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
         base_model_path=str(args.model_path),
         map_location="cpu",
         strict=True,
-        preserve_original_weights_from_base=True,
+        preserve_original_weights_from_base=False,
+    )
+    stripped = normalize_cat_runtime_vae_original_state(model)
+    reference_model = load_frozen_base_reference_model(
+        str(args.model_path),
+        access_token=args.access_token,
+        device="cpu",
+        dtype=_resolve_train_dtype(args),
     )
     logger.info(
-        "Loaded base checkpoint: dir=%s missing_keys=%d unexpected_keys=%d converted_modules=%s",
+        "Loaded base checkpoint: dir=%s missing_keys=%d unexpected_keys=%d converted_modules=%s stripped_original_weight=%d",
         checkpoint_dir,
         len(getattr(load_result, "missing_keys", [])),
         len(getattr(load_result, "unexpected_keys", [])),
         str(load_meta.get("converted_module_count")),
+        int(stripped),
     )
 
     targets_by_category = _collect_residual_targets(
@@ -1299,6 +1390,7 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
     category_metrics: Dict[str, Dict[str, Any]] = {}
     eval_results: Dict[str, Dict[str, object]] = {}
     active_categories: List[str] = []
+    residency = _ResidualFromBaseResidency()
     needs_activation_stats = _metric_requires_activation(args.outlier_rank_metric)
 
     for category in target_categories:
@@ -1307,6 +1399,8 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
         _prewarm_active_residual_categories(
             category=category,
             model=model,
+            reference_model=reference_model,
+            residency=residency,
             active_categories=active_categories,
             args=args,
             logger=logger,
@@ -1343,7 +1437,7 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
         residual_sq_sum = 0.0
         for target in targets:
             reconstructed = _decode_base_reconstruction(target)
-            original = _original_weight(target)
+            original = _reference_weight(reference_model, target)
             residual = (original - reconstructed).contiguous()
             reconstructed_by_name[target.name] = reconstructed
             residual_by_name[target.name] = residual
@@ -1366,6 +1460,7 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
             )
             summary, metrics = _process_channel_residual_vae_category(
                 model=model,
+                reference_model=reference_model,
                 category=category,
                 targets=targets,
                 residual_by_name=residual_by_name,
@@ -1377,6 +1472,7 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
             )
         elif str(args.outlier_protect_mode) == "residual_sparse":
             summary, metrics = _process_sparse_category(
+                reference_model=reference_model,
                 category=category,
                 targets=targets,
                 reconstructed_by_name=reconstructed_by_name,
@@ -1395,6 +1491,8 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
             _prewarm_active_residual_categories(
                 category=category,
                 model=model,
+                reference_model=reference_model,
+                residency=residency,
                 active_categories=active_categories,
                 args=args,
                 logger=logger,
@@ -1419,7 +1517,7 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
         del reconstructed_by_name, residual_by_name
         torch.cuda.empty_cache()
 
-    _set_all_residual_from_base_vae_active(model=model, logger=logger)
+    _restore_all_residual_from_base_vae(model=model, residency=residency, logger=logger)
     save_paths = save_model_checkpoint(
         model,
         planned_checkpoint_out,
@@ -1431,7 +1529,7 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
             "source_base_vae_checkpoint": os.path.abspath(checkpoint_dir),
             "source_base_checkpoint_created_at_utc": base_meta.get("created_at_utc"),
         },
-        unload_vae_original_weights=bool(args.unload_vae_original_weights_on_save),
+        unload_vae_original_weights=False,
     )
 
     train_time_sec = float(time.time() - run_start)

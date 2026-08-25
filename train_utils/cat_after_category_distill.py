@@ -48,11 +48,19 @@ from train_utils.lora_utils import (
     _freeze_model_for_lora,
     _log_lora_stage_start,
     _resolve_distill_stage_config,
+    _resolve_effective_decoder_lr,
     _restore_model_use_cache,
     distill_distributed_barrier,
     is_distill_distributed,
     is_distill_main_process,
     lora_finetune_remaining_categories,
+)
+from train_utils.cat_train_args import _DISTILL_AFTER_CATEGORY_REMAINING_MODES
+from train_utils.distill_teacher import resolve_distill_teacher_required
+from train_utils.distill_decoder import (
+    NamedMainDecoderTarget,
+    enable_main_decoder_targets,
+    finalize_main_decoder_targets,
 )
 from train_utils.utils import collect_linears as _collect_linears
 
@@ -66,6 +74,54 @@ class AfterCategoryDistillResult:
     next_lora_round_idx: int
     trained_target_count: int = 0
     did_train: bool = False
+    distill_meta: Optional[Dict[str, object]] = None
+
+
+def _build_distill_stage_meta(
+    *,
+    mode: str,
+    category: str,
+    did_train: bool,
+    newly_compressed_target_count: int,
+    remaining_lora_target_count: int,
+    decoder_target_count: int,
+    cfg,
+    training_args,
+    resolved_distill_lr: Optional[float] = None,
+    resolved_decoder_lr: Optional[float] = None,
+) -> Dict[str, object]:
+    decoder_count = int(decoder_target_count)
+    effective_distill_lr = float(cfg.lr if resolved_distill_lr is None else resolved_distill_lr)
+    if decoder_count > 0:
+        effective_decoder_lr = float(
+            effective_distill_lr
+            if resolved_decoder_lr is None
+            else resolved_decoder_lr
+        )
+        decoder_weight_decay = 0.0
+    else:
+        effective_decoder_lr = None
+        decoder_weight_decay = None
+    return {
+        "mode": str(mode),
+        "category": str(category),
+        "did_train": bool(did_train),
+        "newly_compressed_target_count": int(newly_compressed_target_count),
+        "remaining_lora_target_count": int(remaining_lora_target_count),
+        "decoder_target_count": decoder_count,
+        "resolved_distill_lr": effective_distill_lr,
+        "resolved_decoder_lr": effective_decoder_lr,
+        "resolved_distill_weight_decay": float(cfg.weight_decay),
+        "decoder_weight_decay": decoder_weight_decay,
+        "teacher_required": resolve_distill_teacher_required(
+            loss_type=cfg.loss_type,
+            hidden_loss_weight=cfg.hidden_loss_weight,
+            pre_mlp_hidden_loss_weight=cfg.pre_mlp_hidden_loss_weight,
+        ),
+        "distill_teacher_model_offload": str(
+            getattr(training_args, "distill_teacher_model_offload", "none")
+        ).strip().lower(),
+    }
 
 
 def _get_module_by_name(model: nn.Module, module_name: str) -> nn.Module:
@@ -265,6 +321,34 @@ def collect_compressed_category_targets(
     return targets
 
 
+def collect_main_decoder_targets(
+    model: nn.Module,
+    *,
+    categories: Sequence[str],
+) -> List[NamedMainDecoderTarget]:
+    category_set = {str(category) for category in categories}
+    targets: List[NamedMainDecoderTarget] = []
+    skip_prefixes: List[str] = []
+    for name, module in model.named_modules():
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in skip_prefixes):
+            continue
+        if isinstance(module, PeftVAELinearProxy):
+            skip_prefixes.append(f"{name}.base_layer")
+            skip_prefixes.append(f"{name}.per_decoded_linear")
+            base_layer = module.base_layer
+        elif isinstance(module, CompressedSubspacePeftProxy):
+            skip_prefixes.append(f"{name}.base_layer")
+            base_layer = module.base_layer
+        elif isinstance(module, VAELinear):
+            base_layer = module
+        else:
+            continue
+        if name.rsplit(".", 1)[-1] not in category_set:
+            continue
+        targets.append(NamedMainDecoderTarget(name=str(name), base_layer=base_layer))
+    return targets
+
+
 def category_targets_have_low_rank(targets: Sequence[Tuple[str, VAELinear]]) -> bool:
     if not targets:
         return False
@@ -317,57 +401,34 @@ def _set_proxy_decoder_adapter_mode(model: nn.Module, module_names: Sequence[str
             module._train_decoder_with_adapter = bool(enabled)
 
 
-def _enable_only_decoder_params(base_layer: VAELinear) -> List[nn.Parameter]:
-    base_layer.enable_trainable_decode(parallel_stage_decode=True)
-    trainable: List[nn.Parameter] = []
-    for param in base_layer.parameters():
-        if bool(param.requires_grad):
-            trainable.append(param)
-    return trainable
-
-
 def _unwrap_peft_proxies_without_export(model: nn.Module, module_names: Sequence[str]) -> int:
     return unwrap_peft_vae_proxies(model, module_names=module_names)
 
 
-def _enable_compressed_trainable_params(
+def _enable_compressed_lora_params_only(
     model: nn.Module,
     module_names: Sequence[str],
-    *,
-    mode: str,
 ) -> List[nn.Parameter]:
-    for param in model.parameters():
-        param.requires_grad = False
-
     trainable: List[nn.Parameter] = []
     for name in module_names:
         module = _get_module_by_name(model, str(name))
-        if mode in {"decoder", "both"}:
-            base_layer = _resolve_base_layer(str(name), module)
-            trainable.extend(_enable_only_decoder_params(base_layer))
-        if mode in {"compressed_lora", "both"}:
-            if not isinstance(module, PeftVAELinearProxy):
-                raise TypeError(f"{name}: expected PeftVAELinearProxy for compressed_lora, got {type(module)}")
-            peft_linear = module.per_decoded_linear
-            if not is_peft_proxy_adapter_linear(peft_linear):
-                raise TypeError(f"{name}: expected PEFT adapter linear, got {type(peft_linear)}")
-            for param_name, param in peft_linear.named_parameters():
-                if param_name in {"base_layer.weight", "base_layer.bias"}:
-                    continue
-                param.requires_grad = True
-                trainable.append(param)
+        if not isinstance(module, PeftVAELinearProxy):
+            raise TypeError(f"{name}: expected PeftVAELinearProxy for compressed_lora, got {type(module)}")
+        peft_linear = module.per_decoded_linear
+        if not is_peft_proxy_adapter_linear(peft_linear):
+            raise TypeError(f"{name}: expected PEFT adapter linear, got {type(peft_linear)}")
+        for param_name, param in peft_linear.named_parameters():
+            if param_name in {"base_layer.weight", "base_layer.bias"}:
+                continue
+            param.requires_grad = True
+            trainable.append(param)
     return trainable
 
 
-def _enable_subspace_compressed_trainable_params(
+def _enable_subspace_compressed_lora_params_only(
     model: nn.Module,
     module_names: Sequence[str],
-    *,
-    mode: str,
 ) -> List[nn.Parameter]:
-    for param in model.parameters():
-        param.requires_grad = False
-
     trainable: List[nn.Parameter] = []
     seen: set[int] = set()
     for name in module_names:
@@ -382,18 +443,6 @@ def _enable_subspace_compressed_trainable_params(
             raise TypeError(
                 f"{name}: expected PEFT plain LoRA Linear on subspace carrier, got {type(carrier)}"
             )
-        if mode == "both":
-            for param in _enable_only_decoder_params(module.base_layer):
-                param_id = id(param)
-                if param_id in seen:
-                    continue
-                seen.add(param_id)
-                trainable.append(param)
-        elif mode != "compressed_lora":
-            raise ValueError(
-                f"{name}: subspace trainable helper only supports compressed_lora/both, got {mode!r}."
-            )
-
         adapter_name = _get_default_adapter_name(carrier)
         for lora_attr in ("lora_A", "lora_B"):
             lora_module = getattr(carrier, lora_attr)[adapter_name]
@@ -413,20 +462,6 @@ def _enable_subspace_compressed_trainable_params(
                 f"{name}: subspace carrier sentinel numel must stay 1, got {int(sentinel.numel())}."
             )
     return trainable
-
-
-def _finalize_decoder_trainables(model: nn.Module, module_names: Sequence[str]) -> int:
-    finalized = 0
-    for name in module_names:
-        module = _get_module_by_name(model, str(name))
-        base_layer = _resolve_base_layer(str(name), module)
-        packed = getattr(base_layer, "_parallel_stage_decoder", None)
-        if packed is not None:
-            packed.requires_grad_(False)
-        base_layer.disable_trainable_decode()
-        base_layer.clear_decoded_weight_cache()
-        finalized += 1
-    return int(finalized)
 
 
 def _train_without_merging_peft_adapters(
@@ -475,8 +510,20 @@ def _run_compressed_category_distill(
     training_args,
     logger,
     lora_round_idx: int,
+    teacher_runtime=None,
+    newly_compressed_target_count: int = 0,
 ) -> AfterCategoryDistillResult:
-    next_round = int(lora_round_idx) + 1
+    newly_compressed_target_count = int(newly_compressed_target_count)
+    if newly_compressed_target_count < 0:
+        raise ValueError(
+            f"newly_compressed_target_count must be >= 0, got {newly_compressed_target_count}."
+        )
+    cfg = _resolve_distill_stage_config(
+        cat_args=cat_args,
+        training_args=training_args,
+        after_category=category,
+        lora_round_idx=lora_round_idx,
+    )
     targets = collect_compressed_category_targets(model, category)
     module_names = [name for name, _module in targets]
     if not module_names:
@@ -487,9 +534,19 @@ def _run_compressed_category_distill(
         )
         return AfterCategoryDistillResult(
             model=model,
-            next_lora_round_idx=next_round,
-            trained_target_count=0,
+            next_lora_round_idx=int(lora_round_idx),
+            trained_target_count=int(newly_compressed_target_count),
             did_train=False,
+            distill_meta=_build_distill_stage_meta(
+                mode=mode,
+                category=category,
+                did_train=False,
+                newly_compressed_target_count=int(newly_compressed_target_count),
+                remaining_lora_target_count=0,
+                decoder_target_count=0,
+                cfg=cfg,
+                training_args=training_args,
+            ),
         )
 
     reset_completed = bool(getattr(cat_args, "distill_reset_completed", False))
@@ -529,9 +586,19 @@ def _run_compressed_category_distill(
                 )
                 return AfterCategoryDistillResult(
                     model=model,
-                    next_lora_round_idx=next_round,
-                    trained_target_count=0,
+                    next_lora_round_idx=int(lora_round_idx),
+                    trained_target_count=int(newly_compressed_target_count),
                     did_train=False,
+                    distill_meta=_build_distill_stage_meta(
+                        mode=mode,
+                        category=category,
+                        did_train=False,
+                        newly_compressed_target_count=int(newly_compressed_target_count),
+                        remaining_lora_target_count=0,
+                        decoder_target_count=0,
+                        cfg=cfg,
+                        training_args=training_args,
+                    ),
                 )
             continue_from_low_rank = True
             logger.info(
@@ -541,12 +608,6 @@ def _run_compressed_category_distill(
                 str(category),
             )
 
-    cfg = _resolve_distill_stage_config(
-        cat_args=cat_args,
-        training_args=training_args,
-        after_category=category,
-        lora_round_idx=lora_round_idx,
-    )
     if bool(cfg.use_dora) and mode in {"compressed_lora", "both"}:
         raise ValueError(f"--distill_after_category={mode} does not support --lora_use_dora=true.")
     if int(cfg.steps) <= 0:
@@ -558,9 +619,19 @@ def _run_compressed_category_distill(
         )
         return AfterCategoryDistillResult(
             model=model,
-            next_lora_round_idx=next_round,
-            trained_target_count=0,
+            next_lora_round_idx=int(lora_round_idx),
+            trained_target_count=int(newly_compressed_target_count),
             did_train=False,
+            distill_meta=_build_distill_stage_meta(
+                mode=mode,
+                category=category,
+                did_train=False,
+                newly_compressed_target_count=int(newly_compressed_target_count),
+                remaining_lora_target_count=0,
+                decoder_target_count=0,
+                cfg=cfg,
+                training_args=training_args,
+            ),
         )
 
     _ensure_lora_stack_available()
@@ -605,9 +676,19 @@ def _run_compressed_category_distill(
         _logger_warning(logger, "After-category distill: 数据集为空，跳过。")
         return AfterCategoryDistillResult(
             model=model,
-            next_lora_round_idx=next_round,
-            trained_target_count=0,
+            next_lora_round_idx=int(lora_round_idx),
+            trained_target_count=int(newly_compressed_target_count),
             did_train=False,
+            distill_meta=_build_distill_stage_meta(
+                mode=mode,
+                category=category,
+                did_train=False,
+                newly_compressed_target_count=int(newly_compressed_target_count),
+                remaining_lora_target_count=0,
+                decoder_target_count=0,
+                cfg=cfg,
+                training_args=training_args,
+            ),
         )
 
     use_lora = mode in {"compressed_lora", "both"}
@@ -760,12 +841,27 @@ def _run_compressed_category_distill(
             prefix=f"After-category distill {category}: after prewarm",
         )
 
+        for param in model.parameters():
+            param.requires_grad = False
+
+        decoder_targets = []
+        decoder_params = ()
+        resolved_decoder_lr = None
+        if use_decoder:
+            decoder_targets = [
+                NamedMainDecoderTarget(
+                    name=str(name),
+                    base_layer=_resolve_base_layer(str(name), _get_module_by_name(model, str(name))),
+                )
+                for name in module_names
+            ]
+            decoder_params = enable_main_decoder_targets(decoder_targets)
+            resolved_decoder_lr = _resolve_effective_decoder_lr(cfg, decoder_params)
+
         if use_lora and compressed_lora_scope == LOW_RANK_SCOPE_FULL:
             _set_proxy_decoder_adapter_mode(model, module_names, enabled=mode == "both")
         if use_lora and compressed_lora_scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
-            trainable = _enable_subspace_compressed_trainable_params(
-                model, module_names, mode=mode
-            )
+            adapter_params = _enable_subspace_compressed_lora_params_only(model, module_names)
             trainable_lora_params = 0
             full_lora_equivalent_params = 0
             for name in module_names:
@@ -793,8 +889,13 @@ def _run_compressed_category_distill(
                 int(trainable_lora_params),
                 int(full_lora_equivalent_params),
             )
+        elif use_lora:
+            adapter_params = _enable_compressed_lora_params_only(model, module_names)
         else:
-            trainable = _enable_compressed_trainable_params(model, module_names, mode=mode)
+            adapter_params = []
+        trainable = list(adapter_params) + list(decoder_params)
+        if len({id(param) for param in trainable}) != len(trainable):
+            raise RuntimeError("After-category distill trainable adapter/decoder parameters contain duplicates.")
         if not trainable:
             if use_lora:
                 if compressed_lora_scope == LOW_RANK_SCOPE_FULL:
@@ -809,7 +910,7 @@ def _run_compressed_category_distill(
                     int(restored),
                 )
             if use_decoder:
-                finalized = _finalize_decoder_trainables(model, module_names)
+                finalized = finalize_main_decoder_targets(decoder_targets)
                 logger.info(
                     "After-category distill: 没有可训练参数，已 finalize decoder modules=%d，跳过。",
                     int(finalized),
@@ -818,9 +919,20 @@ def _run_compressed_category_distill(
                 logger.info("After-category distill: 没有可训练参数，跳过。")
             return AfterCategoryDistillResult(
                 model=model,
-                next_lora_round_idx=next_round,
-                trained_target_count=0,
+                next_lora_round_idx=int(lora_round_idx),
+                trained_target_count=int(newly_compressed_target_count),
                 did_train=False,
+                distill_meta=_build_distill_stage_meta(
+                    mode=mode,
+                    category=category,
+                    did_train=False,
+                    newly_compressed_target_count=int(newly_compressed_target_count),
+                    remaining_lora_target_count=0,
+                    decoder_target_count=len(decoder_targets),
+                    cfg=cfg,
+                    training_args=training_args,
+                    resolved_decoder_lr=resolved_decoder_lr,
+                ),
             )
 
         resolved_lora_loss = str(cfg.loss_type).strip().lower()
@@ -857,7 +969,9 @@ def _run_compressed_category_distill(
             logger=logger,
             cfg=cfg,
             hif4_act_controller=hif4_act_controller,
-            teacher_param_snapshots=[],
+            teacher_runtime=teacher_runtime,
+            decoder_params=decoder_params,
+            decoder_lr=resolved_decoder_lr,
             tokenizer=tokenizer,
             train_is_iterable=train_is_iterable,
             use_lazy_tokenized_dataset=True,
@@ -885,7 +999,7 @@ def _run_compressed_category_distill(
                     int(fuse_stats["miss"]),
                     str(fuse_stats["miss_reasons"]),
                 )
-            finalized = _finalize_decoder_trainables(model, module_names)
+            finalized = finalize_main_decoder_targets(decoder_targets)
             logger.info("After-category distill: finalized trainable decoder modules=%d.", int(finalized))
         if use_lora:
             if compressed_lora_scope == LOW_RANK_SCOPE_FULL:
@@ -914,9 +1028,20 @@ def _run_compressed_category_distill(
             )
         return AfterCategoryDistillResult(
             model=model,
-            next_lora_round_idx=next_round,
-            trained_target_count=len(module_names),
+            next_lora_round_idx=int(lora_round_idx) + 1,
+            trained_target_count=int(newly_compressed_target_count),
             did_train=True,
+            distill_meta=_build_distill_stage_meta(
+                mode=mode,
+                category=category,
+                did_train=True,
+                newly_compressed_target_count=int(newly_compressed_target_count),
+                remaining_lora_target_count=0,
+                decoder_target_count=len(decoder_targets),
+                cfg=cfg,
+                training_args=training_args,
+                resolved_decoder_lr=resolved_decoder_lr,
+            ),
         )
     finally:
         _restore_model_use_cache(model, previous_use_cache, logger=logger)
@@ -934,12 +1059,20 @@ def run_after_category_distill(
     transpose_modules: Sequence[str],
     only_decoder_projections: bool,
     target_categories: Sequence[str],
+    teacher_runtime=None,
+    newly_compressed_target_count: int = 0,
 ) -> AfterCategoryDistillResult:
     mode = str(getattr(cat_args, "distill_after_category", "none")).strip().lower()
     if mode == "none":
         return AfterCategoryDistillResult(model=model, next_lora_round_idx=int(lora_round_idx), trained_target_count=0)
 
-    if mode == "remaining_lora":
+    if mode in _DISTILL_AFTER_CATEGORY_REMAINING_MODES:
+        cfg = _resolve_distill_stage_config(
+            cat_args=cat_args,
+            training_args=training_args,
+            after_category=category,
+            lora_round_idx=lora_round_idx,
+        )
         current_remaining_linears = _collect_linears(
             model,
             transpose_modules=transpose_modules,
@@ -947,35 +1080,70 @@ def run_after_category_distill(
             target_categories=target_categories,
         )
         remaining_categories = list(dict.fromkeys(r.category for r in current_remaining_linears))
+        decoder_categories: List[str] = []
+        if mode == "remaining_lora_decoder":
+            decoder_categories = [str(category)]
+        elif mode == "remaining_lora_all_decoder":
+            target_category_list = [str(item) for item in target_categories]
+            if str(category) not in target_category_list:
+                raise ValueError(f"Current category {category!r} is not present in target_categories.")
+            decoder_categories = target_category_list[: target_category_list.index(str(category)) + 1]
+        decoder_targets = collect_main_decoder_targets(model, categories=decoder_categories)
         has_extra_trainables = bool(getattr(cat_args, "distill_tune_final_norm", False)) or bool(
             getattr(cat_args, "distill_use_post_norm_head_linear", False)
         )
-        if not current_remaining_linears and not has_extra_trainables:
+        if not current_remaining_linears and not has_extra_trainables and not decoder_targets:
             logger.info(
-                "After-category distill: mode=remaining_lora category=%s remaining_categories=empty target_count=0，跳过。",
+                "After-category distill: mode=%s category=%s remaining_categories=empty target_count=0 decoder_target_count=0，跳过。",
+                str(mode),
                 str(category),
             )
             return AfterCategoryDistillResult(
                 model=model,
                 next_lora_round_idx=int(lora_round_idx),
-                trained_target_count=0,
+                trained_target_count=int(newly_compressed_target_count),
+                did_train=False,
+                distill_meta=_build_distill_stage_meta(
+                    mode=mode,
+                    category=category,
+                    did_train=False,
+                    newly_compressed_target_count=int(newly_compressed_target_count),
+                    remaining_lora_target_count=0,
+                    decoder_target_count=0,
+                    cfg=cfg,
+                    training_args=training_args,
+                ),
             )
         finetune_result = lora_finetune_remaining_categories(
             model=model,
             remaining_categories=remaining_categories,
             target_names=[r.name for r in current_remaining_linears],
+            decoder_targets=decoder_targets,
             cat_args=cat_args,
             vae_args=vae_args,
             training_args=training_args,
             logger=logger,
             lora_round_idx=lora_round_idx,
             after_category=category,
+            teacher_runtime=teacher_runtime,
         )
         return AfterCategoryDistillResult(
             model=finetune_result.model,
             next_lora_round_idx=int(lora_round_idx) + (1 if bool(finetune_result.did_train) else 0),
-            trained_target_count=len(current_remaining_linears),
+            trained_target_count=int(newly_compressed_target_count),
             did_train=bool(finetune_result.did_train),
+            distill_meta=_build_distill_stage_meta(
+                mode=mode,
+                category=category,
+                did_train=bool(finetune_result.did_train),
+                newly_compressed_target_count=int(newly_compressed_target_count),
+                remaining_lora_target_count=int(finetune_result.remaining_lora_target_count),
+                decoder_target_count=int(finetune_result.decoder_target_count),
+                cfg=cfg,
+                training_args=training_args,
+                resolved_distill_lr=finetune_result.resolved_distill_lr,
+                resolved_decoder_lr=finetune_result.resolved_decoder_lr,
+            ),
         )
 
     if mode in _COMPRESSED_DISTILL_MODES:
@@ -988,8 +1156,11 @@ def run_after_category_distill(
             training_args=training_args,
             logger=logger,
             lora_round_idx=int(lora_round_idx),
+            teacher_runtime=teacher_runtime,
+            newly_compressed_target_count=int(newly_compressed_target_count),
         )
 
     raise ValueError(
-        "--distill_after_category must be one of: none, remaining_lora, compressed_lora, decoder, both."
+        "--distill_after_category must be one of: none, remaining_lora, "
+        "remaining_lora_decoder, remaining_lora_all_decoder, compressed_lora, decoder, both."
     )

@@ -110,6 +110,7 @@ class NormalizedCatArgs:
     distill_steps: OverrideTable[int]
     distill_batch_size: OverrideTable[int]
     distill_lr: OverrideTable[float]
+    distill_decoder_lr: OverrideTable[Optional[float]]
     distill_weight_decay: OverrideTable[float]
     distill_log_every: OverrideTable[int]
     distill_temperature: OverrideTable[float]
@@ -134,7 +135,6 @@ class NormalizedCatArgs:
     save_candidate_artifact: bool
     candidate_artifact_spec: Optional[str]
     candidate_artifact_output_dir: Optional[str]
-    unload_vae_original_weights_on_final_save: bool
     distill_reset_completed: bool
     distill_independent_categories: bool
     output_dir: str
@@ -174,6 +174,10 @@ class CatTrainHFTrainingArguments:
         metadata={
             "help": "After teacher forward, move teacher logits to CPU (bf16/fp16) until loss computation to reduce GPU peak memory."
         },
+    )
+    distill_teacher_model_offload: str = field(
+        default="none",
+        metadata={"help": "Teacher model residency: none or cpu."},
     )
     fp16: bool = field(default=False)
     bf16: bool = field(default=False)
@@ -215,6 +219,7 @@ class ResolvedDistillRuntimeConfig:
     steps: int
     batch_size: int
     lr: float
+    decoder_lr: Optional[float]
     weight_decay: float
     log_every: int
     temperature: float
@@ -251,7 +256,20 @@ _DISTILL_HIDDEN_ALIGNMENT_LAYER_WEIGHTING_HELP = (
     "LoRA hidden alignment 层权重模式：uniform | linear_depth | adaptive | adaptive_top_<K>。"
     " adaptive 默认 K=3，仅对 teacher 相邻层 cosine 最低的 K 层计算 hidden 对齐损失。"
 )
-_DISTILL_AFTER_CATEGORY_CHOICES = ("none", "remaining_lora", "compressed_lora", "decoder", "both")
+_DISTILL_AFTER_CATEGORY_CHOICES = (
+    "none",
+    "remaining_lora",
+    "remaining_lora_decoder",
+    "remaining_lora_all_decoder",
+    "compressed_lora",
+    "decoder",
+    "both",
+)
+_DISTILL_AFTER_CATEGORY_REMAINING_MODES = {
+    "remaining_lora",
+    "remaining_lora_decoder",
+    "remaining_lora_all_decoder",
+}
 _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES = {"compressed_lora", "both"}
 _OUTLIER_RANK_METRIC_CHOICES = (
     "sparse_residual_abs",
@@ -373,6 +391,13 @@ def _parse_distill_loss_alpha_text(raw: str, *, arg_name: str) -> float:
 
 def _parse_nonnegative_float_text(raw: str, *, arg_name: str) -> float:
     return float(parse_float_text(raw, arg_name=arg_name, min_value=0.0, inclusive_min=True))
+
+
+def _parse_optional_distill_decoder_lr_text(raw: object) -> Optional[float]:
+    text = str(raw).strip().lower()
+    if text == "none":
+        return None
+    return float(parse_float_text(raw, arg_name="--distill_decoder_lr"))
 
 
 def _parse_distill_dataset_mix_text(raw: str, *, arg_name: str) -> str:
@@ -656,6 +681,12 @@ _DISTILL_LR_SPEC = _make_override_spec(
     allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
     example="default=1e-4,after:q_proj=5e-5",
 )
+_DISTILL_DECODER_LR_SPEC = _make_override_spec(
+    arg_name="--distill_decoder_lr",
+    parse_value=_parse_optional_distill_decoder_lr_text,
+    allowed_selectors=_AFTER_CATEGORY_OVERRIDE_SELECTORS,
+    example="default=5e-5,after:gate_proj=3e-5",
+)
 _DISTILL_WEIGHT_DECAY_SPEC = _make_override_spec(
     arg_name="--distill_weight_decay",
     parse_value=lambda raw: parse_float_text(raw, arg_name="--distill_weight_decay"),
@@ -862,6 +893,7 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
         distill_steps=_parse_cat_override(raw_args.distill_steps, spec=_DISTILL_STEPS_SPEC),
         distill_batch_size=_parse_cat_override(raw_args.distill_batch_size, spec=_DISTILL_BATCH_SIZE_SPEC),
         distill_lr=_parse_cat_override(raw_args.distill_lr, spec=_DISTILL_LR_SPEC),
+        distill_decoder_lr=_parse_cat_override(raw_args.distill_decoder_lr, spec=_DISTILL_DECODER_LR_SPEC),
         distill_weight_decay=_parse_cat_override(raw_args.distill_weight_decay, spec=_DISTILL_WEIGHT_DECAY_SPEC),
         distill_log_every=_parse_cat_override(raw_args.distill_log_every, spec=_DISTILL_LOG_EVERY_SPEC),
         distill_temperature=_parse_cat_override(raw_args.distill_temperature, spec=_DISTILL_TEMPERATURE_SPEC),
@@ -902,7 +934,6 @@ def _normalize_cat_train_script_args(raw_args) -> NormalizedCatArgs:
             if raw_args.candidate_artifact_output_dir is None
             else str(raw_args.candidate_artifact_output_dir)
         ),
-        unload_vae_original_weights_on_final_save=bool(raw_args.unload_vae_original_weights_on_final_save),
         distill_reset_completed=bool(raw_args.distill_reset_completed),
         distill_independent_categories=bool(raw_args.distill_independent_categories),
         output_dir=str(raw_args.output_dir),
@@ -1032,9 +1063,9 @@ def _validate_distill_after_category_args(cat_args: NormalizedCatArgs) -> None:
         enabled.append("--distill_tune_final_norm")
     if bool(cat_args.distill_use_post_norm_head_linear):
         enabled.append("--distill_use_post_norm_head_linear")
-    if enabled and mode != "remaining_lora":
+    if enabled and mode not in _DISTILL_AFTER_CATEGORY_REMAINING_MODES:
         raise ValueError(
-            f"{', '.join(enabled)} is only supported with --distill_after_category=remaining_lora."
+            f"{', '.join(enabled)} is only supported with remaining-family --distill_after_category modes."
         )
     if mode in _DISTILL_AFTER_CATEGORY_COMPRESSED_LORA_MODES:
         for _selector, use_dora in _iter_override_entries(cat_args.lora_use_dora):
@@ -1053,6 +1084,13 @@ def _validate_distill_lr_scheduler_args(training_args) -> None:
             "Use --distill_lr_scheduler_type=constant_with_warmup when "
             f"--distill_warmup_ratio={warmup_ratio} > 0, or set --distill_warmup_ratio 0."
         )
+
+
+def _validate_distill_teacher_model_offload_args(training_args) -> None:
+    mode = str(getattr(training_args, "distill_teacher_model_offload", "none")).strip().lower()
+    if mode not in {"none", "cpu"}:
+        raise ValueError("--distill_teacher_model_offload must be one of: none, cpu.")
+    training_args.distill_teacher_model_offload = mode
 
 
 def validate_outlier_rank_metric(
@@ -1356,6 +1394,7 @@ def resolve_distill_runtime_config(cat_args: NormalizedCatArgs, after_category: 
         steps=int(resolve_after_category_value(cat_args.distill_steps, after_category)),
         batch_size=int(resolve_after_category_value(cat_args.distill_batch_size, after_category)),
         lr=float(resolve_after_category_value(cat_args.distill_lr, after_category)),
+        decoder_lr=resolve_after_category_value(cat_args.distill_decoder_lr, after_category),
         weight_decay=float(resolve_after_category_value(cat_args.distill_weight_decay, after_category)),
         log_every=int(resolve_after_category_value(cat_args.distill_log_every, after_category)),
         temperature=float(resolve_after_category_value(cat_args.distill_temperature, after_category)),
@@ -1604,6 +1643,7 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_steps", type=str, default="default=50", help=f"after_category 覆盖参数。示例：{_DISTILL_STEPS_SPEC.example}")
     parser.add_argument("--distill_batch_size", type=str, default="default=2", help=f"after_category 覆盖参数。示例：{_DISTILL_BATCH_SIZE_SPEC.example}")
     parser.add_argument("--distill_lr", type=str, default="default=1e-4", help=f"after_category 覆盖参数。示例：{_DISTILL_LR_SPEC.example}")
+    parser.add_argument("--distill_decoder_lr", type=str, default="default=none", help=f"after_category 覆盖参数。示例：{_DISTILL_DECODER_LR_SPEC.example}")
     parser.add_argument("--distill_weight_decay", type=str, default="default=0.0", help=f"after_category 覆盖参数。示例：{_DISTILL_WEIGHT_DECAY_SPEC.example}")
     parser.add_argument("--distill_log_every", type=str, default="default=1", help=f"after_category 覆盖参数。示例：{_DISTILL_LOG_EVERY_SPEC.example}")
     parser.add_argument("--distill_temperature", type=str, default="default=1.0", help=f"after_category 覆盖参数。示例：{_DISTILL_TEMPERATURE_SPEC.example}")
@@ -1689,7 +1729,6 @@ def build_cat_train_parser() -> argparse.ArgumentParser:
         default=None,
         help="candidate-only 导出目录。",
     )
-    parser.add_argument("--unload_vae_original_weights_on_final_save", action="store_true", default=False, help="最终保存前卸载 VAELinear 中缓存的原始 Linear 权重，减小保存体积。")
     parser.add_argument(
         "--distill_reset_completed",
         type=lambda v: _parse_bool_like(v, arg_name="--distill_reset_completed"),
@@ -1758,6 +1797,7 @@ def process_cat_train_args(argv: Optional[Sequence[str]]):
     hf_parser = transformers.HfArgumentParser((HFArguments, CatTrainHFTrainingArguments))
     hf_args, training_args = hf_parser.parse_args_into_dataclasses(args=unknown_args)
     _validate_distill_lr_scheduler_args(training_args)
+    _validate_distill_teacher_model_offload_args(training_args)
     use_bf16 = bool(training_args.bf16)
     vae_args.vae_weight_dtype = "bf16" if use_bf16 else "fp32"
     vae_args.vae_autocast_dtype = "bf16" if use_bf16 else "fp32"

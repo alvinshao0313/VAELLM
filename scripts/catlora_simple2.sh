@@ -31,7 +31,6 @@ export HF_DATASETS_OFFLINE=1
 # --resume_from_checkpoint "/path/to/last_run/final_model"
 # --include_all_linears
 # --rot_llm
-# --unload_vae_original_weights_on_final_save
 # --allow_tail_group "true"
 # 排序代码，已关闭；不要在实际 CLI 中传入以下旧参数：
 #   --intra_part_sort_mode "default=none"
@@ -53,8 +52,8 @@ export HF_DATASETS_OFFLINE=1
 # --outlier_residual_vae_steps "1500"
 # --outlier_residual_vae_lr "0.002"
 # --outlier_residual_min_abs "1e-6"
-#   原始权重打分只决定保留哪些位置，真正保存的仍是这些位置上的 residual
-#   若 |original-reconstructed| 小于该阈值，则该位置会从 top-p 中剔除，并继续往后补
+#   当前待压缩 student dense weight 只用于决定保留/稀疏 residual 位置；
+#   residual = current_student_dense_weight - VAE_reconstruction
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
@@ -63,7 +62,7 @@ export HF_DATASETS_OFFLINE=1
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
 # 蒸馏数据：先运行 bash scripts/prepare_vaellm_edgerazor_data.sh，见 docs/edgerazor_dataset.md
-  # --unload_vae_original_weights_on_final_save \
+# 可把 --distill_after_category 改为 remaining_lora_decoder 或 remaining_lora_all_decoder 做 decoder 联合恢复消融
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
@@ -152,6 +151,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --distill_steps "default=5000" \
   --distill_batch_size "default=4" \
   --distill_lr "default=1e-4" \
+  --distill_decoder_lr "default=5e-5" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
   --distill_temperature "default=1.0" \
@@ -159,6 +159,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --distill_loss_type "default=kl_top_100" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
+  --distill_teacher_model_offload "none" \
   --distill_hidden_loss_weight "default=0.1" \
   --distill_pre_mlp_hidden_loss_weight "default=0.01" \
   --distill_hidden_alignment_layer_weighting "linear_depth" \

@@ -112,6 +112,7 @@ class RemainingLoraDatasetSeedCacheTests(unittest.TestCase):
             steps=1,
             batch_size=1,
             lr=1e-4,
+            decoder_lr=None,
             weight_decay=0.0,
             log_every=1,
             temperature=1.0,

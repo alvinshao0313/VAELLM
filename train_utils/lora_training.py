@@ -1,5 +1,7 @@
 import argparse
+import logging
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -25,6 +27,10 @@ from train_utils.distill_losses import (
 )
 from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.hif4_act import Hif4ActController
+from train_utils.distill_teacher import DistillTeacherRuntime, resolve_distill_teacher_required
+
+
+logger = logging.getLogger(__name__)
 
 try:
     from peft import LoraConfig, PeftModel, TaskType, get_peft_model
@@ -49,6 +55,14 @@ _DISTILL_HIDDEN_LAYER_WEIGHTING_CHOICES = (
     "adaptive_top_<K>",
 )
 _DEFAULT_ADAPTIVE_TOPK = 3
+
+
+@dataclass
+class _TeacherTargets:
+    logits: Optional[torch.Tensor]
+    reference_hidden: Optional[torch.Tensor]
+    hidden_by_name: Optional[Dict[str, torch.Tensor]]
+    pre_mlp_by_name: Optional[Dict[str, torch.Tensor]]
 
 
 def parse_distill_hidden_alignment_layer_weighting(raw: str) -> str:
@@ -450,11 +464,180 @@ def compute_distill_pre_mlp_hidden_alignment_loss(
     )
 
 
+def _hidden_states_to_named_blocks(
+    hidden_states: Sequence[torch.Tensor],
+    *,
+    num_layers: int,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    if hidden_states is None:
+        raise ValueError("hidden_states is required.")
+    expected = int(num_layers) + 1
+    if len(hidden_states) != expected:
+        raise ValueError(
+            f"hidden_states length must be num_layers + 1: expected={expected} got={len(hidden_states)}."
+        )
+    reference_hidden = hidden_states[0]
+    blocks = {
+        f"model.layers.{layer_idx}": hidden_states[layer_idx + 1]
+        for layer_idx in range(int(num_layers))
+    }
+    return reference_hidden, blocks
+
+
+def _materialize_teacher_tensor(
+    tensor: torch.Tensor,
+    *,
+    stage_to_cpu: bool,
+    cpu_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    raw = tensor.detach()
+    if stage_to_cpu:
+        materialized = raw.to(
+            device=torch.device("cpu"),
+            dtype=cpu_dtype if cpu_dtype is not None else raw.dtype,
+            copy=True,
+        )
+        if bool(getattr(materialized, "is_inference", lambda: False)()):
+            materialized = materialized.clone()
+    else:
+        materialized = raw.clone()
+    if bool(getattr(materialized, "is_inference", lambda: False)()):
+        raise RuntimeError("materialized teacher target is still an inference tensor.")
+    return materialized
+
+
+def _logical_layer_id(logical_name: str) -> int:
+    prefix = "model.layers."
+    if not str(logical_name).startswith(prefix):
+        raise ValueError(f"Unexpected logical layer name: {logical_name}")
+    rest = str(logical_name)[len(prefix):]
+    token = rest.split(".", 1)[0]
+    return int(token)
+
+
+def _compute_named_hidden_alignment_loss(
+    *,
+    teacher_by_name: Dict[str, torch.Tensor],
+    student_by_name: Dict[str, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    layer_weighting: str,
+    teacher_reference_hidden: torch.Tensor,
+    student_reference_hidden: torch.Tensor,
+    teacher_targets_on_cpu: bool,
+) -> torch.Tensor:
+    teacher_names = tuple(teacher_by_name.keys())
+    student_names = tuple(student_by_name.keys())
+    if teacher_names != student_names:
+        raise ValueError(
+            "Teacher/student hidden logical names differ: "
+            f"teacher={teacher_names} student={student_names}."
+        )
+    if not teacher_targets_on_cpu:
+        teacher_hidden_states = (teacher_reference_hidden,) + tuple(
+            teacher_by_name[name] for name in teacher_names
+        )
+        student_hidden_states = (student_reference_hidden,) + tuple(
+            student_by_name[name] for name in student_names
+        )
+        return compute_distill_hidden_alignment_loss(
+            teacher_hidden_states=teacher_hidden_states,
+            student_hidden_states=student_hidden_states,
+            attention_mask=attention_mask,
+            layer_weighting=layer_weighting,
+        )
+
+    num_layers = len(teacher_names)
+    all_indices = tuple(range(num_layers))
+    selected_indices = all_indices
+    if is_adaptive_hidden_alignment_layer_weighting(layer_weighting):
+        selected_indices = tuple(
+            _select_adaptive_hidden_layer_indices(
+                [teacher_by_name[name] for name in teacher_names],
+                attention_mask,
+                parse_adaptive_hidden_alignment_topk(layer_weighting),
+                reference_hidden=teacher_reference_hidden,
+            )
+        )
+    teacher_selected = {
+        int(idx): teacher_by_name[teacher_names[int(idx)]]
+        for idx in selected_indices
+    }
+    student_selected = {
+        int(idx): student_by_name[student_names[int(idx)]]
+        for idx in selected_indices
+    }
+    return compute_selected_distill_hidden_alignment_loss(
+        teacher_hidden_by_layer=teacher_selected,
+        student_hidden_by_layer=student_selected,
+        hidden_layer_indices=selected_indices,
+        attention_mask=attention_mask,
+        layer_weighting=layer_weighting,
+        num_layers=num_layers,
+        loss_device=next(iter(student_by_name.values())).device,
+    )
+
+
+def _compute_named_pre_mlp_hidden_alignment_loss(
+    *,
+    teacher_by_name: Dict[str, torch.Tensor],
+    student_by_name: Dict[str, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    layer_weighting: str,
+    teacher_reference_hidden: Optional[torch.Tensor],
+    teacher_targets_on_cpu: bool,
+) -> torch.Tensor:
+    teacher_names = tuple(teacher_by_name.keys())
+    student_names = tuple(student_by_name.keys())
+    if teacher_names != student_names:
+        raise ValueError(
+            "Teacher/student pre-MLP logical names differ: "
+            f"teacher={teacher_names} student={student_names}."
+        )
+    if not teacher_targets_on_cpu:
+        return compute_distill_pre_mlp_hidden_alignment_loss(
+            teacher_pre_mlp_hiddens=tuple(teacher_by_name[name] for name in teacher_names),
+            student_pre_mlp_hiddens=tuple(student_by_name[name] for name in student_names),
+            attention_mask=attention_mask,
+            layer_weighting=layer_weighting,
+            teacher_reference_hidden=teacher_reference_hidden,
+        )
+
+    num_layers = len(teacher_names)
+    all_indices = tuple(range(num_layers))
+    selected_indices = all_indices
+    if is_adaptive_hidden_alignment_layer_weighting(layer_weighting):
+        selected_indices = tuple(
+            _select_adaptive_hidden_layer_indices(
+                [teacher_by_name[name] for name in teacher_names],
+                attention_mask,
+                parse_adaptive_hidden_alignment_topk(layer_weighting),
+                reference_hidden=teacher_reference_hidden,
+            )
+        )
+    teacher_selected = {
+        int(idx): teacher_by_name[teacher_names[int(idx)]]
+        for idx in selected_indices
+    }
+    student_selected = {
+        int(idx): student_by_name[student_names[int(idx)]]
+        for idx in selected_indices
+    }
+    return compute_selected_distill_hidden_alignment_loss(
+        teacher_hidden_by_layer=teacher_selected,
+        student_hidden_by_layer=student_selected,
+        hidden_layer_indices=selected_indices,
+        attention_mask=attention_mask,
+        layer_weighting=layer_weighting,
+        num_layers=num_layers,
+        loss_device=next(iter(student_by_name.values())).device,
+    )
+
+
 @contextmanager
 def capture_pre_mlp_hiddens(model: nn.Module):
     modules = _resolve_pre_mlp_capture_modules(model)
     with _capture_pre_mlp_hiddens_from_modules(modules) as captured:
-        yield captured
+        yield tuple(captured[name] for name, _module in modules)
 
 
 def _unwrap_accelerator_model(model: nn.Module, accelerator) -> nn.Module:
@@ -469,13 +652,19 @@ def _resolve_peft_and_base_model(unwrapped_model: nn.Module):
     return None, unwrapped_model
 
 
-def _resolve_pre_mlp_capture_modules(base_model: nn.Module) -> Tuple[nn.Module, ...]:
+def _resolve_student_base_model(unwrapped_model: nn.Module) -> nn.Module:
+    if PeftModel is not None and isinstance(unwrapped_model, PeftModel):
+        return unwrapped_model.get_base_model()
+    return unwrapped_model
+
+
+def _resolve_pre_mlp_capture_modules(base_model: nn.Module) -> Tuple[Tuple[str, nn.Module], ...]:
     backbone = getattr(base_model, "model", None)
     layers = getattr(backbone, "layers", None)
     if layers is None:
         raise ValueError("pre-MLP hidden alignment requires model.model.layers.")
 
-    modules: List[nn.Module] = []
+    modules: List[Tuple[str, nn.Module]] = []
     for layer_idx, layer in enumerate(layers):
         module = getattr(layer, "post_attention_layernorm", None)
         if not isinstance(module, nn.Module):
@@ -483,23 +672,25 @@ def _resolve_pre_mlp_capture_modules(base_model: nn.Module) -> Tuple[nn.Module, 
                 "pre-MLP hidden alignment requires every model.model.layers[*] "
                 f"to expose post_attention_layernorm; missing at layer {layer_idx}."
             )
-        modules.append(module)
+        modules.append((f"model.layers.{layer_idx}.post_attention_layernorm", module))
     if not modules:
         raise ValueError("pre-MLP hidden alignment requires at least one model.model.layers entry.")
     return tuple(modules)
 
 
 @contextmanager
-def _capture_pre_mlp_hiddens_from_modules(modules: Sequence[nn.Module]):
-    captured: List[torch.Tensor] = []
+def _capture_pre_mlp_hiddens_from_modules(modules: Sequence[Tuple[str, nn.Module]]):
+    captured: Dict[str, torch.Tensor] = {}
     handles = []
 
-    for layer_idx, module in enumerate(modules):
+    for layer_idx, (logical_name, module) in enumerate(modules):
 
-        def hook(_module, inputs, _layer_idx=layer_idx):
+        def hook(_module, inputs, _layer_idx=layer_idx, _logical_name=logical_name):
             if not inputs:
                 raise RuntimeError(f"post_attention_layernorm pre-hook at layer {_layer_idx} received no inputs.")
-            captured.append(inputs[0])
+            if _logical_name in captured:
+                raise RuntimeError(f"post_attention_layernorm pre-hook captured {_logical_name} more than once.")
+            captured[_logical_name] = inputs[0]
 
         handles.append(module.register_forward_pre_hook(hook))
 
@@ -508,29 +699,16 @@ def _capture_pre_mlp_hiddens_from_modules(modules: Sequence[nn.Module]):
 
     try:
         yield captured
+        expected = [name for name, _module in modules]
+        actual = list(captured.keys())
+        if actual != expected:
+            raise RuntimeError(
+                "pre-MLP hidden capture did not capture every logical layer exactly once: "
+                f"expected={expected} actual={actual}."
+            )
     finally:
         for handle in handles:
             handle.remove()
-
-
-@contextmanager
-def _swap_teacher_snapshot_params(
-    snapshots: Sequence[Tuple[nn.Parameter, torch.Tensor]],
-    restore_buffers: Sequence[torch.Tensor],
-):
-    if len(snapshots) != len(restore_buffers):
-        raise ValueError(
-            "teacher snapshot restore buffer count must match snapshot count: "
-            f"{len(restore_buffers)} vs {len(snapshots)}."
-        )
-    try:
-        for (param, snapshot), restore in zip(snapshots, restore_buffers):
-            restore.copy_(param.detach())
-            param.data.copy_(snapshot)
-        yield
-    finally:
-        for (param, _snapshot), restore in zip(snapshots, restore_buffers):
-            param.data.copy_(restore)
 
 
 def ensure_lora_training_stack_available() -> None:
@@ -577,12 +755,125 @@ def merge_all_lora(model: nn.Module) -> Tuple[nn.Module, int]:
     return merged_model, trainable_count
 
 
+class _DistillOptimizerGroupingMixin:
+    def __init__(
+        self,
+        *args,
+        decoder_param_ids: Optional[Sequence[int]] = None,
+        decoder_lr: Optional[float] = None,
+        **kwargs,
+    ):
+        self.distill_decoder_param_ids = frozenset(int(v) for v in (decoder_param_ids or ()))
+        self.distill_decoder_lr = None if decoder_lr is None else float(decoder_lr)
+        super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        decoder_param_ids = frozenset(int(v) for v in getattr(self, "distill_decoder_param_ids", frozenset()))
+        if not decoder_param_ids:
+            return super().create_optimizer()
+
+        opt_model = getattr(self, "model_wrapped", None) or self.model
+        if self.optimizer is None:
+            decay_parameters = set(self.get_decay_parameter_names(opt_model))
+            nondecoder_decay = []
+            nondecoder_no_decay = []
+            decoder = []
+            trainable_ids = set()
+
+            for name, param in opt_model.named_parameters():
+                if not bool(param.requires_grad):
+                    continue
+                param_id = id(param)
+                trainable_ids.add(param_id)
+                if param_id in decoder_param_ids:
+                    decoder.append(param)
+                elif name in decay_parameters:
+                    nondecoder_decay.append(param)
+                else:
+                    nondecoder_no_decay.append(param)
+
+            grouped_ids = (
+                {id(param) for param in nondecoder_decay}
+                | {id(param) for param in nondecoder_no_decay}
+                | {id(param) for param in decoder}
+            )
+            group_lengths = len(nondecoder_decay) + len(nondecoder_no_decay) + len(decoder)
+            if grouped_ids != trainable_ids or group_lengths != len(grouped_ids):
+                raise RuntimeError("Distill optimizer grouping produced duplicate or missing trainable parameters.")
+            missing_decoder = decoder_param_ids - trainable_ids
+            if missing_decoder:
+                raise RuntimeError(
+                    "Decoder optimizer group contains ids that are not trainable model parameters: "
+                    + ",".join(str(v) for v in sorted(missing_decoder))
+                )
+
+            optimizer_grouped_parameters = []
+            if nondecoder_decay:
+                optimizer_grouped_parameters.append(
+                    {
+                        "group_name": "nondecoder_decay",
+                        "params": nondecoder_decay,
+                        "weight_decay": self.args.weight_decay,
+                    }
+                )
+            if nondecoder_no_decay:
+                optimizer_grouped_parameters.append(
+                    {
+                        "group_name": "nondecoder_no_decay",
+                        "params": nondecoder_no_decay,
+                        "weight_decay": 0.0,
+                    }
+                )
+            if decoder:
+                optimizer_grouped_parameters.append(
+                    {
+                        "group_name": "decoder",
+                        "params": decoder,
+                        "lr": float(self.distill_decoder_lr),
+                        "weight_decay": 0.0,
+                    }
+                )
+
+            if self.optimizer_cls_and_kwargs is not None:
+                optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+            else:
+                optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+
+            if "params" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("params")
+            if "model" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("model")
+            if "optimizer_dict" in optimizer_kwargs:
+                optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
+
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+            if optimizer_cls.__name__ == "Adam8bit":
+                import bitsandbytes
+
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+                skipped = 0
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
+                        logger.info("skipped %s: %sM params", module, skipped / 2**20)
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+                        logger.debug("bitsandbytes: will optimize %s in fp32", module)
+                logger.info("skipped: %sM params", skipped / 2**20)
+        return self.optimizer
+
+
 if SFTTrainer is None:
     class CustomSFTTrainer:
         def __init__(self, *args, **kwargs):
             raise ImportError("未安装 trl。请先安装：pip install trl")
+    GroupedSFTTrainer = CustomSFTTrainer
 else:
-    class CustomSFTTrainer(SFTTrainer):
+    class GroupedSFTTrainer(_DistillOptimizerGroupingMixin, SFTTrainer):
+        pass
+
+
+    class CustomSFTTrainer(_DistillOptimizerGroupingMixin, SFTTrainer):
         def __init__(
             self,
             *args,
@@ -596,7 +887,7 @@ else:
             eakld_confidence_k: int = 16,
             teacher_logits_cpu_staging: bool = False,
             distill_hif4_act_controller: Optional[Hif4ActController] = None,
-            teacher_param_snapshots: Optional[Sequence[Tuple[nn.Parameter, torch.Tensor]]] = None,
+            teacher_runtime: Optional[DistillTeacherRuntime] = None,
             **kwargs,
         ):
             super().__init__(*args, **kwargs)
@@ -622,17 +913,14 @@ else:
                 raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
             self.teacher_logits_cpu_staging = bool(teacher_logits_cpu_staging)
             self.distill_hif4_act_controller = distill_hif4_act_controller
-            self.teacher_param_snapshots = []
-            self._teacher_param_restore_buffers = []
-            for param, snapshot in list(teacher_param_snapshots or []):
-                if tuple(param.shape) != tuple(snapshot.shape):
-                    raise ValueError(
-                        "teacher snapshot shape must match parameter shape: "
-                        f"{tuple(snapshot.shape)} vs {tuple(param.shape)}."
-                    )
-                converted_snapshot = snapshot.detach().to(device=param.device, dtype=param.dtype).clone()
-                self.teacher_param_snapshots.append((param, converted_snapshot))
-                self._teacher_param_restore_buffers.append(torch.empty_like(param))
+            self.teacher_runtime = teacher_runtime
+            self.teacher_required = resolve_distill_teacher_required(
+                loss_type=self.loss_type,
+                hidden_loss_weight=self.hidden_loss_weight,
+                pre_mlp_hidden_loss_weight=self.pre_mlp_hidden_loss_weight,
+            )
+            if self.teacher_required and self.teacher_runtime is None:
+                raise ValueError("teacher_runtime is required for CAT distillation teacher-required losses.")
             self._runtime_view_cache_key = None
             self._runtime_view_cache = None
             self.distill_token_stats = DistillTokenStatsAccumulator()
@@ -650,9 +938,7 @@ else:
             )
             needs_pre_mlp = bool(pre_mlp_hidden_loss_enabled)
             if cache is None or (needs_pre_mlp and cache.get("pre_mlp_capture_modules") is None):
-                peft_model_for_teacher, base_model_for_capture = _resolve_peft_and_base_model(
-                    unwrapped_model
-                )
+                base_model_for_capture = _resolve_student_base_model(unwrapped_model)
                 pre_mlp_capture_modules = (
                     _resolve_pre_mlp_capture_modules(base_model_for_capture)
                     if needs_pre_mlp
@@ -660,13 +946,7 @@ else:
                 )
                 cache = {
                     "unwrapped_model": unwrapped_model,
-                    "peft_model_for_teacher": peft_model_for_teacher,
                     "base_model_for_capture": base_model_for_capture,
-                    "temporary_modules": tuple(
-                        module
-                        for module in unwrapped_model.modules()
-                        if callable(getattr(module, "set_temporary", None))
-                    ),
                     "pre_mlp_capture_modules": pre_mlp_capture_modules,
                 }
                 self._runtime_view_cache_key = cache_key
@@ -680,12 +960,18 @@ else:
                 return torch.float16
             return torch.float32
 
+        def _must_stage_teacher_targets_to_cpu(self) -> bool:
+            runtime = getattr(self, "teacher_runtime", None)
+            return bool(runtime is not None and getattr(runtime, "model_offload", "none") == "cpu")
+
         def _stage_teacher_logits(self, logits: torch.Tensor) -> torch.Tensor:
-            if not bool(getattr(self, "teacher_logits_cpu_staging", False)):
-                return logits
-            return logits.detach().to(
-                device=torch.device("cpu"),
-                dtype=self._teacher_logits_staging_dtype(),
+            return _materialize_teacher_tensor(
+                logits,
+                stage_to_cpu=(
+                    self._must_stage_teacher_targets_to_cpu()
+                    or bool(getattr(self, "teacher_logits_cpu_staging", False))
+                ),
+                cpu_dtype=self._teacher_logits_staging_dtype(),
             )
 
         def _teacher_logits_for_loss(
@@ -696,6 +982,101 @@ else:
             if staged_logits.device.type == "cpu":
                 return staged_logits.to(device=student_logits.device, non_blocking=True)
             return staged_logits
+
+        def _run_teacher_forward(
+            self,
+            *,
+            teacher_inputs,
+            need_logits: bool,
+            need_output_hidden_states: bool,
+            need_pre_mlp_hiddens: bool,
+            student_pre_mlp_modules,
+        ) -> _TeacherTargets:
+            teacher_runtime = getattr(self, "teacher_runtime", None)
+            if teacher_runtime is None:
+                raise ValueError("teacher_runtime is required for teacher forward.")
+            teacher = teacher_runtime.prepare_for_forward()
+            targets = None
+            try:
+                teacher_pre_mlp_modules = (
+                    _resolve_pre_mlp_capture_modules(_resolve_student_base_model(teacher))
+                    if need_pre_mlp_hiddens
+                    else None
+                )
+                if need_pre_mlp_hiddens:
+                    teacher_names = tuple(name for name, _module in teacher_pre_mlp_modules)
+                    student_names = tuple(name for name, _module in student_pre_mlp_modules)
+                    if teacher_names != student_names:
+                        raise ValueError(
+                            "Teacher/student pre-MLP logical names differ: "
+                            f"teacher={teacher_names} student={student_names}."
+                        )
+                    for (teacher_name, teacher_module), (student_name, student_module) in zip(
+                        teacher_pre_mlp_modules,
+                        student_pre_mlp_modules,
+                    ):
+                        if teacher_name != student_name:
+                            raise ValueError(
+                                f"Teacher/student pre-MLP logical name mismatch: {teacher_name} vs {student_name}."
+                            )
+                        if teacher_module is student_module:
+                            raise ValueError(
+                                f"Teacher/student pre-MLP module is shared for {teacher_name}."
+                            )
+                pre_mlp_context = (
+                    _capture_pre_mlp_hiddens_from_modules(teacher_pre_mlp_modules)
+                    if need_pre_mlp_hiddens
+                    else nullcontext()
+                )
+                with pre_mlp_context as captured_pre_mlp:
+                    with torch.inference_mode():
+                        outputs = teacher(
+                            **teacher_inputs,
+                            output_hidden_states=need_output_hidden_states,
+                        )
+
+                stage_hidden_to_cpu = self._must_stage_teacher_targets_to_cpu()
+                logits = (
+                    self._stage_teacher_logits(outputs.logits)
+                    if need_logits
+                    else None
+                )
+                reference_hidden = None
+                hidden_by_name = None
+                if need_output_hidden_states:
+                    teacher_layers = getattr(getattr(_resolve_student_base_model(teacher), "model", None), "layers", None)
+                    if teacher_layers is None:
+                        raise ValueError("teacher hidden alignment requires teacher.model.layers.")
+                    reference_raw, hidden_raw = _hidden_states_to_named_blocks(
+                        outputs.hidden_states,
+                        num_layers=len(teacher_layers),
+                    )
+                    reference_hidden = _materialize_teacher_tensor(
+                        reference_raw,
+                        stage_to_cpu=stage_hidden_to_cpu,
+                    )
+                    hidden_by_name = {
+                        name: _materialize_teacher_tensor(tensor, stage_to_cpu=stage_hidden_to_cpu)
+                        for name, tensor in hidden_raw.items()
+                    }
+                pre_mlp_by_name = None
+                if need_pre_mlp_hiddens:
+                    pre_mlp_by_name = {
+                        name: _materialize_teacher_tensor(tensor, stage_to_cpu=stage_hidden_to_cpu)
+                        for name, tensor in captured_pre_mlp.items()
+                    }
+                targets = _TeacherTargets(
+                    logits=logits,
+                    reference_hidden=reference_hidden,
+                    hidden_by_name=hidden_by_name,
+                    pre_mlp_by_name=pre_mlp_by_name,
+                )
+                del outputs
+            finally:
+                teacher_runtime.finish_forward()
+            if targets is None:
+                raise RuntimeError("teacher forward did not produce materialized targets")
+            return targets
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
             args = self.args
@@ -737,29 +1118,16 @@ else:
                 model,
                 pre_mlp_hidden_loss_enabled=pre_mlp_hidden_loss_enabled,
             )
-            temporary_modules = runtime_view["temporary_modules"]
-            previous_temporary = [getattr(module, "temporary", None) for module in temporary_modules]
             hif4_act_controller = self.distill_hif4_act_controller
             previous_hif4_enabled = bool(getattr(hif4_act_controller, "enabled", False))
-            peft_model_for_teacher = runtime_view["peft_model_for_teacher"]
             pre_mlp_capture_modules = runtime_view["pre_mlp_capture_modules"]
-            teacher_pre_mlp_hiddens = None
             student_pre_mlp_hiddens = None
-
-            def set_temporary(temporary: bool) -> None:
-                for module in temporary_modules:
-                    module.set_temporary(temporary)
-
-            def restore_temporary() -> None:
-                for module, previous in zip(temporary_modules, previous_temporary):
-                    module.set_temporary(True if previous is None else bool(previous))
 
             def set_hif4_act_enabled(enabled: bool) -> None:
                 if hif4_act_controller is not None:
                     hif4_act_controller.enabled = bool(enabled)
 
             def prepare_student_path() -> None:
-                set_temporary(True)
                 set_hif4_act_enabled(previous_hif4_enabled)
 
             def parse_k(prefix: str, default_k: int = 1000) -> int:
@@ -772,40 +1140,14 @@ else:
                     return default_k
                 return max(1, int(suffix))
 
-            @contextmanager
-            def teacher_param_context():
-                if not self.teacher_param_snapshots:
-                    yield
-                    return
-                with _swap_teacher_snapshot_params(
-                    self.teacher_param_snapshots,
-                    self._teacher_param_restore_buffers,
-                ):
-                    yield
-
-            @torch.no_grad()
-            def get_ori_outputs():
-                nonlocal teacher_pre_mlp_hiddens
-                set_temporary(False)
-                set_hif4_act_enabled(False)
-                adapter_context = (
-                    peft_model_for_teacher.disable_adapter()
-                    if peft_model_for_teacher is not None
-                    else nullcontext()
+            def get_teacher_targets():
+                return self._run_teacher_forward(
+                    teacher_inputs=teacher_inputs,
+                    need_logits=loss_type not in {"origin", "sft"},
+                    need_output_hidden_states=need_teacher_output_hidden_states,
+                    need_pre_mlp_hiddens=pre_mlp_hidden_loss_enabled,
+                    student_pre_mlp_modules=pre_mlp_capture_modules,
                 )
-                pre_mlp_context = (
-                    _capture_pre_mlp_hiddens_from_modules(pre_mlp_capture_modules)
-                    if pre_mlp_hidden_loss_enabled
-                    else nullcontext()
-                )
-                with adapter_context, teacher_param_context(), pre_mlp_context as captured_pre_mlp:
-                    outputs = model(
-                        **teacher_inputs,
-                        output_hidden_states=need_teacher_output_hidden_states,
-                    )
-                if pre_mlp_hidden_loss_enabled:
-                    teacher_pre_mlp_hiddens = tuple(captured_pre_mlp)
-                return outputs
 
             def student_forward(model_inputs):
                 nonlocal student_pre_mlp_hiddens
@@ -820,34 +1162,44 @@ else:
                         output_hidden_states=need_student_output_hidden_states,
                     )
                 if pre_mlp_hidden_loss_enabled:
-                    student_pre_mlp_hiddens = tuple(captured_pre_mlp)
+                    student_pre_mlp_hiddens = dict(captured_pre_mlp)
                 return outputs
 
-            def add_hidden_alignment_loss(loss, teacher_outputs, student_outputs):
+            def add_hidden_alignment_loss(loss, teacher_targets, student_outputs):
                 if hidden_loss_enabled:
-                    hidden_loss = compute_distill_hidden_alignment_loss(
-                        teacher_hidden_states=teacher_outputs.hidden_states,
-                        student_hidden_states=student_outputs.hidden_states,
+                    if teacher_targets.hidden_by_name is None or teacher_targets.reference_hidden is None:
+                        raise RuntimeError("hidden alignment requires teacher hidden targets.")
+                    student_layers = getattr(getattr(runtime_view["base_model_for_capture"], "model", None), "layers", None)
+                    if student_layers is None:
+                        raise ValueError("student hidden alignment requires student.model.layers.")
+                    student_reference_hidden, student_hidden_by_name = _hidden_states_to_named_blocks(
+                        student_outputs.hidden_states,
+                        num_layers=len(student_layers),
+                    )
+                    hidden_loss = _compute_named_hidden_alignment_loss(
+                        teacher_by_name=teacher_targets.hidden_by_name,
+                        student_by_name=student_hidden_by_name,
                         attention_mask=full_inputs.get("attention_mask"),
                         layer_weighting=self.hidden_alignment_layer_weighting,
+                        teacher_reference_hidden=teacher_targets.reference_hidden,
+                        student_reference_hidden=student_reference_hidden,
+                        teacher_targets_on_cpu=self._must_stage_teacher_targets_to_cpu(),
                     )
                     loss = loss + float(self.hidden_loss_weight) * hidden_loss
                 if pre_mlp_hidden_loss_enabled:
-                    if teacher_pre_mlp_hiddens is None or student_pre_mlp_hiddens is None:
+                    if teacher_targets.pre_mlp_by_name is None or student_pre_mlp_hiddens is None:
                         raise RuntimeError("pre-MLP hidden alignment requires teacher and student captured hiddens.")
-                    teacher_reference_hidden = None
-                    if pre_mlp_reference_hidden_required:
-                        if teacher_outputs.hidden_states is None:
-                            raise RuntimeError(
-                                "adaptive pre-MLP hidden alignment requires teacher hidden states."
-                            )
-                        teacher_reference_hidden = teacher_outputs.hidden_states[0]
-                    pre_mlp_hidden_loss = compute_distill_pre_mlp_hidden_alignment_loss(
-                        teacher_pre_mlp_hiddens=teacher_pre_mlp_hiddens,
-                        student_pre_mlp_hiddens=student_pre_mlp_hiddens,
+                    pre_mlp_hidden_loss = _compute_named_pre_mlp_hidden_alignment_loss(
+                        teacher_by_name=teacher_targets.pre_mlp_by_name,
+                        student_by_name=student_pre_mlp_hiddens,
                         attention_mask=full_inputs.get("attention_mask"),
                         layer_weighting=self.hidden_alignment_layer_weighting,
-                        teacher_reference_hidden=teacher_reference_hidden,
+                        teacher_reference_hidden=(
+                            teacher_targets.reference_hidden
+                            if pre_mlp_reference_hidden_required
+                            else None
+                        ),
+                        teacher_targets_on_cpu=self._must_stage_teacher_targets_to_cpu(),
                     )
                     loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
                 return loss
@@ -869,10 +1221,10 @@ else:
             try:
                 if loss_type in {"origin", "sft"}:
                     if hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
-                        teacher_outputs = get_ori_outputs()
+                        teacher_targets = get_teacher_targets()
                         prepare_student_path()
                         outputs = student_forward(full_inputs)
-                        loss = add_hidden_alignment_loss(outputs["loss"], teacher_outputs, outputs)
+                        loss = add_hidden_alignment_loss(outputs["loss"], teacher_targets, outputs)
                         return (loss, outputs) if return_outputs else loss
                     try:
                         return super().compute_loss(
@@ -891,8 +1243,8 @@ else:
                 prepare_student_path()
 
                 if loss_type == "rkl":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -907,12 +1259,12 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "dual_rkl":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -926,12 +1278,12 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "kl":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -946,13 +1298,13 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("r_kl_top"):
                     k = parse_k("r_kl_top", default_k=1000)
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -968,13 +1320,13 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("dual_r_kl_top"):
                     k = parse_k("dual_r_kl_top", default_k=1000)
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -989,13 +1341,13 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("kl_top"):
                     k = parse_k("kl_top", default_k=1000)
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -1011,13 +1363,13 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("kd_top"):
                     k = parse_k("kd_top", default_k=1000)
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
@@ -1037,12 +1389,12 @@ else:
                     )
                     # T² is already applied inside compute_kl_topk.
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "mse":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -1056,12 +1408,12 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "kd":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
@@ -1080,12 +1432,12 @@ else:
                     )
                     # T² is already applied inside compute_forward_kl_loss.
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "dual_kl":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -1099,13 +1451,13 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("dual_kl_top"):
                     k = parse_k("dual_kl_top", default_k=1000)
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -1120,13 +1472,13 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type.startswith("dual_kd_top"):
                     k = parse_k("dual_kd_top", default_k=1000)
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
@@ -1144,12 +1496,12 @@ else:
                     )
                     alpha = self.loss_alpha
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "dual_kd":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
@@ -1166,13 +1518,13 @@ else:
                     )
                     alpha = self.loss_alpha
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if is_eakld_top_loss(loss_type):
                     k = parse_eakld_top_k(loss_type, default_k=1000)
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -1189,12 +1541,12 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "eakld":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
                     logits = outputs.logits
@@ -1210,12 +1562,12 @@ else:
                         ),
                         regions,
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 if loss_type == "eakld_kd":
-                    teacher_outputs = get_ori_outputs()
-                    ori_logits = self._stage_teacher_logits(teacher_outputs.logits)
+                    teacher_targets = get_teacher_targets()
+                    ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(full_inputs)
                     logits = outputs.logits
@@ -1235,7 +1587,7 @@ else:
                     )
                     # T² is already applied inside compute_eakld.
                     loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_outputs, outputs)
+                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
                     return (loss, outputs) if return_outputs else loss
 
                 raise ValueError(
@@ -1245,5 +1597,4 @@ else:
                     f"dual_kl, dual_kd, dual_kl_top[_K], dual_kd_top[_K], mse, kd."
                 )
             finally:
-                restore_temporary()
                 set_hif4_act_enabled(previous_hif4_enabled)

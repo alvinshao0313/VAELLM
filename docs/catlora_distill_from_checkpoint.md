@@ -71,7 +71,7 @@ bash scripts/catlora_distill_from_checkpoint.sh \
   linear_by_category.log
 ```
 
-每个类别蒸馏成功后会立刻落盘到 `after_<category>/`（不卸载 `original_weight`，便于续跑）。全部完成后写 `final_model/`。
+每个类别蒸馏成功后会立刻落盘到 `after_<category>/`。保存前会恢复为完整 `VAELinear` 图；CAT 主线 checkpoint 不依赖 `VAELinear.original_weight`。全部完成后写 `final_model/`。
 
 ## 当前脚本默认配置
 
@@ -109,11 +109,11 @@ export CUDA_VISIBLE_DEVICES=4
 
 多卡脚本示例见 `scripts/catlora_distill_4gpu_res0.sh`。
 
-### 1. 已有 `low_rank_a/b` 自动跳过（仅 `reset=false`）
+### 1. 续跑进度来源
 
-对 `compressed_lora` / `both`：当 `--distill_reset_completed false` 且当前类别全部目标 `VAELinear` 已有完整 `low_rank_a/b` 时，会自动跳过，不必再手写 `after:xxx=0`。
+`--distill_reset_completed false` 时，续跑进度只来自 checkpoint metadata 中的 `completed_categories`。已完成类别会跳过本轮蒸馏；本次运行中新完成的类别只在 `run_after_category_distill(...)` 返回 `did_train=true` 后写入 `completed_categories` 并保存。
 
-若同一类别里只有部分模块有 `low_rank`，会直接报错（状态不一致，无法决定跳过或续蒸）。
+已有 `low_rank_a/b` 不再作为本轮自动完成/跳过的进度来源；它只在 `--distill_reset_completed true` 的再蒸路径中作为初始化来源。
 
 ### 2. 从 `after_<category>/` 续跑未完成类
 
@@ -142,10 +142,10 @@ bash scripts/catlora_distill_from_checkpoint.sh \
 行为：
 
 1. 读取 `completed_categories`，跳过已完成类别的蒸馏。
-2. 已完成且已进入 active 前缀的类别会物化为 `TemporarySwitchLinear`（student=decoded，teacher=共享 original bank）；完整 `VAELinear` 卸到 CPU，仅存盘前 restore。
-3. 当前未完成类别保留 GPU 上的 `VAELinear` 供蒸馏。
+2. 训练期 residency 使用独立 fresh frozen base reference：active 类别保留 `VAELinear`，inactive 类别替换为 frozen dense reference clone。
+3. 当前未完成类别保留训练设备上的 `VAELinear` 供蒸馏。
 4. 从未完成类别继续训练，并继续写新的 `after_*` / 最终 `final_model`。
-5. `after_*` 保存前仍会全量 restore 为完整 `VAELinear` 图，ckpt 格式与续跑所需的 `original_weight` 不变。
+5. `after_*` 保存前会全量 restore 为完整 `VAELinear` 图，保存图中不会留下 reference dense clone。
 
 ### 3. `--distill_reset_completed true`：在已有蒸馏参数上再蒸一轮
 
@@ -168,17 +168,17 @@ bash scripts/catlora_distill_from_checkpoint.sh \
 4. `decoder` / `both` 在已有 decoder 权重上继续训。
 5. `--lora_rank` 必须与已有 `low_rank` 内维一致，否则直接报错。
 
-默认 `false`：按 `completed_categories` / 已有 `low_rank_a/b` 跳过，用于第 2 节的类别级续跑。
+默认 `false`：只按 `completed_categories` 跳过，用于第 2 节的类别级续跑。
 
 训练期 residency（显存）三分态：
 
 | 状态 | 模型里 | stash |
 |---|---|---|
-| 已完成 ∩ active | `TemporarySwitchLinear` | 完整 `VAELinear` 在 CPU |
-| active 且未完成 | `VAELinear`（可训） | 无 |
-| 未进入 active | 冻结 `nn.Linear`（weight 引用 original bank） | 完整 `VAELinear` 在 CPU |
+| active 类别 | `VAELinear`（可训） | 无 |
+| inactive 类别 | 冻结 `nn.Linear` reference clone | 完整 `VAELinear` 在 CPU |
+| 保存前 | 完整 `VAELinear` 图 | reference clone 退出 live graph |
 
-全层 `original_weight` 只保留一份（`original_weight_bank`），teacher/student 仍通过 `set_temporary` 切换，不改变 KD 语义。
+reference clone 来自独立 fresh frozen base model，不与 student/checkpoint VAELinear 共享 `Parameter` 或 storage；checkpoint-distill 不再使用 `TemporarySwitchLinear`、`set_temporary` 或 `original_weight_bank`。
 
 ### 4. 不要只写后续类别
 
@@ -200,7 +200,11 @@ bash scripts/catlora_distill_from_checkpoint.sh \
 | `decoder` | 只训 decoder |
 | `both` | 同时训 decoder + LoRA |
 
-checkpoint distill **不支持** `remaining_lora` / `none`。
+checkpoint distill **不支持** `remaining_lora` / `remaining_lora_decoder` / `remaining_lora_all_decoder` / `none`；两个 remaining decoder 模式只支持 inline `cat_train`。
+
+checkpoint-distill 不进行新的 VAE compression，因此 stage metadata 中的 `newly_compressed_target_count` 恒为 `0`。
+
+`decoder` / `both` 模式的 `resolved_decoder_lr` 记录实际 resolve 后的 decoder 参数组学习率；`distill_decoder_lr=none` 时继承 `distill_lr`，decoder 参数组 weight decay 固定为 `0`。
 
 ## 评估
 

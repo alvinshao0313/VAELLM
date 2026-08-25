@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import tempfile
 import unittest
@@ -16,7 +17,6 @@ from train_utils.lora_training import (
     LoraConfig,
     PeftModel,
     TaskType,
-    _swap_teacher_snapshot_params,
     build_distill_hidden_layer_weights,
     capture_pre_mlp_hiddens,
     compute_distill_hidden_alignment_loss,
@@ -334,7 +334,6 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
                 logger=SimpleNamespace(info=lambda *args, **kwargs: None),
                 cfg=cfg,
                 hif4_act_controller=None,
-                teacher_param_snapshots=[],
             )
 
         self.assertIsInstance(trainer, FakeCustomTrainer)
@@ -392,7 +391,6 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
                 logger=logger,
                 cfg=cfg,
                 hif4_act_controller=None,
-                teacher_param_snapshots=[],
                 tokenizer=tokenizer,
                 train_is_iterable=False,
                 use_lazy_tokenized_dataset=True,
@@ -454,7 +452,6 @@ class CatDistillTrainerSelectionTest(unittest.TestCase):
                 logger=logger,
                 cfg=cfg,
                 hif4_act_controller=None,
-                teacher_param_snapshots=[],
                 tokenizer=tokenizer,
                 train_is_iterable=False,
                 use_lazy_tokenized_dataset=True,
@@ -480,6 +477,37 @@ class _FakeOutput:
 
     def __getitem__(self, key):
         return getattr(self, key)
+
+
+class _StaticTeacherRuntime:
+    model_offload = "none"
+
+    def __init__(self, model):
+        self.model = model
+        self.loaded = False
+        self.finish_count = 0
+        self.model.requires_grad_(False)
+        self.model.eval()
+
+    @property
+    def is_loaded(self):
+        return self.loaded
+
+    def prepare_for_forward(self):
+        self.loaded = True
+        return self.model
+
+    def finish_forward(self):
+        self.finish_count += 1
+
+
+def _clone_teacher_from_student(model):
+    teacher = copy.deepcopy(model)
+    if hasattr(teacher, "temp_scale"):
+        teacher.temp_scale.set_temporary(False)
+    teacher.requires_grad_(False)
+    teacher.eval()
+    return teacher
 
 
 class _TempScale(nn.Module):
@@ -586,11 +614,19 @@ def _build_pre_mlp_trainer(
     trainer.eakld_confidence_k = 16
     trainer.teacher_logits_cpu_staging = False
     trainer.distill_hif4_act_controller = None
-    trainer.teacher_param_snapshots = []
-    trainer._teacher_param_restore_buffers = []
+    trainer.teacher_runtime = None
+    trainer.teacher_required = (
+        trainer.loss_type not in {"", "none", "sft", "origin"}
+        or trainer.hidden_loss_weight > 0.0
+        or trainer.pre_mlp_hidden_loss_weight > 0.0
+    )
     trainer.accelerator = None
     trainer.distill_token_stats = DistillTokenStatsAccumulator()
     return trainer
+
+
+def _bind_independent_teacher(trainer: CustomSFTTrainer, model: nn.Module) -> None:
+    trainer.teacher_runtime = _StaticTeacherRuntime(_clone_teacher_from_student(model))
 
 
 class _FakeAccelerator:
@@ -618,6 +654,7 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
             pre_mlp_hidden_loss_weight=0.25,
             hidden_alignment_layer_weighting="uniform",
         )
+        _bind_independent_teacher(trainer, model)
         inputs = _pre_mlp_inputs()
 
         with patch(
@@ -629,7 +666,7 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
         ) as pre_mlp_mock:
             loss = trainer.compute_loss(model, inputs)
 
-        self.assertEqual(model.output_hidden_states_calls, [False, False])
+        self.assertEqual(model.output_hidden_states_calls, [False])
         self.assertTrue(torch.isfinite(loss).item())
         self.assertEqual(hidden_mock.call_count, 0)
         self.assertEqual(pre_mlp_mock.call_count, 1)
@@ -651,6 +688,7 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
             # plan shorthand adaptive_3 == project adaptive_top_3
             hidden_alignment_layer_weighting="adaptive_top_3",
         )
+        _bind_independent_teacher(trainer, model)
         inputs = _pre_mlp_inputs()
         captured = {}
 
@@ -664,14 +702,14 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
         ):
             loss = trainer.compute_loss(model, inputs)
 
-        self.assertEqual(model.output_hidden_states_calls, [True, False])
+        self.assertEqual(model.output_hidden_states_calls, [False])
         self.assertTrue(torch.isfinite(loss).item())
         self.assertIsNotNone(captured["teacher_reference_hidden"])
-        # Teacher forward is first; last_hidden_states was overwritten by student (None).
-        # Re-run teacher-only forward to recover the reference embedding state.
         with torch.no_grad():
-            model.temp_scale.set_temporary(False)
-            teacher_outputs = model(**{k: v for k, v in inputs.items() if k != "labels"}, output_hidden_states=True)
+            teacher_outputs = trainer.teacher_runtime.model(
+                **{k: v for k, v in inputs.items() if k != "labels"},
+                output_hidden_states=True,
+            )
         self.assertTrue(
             torch.equal(captured["teacher_reference_hidden"], teacher_outputs.hidden_states[0])
         )
@@ -687,9 +725,10 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
             pre_mlp_hidden_loss_weight=0.25,
             hidden_alignment_layer_weighting="uniform",
         )
+        _bind_independent_teacher(trainer, model)
         inputs = _pre_mlp_inputs()
         loss = trainer.compute_loss(model, inputs)
-        self.assertEqual(model.output_hidden_states_calls, [True, True])
+        self.assertEqual(model.output_hidden_states_calls, [True])
         self.assertTrue(torch.isfinite(loss).item())
 
     def test_disabled_hidden_paths_skip_hidden_states_and_pre_mlp_hooks(self):
@@ -700,6 +739,7 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
             hidden_alignment_layer_weighting="uniform",
             loss_type="kl",
         )
+        _bind_independent_teacher(trainer, model)
         inputs = _pre_mlp_inputs()
 
         with patch(
@@ -708,7 +748,7 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
         ) as capture_mock:
             loss = trainer.compute_loss(model, inputs)
 
-        self.assertEqual(model.output_hidden_states_calls, [False, False])
+        self.assertEqual(model.output_hidden_states_calls, [False])
         self.assertEqual(capture_mock.call_count, 0)
         self.assertTrue(torch.isfinite(loss).item())
 
@@ -730,6 +770,7 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
             pre_mlp_hidden_loss_weight=0.25,
             hidden_alignment_layer_weighting="uniform",
         )
+        _bind_independent_teacher(trainer, raw_model)
         trainer.accelerator = _FakeAccelerator(peft_model)
         inputs = _pre_mlp_inputs()
 
@@ -782,6 +823,7 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
             hidden_alignment_layer_weighting="uniform",
             loss_type="kl_top_2",
         )
+        _bind_independent_teacher(trainer, raw_model)
         trainer.accelerator = _FakeAccelerator(peft_model)
         loss = trainer.compute_loss(peft_model, inputs)
         self.assertTrue(torch.isfinite(loss).item())
@@ -794,21 +836,6 @@ class CatDistillPreMlpHiddenStateRequestTest(unittest.TestCase):
         ]
         self.assertTrue(lora_grads)
         self.assertTrue(any(grad is not None and torch.isfinite(grad).all() for grad in lora_grads))
-
-    def test_swap_teacher_snapshot_params_reuses_restore_buffer(self):
-        param = nn.Parameter(torch.tensor([1.0, 2.0]))
-        snapshot = torch.tensor([7.0, 8.0])
-        restore = torch.empty_like(param)
-        with _swap_teacher_snapshot_params([(param, snapshot)], [restore]):
-            self.assertTrue(torch.equal(param.detach(), snapshot))
-        self.assertTrue(torch.equal(param.detach(), torch.tensor([1.0, 2.0])))
-
-        with torch.no_grad():
-            param.copy_(torch.tensor([3.0, 4.0]))
-        with _swap_teacher_snapshot_params([(param, snapshot)], [restore]):
-            self.assertTrue(torch.equal(param.detach(), snapshot))
-        self.assertTrue(torch.equal(param.detach(), torch.tensor([3.0, 4.0])))
-
 
 def _build_distill_trainer(
     *,
@@ -832,7 +859,8 @@ def _build_distill_trainer(
     trainer.eakld_confidence_k = int(eakld_confidence_k)
     trainer.teacher_logits_cpu_staging = False
     trainer.distill_hif4_act_controller = None
-    trainer.teacher_param_snapshots = []
+    trainer.teacher_runtime = None
+    trainer.teacher_required = True
     trainer.accelerator = None
     trainer.distill_token_stats = DistillTokenStatsAccumulator()
     return trainer
@@ -857,6 +885,7 @@ class CatDistillRegionNormalizedLossTest(unittest.TestCase):
 
         model = _PreMlpFakeCausalLM()
         trainer = _build_distill_trainer(loss_type="eakld", prompt_kd_weight=0.1)
+        _bind_independent_teacher(trainer, model)
         inputs = _distill_inputs()
 
         captured_masks: list = []
@@ -889,6 +918,7 @@ class CatDistillRegionNormalizedLossTest(unittest.TestCase):
 
         model = _PreMlpFakeCausalLM()
         trainer = _build_distill_trainer(loss_type="eakld", prompt_kd_weight=0.0)
+        _bind_independent_teacher(trainer, model)
         inputs = _distill_inputs()
 
         captured_masks: list = []
@@ -919,17 +949,16 @@ class CatDistillRegionNormalizedLossTest(unittest.TestCase):
         model = _PreMlpFakeCausalLM()
         weight = 0.1
         trainer = _build_distill_trainer(loss_type="kl", prompt_kd_weight=weight)
+        _bind_independent_teacher(trainer, model)
         inputs = _distill_inputs()
         loss = trainer.compute_loss(model, inputs)
 
         # Recompute teacher/student logits with the same temp_scale toggles.
         with torch.no_grad():
-            model.temp_scale.set_temporary(False)
-            teacher_logits = model(
+            teacher_logits = trainer.teacher_runtime.model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
             ).logits
-            model.temp_scale.set_temporary(True)
             student_logits = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
@@ -961,16 +990,15 @@ class CatDistillRegionNormalizedLossTest(unittest.TestCase):
 
         model = _PreMlpFakeCausalLM()
         trainer_zero = _build_distill_trainer(loss_type="kl", prompt_kd_weight=0.0)
+        _bind_independent_teacher(trainer_zero, model)
         inputs = _distill_inputs()
         loss_zero = trainer_zero.compute_loss(model, inputs)
 
         with torch.no_grad():
-            model.temp_scale.set_temporary(False)
-            teacher_logits = model(
+            teacher_logits = trainer_zero.teacher_runtime.model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
             ).logits
-            model.temp_scale.set_temporary(True)
             student_logits = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
@@ -995,6 +1023,7 @@ class CatDistillRegionNormalizedLossTest(unittest.TestCase):
         trainer = _build_distill_trainer(
             loss_type="kd", prompt_kd_weight=0.1, loss_alpha=0.5
         )
+        _bind_independent_teacher(trainer, model)
         inputs = _distill_inputs()
         loss = trainer.compute_loss(model, inputs)
         self.assertTrue(torch.isfinite(loss).item())

@@ -29,7 +29,6 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --convert \
   --save_model \
   --convert_device "cuda" \
-  --unload_vae_original_weights_on_final_save \
   --vae_decoder_checkpoint "true" \
   --target_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --transpose_modules "q_proj,v_proj,o_proj,down_proj" \
@@ -53,6 +52,7 @@ python tools/cat_distill_from_vae_checkpoint.py \
   --distill_loss_type "default=eakld" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
+  --distill_teacher_model_offload "none" \
   --distill_hidden_loss_weight "default=0.01" \
   --distill_pre_mlp_hidden_loss_weight "default=0.0" \
   --distill_hidden_alignment_layer_weighting "linear_depth" \

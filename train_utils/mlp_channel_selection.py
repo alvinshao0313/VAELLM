@@ -264,6 +264,74 @@ def select_mlp_aligned_activation_weighted_channels(
     return protected_indices, detail
 
 
+def _fuse_detail_for_mlp_categories(
+    detail: MlpScoreDetail,
+    *,
+    eligible_categories: Sequence[str],
+    fuse_weights: Sequence[float],
+    eps: float = 1e-8,
+) -> MlpScoreDetail:
+    weight_by_category = {
+        "up_proj": float(fuse_weights[0]),
+        "gate_proj": float(fuse_weights[1]),
+        "down_proj": float(fuse_weights[2]),
+    }
+    score_norm_by_category = {
+        "up_proj": detail.score_up / (detail.score_up.mean() + eps),
+        "gate_proj": detail.score_gate / (detail.score_gate.mean() + eps),
+        "down_proj": detail.score_down / (detail.score_down.mean() + eps),
+    }
+    eligible = [str(category) for category in eligible_categories]
+    if not eligible:
+        raise ValueError("eligible_categories cannot be empty.")
+    unknown = [category for category in eligible if category not in score_norm_by_category]
+    if unknown:
+        raise ValueError(f"Unsupported MLP categories for aligned scoring: {unknown}.")
+    if set(eligible) == set(MLP_CATEGORIES) and len(eligible) == len(MLP_CATEGORIES):
+        return detail
+    for category in eligible:
+        if weight_by_category[category] <= 0.0:
+            raise ValueError(f"fuse_weights for {category} must be > 0, got {weight_by_category[category]}.")
+    denom = sum(weight_by_category[category] for category in eligible)
+    if denom <= eps:
+        raise ValueError(f"eligible fuse weight sum must be > 0, got {denom}.")
+    score_fused = None
+    for category in eligible:
+        weighted = (weight_by_category[category] / denom) * score_norm_by_category[category]
+        score_fused = weighted if score_fused is None else score_fused + weighted
+    if score_fused is None:
+        raise RuntimeError("Failed to build MLP fused score.")
+    score_fused = score_fused.contiguous()
+    if not torch.isfinite(score_fused).all():
+        raise ValueError("MLP fused channel score contains non-finite values.")
+    return MlpScoreDetail(
+        score_up=detail.score_up,
+        score_gate=detail.score_gate,
+        score_down=detail.score_down,
+        score_fused=score_fused,
+        rank_metric=detail.rank_metric,
+    )
+
+
+def _select_protected_indices_from_detail(
+    detail: MlpScoreDetail,
+    *,
+    protect_count: int,
+) -> torch.Tensor:
+    d_ffn = int(detail.score_fused.numel())
+    k = int(protect_count)
+    if k < 0:
+        raise ValueError(f"protect_count must be >= 0, got {k}.")
+    if k == 0:
+        return torch.empty(0, dtype=torch.long)
+    if k >= d_ffn:
+        raise ValueError(
+            f"protect_count={k} must be < intermediate_size={d_ffn} for MLP aligned selection."
+        )
+    _, idx = torch.topk(detail.score_fused, k=k, largest=True, sorted=False)
+    return torch.sort(idx.to(device="cpu", dtype=torch.long)).values.contiguous()
+
+
 def _linear_name_for_mlp_category(layer_idx: int, category: str) -> str:
     if category not in MLP_CATEGORIES:
         raise ValueError(f"Unsupported MLP category={category!r}.")
@@ -291,7 +359,11 @@ def build_mlp_aligned_plans_all_layers(
     for layer_idx, layer in enumerate(layers):
         if not hasattr(layer, "mlp"):
             continue
-        if any((int(layer_idx), cat) in skipped for cat in MLP_CATEGORIES):
+        eligible_mlp_categories = [
+            category for category in MLP_CATEGORIES
+            if (int(layer_idx), category) not in skipped
+        ]
+        if not eligible_mlp_categories:
             continue
         mlp = layer.mlp
         gate = getattr(mlp, "gate_proj", None)
@@ -303,17 +375,23 @@ def build_mlp_aligned_plans_all_layers(
         if block_stats is None:
             raise KeyError(f"Missing MLP activation stats for layer_idx={layer_idx}.")
 
-        protected_indices, detail = select_mlp_aligned_activation_weighted_channels(
+        detail = compute_mlp_intermediate_scores(
             up.weight,
             gate.weight,
             down.weight,
             block_stats,
             rank_metric=resolved_metric,
-            protect_count=int(protect_count),
             fuse_weights=fuse_weights,
             eps=eps,
         )
-        for category in MLP_CATEGORIES:
+        detail = _fuse_detail_for_mlp_categories(
+            detail,
+            eligible_categories=eligible_mlp_categories,
+            fuse_weights=fuse_weights,
+            eps=eps,
+        )
+        protected_indices = _select_protected_indices_from_detail(detail, protect_count=int(protect_count))
+        for category in eligible_mlp_categories:
             plan_by_linear[_linear_name_for_mlp_category(layer_idx, category)] = protected_indices
         summary_by_layer[int(layer_idx)] = detail.to_log_dict(protected_indices=protected_indices)
 

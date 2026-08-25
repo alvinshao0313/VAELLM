@@ -36,7 +36,7 @@ RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTIVATION = (
 def _select_sparse_residual_entries(
     *,
     linear_name: str,
-    original_weight: torch.Tensor,
+    target_weight: torch.Tensor,
     reconstructed_weight: torch.Tensor,
     activation_weight: Optional[torch.Tensor],
     activation_mean: Optional[torch.Tensor],
@@ -44,20 +44,20 @@ def _select_sparse_residual_entries(
     top_p: float,
     min_abs: float,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    original_weight = original_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    target_weight = target_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
     reconstructed_weight = reconstructed_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    if tuple(original_weight.shape) != tuple(reconstructed_weight.shape):
+    if tuple(target_weight.shape) != tuple(reconstructed_weight.shape):
         raise ValueError(
-            f"{linear_name}: original/reconstructed weight shape mismatch: "
-            f"{tuple(original_weight.shape)} vs {tuple(reconstructed_weight.shape)}"
+            f"{linear_name}: target/reconstructed weight shape mismatch: "
+            f"{tuple(target_weight.shape)} vs {tuple(reconstructed_weight.shape)}"
         )
-    out_features, in_features = int(original_weight.shape[0]), int(original_weight.shape[1])
+    out_features, in_features = int(target_weight.shape[0]), int(target_weight.shape[1])
     if not (0.0 < float(top_p) <= 1.0):
         raise ValueError(f"{linear_name}: residual_sparse top_p must satisfy 0 < top_p <= 1, got {top_p}.")
     if float(min_abs) < 0.0:
         raise ValueError(f"{linear_name}: residual_sparse min_abs must be >= 0, got {min_abs}.")
 
-    residual = (original_weight - reconstructed_weight).contiguous()
+    residual = (target_weight - reconstructed_weight).contiguous()
     abs_residual = residual.abs()
     resolved_rank_metric = str(rank_metric).strip().lower()
     if resolved_rank_metric in {
@@ -67,7 +67,7 @@ def _select_sparse_residual_entries(
     }:
         score = abs_residual
     elif resolved_rank_metric in {"sparse_weight_abs", "sparse_weight_actmax_abs", "sparse_weight_actmean_abs"}:
-        score = original_weight.abs()
+        score = target_weight.abs()
     else:
         raise ValueError(
             f"{linear_name}: unsupported residual_sparse rank metric {rank_metric!r}. "
@@ -121,7 +121,7 @@ def _select_sparse_residual_entries(
 def build_sparse_residual_payload(
     *,
     linear_name: str,
-    original_weight: torch.Tensor,
+    target_weight: torch.Tensor,
     reconstructed_weight: torch.Tensor,
     activation_weight: Optional[torch.Tensor],
     activation_mean: Optional[torch.Tensor] = None,
@@ -135,7 +135,7 @@ def build_sparse_residual_payload(
 ) -> Tuple[Optional[Dict[str, object]], int, Dict[str, int]]:
     row_idx, col_idx, values = _select_sparse_residual_entries(
         linear_name=linear_name,
-        original_weight=original_weight,
+        target_weight=target_weight,
         reconstructed_weight=reconstructed_weight,
         activation_weight=activation_weight,
         activation_mean=activation_mean,
@@ -147,8 +147,8 @@ def build_sparse_residual_payload(
         return None, 0, {"coo_bytes": 0, "codec_bytes": 0}
 
     nnz = int(values.numel())
-    out_features = int(original_weight.shape[0])
-    in_features = int(original_weight.shape[1])
+    out_features = int(target_weight.shape[0])
+    in_features = int(target_weight.shape[1])
     coo_bytes = sparse_residual_coo_storage_bytes(nnz)
     resolved_codec = str(codec).strip().lower()
     if resolved_codec == SPARSE_RESIDUAL_FORMAT_COO_FP16:

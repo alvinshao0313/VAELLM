@@ -14,7 +14,6 @@ export HF_DATASETS_OFFLINE=1
 # --resume_from_checkpoint "/path/to/last_run/final_model"
 # --include_all_linears
 # --rot_llm
-# --unload_vae_original_weights_on_final_save
 # --allow_tail_group "true"
 # 排序代码，已关闭；不要在实际 CLI 中传入以下旧参数：
 #   --intra_part_sort_mode "default=none"
@@ -36,8 +35,8 @@ export HF_DATASETS_OFFLINE=1
 # --outlier_residual_vae_steps "1500"
 # --outlier_residual_vae_lr "0.002"
 # --outlier_residual_min_abs "1e-6"
-#   原始权重打分只决定保留哪些位置，真正保存的仍是这些位置上的 residual
-#   若 |original-reconstructed| 小于该阈值，则该位置会从 top-p 中剔除，并继续往后补
+#   当前待压缩 student dense weight 只用于决定保留/稀疏 residual 位置；
+#   residual = current_student_dense_weight - VAE_reconstruction
 # --outlier_residual_codec "blocked_quantized" or "coo_fp16"
 # --outlier_residual_index_bits "8"   # 8 or 4 慎用 4 bits，可能导致结果不稳定
 # --outlier_residual_value_bits "8"   # 8 or 4 
@@ -46,7 +45,6 @@ export HF_DATASETS_OFFLINE=1
 # --eval_ppl "true"                   # 是否跑类别后 PPL；默认 true
 # --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu"       # 可选：类别后下游任务评估；空串表示不跑
 # 蒸馏数据：先运行 bash scripts/prepare_vaellm_edgerazor_data.sh，见 docs/edgerazor_dataset.md
-  # --unload_vae_original_weights_on_final_save \
 
 python tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \

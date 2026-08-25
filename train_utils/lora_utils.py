@@ -3,7 +3,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -41,9 +41,17 @@ from e2e_common.lazy_datasets import (
     is_iterable_training_dataset,
 )
 from train_utils.lora_data import ensure_distill_dataset_stack_available, prepare_distill_datasets
+from litebsq.vae_linear import VAELinear
+from litebsq.vae_linear_prewarm import NamedVAELinearTarget, prime_named_vae_linear_cache
+from train_utils.distill_decoder import (
+    NamedMainDecoderTarget,
+    enable_main_decoder_targets,
+    finalize_main_decoder_targets,
+)
 from train_utils.lora_training import (
     CustomSFTTrainer,
     DataCollatorForCompletionOnlyLM,
+    GroupedSFTTrainer,
     SFTTrainer,
     create_lora_adapters,
     ensure_lora_training_stack_available,
@@ -63,6 +71,7 @@ class _ResolvedDistillStageConfig:
     steps: int
     batch_size: int
     lr: float
+    decoder_lr: Optional[float]
     weight_decay: float
     log_every: int
     temperature: float
@@ -84,6 +93,10 @@ class _ResolvedDistillStageConfig:
 class RemainingLoraFinetuneResult:
     model: nn.Module
     did_train: bool
+    remaining_lora_target_count: int = 0
+    decoder_target_count: int = 0
+    resolved_distill_lr: Optional[float] = None
+    resolved_decoder_lr: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -102,12 +115,42 @@ class _LoraTrainerLogCallback(TrainerCallback if TrainerCallback is not None els
         if not logs:
             return
         values = dict(logs)
+        optimizer = kwargs.get("optimizer")
+        if optimizer is not None:
+            group_lrs = []
+            decoder_lrs = []
+            nondecoder_lrs = []
+            for group in getattr(optimizer, "param_groups", []):
+                params = list(group.get("params", []))
+                if not params:
+                    continue
+                lr = float(group.get("lr", 0.0))
+                group_lrs.append(lr)
+                group_name = group.get("group_name")
+                if group_name == "decoder":
+                    decoder_lrs.append(lr)
+                elif group_name in {"nondecoder_decay", "nondecoder_no_decay"}:
+                    nondecoder_lrs.append(lr)
+            if decoder_lrs:
+                if len(set(nondecoder_lrs)) > 1:
+                    raise ValueError("nondecoder optimizer groups must share the same current lr.")
+                if len(set(decoder_lrs)) > 1:
+                    raise ValueError("decoder optimizer groups must share the same current lr.")
+                if nondecoder_lrs:
+                    values["lr_lora"] = nondecoder_lrs[0]
+                values["lr_decoder"] = decoder_lrs[0]
+            elif group_lrs:
+                if len(set(group_lrs)) > 1:
+                    raise ValueError("legacy LoRA optimizer groups must share the same current lr.")
+                values["lr_lora"] = group_lrs[0]
         values.pop("total_flos", None)
         ordered_keys = (
             "loss",
             "train_loss",
             "eval_loss",
             "learning_rate",
+            "lr_lora",
+            "lr_decoder",
             "grad_norm",
             "epoch",
         )
@@ -209,6 +252,12 @@ def _ensure_lora_stack_available() -> None:
     ensure_distill_dataset_stack_available()
     if AutoTokenizer is None or TrainingArguments is None:
         raise ImportError("未安装 transformers。请先安装：pip install transformers")
+
+
+def _ensure_distill_trainer_data_stack_available() -> None:
+    ensure_distill_dataset_stack_available()
+    if AutoTokenizer is None or TrainingArguments is None or SFTTrainer is None:
+        raise ImportError("未安装 transformers/trl。请先安装 after-category distill 依赖。")
 
 
 def distill_world_size() -> int:
@@ -353,6 +402,7 @@ def _resolve_distill_stage_config(
         steps=int(runtime_cfg.steps),
         batch_size=int(runtime_cfg.batch_size),
         lr=float(runtime_cfg.lr),
+        decoder_lr=runtime_cfg.decoder_lr,
         weight_decay=float(runtime_cfg.weight_decay),
         log_every=int(runtime_cfg.log_every),
         temperature=float(runtime_cfg.temperature),
@@ -428,21 +478,6 @@ def _collect_extra_trainable_modules(
         modules.append(_ExtraTrainableModule(name=post_norm_name, module=post_norm_linear))
 
     return modules
-
-
-def _snapshot_extra_trainable_params(
-    modules: Sequence[_ExtraTrainableModule],
-) -> List[Tuple[nn.Parameter, torch.Tensor]]:
-    snapshots: List[Tuple[nn.Parameter, torch.Tensor]] = []
-    seen = set()
-    for item in modules:
-        for _param_name, param in item.module.named_parameters(recurse=True):
-            param_id = id(param)
-            if param_id in seen:
-                continue
-            seen.add(param_id)
-            snapshots.append((param, param.detach().clone()))
-    return snapshots
 
 
 def _enable_extra_trainable_params(modules: Sequence[_ExtraTrainableModule]) -> List[str]:
@@ -683,6 +718,22 @@ def _prepare_or_reuse_remaining_lora_distill_dataset(
     return cached
 
 
+def _resolve_effective_decoder_lr(
+    cfg: _ResolvedDistillStageConfig,
+    decoder_params: Sequence[nn.Parameter],
+    *,
+    decoder_lr: Optional[float] = None,
+) -> Optional[float]:
+    if not decoder_params:
+        return None
+    value = cfg.decoder_lr if decoder_lr is None else decoder_lr
+    if value is None:
+        value = cfg.lr
+    if float(value) <= 0.0:
+        raise ValueError("effective decoder lr must be > 0 when decoder parameters are trainable.")
+    return float(value)
+
+
 def _build_lora_trainer(
     *,
     model: nn.Module,
@@ -693,7 +744,9 @@ def _build_lora_trainer(
     logger,
     cfg: _ResolvedDistillStageConfig,
     hif4_act_controller,
-    teacher_param_snapshots,
+    teacher_runtime=None,
+    decoder_params: Sequence[nn.Parameter] = (),
+    decoder_lr: Optional[float] = None,
     tokenizer=None,
     train_is_iterable: bool = False,
     use_lazy_tokenized_dataset: bool = False,
@@ -743,6 +796,8 @@ def _build_lora_trainer(
         trainer_kwargs["max_seq_length"] = max_seq_len
     del train_is_iterable
 
+    decoder_param_ids = [id(param) for param in decoder_params]
+    resolved_decoder_lr = _resolve_effective_decoder_lr(cfg, decoder_params, decoder_lr=decoder_lr)
     resolved_lora_loss = str(cfg.loss_type).strip().lower()
     hidden_loss_enabled = float(cfg.hidden_loss_weight) > 0.0
     pre_mlp_hidden_loss_enabled = float(cfg.pre_mlp_hidden_loss_weight) > 0.0
@@ -762,18 +817,27 @@ def _build_lora_trainer(
                 getattr(training_args, "distill_teacher_logits_cpu_staging", False)
             ),
             distill_hif4_act_controller=hif4_act_controller,
-            teacher_param_snapshots=teacher_param_snapshots,
+            teacher_runtime=teacher_runtime,
+            decoder_param_ids=decoder_param_ids,
+            decoder_lr=resolved_decoder_lr,
         )
         trainer = _replace_progress_log_callback(trainer)
         trainer.add_callback(
             _LoraDistillTokenStatsCallback(trainer=trainer, logger=logger)
         )
         return trainer
-    trainer = SFTTrainer(**trainer_kwargs)
+    if decoder_params:
+        trainer = GroupedSFTTrainer(
+            **trainer_kwargs,
+            decoder_param_ids=decoder_param_ids,
+            decoder_lr=resolved_decoder_lr,
+        )
+    else:
+        trainer = SFTTrainer(**trainer_kwargs)
     return _replace_progress_log_callback(trainer)
 
 
-def _train_and_merge_lora_model(
+def _train_lora_trainer_without_merge(
     *,
     trainer,
     hif4_act_controller,
@@ -801,7 +865,21 @@ def _train_and_merge_lora_model(
         remove_hif4_act_hooks(hif4_act_handles)
 
     distill_distributed_barrier()
-    model, merged_count = merge_all_lora(trainer.model)
+    return trainer.model
+
+
+def _train_and_merge_lora_model(
+    *,
+    trainer,
+    hif4_act_controller,
+    logger,
+) -> nn.Module:
+    model = _train_lora_trainer_without_merge(
+        trainer=trainer,
+        hif4_act_controller=hif4_act_controller,
+        logger=logger,
+    )
+    model, merged_count = merge_all_lora(model)
     if is_distill_main_process():
         logger.info("LoRA: 微调完成并融合，融合模块数量=%d", merged_count)
     if is_distill_distributed():
@@ -812,17 +890,114 @@ def _train_and_merge_lora_model(
     return model
 
 
+def _vae_linear_reference_device_dtype(base_layer: VAELinear) -> Tuple[Optional[torch.device], Optional[torch.dtype]]:
+    device = None
+    dtype = None
+    for tensor in list(base_layer.parameters(recurse=True)) + list(base_layer.buffers(recurse=True)):
+        if device is None:
+            device = tensor.device
+        if dtype is None and tensor.is_floating_point():
+            dtype = tensor.dtype
+        if device is not None and dtype is not None:
+            break
+    return device, dtype
+
+
+def _has_valid_decoded_weight_cache(base_layer: VAELinear) -> bool:
+    cached = getattr(base_layer, "_cached_weight", None)
+    if cached is None:
+        return False
+    expected_device, expected_dtype = _vae_linear_reference_device_dtype(base_layer)
+    if expected_device is not None and cached.device != expected_device:
+        return False
+    if expected_dtype is not None and cached.dtype != expected_dtype:
+        return False
+    return True
+
+
+def _collect_remaining_decoder_frozen_vae_prewarm_targets(
+    model: nn.Module,
+    *,
+    decoder_targets: Sequence[NamedMainDecoderTarget],
+) -> Tuple[NamedVAELinearTarget, ...]:
+    excluded_ids = {id(target.base_layer) for target in decoder_targets}
+    seen_ids = set()
+    targets: List[NamedVAELinearTarget] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, VAELinear):
+            continue
+        module_id = id(module)
+        if module_id in seen_ids:
+            continue
+        seen_ids.add(module_id)
+        if module_id in excluded_ids:
+            continue
+        if bool(getattr(module, "trainable_decode", False)):
+            continue
+        if not bool(getattr(module, "cache_decoded_weight", True)):
+            continue
+        if bool(getattr(module, "_skip_global_cache_prewarm", False)):
+            continue
+        if _has_valid_decoded_weight_cache(module):
+            continue
+        targets.append(NamedVAELinearTarget(name=str(name), base_layer=module))
+    return tuple(targets)
+
+
+def _prewarm_remaining_decoder_frozen_vae_linears(
+    model: nn.Module,
+    *,
+    decoder_targets: Sequence[NamedMainDecoderTarget],
+    compute_device: str,
+    logger,
+) -> Dict[str, int]:
+    if not decoder_targets:
+        return {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
+    targets = _collect_remaining_decoder_frozen_vae_prewarm_targets(
+        model,
+        decoder_targets=decoder_targets,
+    )
+    if targets:
+        stats = prime_named_vae_linear_cache(
+            targets,
+            dtype=None,
+            clear_existing=False,
+            group_size=8,
+            compute_device=compute_device,
+            logger=logger,
+        )
+    else:
+        stats = {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
+    if logger is not None:
+        logger.info(
+            "remaining decoder frozen VAE prewarm: selected_decoder_targets=%d frozen_candidates=%d warmed=%d skipped=%d failed=%d",
+            int(len(decoder_targets)),
+            int(len(targets)),
+            int(stats.get("warmed", 0)),
+            int(stats.get("skipped", 0)),
+            int(stats.get("failed", 0)),
+        )
+    return {
+        "total": int(stats.get("total", len(targets))),
+        "warmed": int(stats.get("warmed", 0)),
+        "skipped": int(stats.get("skipped", 0)),
+        "failed": int(stats.get("failed", 0)),
+    }
+
+
 def lora_finetune_remaining_categories(
     model: nn.Module,
     remaining_categories: Sequence[str],
     *,
     target_names: Sequence[str],
+    decoder_targets: Sequence[NamedMainDecoderTarget] = (),
     cat_args,
     vae_args,
     training_args,
     logger,
     lora_round_idx: Optional[int] = None,
     after_category: Optional[str] = None,
+    teacher_runtime=None,
 ) -> RemainingLoraFinetuneResult:
     cfg = _resolve_distill_stage_config(
         cat_args=cat_args,
@@ -831,32 +1006,46 @@ def lora_finetune_remaining_categories(
         lora_round_idx=lora_round_idx,
     )
     has_extra_trainables = bool(cfg.distill_tune_final_norm) or bool(cfg.distill_use_post_norm_head_linear)
+    has_decoder_targets = bool(decoder_targets)
     if cfg.steps <= 0:
         return RemainingLoraFinetuneResult(model=model, did_train=False)
-    if not remaining_categories and not has_extra_trainables:
+    if not remaining_categories and not has_extra_trainables and not has_decoder_targets:
         return RemainingLoraFinetuneResult(model=model, did_train=False)
-    _ensure_lora_stack_available()
+    _ensure_distill_trainer_data_stack_available()
+    if target_names:
+        ensure_lora_training_stack_available()
 
-    if not target_names and not has_extra_trainables:
+    if not target_names and not has_extra_trainables and not has_decoder_targets:
         logger.info("LoRA: 没有可微调的剩余 Linear，跳过。")
         return RemainingLoraFinetuneResult(model=model, did_train=False)
 
     previous_use_cache = _freeze_model_for_lora(model, device=cfg.device, logger=logger)
     try:
         extra_modules = _collect_extra_trainable_modules(model, cfg=cfg, logger=logger)
-        teacher_param_snapshots = _snapshot_extra_trainable_params(extra_modules)
-        model, _lora_config, unique_target_names = create_lora_adapters(
-            model,
-            target_names=target_names,
-            rank=cfg.rank,
-            alpha=cfg.alpha,
-            dropout=cfg.dropout,
-            use_dora=cfg.use_dora,
-        )
+        if target_names:
+            model, _lora_config, unique_target_names = create_lora_adapters(
+                model,
+                target_names=target_names,
+                rank=cfg.rank,
+                alpha=cfg.alpha,
+                dropout=cfg.dropout,
+                use_dora=cfg.use_dora,
+            )
+        else:
+            _lora_config = None
+            unique_target_names = []
         extra_trainable_names = _enable_extra_trainable_params(extra_modules)
+        decoder_params = enable_main_decoder_targets(decoder_targets) if decoder_targets else ()
+        resolved_decoder_lr = _resolve_effective_decoder_lr(cfg, decoder_params)
+        _prewarm_remaining_decoder_frozen_vae_linears(
+            model,
+            decoder_targets=decoder_targets,
+            compute_device=cfg.device,
+            logger=logger,
+        )
         if _lora_config is None:
             logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
-            if not extra_trainable_names:
+            if not extra_trainable_names and not decoder_params:
                 logger.info("LoRA: 没有额外可训练参数，跳过。")
                 return RemainingLoraFinetuneResult(model=model, did_train=False)
 
@@ -912,6 +1101,8 @@ def lora_finetune_remaining_categories(
             )
         if train_len == 0:
             logger.warning("LoRA: 数据集为空，跳过。")
+            if decoder_targets:
+                finalize_main_decoder_targets(decoder_targets)
             model, _merged_count = merge_all_lora(model)
             return RemainingLoraFinetuneResult(model=model, did_train=False)
 
@@ -932,16 +1123,41 @@ def lora_finetune_remaining_categories(
             logger=logger,
             cfg=cfg,
             hif4_act_controller=hif4_act_controller,
-            teacher_param_snapshots=teacher_param_snapshots,
+            teacher_runtime=teacher_runtime,
+            decoder_params=decoder_params,
+            decoder_lr=resolved_decoder_lr,
             tokenizer=tokenizer,
             train_is_iterable=train_is_iterable,
             use_lazy_tokenized_dataset=True,
         )
-        model = _train_and_merge_lora_model(
-            trainer=trainer,
-            hif4_act_controller=hif4_act_controller,
-            logger=logger,
+        if decoder_targets:
+            model = _train_lora_trainer_without_merge(
+                trainer=trainer,
+                hif4_act_controller=hif4_act_controller,
+                logger=logger,
+            )
+            finalized = finalize_main_decoder_targets(decoder_targets)
+            logger.info("LoRA: finalized trainable main decoder targets=%d.", int(finalized))
+            model, merged_count = merge_all_lora(model)
+            if is_distill_main_process():
+                logger.info("LoRA: 微调完成并融合，融合模块数量=%d", merged_count)
+            distill_distributed_barrier()
+            if not is_distill_distributed():
+                model.to("cpu")
+                torch.cuda.empty_cache()
+        else:
+            model = _train_and_merge_lora_model(
+                trainer=trainer,
+                hif4_act_controller=hif4_act_controller,
+                logger=logger,
+            )
+        return RemainingLoraFinetuneResult(
+            model=model,
+            did_train=True,
+            remaining_lora_target_count=len(unique_target_names),
+            decoder_target_count=len(decoder_targets),
+            resolved_distill_lr=float(cfg.lr),
+            resolved_decoder_lr=resolved_decoder_lr,
         )
-        return RemainingLoraFinetuneResult(model=model, did_train=True)
     finally:
         _restore_model_use_cache(model, previous_use_cache, logger=logger)

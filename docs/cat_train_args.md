@@ -77,6 +77,7 @@
 - `distill_steps`
 - `distill_batch_size`
 - `distill_lr`
+- `distill_decoder_lr`
 - `distill_weight_decay`
 - `distill_log_every`
 - `distill_temperature`
@@ -138,7 +139,7 @@
 | `--joint_decoder_lr` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
 | `--joint_decoder_group_size` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
 | `--joint_decoder_batch_size` | 已关闭 | joint decoder 联合优化旧参数 | 不再注册；传入会报错 |
-| `--skip_layers` | `""` | 指定某些层在推理时始终走原始权重 | 格式必须是 `layer_idx.category` |
+| `--skip_layers` | `""` | 指定某些层/类别不进入 VAE 压缩 | 格式必须是 `layer_idx.category`；skip 目标保持原 dense `nn.Linear`，但后续 remaining LoRA/DoRA 仍可覆盖它 |
 | `--linear_group_size` | `32` | 同类别跨层分组大小 | 必须 `>=1` |
 | `--intra_part_sort_mode` | 已关闭 | 排序旧参数 | 不再注册；传入会报错 |
 | `--sort_prep_workers` | 已关闭 | 排序预处理旧参数 | 不再注册；传入会报错 |
@@ -153,7 +154,7 @@
 | `--outlier_rank_metric` | `sparse_residual_abs` | 离群选择排序指标 | `residual_sparse` 只允许 `sparse_*`；`channel_residual_vae` 只允许 `channel_*`；`channel` 实际保护通道时只允许 `channel_weight_*`；`actmax` 使用激活绝对值最大值，`actmean` 使用激活绝对值均值 |
 | `--outlier_mlp_rank_metric` | `none` | MLP gate/up/down 专用选道指标 | `none` 时 MLP 仍走 `--outlier_rank_metric`；`mlp_intermediate_aligned_actrms` / `actmean_abs` / `actrms_abs` 时按 SwiGLU intermediate path 共享保护通道 |
 | `--outlier_mlp_fuse_weights` | `1,1,1` | MLP aligned 选道的 up/gate/down 融合权重 | 格式 `alpha_up,alpha_gate,alpha_down`；对所有 aligned MLP metric 生效 |
-| `--outlier_residual_min_abs` | `1e-6` | `residual_sparse` 模式下 residual 的最小绝对值门槛 | 全局单值；若 `|original-reconstructed| < threshold`，该位置会从 top-p 中剔除，并继续往后补 |
+| `--outlier_residual_min_abs` | `1e-6` | `residual_sparse` 模式下 residual 的最小绝对值门槛 | 全局单值；inline CAT 中 residual = 当前待压缩 student dense weight - VAE reconstruction；低于阈值的位置会从 top-p 中剔除，并继续往后补 |
 | `--outlier_residual_codec` | `coo_fp16` | `residual_sparse` 的存储格式 | `coo_fp16` / `blocked_quantized` |
 | `--outlier_residual_index_bits` | `8` | `blocked_quantized` 的块内索引位宽 | `8` / `4`；`4` 位时 block 边长必须 `<=16` |
 | `--outlier_residual_value_bits` | `8` | `blocked_quantized` 的残差 value 位宽 | `8` / `4` |
@@ -180,9 +181,9 @@
 | `--eval_ppl` | `true` | 是否在类别后评估阶段运行 PPL | 现在和 `convert` 解耦；`false` 时不跑 PPL |
 | `--eval_tasks` | `""` | 类别后 lm_eval 任务列表 | 逗号分隔；空串表示不跑下游任务；当前固定 `fewshot=0`、`batch_size=auto`、`limit=None` |
 | `--ppl_limit` | `-1` | 每个类别训练后 PPL 评估样本上限 | `-1` 表示全量 |
-| `--distill_after_category` | `none` | 每训练完一个类别后的蒸馏模式 | `none` / `remaining_lora` / `compressed_lora` / `decoder` / `both`；非 `none` 要求开启 `--convert` |
+| `--distill_after_category` | `none` | 每训练完一个类别后的蒸馏模式 | `none` / `remaining_lora` / `remaining_lora_decoder` / `remaining_lora_all_decoder` / `compressed_lora` / `decoder` / `both`；非 `none` 要求开启 `--convert` |
 | `--compressed_lora_scope` | `full` | 最终写回 `VAELinear.low_rank_a/b` 的 compressed LoRA 作用域 | 仅影响 `compressed_lora` / `both`；`full`（默认）沿用现有 full PEFT proxy；`compressed_subspace` 只在 VAE 真正压缩的权重子空间上训练 LoRA（protected channel 不被 LoRA 修改）。旧脚本不传该参数时行为不变。不覆盖 block-level PEFT LoRA / `remaining_lora` |
-| `--distill_reset_completed` | `false` | checkpoint distill 是否忽略 resume 中的 `completed_categories` 全量再蒸 | `true`：已有 `low_rank_a/b` 用其初始化 LoRA 续训并覆盖写回；`false`：按 completed / 已有 low_rank 跳过（从 `after_*` 续跑未完成类）。仅 checkpoint distill |
+| `--distill_reset_completed` | `false` | checkpoint distill 是否忽略 resume 中的 `completed_categories` 全量再蒸 | `true`：已有 `low_rank_a/b` 用其初始化 LoRA 续训并覆盖写回；`false`：只按 `completed_categories` 跳过（从 `after_*` 续跑未完成类）。仅 checkpoint distill |
 | `--distill_independent_categories` | `false` | checkpoint distill 是否每类独立蒸馏（不累积前缀压缩状态） | `true` 时每轮只激活当前类，已完成类恢复为未压缩 Linear；全部类结束后再一次性激活已完成类做最终评估/保存。仅对 cat checkpoint distill 生效；inline `cat_train` 会 warning 并忽略 |
 | `--distill_dataset` | `""` | 每类后蒸馏训练混合数据集 | `--distill_after_category != none` 时必填；只支持 `alias=weight,...`，例如 `wiki=1.0`、`openorca=1.0` 或 `openorca=0.5,fineweb_edu=0.5`；alias 对齐 dense_e2e 的 `dataset_mix` |
 | `--lora_rank` | `default=8` | LoRA rank | after-category override |
@@ -191,6 +192,7 @@
 | `--distill_steps` | `default=50` | LoRA 最大步数 | `0` 表示跳过该轮 LoRA |
 | `--distill_batch_size` | `default=2` | LoRA 每卡 batch size | after-category override |
 | `--distill_lr` | `default=1e-4` | LoRA 学习率 | after-category override |
+| `--distill_decoder_lr` | `default=none` | remaining decoder 联合恢复中的 VAE decoder 学习率 | after-category override；`none` 表示继承当前 `distill_lr`；decoder 参数组 weight decay 固定为 `0` |
 | `--distill_weight_decay` | `default=0.0` | LoRA 权重衰减 | after-category override |
 | `--distill_log_every` | `default=1` | LoRA 日志间隔 | after-category override |
 | `--distill_temperature` | `default=1.0` | LoRA 蒸馏温度 | after-category override |
@@ -200,9 +202,9 @@
 | `--distill_hidden_loss_weight` | `default=0.0` | LoRA hidden-state 对齐辅助损失权重 | after-category override；`0` 表示关闭；开启后对齐所有 transformer block 输出 hidden states，跳过 embedding hidden state |
 | `--distill_prompt_kd_weight` | `default=0.0` | LoRA logit KD 的 prompt-region 组合系数 | after-category override；`>=0`；`0.0` 为 response-target-only；`L_logit = L_response + w * L_prompt`，详见 §6.11.1；只作用于 logit KD，不改变 CE / hidden loss |
 | `--distill_hidden_alignment_layer_weighting` | `uniform` | LoRA hidden-state 对齐的层权重模式 | 全局单值；`uniform` 等权全层；`linear_depth` 后层权重线性增大并归一到平均权重为 1；`adaptive` 默认选 cosine 最低的 3 层；`adaptive_top_<K>` 仅对 teacher 相邻层变化最大的 K 层计算对齐损失 |
-| `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 `remaining_lora` 支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
-| `--distill_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 `--distill_after_category=remaining_lora` 支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
-| `--distill_use_post_norm_head_linear` | `false` | 每类后 LoRA 蒸馏是否训练 post-norm head linear | 仅 `--distill_after_category=remaining_lora` 支持；最终保存前会融合回 `lm_head` |
+| `--lora_use_dora` | `default=true` | LoRA 是否启用 DoRA | after-category override；仅 remaining-family 模式支持 DoRA，`compressed_lora` / `both` 若解析到 `true` 会直接报错 |
+| `--distill_tune_final_norm` | `false` | 每类后 LoRA 蒸馏是否同时微调最终 norm | 仅 remaining-family 模式支持；`compressed_lora` / `decoder` / `both` 会直接报错 |
+| `--distill_use_post_norm_head_linear` | `false` | 每类后 LoRA 蒸馏是否训练 post-norm head linear | 仅 remaining-family 模式支持；最终保存前会融合回 `lm_head` |
 | `--distill_hif4_act` | `false` | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化 | 全局开关，不参与 after-category override |
 | `--eval_hif4_act` | `false` | 是否在 cat_train 内部类别后评估阶段启用 HiFloat4 激活伪量化 | 同时作用于 PPL 和 lm_eval；不影响训练 |
 | `--seed` | `0` | 全流程随机种子 | LoRA 每轮会叠加轮次偏移 |
@@ -212,7 +214,6 @@
 | `--convert` | `False` | 训练后把目标 Linear 替换为压缩后的 `VAELinear` | 只控制是否替换模型权重；不再隐式控制 PPL |
 | `--convert_device` | `cuda` | 构建 `VAELinear` 时的设备 | 替换完成后会移回 CPU |
 | `--save_model` | `False` | 最终保存模型 state_dict / config / tokenizer | 需要同时开启 `convert` |
-| `--unload_vae_original_weights_on_final_save` | `False` | 最终保存前卸载 `VAELinear` 中缓存的原始权重 | 用于减小保存体积 |
 | `--output_dir` | `./output_linear_by_category` | 输出根目录 | 实际会创建时间戳子目录 |
 | `--allow_tail_group` | `True` | 是否允许最后一个不足组大小的尾组训练 | 可显式传 `false` 跳过尾组 |
 
@@ -316,6 +317,7 @@
 | `--distill_model_max_length` | LoRA trainer | LoRA 样本最大长度（单样本截断上限） |
 | `--distill_dynamic_padding` | LoRA trainer | `false`：历史行为，所有样本 pad 到 `distill_model_max_length`；`true`：单样本仍先截断到 `distill_model_max_length`，batch 再 pad 到本 batch 最长长度并向上对齐到 8 的倍数。默认 `false` |
 | `--distill_teacher_logits_cpu_staging` | LoRA trainer | teacher forward 后把 logits 暂存 CPU（bf16），算 KL 前搬回 GPU；默认 `true` |
+| `--distill_teacher_model_offload` | LoRA trainer | 独立 frozen base teacher 的模型 offload 策略；`none` 常驻训练设备，`cpu` 在 teacher forward 前搬到训练设备、forward 后搬回 CPU |
 | `--distill_hif4_act` | LoRA trainer | 是否只在 LoRA 阶段对 student 线性层输入启用 HiFloat4 激活伪量化；默认 `false` |
 | `--eval_hif4_act` | cat_train eval | 是否在内部类别后评估时启用 HiFloat4 激活伪量化；默认 `false` |
 
@@ -389,6 +391,8 @@
 |---|---|---|---|
 | `none` | 不做每类后蒸馏 | 只保存 VAE 压缩结果 | 无 |
 | `remaining_lora` | 尚未压缩的剩余 dense `nn.Linear`，可选最终 norm / post-norm head | LoRA 训练后融合回 dense Linear；post-norm head 在最终保存前融合回 `lm_head` | 保留旧行为，支持 DoRA |
+| `remaining_lora_decoder` | 剩余 dense `nn.Linear` LoRA + 当前类别 VAE main decoder | LoRA 融合回 dense；decoder 训练后 finalize 并清 cache | decoder 参数组 weight decay 固定为 0；`distill_decoder_lr=none` 时继承 `distill_lr` |
+| `remaining_lora_all_decoder` | 剩余 dense `nn.Linear` LoRA + 已完成前缀类别 VAE main decoder | 同上 | inline DDP 支持；checkpoint-distill 不支持 |
 | `compressed_lora` | 当前刚压缩类别的 `VAELinear` LoRA（由 `--compressed_lora_scope` 决定 full / compressed_subspace） | `full`：预解码 dense base 后走现有 PEFT proxy；`compressed_subspace`：在压缩子空间 PEFT carrier 上训练；训练后导出为 `VAELinear.low_rank_a/b` 并恢复普通 `VAELinear` | v1 不支持 DoRA；不训练 final norm / post-norm head |
 | `decoder` | 当前刚压缩类别的 `VAELinear` decoder 参数 | 训练后关闭 trainable decode、拆回普通 decoder 并清 cache | 不训练 final norm / post-norm head |
 | `both` | 当前刚压缩类别的 decoder + LoRA（scope 同上） | decoder 收尾同 `decoder`；LoRA delta 导出为 `low_rank_a/b`；最终不保留 proxy | v1 不支持 DoRA；不训练 final norm / post-norm head |
@@ -396,10 +400,13 @@
 注意：
 
 - `--compressed_lora_scope` 默认 `full`；旧脚本不传时行为不变。`compressed_subspace` 时 protected channel 坐标上的 LoRA delta 为 0。整次运行全局 scope 必须一致，已有不同 scope 的 low-rank payload 会直接报错，不做自动转换。
-- 本参数只覆盖最终写回 `VAELinear.low_rank_a/b` 的 compressed LoRA；`remaining_lora` 与 block-level PEFT LoRA 不在此范围。
+- 本参数只覆盖最终写回 `VAELinear.low_rank_a/b` 的 compressed LoRA；remaining-family 与 block-level PEFT LoRA 不在此范围。
 - `compressed_lora` / `both` 如果 `--lora_use_dora` 解析为 `true` 会直接报错；v1 不做 DoRA 到低秩补丁的近似 SVD。
 - `compressed_lora` / `decoder` / `both` 如果开启 `--distill_tune_final_norm` 或 `--distill_use_post_norm_head_linear` 会直接报错，避免每类后移动最终 logits 路径。
 - 最终普通 cat checkpoint 不保留 `PeftVAELinearProxy` / `CompressedSubspacePeftProxy`；保存前若仍有 proxy 残留会直接报错。
+- distill metadata 中的 `teacher_required` 只由 `distill_loss_type`、`distill_hidden_loss_weight`、`distill_pre_mlp_hidden_loss_weight` 决定，不由 mode 名称决定。
+- `newly_compressed_target_count` / `trained_target_count` 统计当前 inline category 本轮新压缩出的 eligible `VAELinear` 数量；checkpoint-distill 不做新 VAE compression，因此恒为 `0`。
+- `resolved_decoder_lr` 记录实际 optimizer decoder 参数组学习率；`distill_decoder_lr=none` 时继承当前 `distill_lr`，无 decoder 参数组时为 `null`。
 
 ### 6.11.1 Prompt KD weighting（`--distill_prompt_kd_weight`）
 
@@ -558,7 +565,9 @@ VAE reconstruction -> protected_channel_residual_vae patch -> low_rank patch -> 
   - 上一次 `cat_train` 的 run 目录
   - run 目录下的 `final_model/`
   - 直接传 `checkpoint_meta.json`
-- 恢复后，已经被转换成 `VAELinear` 的模块不会再被 `collect_linears()` 收集，因此这些类别会自动跳过
+- 恢复后会读取 `checkpoint_meta.json` 里的 `completed_categories` 作为每类后蒸馏进度来源；`lora_round_idx` 初始值等于 `completed_categories` 数量
+- `completed_categories` 中的类别会在任何新 VAE compression / after-category recovery 前显式跳过；这也覆盖全 skip category 仍保持 `nn.Linear` 的情况
+- 新保存的 `after_<category>/` checkpoint 会写入包含当前 stage 的 `distill_stage_history`
 - 继续训练时，剩余仍是 `nn.Linear` 的类别会照常进入后续类别循环
 - 恢复时会优先使用 checkpoint meta 里的 `base_model_path`；如果 meta 没写，才回退到 `--model_path`
 - `--resume_from_checkpoint` 不能和 `--rot_llm` 同时使用，因为 checkpoint 已经包含要续训的模型权重
@@ -779,7 +788,7 @@ python tools/cat_distill_from_vae_checkpoint.py \
 
 说明：
 
-- `false`：按 `completed_categories` / 已有 `low_rank` 跳过，从未完成类继续
+- `false`：只按 `completed_categories` 跳过，从未完成类继续
 - `true`：不跳过；已有 LoRA 分支继续训并写回；`--lora_rank` 须与已有内维一致
 
 ## 10. 评估脚本（`scripts/eval.sh`）

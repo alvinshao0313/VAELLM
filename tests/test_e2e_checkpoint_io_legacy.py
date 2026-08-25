@@ -55,6 +55,9 @@ class _DummyModel(nn.Module):
         super().__init__()
         self.proj = nn.Linear(4, 4, bias=False)
 
+    def forward(self, x):
+        return self.proj(x)
+
 
 class _TinyLmHeadModel(nn.Module):
     def __init__(self):
@@ -356,6 +359,34 @@ class CheckpointBitpackIOTest(unittest.TestCase):
             self.assertEqual(meta["version"], 5)
             self.assertIsInstance(restored_model.proj, VAELinear)
             self.assertTrue(torch.allclose(model.proj._decode_weight(dtype=torch.float32), restored_model.proj._decode_weight(dtype=torch.float32)))
+
+    def test_mainline_vae_checkpoint_does_not_depend_on_original_weight(self):
+        layer, _, _ = _build_single_stage_vae_linear()
+        model = _DummyModel()
+        model.proj = layer
+        inputs = torch.randn(3, 4)
+        expected = model(inputs).detach()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_model_checkpoint(model, tmpdir, save_config=False)
+            state_dict = torch.load(os.path.join(tmpdir, "pytorch_model.bin"), map_location="cpu")
+            self.assertFalse(any(key.endswith(".original_weight") for key in state_dict))
+            with open(os.path.join(tmpdir, "checkpoint_meta.json"), "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            self.assertEqual(meta["converted_module_count"], 1)
+            spec = meta["converted_modules"][0]
+            self.assertIs(spec["has_original_weight"], False)
+            self.assertIs(spec["always_use_original"], False)
+            self.assertIs(spec["protect_original_weight"], False)
+
+            restored_model = _DummyModel()
+            restored_model, _meta, _ = load_checkpoint_into_model(restored_model, tmpdir)
+
+        self.assertIsInstance(restored_model.proj, VAELinear)
+        self.assertIsNone(restored_model.proj.original_weight)
+        self.assertIs(restored_model.proj.always_use_original, False)
+        self.assertIs(restored_model.proj.protect_original_weight, False)
+        self.assertTrue(torch.allclose(restored_model(inputs), expected))
 
     def test_load_old_checkpoint_rejects_with_conversion_message(self):
         layer, bits, decoder = _build_single_stage_vae_linear()

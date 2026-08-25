@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 from torch import nn
 
 import train_utils.cat_inline_distributed as cat_inline_distributed
+from train_utils.cat_train_pipeline import _validate_inline_distill_after_category
 from train_utils.cat_inline_distributed import (
     _pack_bool_tensors_for_transport,
     _resolve_cat_inline_vae_wait_timeout_sec,
@@ -157,7 +158,7 @@ class CatInlineDistributedTests(unittest.TestCase):
         self.assertEqual(received, [(0, [[True, False, True]]), (1, [[True, False, True]])])
 
     def test_gpu_launcher_validation_and_count(self):
-        script = "scripts/catlora_simple copy.sh"
+        script = "scripts/catlora_simple2.sh"
         prefix = "source <(sed -n '3,27p' \"$1\"); printf '%s:%s' \"$CUDA_VISIBLE_DEVICES\" \"$NPROC_PER_NODE\""
         for value, expected in (("5", "5:1"), ("5,6,7,8", "5,6,7,8:4"), ("0,2,4", "0,2,4:3")):
             result = subprocess.run(
@@ -178,3 +179,12 @@ class CatInlineDistributedTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
+
+    def test_inline_distill_after_category_allows_remaining_family(self):
+        for mode in ("remaining_lora", "remaining_lora_decoder", "remaining_lora_all_decoder"):
+            _validate_inline_distill_after_category(mode)
+
+    def test_inline_distill_after_category_rejects_compressed_modes(self):
+        for mode in ("compressed_lora", "decoder", "both"):
+            with self.assertRaises(ValueError):
+                _validate_inline_distill_after_category(mode)

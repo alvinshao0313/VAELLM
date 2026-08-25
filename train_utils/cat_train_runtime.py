@@ -1,8 +1,8 @@
 import argparse
 import json
 import os
-from dataclasses import asdict, is_dataclass
-from typing import Dict
+from dataclasses import asdict, dataclass, is_dataclass
+from typing import Dict, Optional, Tuple
 
 from torch import nn
 
@@ -38,6 +38,112 @@ from train_utils.utils import get_logger
 #     #     return max(1, min(int(cpu_count), max_tasks))
 #     # return max(1, min(requested, max_tasks))
 #     return 1
+
+
+@dataclass(frozen=True)
+class CatResumeDistillProgress:
+    completed_categories: Tuple[str, ...]
+    distill_stage_history: Tuple[Dict[str, object], ...]
+
+
+def _load_checkpoint_meta_payload(checkpoint_dir: str) -> Dict[str, object]:
+    meta_path = os.path.join(checkpoint_dir, META_FILENAME)
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    if not isinstance(meta, dict):
+        raise TypeError(f"{META_FILENAME} must contain a JSON object, got {type(meta)}.")
+    return meta
+
+
+def _resume_progress_source(meta: Dict[str, object]) -> Dict[str, object]:
+    extra_meta = meta.get("extra_meta")
+    if isinstance(extra_meta, dict):
+        return extra_meta
+    return meta
+
+
+def _validate_completed_categories(raw) -> Tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise TypeError(f"completed_categories must be a list/tuple, got {type(raw)}.")
+    completed = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("completed_categories entries must be non-empty strings.")
+        category = str(item)
+        if category in seen:
+            raise ValueError(f"completed_categories contains duplicate category: {category}")
+        seen.add(category)
+        completed.append(category)
+    return tuple(completed)
+
+
+def _validate_distill_stage_history(source: Dict[str, object]) -> Tuple[Dict[str, object], ...]:
+    raw_history = source.get("distill_stage_history")
+    if raw_history is not None:
+        if not isinstance(raw_history, (list, tuple)):
+            raise TypeError(f"distill_stage_history must be a list/tuple, got {type(raw_history)}.")
+        history = []
+        for item in raw_history:
+            if not isinstance(item, dict):
+                raise TypeError(f"distill_stage_history entries must be dicts, got {type(item)}.")
+            history.append(dict(item))
+        return tuple(history)
+
+    raw_stage = source.get("distill_stage")
+    if raw_stage is None:
+        return ()
+    if not isinstance(raw_stage, dict):
+        raise TypeError(f"distill_stage must be a dict when present, got {type(raw_stage)}.")
+    return (dict(raw_stage),)
+
+
+def load_cat_resume_distill_progress(
+    resume_from_checkpoint: Optional[str],
+) -> CatResumeDistillProgress:
+    if resume_from_checkpoint is None or not str(resume_from_checkpoint).strip():
+        return CatResumeDistillProgress(
+            completed_categories=(),
+            distill_stage_history=(),
+        )
+
+    checkpoint_dir = resolve_checkpoint_dir(str(resume_from_checkpoint))
+    meta = _load_checkpoint_meta_payload(checkpoint_dir)
+    source = _resume_progress_source(meta)
+    return CatResumeDistillProgress(
+        completed_categories=_validate_completed_categories(source.get("completed_categories")),
+        distill_stage_history=_validate_distill_stage_history(source),
+    )
+
+
+def normalize_cat_runtime_vae_original_state(model: nn.Module) -> int:
+    from litebsq.vae_linear import VAELinear
+
+    stripped = 0
+    legacy_skip_names = []
+    for name, module in model.named_modules():
+        if not isinstance(module, VAELinear):
+            continue
+        if bool(getattr(module, "always_use_original", False)) or bool(
+            getattr(module, "protect_original_weight", False)
+        ):
+            legacy_skip_names.append(str(name))
+            continue
+        if getattr(module, "original_weight", None) is not None:
+            module.register_parameter("original_weight", None)
+            stripped += 1
+        module.always_use_original = False
+        module.protect_original_weight = False
+        module.temporary = True
+        module.clear_decoded_weight_cache()
+    if legacy_skip_names:
+        raise ValueError(
+            "Legacy skip-as-VAELinear checkpoint is not supported by the new CAT skip semantics: "
+            + ", ".join(legacy_skip_names)
+        )
+    return stripped
 
 
 def _to_jsonable(value):
@@ -124,6 +230,9 @@ def load_model_for_cat_train(*, cat_args, hf_args, vae_args) -> nn.Module:
             len(getattr(load_result, "unexpected_keys", [])),
             str(load_meta.get("converted_module_count")),
         )
+        stripped = normalize_cat_runtime_vae_original_state(model)
+        if stripped:
+            log.info("Normalized resumed CAT checkpoint: stripped original_weight from %d VAELinear modules.", stripped)
         return model
 
     log.info("Loading model: %s", vae_args.model_path)

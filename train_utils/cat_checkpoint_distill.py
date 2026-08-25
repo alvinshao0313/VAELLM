@@ -8,7 +8,6 @@ from torch import nn
 
 from e2e_common.peft_proxy import PeftVAELinearProxy, iter_named_peft_vae_proxies
 from e2e_common.post_norm_head import fuse_post_norm_head_linear
-from e2e_common.temporary_switch_linear import TemporarySwitchLinear
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import (
@@ -16,19 +15,24 @@ from litebsq.vae_linear_prewarm import (
     clear_model_vae_linear_cache,
 )
 from train_utils.cat_after_category_distill import (
-    category_targets_have_low_rank,
     collect_compressed_category_targets,
     run_after_category_distill,
 )
 from train_utils.cat_arg_overrides import resolve_after_category_value
 from train_utils.cat_train_args import resolve_category_runtime_configs
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
-from train_utils.cat_train_runtime import save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot
+from train_utils.cat_train_runtime import (
+    normalize_cat_runtime_vae_original_state,
+    save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
+)
+from train_utils.base_reference import clone_frozen_linear_from_reference
+from train_utils.distill_teacher import DistillTeacherRuntime, resolve_distill_teacher_dtype
 from train_utils.lora_utils import (
     distill_distributed_barrier,
     ensure_distill_process_group_initialized,
     is_distill_distributed,
     is_distill_main_process,
+    resolve_distill_train_device,
 )
 from train_utils.model_checkpoint_io import (
     META_FILENAME,
@@ -59,9 +63,9 @@ class _NamedCategoryVAETarget:
 
 @dataclass
 class _CheckpointDistillResidency:
-    stashed_modules: Dict[str, nn.Module] = field(default_factory=dict)
-    original_weight_bank: Dict[str, nn.Parameter] = field(default_factory=dict)
-    managed_shapes: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    stashed_vae_modules: Dict[str, nn.Module] = field(default_factory=dict)
+    reference_dense_linears: Dict[str, nn.Linear] = field(default_factory=dict)
+    managed_categories: Dict[str, str] = field(default_factory=dict)
 
 
 def _category_of_module_name(name: str) -> str:
@@ -101,38 +105,6 @@ def _iter_named_vae_targets(model: nn.Module) -> List[_NamedCategoryVAETarget]:
     return targets
 
 
-def _detach_original_weight(base_layer: VAELinear) -> None:
-    """Drop original_weight from VAE so .cpu() cannot move shared bank Parameter."""
-    if getattr(base_layer, "original_weight", None) is None:
-        return
-    base_layer.register_parameter("original_weight", None)
-
-
-def _bind_original_weight(base_layer: VAELinear, weight: nn.Parameter) -> None:
-    weight.requires_grad = False
-    base_layer.original_weight = weight
-
-
-def _ensure_bank_param(
-    residency: _CheckpointDistillResidency,
-    *,
-    name: str,
-    source: torch.Tensor,
-    device: torch.device,
-) -> nn.Parameter:
-    existing = residency.original_weight_bank.get(name)
-    if existing is not None:
-        if existing.device != device:
-            existing.data = existing.data.to(device=device, non_blocking=True)
-        existing.requires_grad = False
-        return existing
-    data = source.detach().to(device=device)
-    param = nn.Parameter(data, requires_grad=False)
-    residency.original_weight_bank[name] = param
-    residency.managed_shapes[name] = (int(param.shape[0]), int(param.shape[1]))
-    return param
-
-
 def _stash_vae_module_to_cpu(
     *,
     name: str,
@@ -141,119 +113,20 @@ def _stash_vae_module_to_cpu(
 ) -> None:
     base_layer = _resolve_vae_base_layer(module)
     base_layer.clear_decoded_weight_cache()
-    _detach_original_weight(base_layer)
     module.to("cpu")
-    residency.stashed_modules[name] = module
-
-
-def _make_frozen_linear_from_bank(
-    *,
-    name: str,
-    bank_weight: nn.Parameter,
-    bias: Optional[torch.Tensor],
-    in_features: int,
-    out_features: int,
-) -> nn.Linear:
-    if tuple(bank_weight.shape) != (int(out_features), int(in_features)):
-        raise ValueError(
-            f"{name}: bank weight shape {tuple(bank_weight.shape)} != ({int(out_features)}, {int(in_features)})"
-        )
-    linear = nn.Linear(
-        int(in_features),
-        int(out_features),
-        bias=bias is not None,
-        device=bank_weight.device,
-        dtype=bank_weight.dtype,
-    )
-    linear.weight = bank_weight
-    if bias is not None:
-        if tuple(bias.shape) != (int(out_features),):
-            raise ValueError(f"{name}: bias shape {tuple(bias.shape)} != ({int(out_features)},)")
-        bias_param = bias if isinstance(bias, nn.Parameter) else nn.Parameter(bias.detach().clone())
-        bias_param.requires_grad = False
-        if bias_param.device != bank_weight.device or bias_param.dtype != bank_weight.dtype:
-            bias_param = nn.Parameter(
-                bias_param.detach().to(device=bank_weight.device, dtype=bank_weight.dtype),
-                requires_grad=False,
-            )
-        linear.bias = bias_param
-    linear.requires_grad_(False)
-    linear.eval()
-    return linear
-
-
-def _make_switch_linear_from_vae(
-    *,
-    name: str,
-    base_layer: VAELinear,
-    bank_weight: nn.Parameter,
-    dtype: torch.dtype,
-) -> TemporarySwitchLinear:
-    del name  # used by callers for error context only
-    compute_device = bank_weight.device
-    sample_param = next(base_layer.parameters(), None)
-    if sample_param is None or sample_param.device != compute_device:
-        base_layer.to(compute_device)
-    decoded = base_layer._decode_weight(dtype=dtype).detach().to(device=compute_device, dtype=dtype)
-    student = nn.Parameter(decoded, requires_grad=False)
-    bias = getattr(base_layer, "bias", None)
-    bias_tensor = None if bias is None else bias.detach().to(device=compute_device, dtype=dtype)
-    return TemporarySwitchLinear(
-        in_features=int(base_layer.in_features),
-        out_features=int(base_layer.out_features),
-        student_weight=student,
-        teacher_weight=bank_weight,
-        bias=bias_tensor,
-    )
+    residency.stashed_vae_modules[name] = module
 
 
 def _ensure_managed_name_inventory(
     *,
     model: nn.Module,
     residency: _CheckpointDistillResidency,
-    device: torch.device,
 ) -> List[str]:
-    """Populate bank from live VAE targets and return all managed module names."""
     for target in _iter_named_vae_targets(model):
-        original = getattr(target.base_layer, "original_weight", None)
-        if original is None and target.name not in residency.original_weight_bank:
-            raise RuntimeError(
-                f"{target.name}: original_weight is required for checkpoint-distill residency bank."
-            )
-        if original is not None:
-            bank_param = _ensure_bank_param(
-                residency,
-                name=target.name,
-                source=original,
-                device=device,
-            )
-            _bind_original_weight(target.base_layer, bank_param)
-            residency.managed_shapes[target.name] = (
-                int(target.base_layer.out_features),
-                int(target.base_layer.in_features),
-            )
-        elif target.name in residency.original_weight_bank:
-            _bind_original_weight(target.base_layer, residency.original_weight_bank[target.name])
-
-    for name, module in list(residency.stashed_modules.items()):
-        base_layer = _resolve_vae_base_layer(module)
-        residency.managed_shapes.setdefault(
-            name,
-            (int(base_layer.out_features), int(base_layer.in_features)),
-        )
-        if name not in residency.original_weight_bank:
-            original = getattr(base_layer, "original_weight", None)
-            if original is None:
-                raise RuntimeError(f"{name}: stashed VAELinear missing original_weight and bank entry.")
-            _ensure_bank_param(residency, name=name, source=original, device=device)
-            _detach_original_weight(base_layer)
-
-    names: Set[str] = set(residency.original_weight_bank.keys())
-    names.update(residency.stashed_modules.keys())
-    names.update(residency.managed_shapes.keys())
-    for name, module in model.named_modules():
-        if isinstance(module, (VAELinear, PeftVAELinearProxy, TemporarySwitchLinear)):
-            names.add(str(name))
+        residency.managed_categories.setdefault(str(target.name), str(target.category))
+    names = set(residency.managed_categories.keys())
+    names.update(residency.stashed_vae_modules.keys())
+    names.update(residency.reference_dense_linears.keys())
     return sorted(names)
 
 
@@ -322,50 +195,34 @@ def _get_module_by_name(model: nn.Module, name: str) -> Optional[nn.Module]:
     return module
 
 
-def _materialize_name_to_switch_linear(
+def _get_or_create_reference_linear(
     *,
-    model: nn.Module,
+    teacher_runtime,
     name: str,
     residency: _CheckpointDistillResidency,
     device: torch.device,
     dtype: torch.dtype,
-) -> None:
-    module = _get_module_by_name(model, name)
-    bank_weight = residency.original_weight_bank[name]
-    if bank_weight.device != device:
-        bank_weight.data = bank_weight.data.to(device=device, non_blocking=True)
-
-    if isinstance(module, TemporarySwitchLinear):
-        if module.teacher_weight is not bank_weight:
-            module.register_parameter("teacher_weight", bank_weight)
-        module.set_temporary(True)
-        module.to(device)
-        return
-
-    if name in residency.stashed_modules:
-        vae_module = residency.stashed_modules.pop(name)
-        set_module_by_name(model, name, vae_module)
-        module = vae_module
-
-    if module is None:
-        raise RuntimeError(f"{name}: cannot materialize completed category; module missing.")
-    if not isinstance(module, (VAELinear, PeftVAELinearProxy)):
-        raise TypeError(f"{name}: expected VAELinear to materialize, got {type(module)}")
-
-    base_layer = _resolve_vae_base_layer(module)
-    if getattr(base_layer, "original_weight", None) is None:
-        _bind_original_weight(base_layer, bank_weight)
-    switch = _make_switch_linear_from_vae(
-        name=name,
-        base_layer=base_layer,
-        bank_weight=bank_weight,
+) -> nn.Linear:
+    existing = residency.reference_dense_linears.get(name)
+    if existing is not None:
+        existing.to(device=device, dtype=dtype)
+        existing.requires_grad_(False)
+        existing.eval()
+        return existing
+    if teacher_runtime is None:
+        raise RuntimeError("checkpoint-distill residency requires independent teacher_runtime for reference clones.")
+    reference_model = teacher_runtime.get_or_load()
+    clone = clone_frozen_linear_from_reference(
+        reference_model,
+        name,
+        device=device,
         dtype=dtype,
     )
-    _stash_vae_module_to_cpu(name=name, module=module, residency=residency)
-    set_module_by_name(model, name, switch)
+    residency.reference_dense_linears[name] = clone
+    return clone
 
 
-def _ensure_current_vae_on_model(
+def _ensure_active_vae(
     *,
     model: nn.Module,
     name: str,
@@ -375,63 +232,55 @@ def _ensure_current_vae_on_model(
     module = _get_module_by_name(model, name)
     if isinstance(module, (VAELinear, PeftVAELinearProxy)):
         base_layer = _resolve_vae_base_layer(module)
-        _bind_original_weight(base_layer, residency.original_weight_bank[name])
-        if callable(getattr(module, "set_temporary", None)):
-            module.set_temporary(True)
-        else:
-            base_layer.set_temporary(True)
         base_layer.clear_decoded_weight_cache()
         module.to(device)
         return
 
-    if name not in residency.stashed_modules:
-        raise RuntimeError(f"{name}: active non-completed category missing VAELinear stash.")
-    vae_module = residency.stashed_modules.pop(name)
+    if not isinstance(module, nn.Linear):
+        raise TypeError(f"{name}: expected active VAELinear or reference nn.Linear, got {type(module)}.")
+    if name not in residency.stashed_vae_modules:
+        raise RuntimeError(f"{name}: active category missing stashed VAELinear.")
+    vae_module = residency.stashed_vae_modules.pop(name)
     base_layer = _resolve_vae_base_layer(vae_module)
-    _bind_original_weight(base_layer, residency.original_weight_bank[name])
-    if callable(getattr(vae_module, "set_temporary", None)):
-        vae_module.set_temporary(True)
-    else:
-        base_layer.set_temporary(True)
     base_layer.clear_decoded_weight_cache()
     vae_module.to(device)
     set_module_by_name(model, name, vae_module)
+    module.to("cpu")
 
 
-def _ensure_future_linear_on_model(
+def _ensure_inactive_reference_linear(
     *,
     model: nn.Module,
     name: str,
     residency: _CheckpointDistillResidency,
+    teacher_runtime,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> None:
-    bank_weight = residency.original_weight_bank[name]
-    if bank_weight.device != device:
-        bank_weight.data = bank_weight.data.to(device=device, non_blocking=True)
-
     module = _get_module_by_name(model, name)
-    out_features, in_features = residency.managed_shapes.get(name, (int(bank_weight.shape[0]), int(bank_weight.shape[1])))
-    bias = None
     if isinstance(module, (VAELinear, PeftVAELinearProxy)):
-        base_layer = _resolve_vae_base_layer(module)
-        bias = getattr(base_layer, "bias", None)
         _stash_vae_module_to_cpu(name=name, module=module, residency=residency)
-    elif isinstance(module, TemporarySwitchLinear):
-        bias = module.bias
-        if name not in residency.stashed_modules:
-            raise RuntimeError(
-                f"{name}: TemporarySwitchLinear leaving active prefix without stashed VAELinear."
-            )
-    elif isinstance(module, nn.Linear) and module.weight is bank_weight:
-        module.to(device)
+    elif isinstance(module, nn.Linear):
+        reference = _get_or_create_reference_linear(
+            teacher_runtime=teacher_runtime,
+            name=name,
+            residency=residency,
+            device=device,
+            dtype=dtype,
+        )
+        if module is not reference:
+            raise TypeError(f"{name}: live nn.Linear is not the managed reference clone.")
+        reference.to(device=device, dtype=dtype)
         return
+    else:
+        raise TypeError(f"{name}: expected inactive VAELinear or managed reference nn.Linear, got {type(module)}.")
 
-    linear = _make_frozen_linear_from_bank(
+    linear = _get_or_create_reference_linear(
+        teacher_runtime=teacher_runtime,
         name=name,
-        bank_weight=bank_weight,
-        bias=None if bias is None else bias.detach(),
-        in_features=int(in_features),
-        out_features=int(out_features),
+        residency=residency,
+        device=device,
+        dtype=dtype,
     )
     set_module_by_name(model, name, linear)
 
@@ -440,32 +289,21 @@ def _apply_checkpoint_distill_residency(
     *,
     model: nn.Module,
     active_categories: Sequence[str],
-    completed_categories: Sequence[str],
     residency: _CheckpointDistillResidency,
+    teacher_runtime,
     device: torch.device,
     dtype: torch.dtype,
     logger,
 ) -> None:
     active_set = {str(category) for category in active_categories}
-    completed_set = {str(category) for category in completed_categories}
-    managed_names = _ensure_managed_name_inventory(model=model, residency=residency, device=device)
+    managed_names = _ensure_managed_name_inventory(model=model, residency=residency)
 
-    dual_count = 0
     active_vae = 0
-    future_count = 0
+    inactive_reference_linear = 0
     for name in managed_names:
         category = _category_of_module_name(name)
-        if category in active_set and category in completed_set:
-            _materialize_name_to_switch_linear(
-                model=model,
-                name=name,
-                residency=residency,
-                device=device,
-                dtype=dtype,
-            )
-            dual_count += 1
-        elif category in active_set:
-            _ensure_current_vae_on_model(
+        if category in active_set:
+            _ensure_active_vae(
                 model=model,
                 name=name,
                 residency=residency,
@@ -473,24 +311,24 @@ def _apply_checkpoint_distill_residency(
             )
             active_vae += 1
         else:
-            _ensure_future_linear_on_model(
+            _ensure_inactive_reference_linear(
                 model=model,
                 name=name,
                 residency=residency,
+                teacher_runtime=teacher_runtime,
                 device=device,
+                dtype=dtype,
             )
-            future_count += 1
+            inactive_reference_linear += 1
 
     logger.info(
-        "Checkpoint distill residency: active_categories=%s completed=%s "
-        "switch_linear=%d active_vae=%d future_linear=%d total_stashed=%d bank=%d",
+        "Checkpoint distill residency: active_categories=%s active_vae=%d "
+        "inactive_reference_linear=%d stashed_vae=%d reference_clone_cache_size=%d",
         ",".join(str(category) for category in active_categories),
-        ",".join(str(category) for category in completed_categories) if completed_categories else "(none)",
-        int(dual_count),
         int(active_vae),
-        int(future_count),
-        int(len(residency.stashed_modules)),
-        int(len(residency.original_weight_bank)),
+        int(inactive_reference_linear),
+        int(len(residency.stashed_vae_modules)),
+        int(len(residency.reference_dense_linears)),
     )
 
 
@@ -501,16 +339,19 @@ def _restore_checkpoint_distill_residency(
     logger,
 ) -> None:
     restored = 0
-    for name, module in list(residency.stashed_modules.items()):
+    for name, module in list(residency.stashed_vae_modules.items()):
         base_layer = _resolve_vae_base_layer(module)
         base_layer.clear_decoded_weight_cache()
-        bank_weight = residency.original_weight_bank.get(name)
-        if bank_weight is None:
-            raise RuntimeError(f"{name}: missing original_weight_bank entry during residency restore.")
-        _bind_original_weight(base_layer, bank_weight)
         set_module_by_name(model, name, module)
-        del residency.stashed_modules[name]
+        del residency.stashed_vae_modules[name]
         restored += 1
+    removed_reference = 0
+    for name, reference in list(residency.reference_dense_linears.items()):
+        live = _get_module_by_name(model, name)
+        if live is reference:
+            raise RuntimeError(f"{name}: reference clone still live after restoring all VAELinear modules.")
+        reference.to("cpu")
+        removed_reference += 1
     logger.info("Checkpoint distill residency: restored stashed VAELinear modules=%d", int(restored))
 
 
@@ -532,7 +373,7 @@ def _resolve_residency_dtype(*, bf16: bool, fp16: bool) -> torch.dtype:
     return torch.float32
 
 
-def _set_active_vae_category_prefix(
+def _collect_active_vae_prewarm_targets(
     *,
     model: nn.Module,
     active_categories: Sequence[str],
@@ -540,47 +381,16 @@ def _set_active_vae_category_prefix(
 ) -> List[NamedVAELinearTarget]:
     active_set = {str(category) for category in active_categories}
     prewarm_targets: List[NamedVAELinearTarget] = []
-    missing_original: List[str] = []
-    compressed_count = 0
-    original_count = 0
-    switch_count = 0
-
-    for name, module in model.named_modules():
-        if isinstance(module, TemporarySwitchLinear):
-            module.set_temporary(True)
-            switch_count += 1
 
     for target in _iter_named_vae_targets(model):
-        active = target.category in active_set
-        if callable(getattr(target.module, "set_temporary", None)):
-            target.module.set_temporary(active)
-        else:
-            target.base_layer.set_temporary(active)
         target.base_layer.clear_decoded_weight_cache()
-
-        use_original = bool(getattr(target.base_layer, "always_use_original", False)) or not bool(
-            getattr(target.base_layer, "temporary", True)
-        )
-        if use_original:
-            original_count += 1
-            if getattr(target.base_layer, "original_weight", None) is None:
-                missing_original.append(target.name)
-        else:
-            compressed_count += 1
-        if active:
+        if target.category in active_set:
             prewarm_targets.append(NamedVAELinearTarget(name=target.name, base_layer=target.base_layer))
 
-    if missing_original:
-        raise RuntimeError(
-            "Original-weight path requested but original_weight is missing for: "
-            + ", ".join(missing_original)
-        )
     logger.info(
-        "Checkpoint distill active categories=%s compressed_vae=%d original_vae=%d switch_linear=%d",
+        "Checkpoint distill active categories=%s active_prewarm_targets=%d",
         ",".join(str(category) for category in active_categories),
-        int(compressed_count),
-        int(original_count),
-        int(switch_count),
+        int(len(prewarm_targets)),
     )
     return prewarm_targets
 
@@ -597,7 +407,7 @@ def _restore_final_vae_representation(
         residency=residency,
         logger=logger,
     )
-    return _set_active_vae_category_prefix(
+    return _collect_active_vae_prewarm_targets(
         model=model,
         active_categories=list(completed_categories),
         logger=logger,
@@ -625,14 +435,16 @@ def _load_checkpoint_for_distill(*, cat_args, hf_args, vae_args, logger) -> nn.M
         base_model_path=str(base_model_path),
         map_location="cpu",
         strict=True,
-        preserve_original_weights_from_base=True,
+        preserve_original_weights_from_base=False,
     )
+    stripped = normalize_cat_runtime_vae_original_state(model)
     vae_args.model_path = str(load_meta.get("base_model_path") or base_model_path)
     logger.info(
-        "Checkpoint loaded for distill. missing_keys=%d unexpected_keys=%d converted_module_count=%s",
+        "Checkpoint loaded for distill. missing_keys=%d unexpected_keys=%d converted_module_count=%s stripped_original_weight=%d",
         len(getattr(load_result, "missing_keys", [])),
         len(getattr(load_result, "unexpected_keys", [])),
         str(load_meta.get("converted_module_count")),
+        int(stripped),
     )
     return model
 
@@ -687,7 +499,7 @@ def _save_distill_model(
         tokenizer=tok,
         save_config=True,
         extra_meta=extra_meta,
-        unload_vae_original_weights=bool(unload_vae_original_weights),
+        unload_vae_original_weights=False,
     )
     logger.info("Saved model to %s", save_paths["output_dir"])
 
@@ -713,7 +525,7 @@ def _save_final_model(
             "stage": "final",
             "completed_categories": [str(item) for item in (completed_categories or [])],
         },
-        unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
+        unload_vae_original_weights=False,
     )
 
 
@@ -730,6 +542,7 @@ def _save_after_category_checkpoint(
     hf_args,
     vae_args,
     training_args,
+    teacher_runtime,
     logger,
 ) -> None:
     # All ranks restore so DDP model graphs stay aligned; only rank0 writes.
@@ -762,13 +575,13 @@ def _save_after_category_checkpoint(
         _apply_checkpoint_distill_residency(
             model=model,
             active_categories=active_categories,
-            completed_categories=completed_categories,
             residency=residency,
+            teacher_runtime=teacher_runtime,
             device=residency_device,
             dtype=residency_dtype,
             logger=logger,
         )
-        _set_active_vae_category_prefix(
+        _collect_active_vae_prewarm_targets(
             model=model,
             active_categories=active_categories,
             logger=logger,
@@ -817,6 +630,14 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     )
 
     model = _load_checkpoint_for_distill(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args, logger=logger)
+    teacher_runtime = DistillTeacherRuntime(
+        model_path=str(vae_args.model_path),
+        access_token=hf_args.access_token,
+        forward_device=resolve_distill_train_device(cat_args.train_device),
+        dtype=resolve_distill_teacher_dtype(training_args, model),
+        model_offload=str(getattr(training_args, "distill_teacher_model_offload", "none")),
+        logger=logger,
+    )
     _apply_vae_decoder_checkpoint_override(model=model, vae_args=vae_args, logger=logger, mode=mode)
     transpose_modules = _split_csv(cat_args.transpose_modules)
     target_categories = _split_csv(cat_args.target_categories)
@@ -886,7 +707,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         bf16=bool(getattr(training_args, "bf16", False)),
         fp16=bool(getattr(training_args, "fp16", False)),
     )
-    lora_round_idx = 0
+    lora_round_idx = int(len(completed_categories))
     active_categories: List[str] = []
     completed_categories = list(completed_categories)
     independent_categories = bool(getattr(cat_args, "distill_independent_categories", False))
@@ -904,13 +725,13 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         _apply_checkpoint_distill_residency(
             model=model,
             active_categories=round_active_categories,
-            completed_categories=completed_categories,
             residency=residency,
+            teacher_runtime=teacher_runtime,
             device=residency_device,
             dtype=residency_dtype,
             logger=logger,
         )
-        prewarm_targets = _set_active_vae_category_prefix(
+        prewarm_targets = _collect_active_vae_prewarm_targets(
             model=model,
             active_categories=round_active_categories,
             logger=logger,
@@ -920,10 +741,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         skip_from_progress = str(category) in set(completed_categories)
         if skip_from_progress:
             logger.info(
-                "Checkpoint distill: category=%s 已在 completed_categories 中，跳过蒸馏（已物化为 TemporarySwitchLinear）。",
+                "Checkpoint distill: category=%s 已在 completed_categories 中，跳过蒸馏。",
                 str(category),
             )
-            lora_round_idx = int(lora_round_idx) + 1
             continue
 
         category_steps = int(resolve_after_category_value(cat_args.distill_steps, category))
@@ -963,19 +783,20 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             transpose_modules=transpose_modules,
             only_decoder_projections=only_decoder_projections,
             target_categories=target_categories,
+            teacher_runtime=teacher_runtime,
+            newly_compressed_target_count=0,
         )
         model = distill_result.model
         lora_round_idx = int(distill_result.next_lora_round_idx)
 
-        if int(distill_result.trained_target_count) > 0:
+        if bool(distill_result.did_train):
             if str(category) not in completed_categories:
                 completed_categories.append(str(category))
-            # Materialize this category to TemporarySwitchLinear before save/eval.
             _apply_checkpoint_distill_residency(
                 model=model,
                 active_categories=round_active_categories,
-                completed_categories=completed_categories,
                 residency=residency,
+                teacher_runtime=teacher_runtime,
                 device=residency_device,
                 dtype=residency_dtype,
                 logger=logger,
@@ -993,23 +814,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                     hf_args=hf_args,
                     vae_args=vae_args,
                     training_args=training_args,
-                    logger=logger,
-                )
-        elif mode in {"compressed_lora", "both"}:
-            if category_targets_have_low_rank(collect_compressed_category_targets(model, category)):
-                if str(category) not in completed_categories:
-                    completed_categories.append(str(category))
-                    logger.info(
-                        "Checkpoint distill: category=%s 因已有 low_rank_a/b 记入 completed_categories。",
-                        str(category),
-                    )
-                _apply_checkpoint_distill_residency(
-                    model=model,
-                    active_categories=round_active_categories,
-                    completed_categories=completed_categories,
-                    residency=residency,
-                    device=residency_device,
-                    dtype=residency_dtype,
+                    teacher_runtime=teacher_runtime,
                     logger=logger,
                 )
 

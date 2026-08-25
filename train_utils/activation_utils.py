@@ -375,7 +375,7 @@ def collect_mlp_block_activation_stats(
     for layer_idx in requested:
         if int(layer_idx) < 0 or int(layer_idx) >= len(layers):
             raise ValueError(f"layer_idx={layer_idx} is out of range for model with {len(layers)} layers.")
-        if any((int(layer_idx), cat) in skipped for cat in ("gate_proj", "up_proj", "down_proj")):
+        if all((int(layer_idx), cat) in skipped for cat in ("gate_proj", "up_proj", "down_proj")):
             continue
         layer = layers[int(layer_idx)]
         mlp = getattr(layer, "mlp", None)

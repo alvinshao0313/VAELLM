@@ -175,6 +175,19 @@ class _PreMlpFakeCausalLM(nn.Module):
         return _FakeOutput(loss=loss, logits=logits, hidden_states=packed)
 
 
+class _StaticTeacherRuntime:
+    model_offload = "none"
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+
+    def prepare_for_forward(self) -> nn.Module:
+        return self.model
+
+    def finish_forward(self) -> None:
+        return None
+
+
 def _e2e_inputs(*, seq_len: int = 8) -> dict[str, torch.Tensor]:
     assert seq_len <= 128
     input_ids = torch.arange(1, seq_len + 1, dtype=torch.long).unsqueeze(0)
@@ -341,6 +354,10 @@ def _build_pre_mlp_trainer(
     hidden_alignment_layer_weighting: str,
 ) -> CustomSFTTrainer:
     trainer = CustomSFTTrainer.__new__(CustomSFTTrainer)
+    teacher = _PreMlpFakeCausalLM()
+    teacher.eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad = False
     trainer.args = SimpleNamespace(bf16=False, fp16=False)
     trainer.loss_type = "sft"
     trainer.temperature = 1.0
@@ -353,6 +370,7 @@ def _build_pre_mlp_trainer(
     )
     trainer.eakld_confidence_k = 16
     trainer.teacher_logits_cpu_staging = False
+    trainer.teacher_runtime = _StaticTeacherRuntime(teacher)
     trainer.distill_hif4_act_controller = None
     trainer.teacher_param_snapshots = []
     trainer.accelerator = None
@@ -370,13 +388,13 @@ def _pre_mlp_inputs() -> dict[str, torch.Tensor]:
 
 
 @pytest.mark.parametrize(
-    "weighting,expected_hidden_calls",
+    "weighting,expected_teacher_hidden_calls",
     (
-        ("uniform", [False, False]),
-        ("adaptive_top_3", [True, False]),
+        ("uniform", [False]),
+        ("adaptive_top_3", [True]),
     ),
 )
-def test_pre_mlp_only_one_step_smoke(weighting: str, expected_hidden_calls: list[bool]) -> None:
+def test_pre_mlp_only_one_step_smoke(weighting: str, expected_teacher_hidden_calls: list[bool]) -> None:
     """Step 3: category distill pre-MLP-only (uniform + adaptive_top_3)."""
     model = _PreMlpFakeCausalLM()
     trainer = _build_pre_mlp_trainer(hidden_alignment_layer_weighting=weighting)
@@ -396,7 +414,8 @@ def test_pre_mlp_only_one_step_smoke(weighting: str, expected_hidden_calls: list
         else:
             assert pre_kwargs["teacher_reference_hidden"] is not None
 
-    assert model.output_hidden_states_calls == expected_hidden_calls
+    assert model.output_hidden_states_calls == [False]
+    assert trainer.teacher_runtime.model.output_hidden_states_calls == expected_teacher_hidden_calls
     assert torch.isfinite(loss).item()
 
     optimizer.zero_grad(set_to_none=True)

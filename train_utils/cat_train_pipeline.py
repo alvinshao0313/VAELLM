@@ -14,16 +14,20 @@ if _REPO_ROOT not in sys.path:
 
 from train_utils.train_args import create_optimizer
 from train_utils.cat_train_args import (
+    _DISTILL_AFTER_CATEGORY_REMAINING_MODES,
     ResolvedCategoryRuntimeConfig,
     process_cat_train_args,
     resolve_category_runtime_configs,
     resolve_skip_layer_matches,
 )
 from train_utils.cat_after_category_distill import run_after_category_distill
+from train_utils.distill_teacher import DistillTeacherRuntime, resolve_distill_teacher_dtype
 from train_utils.cat_train_runtime import (
+    load_cat_resume_distill_progress,
     load_model_for_cat_train as _load_model_for_cat_train,
     save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
 )
+from train_utils.lora_utils import resolve_distill_train_device
 from train_utils.cat_train_residual_protection import (
     RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX as _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX,
     RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN as _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN,
@@ -103,6 +107,15 @@ from train_utils.utils import (
 
 
 log = get_logger("linear_by_category")
+
+
+def _validate_inline_distill_after_category(mode: str) -> None:
+    resolved = str(mode).strip().lower()
+    if resolved not in _DISTILL_AFTER_CATEGORY_REMAINING_MODES:
+        raise ValueError(
+            "WORLD_SIZE > 1 inline cat_train requires --distill_after_category to be one of: "
+            + ",".join(sorted(_DISTILL_AFTER_CATEGORY_REMAINING_MODES))
+        )
 
 
 def _safe_shared_decoder_ref(value: str) -> str:
@@ -806,6 +819,33 @@ def _collect_sorted_category_refs(
     return refs_sorted, missing
 
 
+def _filter_eligible_vae_refs(
+    refs_sorted: Sequence[Tuple[int, LinearRef]],
+    skip_layer_keys: Set[Tuple[int, str]],
+) -> List[Tuple[int, LinearRef]]:
+    skipped = {
+        (int(layer_idx), str(category))
+        for layer_idx, category in (skip_layer_keys or set())
+    }
+    eligible: List[Tuple[int, LinearRef]] = []
+    for layer_idx, ref in refs_sorted:
+        if (int(layer_idx), str(ref.category)) in skipped:
+            continue
+        eligible.append((int(layer_idx), ref))
+    return eligible
+
+
+def _is_skipped_linear_ref(ref: LinearRef, skip_layer_keys: Set[Tuple[int, str]]) -> bool:
+    layer_idx = _extract_layer_idx(ref.name)
+    return (
+        layer_idx is not None
+        and (int(layer_idx), str(ref.category)) in {
+            (int(skipped_layer_idx), str(skipped_category))
+            for skipped_layer_idx, skipped_category in (skip_layer_keys or set())
+        }
+    )
+
+
 def _build_vae_linear_from_stage_payload(
     *,
     old_module: nn.Module,
@@ -819,9 +859,6 @@ def _build_vae_linear_from_stage_payload(
     parallel_cols: int,
     parallel_parts: int,
     bias,
-    original_weight,
-    always_use_original: bool,
-    protect_original_weight: bool,
     sparse_residual_kwargs: Optional[Dict[str, object]] = None,
     protected_residual_kwargs: Optional[Dict[str, object]] = None,
     protected_channel_quant_format: str = "none",
@@ -847,7 +884,7 @@ def _build_vae_linear_from_stage_payload(
         in_features=old_module.in_features,
         out_features=old_module.out_features,
         bias=bias,
-        original_weight=original_weight,
+        original_weight=None,
         codebook_dim=int(stage_codebook_dims[0]),
         stage_codebook_dims=list(int(v) for v in stage_codebook_dims),
         transpose=bool(transpose),
@@ -873,8 +910,8 @@ def _build_vae_linear_from_stage_payload(
         protected_output_qvalues=split_meta.protected_output_qvalues,
         protected_output_scales=split_meta.protected_output_scales,
         protected_channel_quant_format=str(protected_channel_quant_format),
-        always_use_original=bool(always_use_original),
-        protect_original_weight=bool(protect_original_weight),
+        always_use_original=False,
+        protect_original_weight=False,
     )
     if sparse_residual_kwargs:
         common_kwargs.update(dict(sparse_residual_kwargs))
@@ -920,9 +957,6 @@ def _decode_reconstructed_linear_weight(
         parallel_cols=parallel_cols,
         parallel_parts=parallel_parts,
         bias=None,
-        original_weight=None,
-        always_use_original=False,
-        protect_original_weight=False,
     )
     return temp_linear._decode_weight(dtype=torch.float32).detach().to(device="cpu", dtype=torch.float32)
 
@@ -1223,7 +1257,6 @@ def train_group_vae_payload(
     eval_every: int,
     eval_blocks: int,
     gpu_resident_data: bool = False,
-    skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
     outlier_protect_mode: str = "channel",
     outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
@@ -2194,7 +2227,6 @@ def apply_group_vae_payload(
     group_tag: str,
     payload: Dict[str, Any],
     convert_device: str,
-    skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
 ) -> None:
     if str(payload.get("format", "")) != "vaellm_group_vae_payload":
         raise ValueError(f"[{group_tag}] invalid VAE payload format: {payload.get('format')!r}.")
@@ -2250,12 +2282,6 @@ def apply_group_vae_payload(
                 f"[{group_tag}] split parts mismatch at idx={i}: "
                 f"meta={split_meta.parallel_rows}x{split_meta.parallel_cols}, expected={parts_per_linear}"
             )
-        layer_idx = _extract_layer_idx(r.name)
-        skip_this = bool(
-            skip_layer_keys
-            and layer_idx is not None
-            and (int(layer_idx), str(r.category)) in skip_layer_keys
-        )
         start_idx = i * parts_per_linear
         end_idx = start_idx + parts_per_linear
         stage_part_bits_payload: List[object] = []
@@ -2309,7 +2335,7 @@ def apply_group_vae_payload(
                 raise RuntimeError(f"[{group_tag}] missing reconstructed weight for residual_sparse payload.")
             sparse_residual_kwargs, sparse_nnz, sparse_storage = _build_sparse_residual_payload(
                 linear_name=r.name,
-                original_weight=old.weight,
+                target_weight=old.weight,
                 reconstructed_weight=reconstructed_weight,
                 activation_weight=activation_weight,
                 activation_mean=activation_mean,
@@ -2359,9 +2385,6 @@ def apply_group_vae_payload(
             parallel_cols=col_parts,
             parallel_parts=parts_per_linear,
             bias=old.bias,
-            original_weight=old.weight,
-            always_use_original=skip_this,
-            protect_original_weight=skip_this,
             sparse_residual_kwargs=sparse_residual_kwargs,
             protected_residual_kwargs=protected_residual_kwargs,
             protected_channel_quant_format=protected_channel_quant_format,
@@ -2388,7 +2411,6 @@ def _train_group_vae_and_replace(
     eval_every: int,
     eval_blocks: int,
     gpu_resident_data: bool = False,
-    skip_layer_keys: Optional[Set[Tuple[int, str]]] = None,
     activation_runtime: Optional[Dict[str, object]] = None,
     outlier_protect_mode: str = "channel",
     outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
@@ -2427,7 +2449,6 @@ def _train_group_vae_and_replace(
         log_every=log_every,
         eval_every=eval_every,
         eval_blocks=eval_blocks,
-        skip_layer_keys=skip_layer_keys,
         activation_runtime=activation_runtime,
         outlier_protect_mode=outlier_protect_mode,
         outlier_channel_plan=outlier_channel_plan,
@@ -2458,7 +2479,6 @@ def _train_group_vae_and_replace(
         group_tag=group_tag,
         payload=payload,
         convert_device=convert_device,
-        skip_layer_keys=skip_layer_keys,
     )
 
 
@@ -2469,7 +2489,7 @@ def _train_group_vae_and_replace_inline_distributed(
     group_tag: str,
     inline_distributed: bool,
     **vae_group_kwargs,
-) -> None:
+) -> int:
     """Run VAE on rank 0, then apply its broadcast payload on every rank."""
     if not inline_distributed:
         _train_group_vae_and_replace(
@@ -2478,7 +2498,7 @@ def _train_group_vae_and_replace_inline_distributed(
             group_tag=group_tag,
             **vae_group_kwargs,
         )
-        return
+        return len(group_refs) if bool(vae_group_kwargs["do_convert"]) else 0
 
     rank = distill_rank()
     if rank == 0:
@@ -2529,9 +2549,9 @@ def _train_group_vae_and_replace_inline_distributed(
             if rank == 0
             else "cpu"
         ),
-        skip_layer_keys=vae_group_kwargs.get("skip_layer_keys"),
     )
     distill_distributed_barrier()
+    return len(group_refs)
 
 
 def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
@@ -2540,10 +2560,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     world_size = distill_world_size()
     inline_distributed = world_size > 1
     if inline_distributed:
-        if distill_after_category != "remaining_lora":
-            raise ValueError(
-                "WORLD_SIZE > 1 inline cat_train requires --distill_after_category=remaining_lora."
-            )
+        _validate_inline_distill_after_category(distill_after_category)
         ensure_distill_process_group_initialized()
         initialize_cat_payload_group()
     if bool(getattr(training_args, "distill_hif4_act", False)) and distill_after_category == "none":
@@ -2566,8 +2583,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     log.info("Run output directory: %s", run_output_dir)
     if inline_distributed and is_distill_main_process():
         log.info(
-            "Cat inline distributed mode: world_size=%d, VAE rank=0, distill=remaining_lora",
+            "Cat inline distributed mode: world_size=%d, VAE rank=0, distill=%s",
             world_size,
+            distill_after_category,
         )
     if bool(getattr(cat_args, "distill_independent_categories", False)):
         log.warning(
@@ -2584,6 +2602,16 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     )
 
     model = _load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
+    teacher_runtime = None
+    if distill_after_category != "none":
+        teacher_runtime = DistillTeacherRuntime(
+            model_path=str(vae_args.model_path),
+            access_token=hf_args.access_token,
+            forward_device=resolve_distill_train_device(cat_args.train_device),
+            dtype=resolve_distill_teacher_dtype(training_args, model),
+            model_offload=str(getattr(training_args, "distill_teacher_model_offload", "none")),
+            logger=log,
+        )
     activation_runtime: Optional[Dict[str, object]] = None
     outlier_protect_axis = str(getattr(cat_args, "outlier_protect_axis", "input")).strip().lower()
     outlier_protect_channel_quant = str(getattr(cat_args, "outlier_protect_channel_quant", "none")).strip().lower()
@@ -2633,6 +2661,10 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 "skip_layers contains unknown layer/category pairs: "
                 + ",".join(f"{li}.{cat}" for li, cat in missing)
             )
+    eligible_all_linears = [
+        ref for ref in all_linears
+        if not _is_skipped_linear_ref(ref, skip_layer_keys)
+    ]
 
     linear_group_size = int(cat_args.linear_group_size)
     if linear_group_size < 1:
@@ -2804,7 +2836,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             int(activation_runtime["seed"]),
             str(activation_runtime["device"]),
         )
-        linear_items = [(r.name, r.module) for r in all_linears]
+        linear_items = [(r.name, r.module) for r in eligible_all_linears]
         stats_by_linear, new_cache = collect_activation_stats_for_linears(
             model=model,
             linear_items=linear_items,
@@ -2847,7 +2879,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             mlp_layer_indices = sorted(
                 {
                     int(layer_idx)
-                    for ref in all_linears
+                    for ref in eligible_all_linears
                     if ref.category in MLP_CATEGORIES
                     for layer_idx in [_extract_layer_idx(ref.name)]
                     if layer_idx is not None
@@ -2981,8 +3013,22 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             log.info("Saved normalized parameter snapshot: %s", snapshot_path)
         if inline_distributed:
             distill_distributed_barrier()
-        lora_round_idx = 0
-        completed_distill_categories: List[str] = []
+        resume_progress = load_cat_resume_distill_progress(
+            getattr(cat_args, "resume_from_checkpoint", None)
+        )
+        completed_distill_categories: List[str] = list(resume_progress.completed_categories)
+        completed_distill_category_set = set(completed_distill_categories)
+        lora_round_idx = len(completed_distill_categories)
+        distill_stage_history: List[dict] = [
+            dict(item) for item in resume_progress.distill_stage_history
+        ]
+        if completed_distill_categories or distill_stage_history:
+            log.info(
+                "Inline CAT resume distill progress: completed_categories=%s lora_round_idx=%d history_entries=%d",
+                ",".join(completed_distill_categories) if completed_distill_categories else "(none)",
+                int(lora_round_idx),
+                int(len(distill_stage_history)),
+            )
         any_distill_after_overrides = any(table.is_override_enabled() for table, _ in distill_tables)
         if any_distill_after_overrides:
             log.info(
@@ -2998,6 +3044,12 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 ),
             )
         for cat_idx, cat in enumerate(active_categories):
+            if str(cat) in completed_distill_category_set:
+                log.info(
+                    "[%s] resume progress: category already completed; skip VAE compression and after-category recovery.",
+                    str(cat),
+                )
+                continue
             refs_sorted, missing = _collect_sorted_category_refs(
                 model,
                 category=cat,
@@ -3011,13 +3063,15 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 continue
 
             cat_cfg = resolved_category_cfgs[cat]
-            refs = [ref for _, ref in refs_sorted]
+            eligible_vae_pairs = _filter_eligible_vae_refs(refs_sorted, skip_layer_keys)
+            refs = [ref for _, ref in eligible_vae_pairs]
             cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
             cat_residual_vae_codebook_bits, cat_residual_vae_codebook_dim = category_residual_vae_codebook[cat]
             log.info(
-                "=== Category: %s (%d linears, residual_stages=%d, codebook_bits=%d, codebook_dim=%d, residual_vae_codebook_bits=%d, residual_vae_codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
+                "=== Category: %s (%d eligible linears, %d discovered linears, residual_stages=%d, codebook_bits=%d, codebook_dim=%d, residual_vae_codebook_bits=%d, residual_vae_codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
                 cat,
                 len(refs),
+                len(refs_sorted),
                 int(cat_cfg.residual_stages),
                 int(cat_codebook_bits),
                 int(cat_codebook_dim),
@@ -3031,21 +3085,14 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 # int(cat_cfg.joint_decoder_group_size),
                 # "none" if cat_cfg.joint_decoder_batch_size is None else str(int(cat_cfg.joint_decoder_batch_size)),
             )
-            ordered_refs = [r for _, r in refs_sorted]
             if bool(cat_args.allow_tail_group):
-                planned_refs = list(ordered_refs)
+                planned_eligible_pairs = list(eligible_vae_pairs)
             else:
-                planned_count = (len(ordered_refs) // int(linear_group_size)) * int(linear_group_size)
-                planned_refs = list(ordered_refs[:planned_count])
-            if skip_layer_keys:
-                eligible_plan_refs = []
-                for ref in planned_refs:
-                    layer_idx = _extract_layer_idx(ref.name)
-                    if layer_idx is not None and (int(layer_idx), ref.category) in skip_layer_keys:
-                        continue
-                    eligible_plan_refs.append(ref)
-            else:
-                eligible_plan_refs = planned_refs
+                planned_count = (len(eligible_vae_pairs) // int(linear_group_size)) * int(linear_group_size)
+                planned_eligible_pairs = list(eligible_vae_pairs[:planned_count])
+            planned_refs = [ref for _, ref in planned_eligible_pairs]
+            if not eligible_vae_pairs:
+                log.info("[%s] no eligible VAE refs after skip filtering; skipping VAE groups.", cat)
 
             category_protect_axis = outlier_protect_axis
             if (
@@ -3066,17 +3113,17 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     and mlp_channel_plan_by_linear is not None
                 ):
                     outlier_channel_plan = {}
-                    for ref in eligible_plan_refs:
-                        outlier_channel_plan[ref.name] = mlp_channel_plan_by_linear.get(
-                            ref.name,
-                            torch.empty(0, dtype=torch.long),
-                        ).detach().to(device="cpu", dtype=torch.long).contiguous()
                     for ref in planned_refs:
-                        outlier_channel_plan.setdefault(ref.name, torch.empty(0, dtype=torch.long))
+                        if ref.name not in mlp_channel_plan_by_linear:
+                            raise KeyError(f"[{cat}] missing MLP aligned outlier channel plan for eligible linear {ref.name}.")
+                        outlier_channel_plan[ref.name] = mlp_channel_plan_by_linear[ref.name].detach().to(
+                            device="cpu",
+                            dtype=torch.long,
+                        ).contiguous()
                     log.info(
                         "[%s] MLP aligned outlier channel plan: eligible_linears=%d total_channels=%d axis=%s",
                         cat,
-                        len(eligible_plan_refs),
+                        len(planned_refs),
                         sum(int(v.numel()) for v in outlier_channel_plan.values()),
                         category_protect_axis,
                     )
@@ -3095,7 +3142,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                             )
                         subset_stats = subset_activation_stats(
                             stats_by_linear,
-                            [r.name for r in eligible_plan_refs],
+                            [r.name for r in planned_refs],
                         )
                         plan_activation_weight, plan_activation_abs_mean, _ = activation_stats_to_views(subset_stats)
                     plan_refs = [
@@ -3106,7 +3153,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                             out_features=int(r.module.out_features),
                             transpose=bool(r.transpose),
                         )
-                        for r in eligible_plan_refs
+                        for r in planned_refs
                     ]
                     outlier_channel_plan = build_outlier_channel_index_plan(
                         group_refs=plan_refs,
@@ -3118,8 +3165,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         outlier_rank_metric=resolved_outlier_rank_metric,
                         outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
                     )
-                    for ref in planned_refs:
-                        outlier_channel_plan.setdefault(ref.name, torch.empty(0, dtype=torch.long))
                     log.info(
                         "[%s] outlier channel plan: mode=%s scope=%s eligible_linears=%d total_channels=%d",
                         cat,
@@ -3129,12 +3174,17 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         sum(int(v.numel()) for v in outlier_channel_plan.values()),
                     )
 
-            for start in range(0, len(ordered_refs), linear_group_size):
-                group_refs = ordered_refs[start:start + linear_group_size]
-                if len(group_refs) < linear_group_size and not cat_args.allow_tail_group:
-                    log.info("[%s] tail group size=%d skipped (set --allow_tail_group to include).", cat, len(group_refs))
-                    break
-                layer_indices = [idx for idx, _ in refs_sorted[start:start + linear_group_size]]
+            newly_compressed_target_count = 0
+            if not bool(cat_args.allow_tail_group) and len(eligible_vae_pairs) != len(planned_eligible_pairs):
+                log.info(
+                    "[%s] tail eligible group size=%d skipped (set --allow_tail_group to include).",
+                    cat,
+                    len(eligible_vae_pairs) - len(planned_eligible_pairs),
+                )
+            for start in range(0, len(planned_eligible_pairs), linear_group_size):
+                group_pairs = planned_eligible_pairs[start:start + linear_group_size]
+                group_refs = [ref for _, ref in group_pairs]
+                layer_indices = [idx for idx, _ in group_pairs]
                 group_tag = f"{cat}.L{layer_indices[0]}-{layer_indices[-1]}"
                 log.info(
                     "---- Group: %s (linears=%d, num_models=%d) ----",
@@ -3142,7 +3192,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     len(group_refs),
                     len(group_refs),
                 )
-                _train_group_vae_and_replace_inline_distributed(
+                newly_compressed_target_count += _train_group_vae_and_replace_inline_distributed(
                     model=model,
                     group_refs=group_refs,
                     group_tag=group_tag,
@@ -3158,7 +3208,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     eval_every=cat_args.eval_every,
                     eval_blocks=cat_args.eval_blocks,
                     gpu_resident_data=bool(getattr(cat_args, "gpu_resident_data", False)),
-                    skip_layer_keys=skip_layer_keys,
                     activation_runtime=activation_runtime,
                     outlier_protect_mode=resolved_outlier_mode,
                     outlier_channel_plan=outlier_channel_plan,
@@ -3230,9 +3279,17 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     transpose_modules=transpose_modules,
                     only_decoder_projections=only_decoder_projections,
                     target_categories=target_categories,
+                    teacher_runtime=teacher_runtime,
+                    newly_compressed_target_count=newly_compressed_target_count,
                 )
                 model = distill_result.model
                 lora_round_idx = int(distill_result.next_lora_round_idx)
+                if distill_result.distill_meta is not None:
+                    distill_stage_history.append(dict(distill_result.distill_meta))
+                if bool(distill_result.did_train):
+                    if str(cat) not in completed_distill_category_set:
+                        completed_distill_categories.append(str(cat))
+                        completed_distill_category_set.add(str(cat))
                 if inline_distributed:
                     model.to("cpu")
                     torch.cuda.empty_cache()
@@ -3265,8 +3322,6 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     and bool(cat_args.save_model)
                     and (not inline_distributed or is_distill_main_process())
                 ):
-                    if str(cat) not in completed_distill_categories:
-                        completed_distill_categories.append(str(cat))
                     from transformers import AutoTokenizer
                     from e2e_common.compressed_subspace_lora import (
                         iter_named_compressed_subspace_peft_proxies,
@@ -3304,6 +3359,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                             "category": str(cat),
                             "completed_categories": list(completed_distill_categories),
                             "distill_after_category": str(distill_after_category),
+                            "distill_stage": distill_result.distill_meta,
+                            "distill_stage_history": list(distill_stage_history),
                         },
                         unload_vae_original_weights=False,
                     )
@@ -3404,8 +3461,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     base_model_path=vae_args.model_path,
                     tokenizer=tok,
                     save_config=True,
-                    extra_meta={"stage": "final"},
-                    unload_vae_original_weights=bool(cat_args.unload_vae_original_weights_on_final_save),
+                    extra_meta={
+                        "stage": "final",
+                        "completed_categories": list(completed_distill_categories),
+                        "distill_after_category": str(distill_after_category),
+                        "distill_stage_history": list(distill_stage_history),
+                    },
+                    unload_vae_original_weights=False,
                 )
                 log.info("Saved final model to %s", save_paths["output_dir"])
             if inline_distributed:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import copy
 import os
 from types import SimpleNamespace
 
@@ -244,7 +245,22 @@ class _MseFakeCausalLM(nn.Module):
         return _FakeOutput(loss=loss, logits=logits, hidden_states=None)
 
 
-def _build_mse_trainer() -> CustomSFTTrainer:
+class _StaticTeacherRuntime:
+    model_offload = "none"
+
+    def __init__(self, model):
+        self.model = copy.deepcopy(model)
+        self.model.requires_grad_(False)
+        self.model.eval()
+
+    def prepare_for_forward(self):
+        return self.model
+
+    def finish_forward(self):
+        return None
+
+
+def _build_mse_trainer(model: _MseFakeCausalLM) -> CustomSFTTrainer:
     trainer = CustomSFTTrainer.__new__(CustomSFTTrainer)
     trainer.args = SimpleNamespace(bf16=False, fp16=False)
     trainer.loss_type = "mse"
@@ -257,7 +273,8 @@ def _build_mse_trainer() -> CustomSFTTrainer:
     trainer.eakld_confidence_k = 16
     trainer.teacher_logits_cpu_staging = False
     trainer.distill_hif4_act_controller = None
-    trainer.teacher_param_snapshots = []
+    trainer.teacher_runtime = _StaticTeacherRuntime(model)
+    trainer.teacher_required = True
     trainer.accelerator = None
     trainer.distill_token_stats = DistillTokenStatsAccumulator()
     return trainer
@@ -285,7 +302,7 @@ def _grad_accum_micro_batch_b():
 
 def test_gradient_accumulation_factor_two_includes_both_micro_batches(tmp_path):
     model = _MseFakeCausalLM()
-    trainer = _build_mse_trainer()
+    trainer = _build_mse_trainer(model)
 
     # simulate 10 optimizer steps with grad accum 2: two compute_loss calls per step
     for _ in range(10):
@@ -310,7 +327,7 @@ def test_gradient_accumulation_factor_two_includes_both_micro_batches(tmp_path):
 
 def test_compute_loss_does_not_update_when_model_not_training(tmp_path):
     model = _MseFakeCausalLM()
-    trainer = _build_mse_trainer()
+    trainer = _build_mse_trainer(model)
 
     model.eval()
     trainer.compute_loss(model, _grad_accum_micro_batch_a())

@@ -328,6 +328,8 @@ def evaluate_vae_linear_mse(
 ) -> Dict[str, Any]:
     if topk <= 0:
         raise ValueError(f"`topk` must be > 0, got {topk}")
+    if ref_model is None:
+        raise ValueError("[linear_mse] ref_model is required; checkpoint original_weight fallback is no longer supported.")
 
     log.info("[linear_mse] Start evaluation (topk=%d).", topk)
     metrics: List[Dict[str, Any]] = []
@@ -346,34 +348,17 @@ def evaluate_vae_linear_mse(
                 skipped += 1
                 continue
 
-            ref_weight = None
+            ref_module = _get_module_by_name(ref_model, name)
+            if not isinstance(ref_module, nn.Linear):
+                raise TypeError(f"[linear_mse] Reference module is not nn.Linear for {name}: {type(ref_module)}")
+            ref_weight = ref_module.weight.detach().cpu().float()
             ref_source = "ref_model"
-            if ref_model is not None:
-                try:
-                    ref_module = _get_module_by_name(ref_model, name)
-                    if isinstance(ref_module, nn.Linear):
-                        ref_weight = ref_module.weight.detach().cpu().float()
-                except Exception:
-                    ref_weight = None
-
-            if ref_weight is None and module.original_weight is not None:
-                ref_weight = module.original_weight.detach().cpu().float()
-                ref_source = "checkpoint_original_weight"
-
-            if ref_weight is None:
-                log.warning("[linear_mse] Skip %s: no reference weight found.", name)
-                skipped += 1
-                continue
 
             if tuple(recon_weight.shape) != tuple(ref_weight.shape):
-                log.warning(
-                    "[linear_mse] Skip %s: shape mismatch recon=%s ref=%s",
-                    name,
-                    tuple(recon_weight.shape),
-                    tuple(ref_weight.shape),
+                raise ValueError(
+                    f"[linear_mse] {name}: shape mismatch recon={tuple(recon_weight.shape)} "
+                    f"ref={tuple(ref_weight.shape)}"
                 )
-                skipped += 1
-                continue
 
             err_sq = (recon_weight - ref_weight).pow(2)
             mse = float(err_sq.mean().item())
