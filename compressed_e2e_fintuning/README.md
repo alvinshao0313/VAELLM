@@ -23,6 +23,21 @@
 
 `--model_max_length` 始终是单样本截断上限。仅对 `dataset_task=sft/lm` 的 shared sequence collator 生效；`mcqa` 不受影响。
 
+## Packed VQ decoder first-linear kernel
+
+主 VAE decode 默认启用：
+
+```bash
+--parallel_stage_decode true
+--packed_vq_decoder_linear true
+```
+
+该路径在 decoder 优化时不再先把 checkpoint 中的 bit-packed `uint8` VQ code 展开成持久的 BOOL/BF16 grouped VQ，而是在 Triton kernel 中按 K 维分 tile 解 bit，并直接完成 decoder 第一层线性投影。serial stage decode 和 parallel-stage decode 共用同一个 packed first-linear helper。
+
+kernel 本身只依赖 `packed uint8 + first linear weight/bias`，不把实验配置写死：`codebook_bits` 是 K 维并按 tile 循环，可为任意正整数；`codebook_dim` 不设固定值限制。`decoder_type=linear` 时 first linear 即 `decoder.linear`；`symmetric/asymmetric` 时 first linear 为 `decoder.linear_in`，后续 `resblock -> norm -> activation -> linear_out` 仍使用原 decoder，因此 `decoder_num_res_blocks=0/1/...` 都兼容。
+
+训练和推理都可使用 packed helper，但路由优先级不同：decoder 参数需要梯度时优先 packed 路径，自定义 backward 直接从 packed uint8 重新解 bit 计算第一层参数梯度，不保存 dense latent；普通 `no_grad` 推理/prewarm 若满足现有 `resblock=0 + symmetric + layer norm + swish` whole-decoder fused Triton 条件，则继续优先原 whole-decoder fuse，避免为了节省一次性 decode 显存而回退推理速度，并在 decoded weight cache 建好后立即释放该路径临时 materialize 的 dense BOOL/BF16 grouped VQ；旧 whole-decoder fuse 不适用时直接尝试 packed first-linear。若关闭 `--packed_vq_decoder_linear`，或运行环境不是 CUDA/Triton，则回退旧的 dense decode 路径。最终 checkpoint 格式不变，VQ code 仍按原 bitpack uint8 保存。
+
 ## Hidden-state 对齐
 
 可选参数：

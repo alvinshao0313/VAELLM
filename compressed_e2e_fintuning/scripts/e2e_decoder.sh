@@ -89,6 +89,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --decoder_layers 0-35 \
     --target_modules all \
     --parallel_stage_decode true \
+    --packed_vq_decoder_linear true \
     --vae_decoder_checkpoint true \
     --tune_final_norm true \
     --use_post_norm_head_linear true \
@@ -150,6 +151,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --target_modules all \
     --layer_device_map auto \
     --parallel_stage_decode true \
+    --packed_vq_decoder_linear true \
     --vae_decoder_checkpoint true \
     --tune_final_norm false \
     --use_post_norm_head_linear false \

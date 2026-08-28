@@ -289,7 +289,7 @@ def _decode_named_vae_linear_weights_chunk(
                 base_layer.pack_parallel_stage_decoder_(trainable=False)
         if getattr(base_layer, "_parallel_stage_decoder", None) is not None:
             base_layer.parallel_stage_decode = True
-            if getattr(base_layer, "_parallel_stage_grouped_vq_weight", None) is None:
+            if getattr(base_layer, "_parallel_stage_grouped_vq_packed", None) is None:
                 base_layer._build_parallel_stage_decode_plan()
 
         packed_decoder = getattr(base_layer, "_parallel_stage_decoder", None)
@@ -613,6 +613,7 @@ def prime_named_vae_linear_cache(
         raise RuntimeError(f"VAELinear prewarm failed: {exc}") from exc
     for result in decoded_results:
         result.base_layer._cached_weight = result.decoded_weight
+        result.base_layer._clear_parallel_stage_decode_runtime_cache()
     warmed = len(decoded_results)
     return {
         "total": int(total),

@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 from transformers import AutoTokenizer, default_data_collator
+from transformers.trainer_pt_utils import AcceleratorConfig
 
 from e2e_common.compressed_checkpoint import (
     get_decode_device_diagnostics,
@@ -135,6 +136,17 @@ def _set_vae_decoder_checkpoint(model: nn.Module, enabled: bool) -> Tuple[int, i
                 if bool(getattr(decoder, "use_checkpoint", False)) != bool(enabled):
                     decoder.use_checkpoint = bool(enabled)
                     changed += 1
+    return changed, total
+
+
+def _set_packed_vq_decoder_linear(model: nn.Module, enabled: bool) -> Tuple[int, int]:
+    changed = 0
+    total = 0
+    for _name, module in _iter_named_vae_linears(model):
+        total += 1
+        if bool(getattr(module, "packed_vq_decoder_linear", False)) != bool(enabled):
+            module.packed_vq_decoder_linear = bool(enabled)
+            changed += 1
     return changed, total
 
 
@@ -804,6 +816,17 @@ def run(args, hf_args, training_args):
         int(decoder_ckpt_total),
     )
 
+    packed_vq_changed, packed_vq_total = _set_packed_vq_decoder_linear(
+        model,
+        enabled=bool(args.packed_vq_decoder_linear),
+    )
+    log.info(
+        "Applied packed VQ decoder linear config: enabled=%s changed=%d total=%d",
+        str(bool(args.packed_vq_decoder_linear)).lower(),
+        int(packed_vq_changed),
+        int(packed_vq_total),
+    )
+
     layers = list(get_layers(model))
     decoder_layer_ids = resolve_target_layer_ids(args.decoder_layer_ids, len(layers))
     train_mode = str(getattr(args, "vae_train_mode", "decoder")).strip().lower()
@@ -971,6 +994,10 @@ def run(args, hf_args, training_args):
     training_args.dataloader_pin_memory = True
     if bool(data_info.get("lazy_iterable", False)):
         training_args.group_by_length = False
+        training_args.accelerator_config = AcceleratorConfig(
+            dispatch_batches=False,
+            split_batches=False,
+        )
     dataset_task = str(data_info.get("dataset_task", "lm")).strip().lower()
     data_collator = _build_training_data_collator(
         tokenizer=tokenizer,

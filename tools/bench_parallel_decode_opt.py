@@ -103,7 +103,7 @@ def load_vae_linear(
     sub = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
     layer.load_state_dict(sub, strict=False)
     layer = layer.to(device=device)
-    if getattr(layer, "_parallel_stage_grouped_vq_weight", None) is None and getattr(
+    if getattr(layer, "_parallel_stage_grouped_vq_packed", None) is None and getattr(
         layer, "_parallel_stage_decoder", None
     ) is not None:
         layer._build_parallel_stage_decode_plan()

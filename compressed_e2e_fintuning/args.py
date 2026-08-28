@@ -66,6 +66,7 @@ class VAEDecoderE2EArguments:
     parallel_mode: str = "layer_mp"
     layer_device_map: str = "auto"
     parallel_stage_decode: bool = True
+    packed_vq_decoder_linear: bool = True
     vae_decoder_checkpoint: bool = True
     tune_final_norm: bool = False
     use_post_norm_head_linear: bool = False
@@ -161,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--parallel_stage_decode",
         type=lambda v: _parse_bool_like(v, arg_name="--parallel_stage_decode"),
+        default=True,
+    )
+    parser.add_argument(
+        "--packed_vq_decoder_linear",
+        type=lambda v: _parse_bool_like(v, arg_name="--packed_vq_decoder_linear"),
         default=True,
     )
     parser.add_argument(

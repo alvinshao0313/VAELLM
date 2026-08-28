@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 from torch import nn
 
 from litebsq.autoencoder import pack_decoders
@@ -22,6 +23,8 @@ from litebsq.fused_multistage_decoder import (
     fused_decode_packed_symmetric_decoder,
     packed_symmetric_decoder_supports_fuse,
 )
+from litebsq.packed_bit_linear import packed_u8_linear_available, packed_u8_parallel_linear
+from litebsq.parallel_layers import apply_activation
 from litebsq.protected_channel_quant import (
     PROTECTED_CHANNEL_QUANT_NONE,
     decode_protected_channel_weight,
@@ -49,12 +52,14 @@ class VAELinear(nn.Module):
     _fuse_stats_hit: int = 0
     _fuse_stats_miss: int = 0
     _fuse_stats_miss_reasons: Counter = Counter()
+    _packed_u8_linear_hit: int = 0
 
     @classmethod
     def reset_fuse_stats(cls) -> None:
         cls._fuse_stats_hit = 0
         cls._fuse_stats_miss = 0
         cls._fuse_stats_miss_reasons = Counter()
+        cls._packed_u8_linear_hit = 0
 
     @classmethod
     def get_fuse_stats(cls) -> Dict[str, Any]:
@@ -62,11 +67,16 @@ class VAELinear(nn.Module):
             "hit": int(cls._fuse_stats_hit),
             "miss": int(cls._fuse_stats_miss),
             "miss_reasons": dict(cls._fuse_stats_miss_reasons),
+            "packed_u8_linear_hit": int(cls._packed_u8_linear_hit),
         }
 
     @classmethod
     def _record_fuse_hit(cls) -> None:
         cls._fuse_stats_hit = int(cls._fuse_stats_hit) + 1
+
+    @classmethod
+    def _record_packed_u8_linear_hit(cls) -> None:
+        cls._packed_u8_linear_hit = int(cls._packed_u8_linear_hit) + 1
 
     @classmethod
     def _record_fuse_miss(cls, reason: str) -> None:
@@ -719,16 +729,25 @@ class VAELinear(nn.Module):
         self.cache_decoded_weight = True
         self.trainable_decode = False
         self.parallel_stage_decode = False
+        # Shared inference/training fast path: consume the checkpoint's packed
+        # uint8 VQ storage directly in the decoder's first linear projection.
+        # Callers can explicitly disable it to compare against the legacy dense
+        # bool/bf16 materialization path.
+        self.packed_vq_decoder_linear = True
         self._parallel_stage_layout: List[Tuple[int, int]] = []
         self._parallel_stage_layout_is_stage_major = False
         self._parallel_stage_restore_identity = False
+        self._parallel_stage_grouped_vq_logical_shape: Optional[Tuple[int, int, int]] = None
         self._parallel_stage_grouped_vq_runtime_key: Optional[Tuple[str, torch.dtype]] = None
+        self._parallel_stage_grouped_vq_packed_runtime_key: Optional[str] = None
         self._parallel_stage_model_indices_runtime_key: Optional[str] = None
         self._parallel_stage_restore_index_cache: Dict[Tuple[Any, ...], torch.Tensor] = {}
         self.register_buffer("_cached_weight", None, persistent=False)
         self.register_buffer("_cached_sparse_residual_row_indices", None, persistent=False)
         self.register_buffer("_cached_sparse_residual_col_indices", None, persistent=False)
         self.register_buffer("_cached_sparse_residual_values", None, persistent=False)
+        self.register_buffer("_parallel_stage_grouped_vq_packed", None, persistent=False)
+        self.register_buffer("_parallel_stage_grouped_vq_packed_runtime", None, persistent=False)
         self.register_buffer("_parallel_stage_grouped_vq_weight", None, persistent=False)
         self.register_buffer("_parallel_stage_grouped_vq_runtime", None, persistent=False)
         self.register_buffer("_parallel_stage_model_indices", None, persistent=False)
@@ -1339,8 +1358,12 @@ class VAELinear(nn.Module):
 
     def _clear_parallel_stage_decode_runtime_cache(self) -> None:
         self._parallel_stage_grouped_vq_runtime_key = None
+        self._parallel_stage_grouped_vq_packed_runtime_key = None
         self._parallel_stage_model_indices_runtime_key = None
         self._parallel_stage_restore_index_cache = {}
+        # Packed uint8 is the plan source; dense BOOL/BF16 grouped VQ is scratch.
+        self._parallel_stage_grouped_vq_weight = None
+        self._parallel_stage_grouped_vq_packed_runtime = None
         self._parallel_stage_grouped_vq_runtime = None
         self._parallel_stage_model_indices_runtime = None
 
@@ -1348,37 +1371,73 @@ class VAELinear(nn.Module):
         self._clear_parallel_stage_decode_runtime_cache()
         self._parallel_stage_layout_is_stage_major = False
         self._parallel_stage_restore_identity = False
+        self._parallel_stage_grouped_vq_logical_shape = None
+        self._parallel_stage_grouped_vq_packed = None
         self._parallel_stage_grouped_vq_weight = None
         self._parallel_stage_model_indices = None
 
-    def _build_parallel_stage_grouped_vq_weight(self, layout: Sequence[Tuple[int, int]]) -> torch.Tensor:
+    def _build_parallel_stage_grouped_vq_packed(
+        self,
+        layout: Sequence[Tuple[int, int]],
+    ) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
         if not layout:
             raise RuntimeError("parallel stage layout cannot be empty.")
-        vq_tensors: List[torch.Tensor] = []
-        first_shape = None
+        packed_tensors: List[torch.Tensor] = []
+        first_logical_shape: Optional[Tuple[int, int, int]] = None
+        first_packed_shape: Optional[Tuple[int, int, int]] = None
         for stage_idx, part_idx in layout:
-            vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
-            if bool(vq_weight.requires_grad):
-                raise RuntimeError("parallel_stage_decode runtime VQ packing requires frozen vq_weight tensors.")
-            if vq_weight.ndim != 3 or int(vq_weight.shape[1]) != 1:
+            storage = self.get_stage_part_vq_storage(stage_idx=stage_idx, part_idx=part_idx)
+            spec = self.get_stage_part_vq_spec(stage_idx=stage_idx, part_idx=part_idx)
+            logical_shape = tuple(int(v) for v in spec["logical_shape"])
+            packed_shape = tuple(int(v) for v in storage.shape)
+            if storage.dtype != torch.uint8:
                 raise ValueError(
-                    f"parallel_stage_decode expects vq shape [N_blocks, 1, latent_dim], got {tuple(vq_weight.shape)} "
-                    f"for stage={int(stage_idx)} part={int(part_idx)}."
+                    "parallel_stage_decode packed fast path requires uint8 bitpack storage; "
+                    f"got {storage.dtype} for stage={int(stage_idx)} part={int(part_idx)}."
                 )
-            shape = tuple(int(v) for v in vq_weight.shape)
-            if first_shape is None:
-                first_shape = shape
-            elif shape != first_shape:
+            if len(logical_shape) != 3 or int(logical_shape[1]) != 1:
                 raise ValueError(
-                    f"parallel_stage_decode requires identical vq shapes, got {shape} vs {first_shape}."
+                    "parallel_stage_decode expects logical VQ shape [N_blocks, 1, latent_dim], "
+                    f"got {logical_shape} for stage={int(stage_idx)} part={int(part_idx)}."
                 )
-            vq_tensors.append(vq_weight.detach())
-        grouped_vq = torch.cat(vq_tensors, dim=1).contiguous()
-        if int(grouped_vq.shape[1]) != len(layout):
-            raise RuntimeError(
-                f"parallel grouped VQ model axis {int(grouped_vq.shape[1])} != layout length {len(layout)}."
+            expected_packed_shape = (
+                int(logical_shape[0]),
+                1,
+                (int(logical_shape[2]) + 7) // 8,
             )
-        return grouped_vq
+            if packed_shape != expected_packed_shape:
+                raise ValueError(
+                    f"parallel_stage_decode packed shape {packed_shape} != expected {expected_packed_shape}."
+                )
+            if first_logical_shape is None:
+                first_logical_shape = logical_shape
+                first_packed_shape = packed_shape
+            elif logical_shape != first_logical_shape or packed_shape != first_packed_shape:
+                raise ValueError(
+                    "parallel_stage_decode requires identical per-stage packed VQ shapes; "
+                    f"got logical={logical_shape}, packed={packed_shape} vs "
+                    f"logical={first_logical_shape}, packed={first_packed_shape}."
+                )
+            packed_tensors.append(storage.detach())
+
+        if first_logical_shape is None:
+            raise RuntimeError("parallel stage packed VQ build produced no payload.")
+        grouped_packed = torch.cat(packed_tensors, dim=1).contiguous()
+        grouped_logical_shape = (
+            int(first_logical_shape[0]),
+            len(layout),
+            int(first_logical_shape[2]),
+        )
+        expected_grouped_packed = (
+            grouped_logical_shape[0],
+            grouped_logical_shape[1],
+            (grouped_logical_shape[2] + 7) // 8,
+        )
+        if tuple(int(v) for v in grouped_packed.shape) != expected_grouped_packed:
+            raise RuntimeError(
+                f"parallel grouped packed VQ shape {tuple(grouped_packed.shape)} != {expected_grouped_packed}."
+            )
+        return grouped_packed, grouped_logical_shape
 
     def _parallel_stage_restore_is_identity(self) -> bool:
         # 排序代码，已关闭。原 restore identity 检查保留如下：
@@ -1421,17 +1480,48 @@ class VAELinear(nn.Module):
         if len(seen) != expected:
             raise RuntimeError(f"parallel stage layout covers {len(seen)} entries, expected {expected}.")
 
-        grouped_vq = self._build_parallel_stage_grouped_vq_weight(layout)
-        self._parallel_stage_grouped_vq_weight = grouped_vq
+        grouped_packed, grouped_logical_shape = self._build_parallel_stage_grouped_vq_packed(layout)
+        self._parallel_stage_grouped_vq_packed = grouped_packed
+        self._parallel_stage_grouped_vq_logical_shape = grouped_logical_shape
+        # Dense bool/bf16 grouped VQ is intentionally lazy. Packed decode paths
+        # consume uint8 directly and never instantiate this buffer.
+        self._parallel_stage_grouped_vq_weight = None
         self._parallel_stage_model_indices = model_indices
         self._parallel_stage_layout_is_stage_major = list(layout) == stage_major
         self._parallel_stage_restore_identity = self._parallel_stage_restore_is_identity()
         self._clear_parallel_stage_decode_runtime_cache()
 
+    def _get_parallel_stage_grouped_vq_packed(self, *, device: torch.device) -> torch.Tensor:
+        grouped_packed = getattr(self, "_parallel_stage_grouped_vq_packed", None)
+        if grouped_packed is None:
+            raise RuntimeError("parallel_stage_decode grouped uint8 VQ buffer is missing.")
+        target_device = torch.device(device)
+        cache_key = str(target_device)
+        cached = getattr(self, "_parallel_stage_grouped_vq_packed_runtime", None)
+        if (
+            isinstance(cached, torch.Tensor)
+            and self._parallel_stage_grouped_vq_packed_runtime_key == cache_key
+            and cached.device == target_device
+            and cached.dtype == torch.uint8
+        ):
+            return cached
+        out = grouped_packed.to(device=target_device, dtype=torch.uint8, non_blocking=True)
+        self._parallel_stage_grouped_vq_packed_runtime = out
+        self._parallel_stage_grouped_vq_packed_runtime_key = cache_key
+        return out
+
     def _get_parallel_stage_grouped_vq(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         grouped_vq = getattr(self, "_parallel_stage_grouped_vq_weight", None)
+        logical_shape = getattr(self, "_parallel_stage_grouped_vq_logical_shape", None)
         if grouped_vq is None:
-            raise RuntimeError("parallel_stage_decode packed VQ buffer is missing.")
+            grouped_packed = getattr(self, "_parallel_stage_grouped_vq_packed", None)
+            if grouped_packed is None or logical_shape is None:
+                raise RuntimeError("parallel_stage_decode grouped packed VQ plan is missing.")
+            grouped_vq = unpack_uint8_tensor_to_bool(
+                grouped_packed,
+                logical_shape=tuple(int(v) for v in logical_shape),
+            )
+            self._parallel_stage_grouped_vq_weight = grouped_vq
         target_device = torch.device(device)
         cache_key = (str(target_device), dtype)
         cached = getattr(self, "_parallel_stage_grouped_vq_runtime", None)
@@ -1655,7 +1745,7 @@ class VAELinear(nn.Module):
             packed_decoder.requires_grad_(bool(trainable))
             packed_decoder.train(self.training)
             self.parallel_stage_decode = True
-            if getattr(self, "_parallel_stage_grouped_vq_weight", None) is None:
+            if getattr(self, "_parallel_stage_grouped_vq_packed", None) is None:
                 self._build_parallel_stage_decode_plan()
             return True
         decoders, layout = self._iter_stage_part_decoders_for_pack()
@@ -1828,6 +1918,80 @@ class VAELinear(nn.Module):
             return getattr(self, "part_restore_col_indices", None)
         return getattr(self, f"part_restore_col_indices_s{stage_idx}", None)
 
+    def _decode_packed_u8_with_decoder(
+        self,
+        decoder: nn.Module,
+        packed_vq: torch.Tensor,
+        *,
+        logical_shape: Sequence[int],
+    ) -> Optional[torch.Tensor]:
+        if not bool(getattr(self, "packed_vq_decoder_linear", False)):
+            return None
+        if not packed_u8_linear_available():
+            return None
+        logical = tuple(int(v) for v in logical_shape)
+        if len(logical) != 3:
+            return None
+        B, M, logical_in = logical
+        if B < 0 or M < 1 or logical_in < 1:
+            return None
+
+        param = next(decoder.parameters(), None)
+        decode_device = param.device if param is not None else packed_vq.device
+        if torch.device(decode_device).type != "cuda":
+            return None
+        if int(getattr(decoder, "num_models", 0)) != M:
+            return None
+        if int(getattr(decoder, "in_dim", 0)) != logical_in:
+            return None
+        expected_packed_shape = (B, M, (logical_in + 7) // 8)
+        if packed_vq.dtype != torch.uint8 or tuple(int(v) for v in packed_vq.shape) != expected_packed_shape:
+            return None
+        packed_input = packed_vq.to(device=decode_device, dtype=torch.uint8, non_blocking=True)
+
+        decoder_type = str(getattr(decoder, "decoder_type", "")).strip().lower()
+
+        def _forward_from_packed(packed_tensor: torch.Tensor) -> torch.Tensor:
+            if decoder_type == "linear":
+                linear = getattr(decoder, "linear", None)
+                if linear is None:
+                    raise RuntimeError("linear decoder is missing decoder.linear.")
+                return packed_u8_parallel_linear(
+                    packed_tensor,
+                    linear,
+                    logical_in_dim=logical_in,
+                )
+
+            if decoder_type not in {"symmetric", "asymmetric"}:
+                raise RuntimeError(f"Unsupported decoder_type={decoder_type!r} for packed VQ decoder linear.")
+            linear_in = getattr(decoder, "linear_in", None)
+            blocks = getattr(decoder, "blocks", None)
+            norm_out = getattr(decoder, "norm_out", None)
+            linear_out = getattr(decoder, "linear_out", None)
+            if linear_in is None or blocks is None or norm_out is None or linear_out is None:
+                raise RuntimeError(f"decoder_type={decoder_type!r} is missing decoder submodules.")
+            h = packed_u8_parallel_linear(
+                packed_tensor,
+                linear_in,
+                logical_in_dim=logical_in,
+            )
+            for block in blocks:
+                h = block(h)
+            h = norm_out(h)
+            h = apply_activation(h, str(getattr(decoder, "activation_type", "swish")))
+            return linear_out(h)
+
+        if bool(getattr(decoder, "use_checkpoint", False)) and torch.is_grad_enabled():
+            w_blocks = checkpoint.checkpoint(
+                _forward_from_packed,
+                packed_input,
+                use_reentrant=False,
+            )
+        else:
+            w_blocks = _forward_from_packed(packed_input)
+        self._record_packed_u8_linear_hit()
+        return w_blocks
+
     def _decode_single_flat(self, decoder: nn.Module, vq_weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         # decoder expects [B, num_models=1, latent_dim]; output [B, 1, codebook_dim]
         # 为避免 matmul device/dtype 不一致，先对齐到 decoder 参数设备和 dtype，
@@ -1900,6 +2064,16 @@ class VAELinear(nn.Module):
 
     def _decode_part_flat(self, stage_idx: int, part_idx: int, dtype: torch.dtype) -> torch.Tensor:
         decoder = self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+        storage = self.get_stage_part_vq_storage(stage_idx=stage_idx, part_idx=part_idx)
+        spec = self.get_stage_part_vq_spec(stage_idx=stage_idx, part_idx=part_idx)
+        packed_out = self._decode_packed_u8_with_decoder(
+            decoder,
+            storage,
+            logical_shape=tuple(int(v) for v in spec["logical_shape"]),
+        )
+        if packed_out is not None:
+            return packed_out.permute(1, 0, 2).contiguous().view(-1)
+
         vq_weight = self.get_stage_part_vq_weight(stage_idx=stage_idx, part_idx=part_idx)
         return self._decode_single_flat(decoder, vq_weight, dtype=dtype)
 
@@ -2001,6 +2175,25 @@ class VAELinear(nn.Module):
             return restored_stages[0].contiguous()
         return torch.stack(restored_stages, dim=0).sum(dim=0).contiguous()
 
+    def _try_packed_u8_parallel_stage_decode(
+        self,
+        packed_decoder: nn.Module,
+        *,
+        decode_device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        logical_shape = getattr(self, "_parallel_stage_grouped_vq_logical_shape", None)
+        if logical_shape is None:
+            raise RuntimeError("parallel_stage_decode grouped logical VQ shape is missing.")
+        grouped_packed = self._get_parallel_stage_grouped_vq_packed(device=decode_device)
+        stage_out = self._decode_packed_u8_with_decoder(
+            packed_decoder,
+            grouped_packed,
+            logical_shape=tuple(int(v) for v in logical_shape),
+        )
+        if stage_out is not None:
+            self._record_fuse_hit()
+        return stage_out
+
     def _try_fused_parallel_stage_decode(
         self,
         packed_decoder: nn.Module,
@@ -2057,23 +2250,62 @@ class VAELinear(nn.Module):
         param = next(packed_decoder.parameters(), None)
         decode_device = param.device if param is not None else torch.device("cpu")
         decode_dtype = param.dtype if param is not None else dtype
-        grouped_vq = self._get_parallel_stage_grouped_vq(dtype=decode_dtype, device=decode_device)
 
-        # Training and inference share the fused Triton path when config matches.
-        fused = self._try_fused_parallel_stage_decode(
-            packed_decoder,
-            grouped_vq,
-            dtype=dtype,
-            decode_device=decode_device,
+        # Decoder optimization (grad enabled) prioritizes the packed uint8 path
+        # to avoid materializing dense VQ latents. Ordinary inference/cache
+        # prewarm runs under no_grad; for the already-optimized resblock=0
+        # symmetric case, preserve the existing whole-decoder fused kernel first
+        # so this memory optimization does not silently regress inference speed.
+        stage_out = None
+        grouped_vq = None
+        full_fuse_eligible = (
+            int(self.parallel_parts) == 1
+            and bool(getattr(self, "_parallel_stage_layout_is_stage_major", False))
+            and bool(getattr(self, "_parallel_stage_restore_identity", False))
+            and packed_symmetric_decoder_supports_fuse(packed_decoder)
+            and torch.device(decode_device).type == "cuda"
+            and bool(_TRITON_AVAILABLE)
         )
-        if fused is not None:
-            return fused
+        if not torch.is_grad_enabled() and full_fuse_eligible:
+            grouped_vq = self._get_parallel_stage_grouped_vq(dtype=decode_dtype, device=decode_device)
+            fused = self._try_fused_parallel_stage_decode(
+                packed_decoder,
+                grouped_vq,
+                dtype=dtype,
+                decode_device=decode_device,
+            )
+            if fused is not None:
+                return fused
 
-        stage_out = packed_decoder(grouped_vq)
-        if tuple(int(v) for v in stage_out.shape[:2]) != (int(grouped_vq.shape[0]), expected_models):
+        if stage_out is None:
+            stage_out = self._try_packed_u8_parallel_stage_decode(
+                packed_decoder,
+                decode_device=decode_device,
+            )
+
+        if stage_out is None:
+            if grouped_vq is None:
+                grouped_vq = self._get_parallel_stage_grouped_vq(dtype=decode_dtype, device=decode_device)
+            fused = self._try_fused_parallel_stage_decode(
+                packed_decoder,
+                grouped_vq,
+                dtype=dtype,
+                decode_device=decode_device,
+            )
+            if fused is not None:
+                return fused
+            stage_out = packed_decoder(grouped_vq)
+            expected_rows = int(grouped_vq.shape[0])
+        else:
+            logical_shape = getattr(self, "_parallel_stage_grouped_vq_logical_shape", None)
+            if logical_shape is None:
+                raise RuntimeError("parallel_stage_decode grouped logical VQ shape is missing.")
+            expected_rows = int(logical_shape[0])
+
+        if tuple(int(v) for v in stage_out.shape[:2]) != (expected_rows, expected_models):
             raise RuntimeError(
                 f"parallel stage decoder output shape mismatch: out={tuple(stage_out.shape)} "
-                f"expected leading={(int(grouped_vq.shape[0]), expected_models)}."
+                f"expected leading={(expected_rows, expected_models)}."
             )
         model_flats = stage_out.permute(1, 0, 2).contiguous().view(expected_models, -1)
         if bool(getattr(self, "_parallel_stage_layout_is_stage_major", False)):
@@ -2665,6 +2897,7 @@ class VAELinear(nn.Module):
 
         w = self._decode_weight(dtype=target_dtype).detach()
         self._cached_weight = w
+        self._clear_parallel_stage_decode_runtime_cache()
         return True
 
     def set_temporary(self, temporary: bool = True) -> None:  # 当 temporary=False 时走原始权重前向。
@@ -2713,6 +2946,7 @@ class VAELinear(nn.Module):
                 w = self._decode_weight(dtype=x.dtype)
             if can_use_cache:
                 self._cached_weight = w.detach()
+                self._clear_parallel_stage_decode_runtime_cache()
 
         bias = self.bias
         if bias is not None and bias.dtype != x.dtype:

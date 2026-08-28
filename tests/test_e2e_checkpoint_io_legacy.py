@@ -528,9 +528,11 @@ class CheckpointBitpackIOTest(unittest.TestCase):
             self.assertIsNotNone(restored._parallel_stage_decoder)
 
             layout = list(restored._parallel_stage_layout)
-            expected_grouped_vq = restored._build_parallel_stage_grouped_vq_weight(layout)
-            actual_grouped_vq = restored._parallel_stage_grouped_vq_weight
-            self.assertTrue(torch.equal(actual_grouped_vq, expected_grouped_vq))
+            expected_grouped_packed, expected_logical_shape = restored._build_parallel_stage_grouped_vq_packed(layout)
+            actual_grouped_packed = restored._parallel_stage_grouped_vq_packed
+            self.assertTrue(torch.equal(actual_grouped_packed, expected_grouped_packed))
+            self.assertEqual(restored._parallel_stage_grouped_vq_logical_shape, expected_logical_shape)
+            self.assertIsNone(restored._parallel_stage_grouped_vq_weight)
 
             restored_weight = restored._decode_weight(dtype=torch.float32)
             restored_output = restored(x)
