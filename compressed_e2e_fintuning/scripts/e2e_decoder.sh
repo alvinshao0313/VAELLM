@@ -12,8 +12,8 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
-MAX_STEPS="${MAX_STEPS:-20000}"
-STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora_distill/res0-bf16-protect-channel-vae2/Qwen_Qwen3-8B_20260817_002419/final_model}"
+MAX_STEPS="${MAX_STEPS:-5000}"
+STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora/Qwen_Qwen3-8B_20260828_183213/final_model/}"
 # 用 ${VAR-default}：仅在未设置时填默认；允许 EVAL_TASKS="" 关闭最终 lm-eval。
 EVAL_TASKS="${EVAL_TASKS-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
@@ -68,18 +68,18 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --gradient_checkpointing true \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
     --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning \
-    --finetune_mode both \
+    --finetune_mode decoder \
     --parallel_mode dp \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
     --dataset_task sft \
-    --loss_type kl_top_1000 \
+    --loss_type kl_top_100 \
     --eakld_confidence_k 16 \
     --distill_temperature 1.0 \
     --distill_alpha 0.5 \
     --prompt_kd_weight 0.0 \
-    --hidden_loss_weight 0.0 \
-    --distill_pre_mlp_hidden_loss_weight 0.0 \
-    --hidden_layer_weighting adaptive_top_3 \
+    --hidden_loss_weight 0.1 \
+    --distill_pre_mlp_hidden_loss_weight 0.001 \
+    --hidden_layer_weighting linear_depth \
     --teacher_output_offload cpu \
     --distill_teacher_model_offload none \
     --teacher_output_pin_memory true \
@@ -89,7 +89,6 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --decoder_layers 0-35 \
     --target_modules all \
     --parallel_stage_decode true \
-    --packed_vq_decoder_linear true \
     --vae_decoder_checkpoint true \
     --tune_final_norm true \
     --use_post_norm_head_linear true \
@@ -109,11 +108,11 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --bf16 true \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 1 \
-    --learning_rate 3e-6 \
+    --learning_rate 1e-5 \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \
-    --weight_decay 0.0001 \
-    --max_grad_norm 15.0 \
+    --weight_decay 0.001 \
+    --max_grad_norm 1.5 \
     --logging_steps 10 \
     --eval_strategy no \
     --save_strategy steps \
@@ -151,7 +150,6 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --target_modules all \
     --layer_device_map auto \
     --parallel_stage_decode true \
-    --packed_vq_decoder_linear true \
     --vae_decoder_checkpoint true \
     --tune_final_norm false \
     --use_post_norm_head_linear false \

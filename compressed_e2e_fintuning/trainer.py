@@ -238,6 +238,15 @@ def _causal_lm_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torc
     )
 
 
+def _dense_loss_requires_ce(loss_type: str) -> bool:
+    norm = str(loss_type or "").strip().lower()
+    return (
+        norm in {"sft", "origin", "kd", "dual_kd", "eakld_kd"}
+        or norm.startswith("kd_top")
+        or norm.startswith("dual_kd_top")
+    )
+
+
 def compute_choice_scores_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     if logits.ndim != 4:
         raise ValueError(f"choice logits must have shape [B, C, L, V], got {tuple(logits.shape)}.")
@@ -774,11 +783,11 @@ class VAEDecoderE2ETrainer(Trainer):
             outputs = model(**student_inputs, output_hidden_states=hidden_loss_enabled)
         logits = get_output_logits(outputs)
 
+        loss_type = self.loss_type
         ce_loss = None
-        if labels is not None:
+        if labels is not None and _dense_loss_requires_ce(loss_type):
             ce_loss = _causal_lm_cross_entropy(logits, labels)
 
-        loss_type = self.loss_type
         if loss_type in {"sft", "origin"}:
             if ce_loss is None:
                 raise ValueError(f"loss_type={loss_type} requires labels.")
@@ -961,7 +970,7 @@ class VAEDecoderE2ETrainer(Trainer):
             logits = get_output_logits(outputs)
 
             ce_loss = None
-            if labels is not None:
+            if labels is not None and _dense_loss_requires_ce(loss_type):
                 ce_loss = _causal_lm_cross_entropy(logits, labels)
 
             if loss_type in {"sft", "origin"}:
