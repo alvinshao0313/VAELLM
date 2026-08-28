@@ -94,8 +94,10 @@ if _TRITON_AVAILABLE:
             )
             if MM_KIND == 1:
                 bits = bits.to(tl.bfloat16)
+                weight = weight.to(tl.bfloat16)
             elif MM_KIND == 2:
                 bits = bits.to(tl.float16)
+                weight = weight.to(tl.float16)
             else:
                 bits = bits.to(tl.float32)
                 weight = weight.to(tl.float32)
@@ -268,6 +270,7 @@ def _packed_u8_linear_forward(
     bias: Tensor,
     *,
     logical_in_dim: int,
+    activation_dtype: torch.dtype,
 ) -> Tuple[Tensor, Tensor, int, int, int, int]:
     B, M, IN, H = _validate_inputs(
         packed,
@@ -276,11 +279,12 @@ def _packed_u8_linear_forward(
         logical_in_dim=int(logical_in_dim),
     )
     packed_c = packed.contiguous()
-    out = torch.empty((B, M, H), device=weight.device, dtype=weight.dtype)
+    _resolve_mm_kind(activation_dtype)
+    out = torch.empty((B, M, H), device=weight.device, dtype=activation_dtype)
     block_k = 32
     block_b = 64
     block_h = 32
-    mm_kind = _resolve_mm_kind(weight.dtype)
+    mm_kind = _resolve_mm_kind(activation_dtype)
     grid = (triton.cdiv(B, block_b), M, triton.cdiv(H, block_h))
     _packed_u8_linear_fwd_kernel[grid](
         packed_c,
@@ -313,12 +317,20 @@ def _packed_u8_linear_forward(
 
 class _PackedU8Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, packed: Tensor, weight: Tensor, bias: Tensor, logical_in_dim: int) -> Tensor:
+    def forward(
+        ctx,
+        packed: Tensor,
+        weight: Tensor,
+        bias: Tensor,
+        logical_in_dim: int,
+        activation_dtype: torch.dtype,
+    ) -> Tensor:
         out, packed_c, _B, M, IN, H = _packed_u8_linear_forward(
             packed,
             weight,
             bias,
             logical_in_dim=int(logical_in_dim),
+            activation_dtype=activation_dtype,
         )
         ctx.save_for_backward(packed_c)
         ctx.logical_in_dim = int(IN)
@@ -377,7 +389,7 @@ class _PackedU8Linear(torch.autograd.Function):
         )
         grad_weight = partial.sum(dim=0, dtype=torch.float32).to(dtype=ctx.weight_dtype)
         grad_bias = grad_c.sum(dim=0, dtype=torch.float32).to(dtype=ctx.weight_dtype)
-        return None, grad_weight, grad_bias, None
+        return None, grad_weight, grad_bias, None, None
 
 
 def packed_u8_linear(
@@ -386,6 +398,7 @@ def packed_u8_linear(
     bias: Tensor,
     *,
     logical_in_dim: int,
+    activation_dtype: torch.dtype,
 ) -> Tensor:
     """Compute ``bool_unpack(packed) @ weight.T + bias`` without dense unpack."""
 
@@ -395,9 +408,16 @@ def packed_u8_linear(
             weight,
             bias,
             logical_in_dim=int(logical_in_dim),
+            activation_dtype=activation_dtype,
         )
         return out
-    return _PackedU8Linear.apply(packed, weight, bias, int(logical_in_dim))
+    return _PackedU8Linear.apply(
+        packed,
+        weight,
+        bias,
+        int(logical_in_dim),
+        activation_dtype,
+    )
 
 
 def resolve_parallel_linear_weight_bias(linear) -> Tuple[Tensor, Tensor]:
@@ -437,6 +457,7 @@ def packed_u8_parallel_linear(
     linear,
     *,
     logical_in_dim: Optional[int] = None,
+    activation_dtype: torch.dtype,
 ) -> Tensor:
     """Apply a ParallelLinear directly to bit-packed binary inputs."""
 
@@ -447,4 +468,5 @@ def packed_u8_parallel_linear(
         weight,
         bias,
         logical_in_dim=resolved_in,
+        activation_dtype=activation_dtype,
     )

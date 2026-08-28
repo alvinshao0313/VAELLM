@@ -7,12 +7,14 @@ import torch
 from torch import nn
 
 from compressed_e2e_fintuning.offload import OffloadedCheckpointLayer
+from e2e_common.selective_topk_head import TeacherTopKTargets
 from rotation.model_utils import get_layers
 
 
 @dataclass
 class TeacherTargetBatch:
     logits_cpu: Optional[torch.Tensor] = None
+    selective_topk: Optional[TeacherTopKTargets] = None
     eakld_gamma_cpu: Optional[torch.Tensor] = None
     teacher_entropy_mean_cpu: Optional[torch.Tensor] = None
     teacher_valid_token_count_cpu: Optional[torch.Tensor] = None
@@ -27,6 +29,9 @@ class TeacherTargetBatch:
 
     def clear(self) -> None:
         self.logits_cpu = None
+        if self.selective_topk is not None:
+            self.selective_topk.clear()
+        self.selective_topk = None
         self.eakld_gamma_cpu = None
         self.teacher_entropy_mean_cpu = None
         self.teacher_valid_token_count_cpu = None

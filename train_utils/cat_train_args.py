@@ -175,6 +175,14 @@ class CatTrainHFTrainingArguments:
             "help": "After teacher forward, move teacher logits to CPU (bf16/fp16) until loss computation to reduce GPU peak memory."
         },
     )
+    distill_selective_student_topk: bool = field(
+        default=False,
+        metadata={"help": "For kl_top[_K], project only teacher top-k lm_head rows on the student instead of full-vocab logits."},
+    )
+    distill_selective_student_topk_chunk_rows: int = field(
+        default=32,
+        metadata={"help": "Temporary flattened-token row chunk size used by selective student top-k lm_head projection."},
+    )
     distill_teacher_model_offload: str = field(
         default="none",
         metadata={"help": "Teacher model residency: none or cpu."},

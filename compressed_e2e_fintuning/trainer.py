@@ -25,6 +25,14 @@ from e2e_common.dense_loss import (
     compute_dense_loss_from_offloaded_teacher,
     get_output_logits,
 )
+from e2e_common.selective_topk_head import (
+    compute_selected_teacher_topk_kl,
+    extract_teacher_topk_targets,
+    is_selective_student_topk_loss,
+    move_teacher_topk_targets_to_device,
+    parse_selective_student_topk_k,
+    selective_student_lm_head,
+)
 from train_utils.distill_losses import (
     DistillTokenRegions,
     build_distill_token_regions,
@@ -326,6 +334,8 @@ class VAEDecoderE2ETrainer(Trainer):
         teacher_model_offload: str = "none",
         teacher_output_pin_memory: bool = True,
         teacher_output_chunk_tokens: int = 8,
+        selective_student_topk: bool = False,
+        selective_student_topk_chunk_rows: int = 32,
         **kwargs,
     ):
         self.loss_type = str(loss_type).strip().lower()
@@ -372,6 +382,12 @@ class VAEDecoderE2ETrainer(Trainer):
         self.teacher_output_chunk_tokens = int(teacher_output_chunk_tokens)
         if self.teacher_output_chunk_tokens < 1:
             raise ValueError("teacher_output_chunk_tokens must be >= 1.")
+        self.selective_student_topk = bool(selective_student_topk)
+        self.selective_student_topk_chunk_rows = int(selective_student_topk_chunk_rows)
+        if self.selective_student_topk_chunk_rows < 1:
+            raise ValueError("selective_student_topk_chunk_rows must be >= 1.")
+        if self.selective_student_topk and not is_selective_student_topk_loss(self.loss_type):
+            raise ValueError("selective_student_topk only supports loss_type=kl_top[_K].")
         self._active_teacher_targets: Optional[TeacherTargetBatch] = None
         self._last_teacher_target_stats: Dict[str, object] = {}
         self._logged_teacher_target_stats = False
@@ -578,6 +594,7 @@ class VAEDecoderE2ETrainer(Trainer):
                 )
 
             logits_cpu = None
+            selective_topk = None
             gamma_cpu = None
             entropy_mean_cpu = None
             valid_count_cpu = None
@@ -586,11 +603,19 @@ class VAEDecoderE2ETrainer(Trainer):
             prompt_valid_count_cpu = None
             if logits_required:
                 teacher_logits = get_output_logits(teacher_outputs)
-                # Single CPU copy of full teacher logits, reused for EAKLD metadata.
-                logits_cpu = copy_detached_tensor_to_cpu(
-                    teacher_logits,
-                    pin_memory=self.teacher_output_pin_memory,
-                )
+                if self.selective_student_topk:
+                    selective_topk = extract_teacher_topk_targets(
+                        teacher_logits,
+                        k=parse_selective_student_topk_k(self.loss_type),
+                        sequence_chunk_size=self.teacher_output_chunk_tokens,
+                        pin_memory=self.teacher_output_pin_memory,
+                    )
+                else:
+                    # Single CPU copy of full teacher logits, reused for EAKLD metadata.
+                    logits_cpu = copy_detached_tensor_to_cpu(
+                        teacher_logits,
+                        pin_memory=self.teacher_output_pin_memory,
+                    )
                 if eakld_metadata_required:
                     regions = self._build_distill_token_regions(inputs, teacher_logits)
                     entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
@@ -669,6 +694,7 @@ class VAEDecoderE2ETrainer(Trainer):
 
             targets = TeacherTargetBatch(
                 logits_cpu=logits_cpu,
+                selective_topk=selective_topk,
                 eakld_gamma_cpu=gamma_cpu,
                 teacher_entropy_mean_cpu=entropy_mean_cpu,
                 teacher_valid_token_count_cpu=valid_count_cpu,
@@ -938,6 +964,26 @@ class VAEDecoderE2ETrainer(Trainer):
                     eakld_metadata_required=eakld_metadata_required,
                 )
 
+            selective_indices = None
+            selective_teacher_logits = None
+            if self.selective_student_topk:
+                if targets is None or targets.selective_topk is None:
+                    raise RuntimeError("selective student top-k requires compact teacher top-k targets.")
+                input_tensor = next(
+                    value for value in student_inputs.values() if torch.is_tensor(value)
+                )
+                selective_indices, selective_teacher_logits = move_teacher_topk_targets_to_device(
+                    targets.selective_topk,
+                    device=input_tensor.device,
+                )
+                selective_head_ctx = selective_student_lm_head(
+                    model,
+                    teacher_topk_indices=selective_indices,
+                    chunk_rows=self.selective_student_topk_chunk_rows,
+                )
+            else:
+                selective_head_ctx = nullcontext()
+
             student_collector_ctx = (
                 StudentHiddenCollector(
                     model=model,
@@ -963,6 +1009,7 @@ class VAEDecoderE2ETrainer(Trainer):
             )
             with (
                 offload_context,
+                selective_head_ctx,
                 student_collector_ctx as student_collector,
                 student_pre_mlp_capture_ctx as captured_student_pre_mlp,
             ):
@@ -973,7 +1020,27 @@ class VAEDecoderE2ETrainer(Trainer):
             if labels is not None and _dense_loss_requires_ce(loss_type):
                 ce_loss = _causal_lm_cross_entropy(logits, labels)
 
-            if loss_type in {"sft", "origin"}:
+            if self.selective_student_topk:
+                if selective_teacher_logits is None:
+                    raise RuntimeError("selective student top-k teacher logits are missing.")
+                regions = self._build_distill_token_regions(inputs, logits)
+                response_loss = compute_selected_teacher_topk_kl(
+                    student_selected_logits=logits,
+                    teacher_topk_logits=selective_teacher_logits,
+                    mask=regions.response_mask,
+                    temperature=self.distill_temperature,
+                )
+                if self.prompt_kd_weight > 0.0:
+                    prompt_loss = compute_selected_teacher_topk_kl(
+                        student_selected_logits=logits,
+                        teacher_topk_logits=selective_teacher_logits,
+                        mask=regions.prompt_mask,
+                        temperature=self.distill_temperature,
+                    )
+                    distill_loss = response_loss + self.prompt_kd_weight * prompt_loss
+                else:
+                    distill_loss = response_loss
+            elif loss_type in {"sft", "origin"}:
                 if ce_loss is None:
                     raise ValueError(f"loss_type={loss_type} requires labels.")
                 if targets is not None and targets.logits_cpu is not None:
@@ -1100,6 +1167,8 @@ class VAEDecoderE2ETrainer(Trainer):
                 )
         if "choice_input_ids" in inputs:
             return self._compute_choice_kd_loss(model, inputs, return_outputs=bool(return_outputs))
+        if self.selective_student_topk:
+            return self._compute_teacher_first_cpu_loss(model, inputs, return_outputs=bool(return_outputs))
         if self.teacher_output_offload == "none":
             return self._compute_legacy_dense_loss(model, inputs, return_outputs=bool(return_outputs))
         if self.teacher_output_offload == "cpu":

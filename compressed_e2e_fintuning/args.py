@@ -58,6 +58,8 @@ class VAEDecoderE2EArguments:
     teacher_model_offload: str = "none"
     teacher_output_pin_memory: bool = True
     teacher_output_chunk_tokens: int = 8
+    selective_student_topk: bool = False
+    selective_student_topk_chunk_rows: int = 32
     decoder_layers: str = "all"
     target_modules: str = "all"
     finetune_mode: str = "decoder"
@@ -152,6 +154,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument("--teacher_output_chunk_tokens", type=int, default=8)
+    parser.add_argument(
+        "--selective_student_topk",
+        type=lambda value: _parse_bool_like(value, arg_name="--selective_student_topk"),
+        default=False,
+    )
+    parser.add_argument("--selective_student_topk_chunk_rows", type=int, default=32)
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
     parser.add_argument("--finetune_mode", type=str, default="decoder")
@@ -353,6 +361,13 @@ def validate_args(
 
     if int(args.teacher_output_chunk_tokens) < 1:
         parser.error("--teacher_output_chunk_tokens must be >= 1.")
+    if int(args.selective_student_topk_chunk_rows) < 1:
+        parser.error("--selective_student_topk_chunk_rows must be >= 1.")
+    if bool(args.selective_student_topk) and not (
+        str(args.loss_type).strip().lower() == "kl_top"
+        or str(args.loss_type).strip().lower().startswith("kl_top_")
+    ):
+        parser.error("--selective_student_topk true requires --loss_type kl_top[_K].")
     finetune_mode = str(args.finetune_mode or "").strip().lower()
     if finetune_mode not in _VALID_FINETUNE_MODES:
         parser.error("--finetune_mode must be one of: decoder | compressed_lora | both.")

@@ -9,7 +9,7 @@ _ACTIVATION_CHOICES = ("swish", "relu", "none", "sigmoid", "gelu", "hard_swish")
 
 
 def swish(x: Tensor) -> Tensor:
-    return x * torch.sigmoid(x)
+    return F.silu(x)
 
 
 def hard_swish(x: Tensor) -> Tensor:
@@ -245,14 +245,21 @@ class Normalize(nn.Module):
             return self.norm(x)
         if self.norm_type == "layer":
             out = self.norm(x)
+            if out.dtype != x.dtype:
+                out = out.to(dtype=x.dtype)
             if self.num_models == 1:
                 return out
-            return out * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+            weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(dtype=x.dtype)
+            bias = self.bias if self.bias.dtype == x.dtype else self.bias.to(dtype=x.dtype)
+            return out * weight.unsqueeze(0) + bias.unsqueeze(0)
         if self.norm_type == "rms":
             out = self.norm(x)
+            if out.dtype != x.dtype:
+                out = out.to(dtype=x.dtype)
             if self.num_models == 1:
                 return out
-            return out * self.weight.unsqueeze(0)
+            weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(dtype=x.dtype)
+            return out * weight.unsqueeze(0)
 
         flat = self._flatten_parallel(x)
         out = self.norm(flat)

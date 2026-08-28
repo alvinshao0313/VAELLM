@@ -66,6 +66,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --data_seed "${SEED}" \
     --full_determinism "${FULL_DETERMINISM}" \
     --gradient_checkpointing true \
+    --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
     --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning \
     --finetune_mode decoder \
@@ -84,6 +85,8 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --distill_teacher_model_offload none \
     --teacher_output_pin_memory true \
     --teacher_output_chunk_tokens 8 \
+    --selective_student_topk true \
+    --selective_student_topk_chunk_rows 32 \
     --dynamic_padding true \
     --model_max_length "1024" \
     --decoder_layers 0-35 \
@@ -126,6 +129,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --data_seed "${SEED}" \
     --full_determinism "${FULL_DETERMINISM}" \
     --gradient_checkpointing true \
+    --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
     --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning \
     --finetune_mode both \
@@ -144,6 +148,8 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --distill_teacher_model_offload none \
     --teacher_output_pin_memory true \
     --teacher_output_chunk_tokens 8 \
+    --selective_student_topk true \
+    --selective_student_topk_chunk_rows 32 \
     --dynamic_padding true \
     --model_max_length "1024" \
     --decoder_layers 0-35 \

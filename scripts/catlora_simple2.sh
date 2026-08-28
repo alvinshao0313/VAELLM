@@ -160,6 +160,8 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --distill_loss_type "default=kl_top_100" \
   --distill_eakld_confidence_k "16" \
   --distill_teacher_logits_cpu_staging "true" \
+  --distill_selective_student_topk "true" \
+  --distill_selective_student_topk_chunk_rows "32" \
   --distill_teacher_model_offload "none" \
   --distill_hidden_loss_weight "default=0.1" \
   --distill_pre_mlp_hidden_loss_weight "default=0.001" \

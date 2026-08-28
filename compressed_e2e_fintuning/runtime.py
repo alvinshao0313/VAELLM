@@ -1076,6 +1076,12 @@ def run(args, hf_args, training_args):
             str(args.eval_tasks),
         )
 
+    log.info(
+        "Selective student top-k: enabled=%s loss_type=%s chunk_rows=%d",
+        str(bool(args.selective_student_topk)).lower(),
+        str(args.loss_type),
+        int(args.selective_student_topk_chunk_rows),
+    )
     # Custom token-mean distill loss; disable HF num_items_in_batch loss scaling.
     model.accepts_loss_kwargs = False
     trainer = VAEDecoderE2ETrainer(
@@ -1097,6 +1103,8 @@ def run(args, hf_args, training_args):
         teacher_model_offload=str(args.teacher_model_offload),
         teacher_output_pin_memory=bool(args.teacher_output_pin_memory),
         teacher_output_chunk_tokens=int(args.teacher_output_chunk_tokens),
+        selective_student_topk=bool(args.selective_student_topk),
+        selective_student_topk_chunk_rows=int(args.selective_student_topk_chunk_rows),
         eakld_confidence_k=int(args.eakld_confidence_k),
         saved_tensor_offload=saved_tensor_offload,
         streaming_offload_manager=streaming_manager,

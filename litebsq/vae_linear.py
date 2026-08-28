@@ -1924,6 +1924,7 @@ class VAELinear(nn.Module):
         packed_vq: torch.Tensor,
         *,
         logical_shape: Sequence[int],
+        activation_dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
         if not bool(getattr(self, "packed_vq_decoder_linear", False)):
             return None
@@ -1938,6 +1939,11 @@ class VAELinear(nn.Module):
 
         param = next(decoder.parameters(), None)
         decode_device = param.device if param is not None else packed_vq.device
+        compute_dtype = (
+            activation_dtype
+            if torch.is_grad_enabled()
+            else (param.dtype if param is not None else activation_dtype)
+        )
         if torch.device(decode_device).type != "cuda":
             return None
         if int(getattr(decoder, "num_models", 0)) != M:
@@ -1960,6 +1966,7 @@ class VAELinear(nn.Module):
                     packed_tensor,
                     linear,
                     logical_in_dim=logical_in,
+                    activation_dtype=compute_dtype,
                 )
 
             if decoder_type not in {"symmetric", "asymmetric"}:
@@ -1974,6 +1981,7 @@ class VAELinear(nn.Module):
                 packed_tensor,
                 linear_in,
                 logical_in_dim=logical_in,
+                activation_dtype=compute_dtype,
             )
             for block in blocks:
                 h = block(h)
@@ -2070,6 +2078,7 @@ class VAELinear(nn.Module):
             decoder,
             storage,
             logical_shape=tuple(int(v) for v in spec["logical_shape"]),
+            activation_dtype=dtype,
         )
         if packed_out is not None:
             return packed_out.permute(1, 0, 2).contiguous().view(-1)
@@ -2179,6 +2188,7 @@ class VAELinear(nn.Module):
         self,
         packed_decoder: nn.Module,
         *,
+        dtype: torch.dtype,
         decode_device: torch.device,
     ) -> Optional[torch.Tensor]:
         logical_shape = getattr(self, "_parallel_stage_grouped_vq_logical_shape", None)
@@ -2189,6 +2199,7 @@ class VAELinear(nn.Module):
             packed_decoder,
             grouped_packed,
             logical_shape=tuple(int(v) for v in logical_shape),
+            activation_dtype=dtype,
         )
         if stage_out is not None:
             self._record_fuse_hit()
@@ -2280,6 +2291,7 @@ class VAELinear(nn.Module):
         if stage_out is None:
             stage_out = self._try_packed_u8_parallel_stage_decode(
                 packed_decoder,
+                dtype=dtype,
                 decode_device=decode_device,
             )
 

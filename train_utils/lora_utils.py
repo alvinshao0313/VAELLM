@@ -816,6 +816,13 @@ def _build_lora_trainer(
             teacher_logits_cpu_staging=bool(
                 getattr(training_args, "distill_teacher_logits_cpu_staging", False)
             ),
+            selective_student_topk=bool(
+                getattr(training_args, "distill_selective_student_topk", False)
+            ),
+            selective_student_topk_chunk_rows=int(
+                getattr(training_args, "distill_selective_student_topk_chunk_rows", 32)
+            ),
+            selective_teacher_topk_chunk_tokens=8,
             distill_hif4_act_controller=hif4_act_controller,
             teacher_runtime=teacher_runtime,
             decoder_param_ids=decoder_param_ids,

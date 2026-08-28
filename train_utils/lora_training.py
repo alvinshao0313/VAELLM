@@ -8,6 +8,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from e2e_common.selective_topk_head import (
+    TeacherTopKTargets,
+    compute_selected_teacher_topk_kl,
+    extract_teacher_topk_targets,
+    is_selective_student_topk_loss,
+    move_teacher_topk_targets_to_device,
+    parse_selective_student_topk_k,
+    selective_student_lm_head,
+)
 from train_utils.distill_losses import (
     build_distill_token_regions,
     compute_dual_kl_loss,
@@ -60,6 +69,7 @@ _DEFAULT_ADAPTIVE_TOPK = 3
 @dataclass
 class _TeacherTargets:
     logits: Optional[torch.Tensor]
+    selective_topk: Optional[TeacherTopKTargets]
     reference_hidden: Optional[torch.Tensor]
     hidden_by_name: Optional[Dict[str, torch.Tensor]]
     pre_mlp_by_name: Optional[Dict[str, torch.Tensor]]
@@ -886,6 +896,9 @@ else:
             hidden_alignment_layer_weighting: str = "uniform",
             eakld_confidence_k: int = 16,
             teacher_logits_cpu_staging: bool = False,
+            selective_student_topk: bool = False,
+            selective_student_topk_chunk_rows: int = 32,
+            selective_teacher_topk_chunk_tokens: int = 8,
             distill_hif4_act_controller: Optional[Hif4ActController] = None,
             teacher_runtime: Optional[DistillTeacherRuntime] = None,
             **kwargs,
@@ -912,6 +925,15 @@ else:
             if self.eakld_confidence_k < 2:
                 raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
             self.teacher_logits_cpu_staging = bool(teacher_logits_cpu_staging)
+            self.selective_student_topk = bool(selective_student_topk)
+            self.selective_student_topk_chunk_rows = int(selective_student_topk_chunk_rows)
+            self.selective_teacher_topk_chunk_tokens = int(selective_teacher_topk_chunk_tokens)
+            if self.selective_student_topk_chunk_rows < 1:
+                raise ValueError("selective_student_topk_chunk_rows must be >= 1.")
+            if self.selective_teacher_topk_chunk_tokens < 1:
+                raise ValueError("selective_teacher_topk_chunk_tokens must be >= 1.")
+            if self.selective_student_topk and not is_selective_student_topk_loss(self.loss_type):
+                raise ValueError("selective_student_topk only supports loss_type=kl_top[_K].")
             self.distill_hif4_act_controller = distill_hif4_act_controller
             self.teacher_runtime = teacher_runtime
             self.teacher_required = resolve_distill_teacher_required(
@@ -1036,9 +1058,19 @@ else:
                         )
 
                 stage_hidden_to_cpu = self._must_stage_teacher_targets_to_cpu()
+                selective_topk = (
+                    extract_teacher_topk_targets(
+                        outputs.logits,
+                        k=parse_selective_student_topk_k(self.loss_type),
+                        sequence_chunk_size=self.selective_teacher_topk_chunk_tokens,
+                        pin_memory=True,
+                    )
+                    if need_logits and self.selective_student_topk
+                    else None
+                )
                 logits = (
                     self._stage_teacher_logits(outputs.logits)
-                    if need_logits
+                    if need_logits and not self.selective_student_topk
                     else None
                 )
                 reference_hidden = None
@@ -1067,6 +1099,7 @@ else:
                     }
                 targets = _TeacherTargets(
                     logits=logits,
+                    selective_topk=selective_topk,
                     reference_hidden=reference_hidden,
                     hidden_by_name=hidden_by_name,
                     pre_mlp_by_name=pre_mlp_by_name,
@@ -1347,6 +1380,38 @@ else:
                 if loss_type.startswith("kl_top"):
                     k = parse_k("kl_top", default_k=1000)
                     teacher_targets = get_teacher_targets()
+                    if self.selective_student_topk:
+                        if teacher_targets.selective_topk is None:
+                            raise RuntimeError("selective student top-k requires compact teacher targets.")
+                        if int(teacher_targets.selective_topk.k) != int(k):
+                            raise RuntimeError("selective teacher top-k K does not match loss K.")
+                        input_tensor = next(
+                            value for value in student_inputs.values() if torch.is_tensor(value)
+                        )
+                        selected_indices, selected_teacher_logits = move_teacher_topk_targets_to_device(
+                            teacher_targets.selective_topk,
+                            device=input_tensor.device,
+                        )
+                        prepare_student_path()
+                        with selective_student_lm_head(
+                            model,
+                            teacher_topk_indices=selected_indices,
+                            chunk_rows=self.selective_student_topk_chunk_rows,
+                        ):
+                            outputs = student_forward(student_inputs)
+                        logits = outputs.logits
+                        regions = build_token_regions(logits)
+                        loss = combine_region_loss(
+                            lambda mask: compute_selected_teacher_topk_kl(
+                                student_selected_logits=logits,
+                                teacher_topk_logits=selected_teacher_logits,
+                                mask=mask,
+                                temperature=float(self.temperature),
+                            ),
+                            regions,
+                        )
+                        loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
+                        return (loss, outputs) if return_outputs else loss
                     ori_logits = teacher_targets.logits
                     prepare_student_path()
                     outputs = student_forward(student_inputs)
