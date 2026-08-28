@@ -50,10 +50,12 @@ class VAEDecoderE2EArguments:
     distill_temperature: float = 1.0
     distill_alpha: float = 0.5
     hidden_loss_weight: float = 0.0
+    pre_mlp_hidden_loss_weight: float = 0.0
     prompt_kd_weight: float = 0.0
     eakld_confidence_k: int = 16
     hidden_layer_weighting: str = "uniform"
     teacher_output_offload: str = "none"
+    teacher_model_offload: str = "none"
     teacher_output_pin_memory: bool = True
     teacher_output_chunk_tokens: int = 8
     decoder_layers: str = "all"
@@ -122,10 +124,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--distill_alpha", type=float, default=0.5)
     parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--distill_pre_mlp_hidden_loss_weight",
+        "--pre_mlp_hidden_loss_weight",
+        dest="pre_mlp_hidden_loss_weight",
+        type=float,
+        default=0.0,
+    )
     parser.add_argument("--prompt_kd_weight", type=float, default=0.0)
     parser.add_argument("--eakld_confidence_k", type=int, default=16)
     parser.add_argument("--hidden_layer_weighting", type=str, default="uniform")
     parser.add_argument("--teacher_output_offload", type=str, default="none")
+    parser.add_argument(
+        "--distill_teacher_model_offload",
+        "--teacher_model_offload",
+        dest="teacher_model_offload",
+        type=str,
+        default="none",
+    )
     parser.add_argument(
         "--teacher_output_pin_memory",
         type=lambda value: _parse_bool_like(
@@ -281,6 +297,11 @@ def validate_args(
             parser.error("--dataset_task mcqa requires --loss_type choice_kd or choice_kd_ce.")
         if float(args.hidden_loss_weight) > 0.0:
             parser.error("--dataset_task mcqa does not support --hidden_loss_weight > 0.")
+        if float(args.pre_mlp_hidden_loss_weight) > 0.0:
+            parser.error(
+                "--dataset_task mcqa does not support "
+                "--distill_pre_mlp_hidden_loss_weight > 0."
+            )
         if float(args.prompt_kd_weight) != 0.0:
             parser.error(
                 "--dataset_task mcqa does not support --prompt_kd_weight != 0 "
@@ -292,6 +313,8 @@ def validate_args(
         parser.error("--distill_alpha must satisfy 0 <= alpha <= 1.")
     if float(args.hidden_loss_weight) < 0.0:
         parser.error("--hidden_loss_weight must be >= 0.")
+    if float(args.pre_mlp_hidden_loss_weight) < 0.0:
+        parser.error("--distill_pre_mlp_hidden_loss_weight must be >= 0.")
     if float(args.prompt_kd_weight) < 0.0:
         parser.error("--prompt_kd_weight must be >= 0.")
     if int(args.eakld_confidence_k) < 2:
@@ -311,6 +334,16 @@ def validate_args(
     if teacher_output_offload not in {"none", "cpu"}:
         parser.error("--teacher_output_offload must be one of: none | cpu.")
     args.teacher_output_offload = teacher_output_offload
+
+    teacher_model_offload = str(args.teacher_model_offload or "").strip().lower()
+    if teacher_model_offload not in {"none", "cpu"}:
+        parser.error("--distill_teacher_model_offload must be one of: none | cpu.")
+    if teacher_model_offload == "cpu" and teacher_output_offload != "cpu":
+        parser.error(
+            "--distill_teacher_model_offload cpu requires --teacher_output_offload cpu "
+            "so teacher targets are staged off GPU before the student forward."
+        )
+    args.teacher_model_offload = teacher_model_offload
 
     if int(args.teacher_output_chunk_tokens) < 1:
         parser.error("--teacher_output_chunk_tokens must be >= 1.")

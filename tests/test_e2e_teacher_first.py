@@ -8,19 +8,28 @@ import pytest
 import torch
 from torch import nn
 
-from compressed_e2e_fintuning.trainer import VAEDecoderE2ETrainer
+from compressed_e2e_fintuning.trainer import (
+    VAEDecoderE2ETrainer,
+    _resolve_e2e_pre_mlp_capture_modules,
+)
 from train_utils.distill_losses import compute_teacher_entropy_mean_and_gamma
+from train_utils.lora_training import (
+    _capture_pre_mlp_hiddens_from_modules,
+    _compute_named_pre_mlp_hidden_alignment_loss,
+)
 from train_utils.train_args import TrainingArguments
 
 
 class _TinyBlock(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
+        self.post_attention_layernorm = nn.Identity()
         self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
         nn.init.eye_(self.proj.weight)
         self.last_output = None
 
     def forward(self, hidden_states: torch.Tensor, **_kwargs):
+        hidden_states = self.post_attention_layernorm(hidden_states)
         output = hidden_states + 0.1 * torch.tanh(self.proj(hidden_states))
         self.last_output = output
         return (output,)
@@ -98,9 +107,11 @@ def _build_trainer(
     *,
     loss_type: str,
     hidden_loss_weight: float,
+    pre_mlp_hidden_loss_weight: float = 0.0,
     hidden_layer_weighting: str = "adaptive_top_2",
     prompt_kd_weight: float = 0.0,
     teacher_output_offload: str = "cpu",
+    teacher_model_offload: str = "none",
 ):
     events: list[str] = []
     teacher = _TinyCausalLM(role="teacher", events=events)
@@ -124,10 +135,12 @@ def _build_trainer(
         loss_type=loss_type,
         teacher_model=teacher,
         hidden_loss_weight=hidden_loss_weight,
+        pre_mlp_hidden_loss_weight=pre_mlp_hidden_loss_weight,
         hidden_layer_weighting=hidden_layer_weighting,
         prompt_kd_weight=prompt_kd_weight,
         eakld_confidence_k=16,
         teacher_output_offload=teacher_output_offload,
+        teacher_model_offload=teacher_model_offload,
         teacher_output_pin_memory=False,
         teacher_output_chunk_tokens=2,
     )
@@ -294,6 +307,82 @@ def test_cpu_sft_hidden_positive_teacher_first_no_logits_cache(tmp_path):
     assert targets.logits_cpu is None
     assert targets.eakld_gamma_cpu is None
     assert len(targets.hidden_cpu_by_layer) == 2
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_cpu_pre_mlp_loss_matches_cat_helper(tmp_path):
+    trainer, student, teacher, events = _build_trainer(
+        tmp_path,
+        loss_type="kl_top_1000",
+        hidden_loss_weight=0.0,
+        pre_mlp_hidden_loss_weight=0.25,
+        hidden_layer_weighting="adaptive_top_2",
+        teacher_output_offload="cpu",
+    )
+    inputs = _inputs()
+    loss = trainer.compute_loss(student, inputs)
+
+    assert events == ["teacher_forward", "student_forward"]
+    assert "pre_mlp_hidden_loss" in trainer._last_loss_parts
+    targets = trainer._active_teacher_targets
+    assert targets is not None
+    assert len(targets.pre_mlp_hidden_cpu_by_name) == 4
+    assert targets.pre_mlp_reference_hidden_cpu is not None
+
+    student.teacher_for_lifetime_check = None
+    teacher_inputs = dict(inputs)
+    teacher_inputs.pop("labels")
+    teacher_modules = _resolve_e2e_pre_mlp_capture_modules(teacher)
+    student_modules = _resolve_e2e_pre_mlp_capture_modules(student)
+    with torch.no_grad():
+        with _capture_pre_mlp_hiddens_from_modules(teacher_modules) as teacher_capture:
+            teacher_outputs = teacher(
+                **teacher_inputs,
+                output_hidden_states=True,
+            )
+        with _capture_pre_mlp_hiddens_from_modules(student_modules) as student_capture:
+            student(**teacher_inputs, output_hidden_states=False)
+
+    expected = _compute_named_pre_mlp_hidden_alignment_loss(
+        teacher_by_name={
+            name: tensor.detach().clone().cpu()
+            for name, tensor in teacher_capture.items()
+        },
+        student_by_name=dict(student_capture),
+        attention_mask=inputs["attention_mask"],
+        layer_weighting="adaptive_top_2",
+        teacher_reference_hidden=teacher_outputs.hidden_states[0].detach().clone().cpu(),
+        teacher_targets_on_cpu=True,
+    )
+    assert trainer._last_loss_parts["pre_mlp_hidden_loss"] == pytest.approx(
+        float(expected.item()),
+        rel=1e-6,
+        abs=1e-7,
+    )
+
+    try:
+        loss.backward()
+        _assert_student_has_finite_trainable_grad(student)
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_teacher_model_offload_cpu_returns_teacher_to_cpu(tmp_path):
+    trainer, student, teacher, events = _build_trainer(
+        tmp_path,
+        loss_type="kl_top_1000",
+        hidden_loss_weight=0.0,
+        teacher_output_offload="cpu",
+        teacher_model_offload="cpu",
+    )
+    loss = trainer.compute_loss(student, _inputs())
+    assert events == ["teacher_forward", "student_forward"]
+    assert teacher.to_calls
+    assert teacher.to_calls[-1] == "cpu"
+    assert trainer._teacher_device == torch.device("cpu")
     try:
         loss.backward()
     finally:

@@ -207,6 +207,57 @@ class DatasetMixArgsTest(unittest.TestCase):
         )
         self.assertEqual(e2e_args.parallel_mode, "dp")
 
+    def test_parse_args_accepts_pre_mlp_and_teacher_model_offload(self):
+        e2e_args, _hf_args, _training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--distill_pre_mlp_hidden_loss_weight",
+                "0.01",
+                "--teacher_output_offload",
+                "cpu",
+                "--distill_teacher_model_offload",
+                "cpu",
+                "--max_steps",
+                "10",
+            ]
+        )
+        self.assertEqual(e2e_args.pre_mlp_hidden_loss_weight, 0.01)
+        self.assertEqual(e2e_args.teacher_output_offload, "cpu")
+        self.assertEqual(e2e_args.teacher_model_offload, "cpu")
+
+    def test_parse_args_rejects_negative_pre_mlp_hidden_loss_weight(self):
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--student_checkpoint_dir",
+                    self._checkpoint_dir(),
+                    "--dataset_mix",
+                    "openorca=1",
+                    "--distill_pre_mlp_hidden_loss_weight",
+                    "-0.01",
+                    "--max_steps",
+                    "10",
+                ]
+            )
+
+    def test_parse_args_rejects_teacher_model_offload_without_cpu_targets(self):
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--student_checkpoint_dir",
+                    self._checkpoint_dir(),
+                    "--dataset_mix",
+                    "openorca=1",
+                    "--distill_teacher_model_offload",
+                    "cpu",
+                    "--max_steps",
+                    "10",
+                ]
+            )
+
     def test_parse_args_rejects_layer_mp_under_torchrun(self):
         with mock.patch.dict("os.environ", {"WORLD_SIZE": "4"}, clear=False):
             with self.assertRaises(SystemExit):

@@ -18,6 +18,7 @@ from compressed_e2e_fintuning.teacher_targets import (
     TeacherHiddenTargetCollector,
     TeacherTargetBatch,
     copy_detached_tensor_to_cpu,
+    resolve_pre_mlp_modules,
 )
 from e2e_common.dense_loss import (
     compute_dense_loss_from_logits,
@@ -42,11 +43,21 @@ _EAKLD_WEIGHTED_KEYS = (
 )
 from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.lora_training import (
+    _capture_pre_mlp_hiddens_from_modules,
+    _compute_named_pre_mlp_hidden_alignment_loss,
     build_distill_hidden_layer_weights,
     compute_distill_hidden_alignment_loss,
     compute_selected_distill_hidden_alignment_loss,
+    is_adaptive_hidden_alignment_layer_weighting,
     parse_distill_hidden_alignment_layer_weighting,
 )
+
+
+def _resolve_e2e_pre_mlp_capture_modules(model: nn.Module):
+    return tuple(
+        (f"model.layers.{layer_id}.post_attention_layernorm", module)
+        for layer_id, module in enumerate(resolve_pre_mlp_modules(model))
+    )
 
 
 class E2ETrainerLogCallback(TrainerCallback):
@@ -66,6 +77,7 @@ class E2ETrainerLogCallback(TrainerCallback):
             "loss",
             "distill_loss",
             "hidden_loss",
+            "pre_mlp_hidden_loss",
             "train_loss",
             "eval_loss",
             "learning_rate",
@@ -295,12 +307,14 @@ class VAEDecoderE2ETrainer(Trainer):
         distill_temperature: float = 1.0,
         distill_alpha: float = 0.5,
         hidden_loss_weight: float = 0.0,
+        pre_mlp_hidden_loss_weight: float = 0.0,
         prompt_kd_weight: float = 0.0,
         eakld_confidence_k: int = 16,
         hidden_layer_weighting: str = "uniform",
         saved_tensor_offload=None,
         streaming_offload_manager=None,
         teacher_output_offload: str = "none",
+        teacher_model_offload: str = "none",
         teacher_output_pin_memory: bool = True,
         teacher_output_chunk_tokens: int = 8,
         **kwargs,
@@ -312,6 +326,12 @@ class VAEDecoderE2ETrainer(Trainer):
         self.hidden_loss_weight = float(hidden_loss_weight)
         if self.hidden_loss_weight < 0.0:
             raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
+        self.pre_mlp_hidden_loss_weight = float(pre_mlp_hidden_loss_weight)
+        if self.pre_mlp_hidden_loss_weight < 0.0:
+            raise ValueError(
+                "pre_mlp_hidden_loss_weight must be >= 0, "
+                f"got {self.pre_mlp_hidden_loss_weight}."
+            )
         self.prompt_kd_weight = float(prompt_kd_weight)
         if self.prompt_kd_weight < 0.0:
             raise ValueError(f"prompt_kd_weight must be >= 0, got {self.prompt_kd_weight}.")
@@ -332,6 +352,13 @@ class VAEDecoderE2ETrainer(Trainer):
         self.teacher_output_offload = str(teacher_output_offload).strip().lower()
         if self.teacher_output_offload not in {"none", "cpu"}:
             raise ValueError("teacher_output_offload must be one of: none | cpu.")
+        self.teacher_model_offload = str(teacher_model_offload).strip().lower()
+        if self.teacher_model_offload not in {"none", "cpu"}:
+            raise ValueError("teacher_model_offload must be one of: none | cpu.")
+        if self.teacher_model_offload == "cpu" and self.teacher_output_offload != "cpu":
+            raise ValueError(
+                "teacher_model_offload=cpu requires teacher_output_offload=cpu."
+            )
         self.teacher_output_pin_memory = bool(teacher_output_pin_memory)
         self.teacher_output_chunk_tokens = int(teacher_output_chunk_tokens)
         if self.teacher_output_chunk_tokens < 1:
@@ -402,10 +429,20 @@ class VAEDecoderE2ETrainer(Trainer):
             loss_device=loss_device,
         )
 
-    def _store_loss_parts(self, *, distill_loss: torch.Tensor, hidden_loss: Optional[torch.Tensor] = None) -> None:
+    def _store_loss_parts(
+        self,
+        *,
+        distill_loss: torch.Tensor,
+        hidden_loss: Optional[torch.Tensor] = None,
+        pre_mlp_hidden_loss: Optional[torch.Tensor] = None,
+    ) -> None:
         parts = {"distill_loss": float(distill_loss.detach().float().item())}
         if hidden_loss is not None:
             parts["hidden_loss"] = float(hidden_loss.detach().float().item())
+        if pre_mlp_hidden_loss is not None:
+            parts["pre_mlp_hidden_loss"] = float(
+                pre_mlp_hidden_loss.detach().float().item()
+            )
         self._last_loss_parts = parts
 
     def _record_eakld_telemetry(self, telemetry: Dict[str, torch.Tensor]) -> None:
@@ -482,6 +519,7 @@ class VAEDecoderE2ETrainer(Trainer):
         inputs: Dict[str, torch.Tensor],
         logits_required: bool,
         hidden_required: bool,
+        pre_mlp_hidden_required: bool,
         eakld_metadata_required: bool,
     ) -> TeacherTargetBatch:
         if self._active_teacher_targets is not None:
@@ -509,11 +547,25 @@ class VAEDecoderE2ETrainer(Trainer):
                 if hidden_required
                 else nullcontext(None)
             )
+            pre_mlp_reference_hidden_required = bool(
+                pre_mlp_hidden_required
+                and is_adaptive_hidden_alignment_layer_weighting(self.hidden_layer_weighting)
+            )
+            pre_mlp_capture_modules = (
+                _resolve_e2e_pre_mlp_capture_modules(self.teacher_model)
+                if pre_mlp_hidden_required
+                else ()
+            )
+            pre_mlp_capture_ctx = (
+                _capture_pre_mlp_hiddens_from_modules(pre_mlp_capture_modules)
+                if pre_mlp_hidden_required
+                else nullcontext(None)
+            )
 
-            with collector_ctx as collector:
+            with collector_ctx as collector, pre_mlp_capture_ctx as captured_pre_mlp:
                 teacher_outputs = self._compute_teacher_outputs(
                     teacher_inputs,
-                    output_hidden_states=False,
+                    output_hidden_states=pre_mlp_reference_hidden_required,
                 )
 
             logits_cpu = None
@@ -577,6 +629,30 @@ class VAEDecoderE2ETrainer(Trainer):
                     raise RuntimeError("hidden_required=True but teacher hidden collector is missing.")
                 hidden_layer_indices, hidden_cpu_by_layer, num_hidden_layers = collector.finalize()
 
+            pre_mlp_hidden_cpu_by_name: Dict[str, torch.Tensor] = {}
+            pre_mlp_reference_hidden_cpu = None
+            if pre_mlp_hidden_required:
+                if captured_pre_mlp is None:
+                    raise RuntimeError(
+                        "pre_mlp_hidden_required=True but teacher pre-MLP capture is missing."
+                    )
+                pre_mlp_hidden_cpu_by_name = {
+                    logical_name: copy_detached_tensor_to_cpu(
+                        captured_pre_mlp[logical_name],
+                        pin_memory=self.teacher_output_pin_memory,
+                    )
+                    for logical_name, _module in pre_mlp_capture_modules
+                }
+                if pre_mlp_reference_hidden_required:
+                    if teacher_outputs.hidden_states is None:
+                        raise RuntimeError(
+                            "adaptive pre-MLP hidden alignment requires teacher hidden_states."
+                        )
+                    pre_mlp_reference_hidden_cpu = copy_detached_tensor_to_cpu(
+                        teacher_outputs.hidden_states[0],
+                        pin_memory=self.teacher_output_pin_memory,
+                    )
+
             del teacher_outputs, teacher_logits, regions
             teacher_outputs = None
             teacher_logits = None
@@ -593,12 +669,15 @@ class VAEDecoderE2ETrainer(Trainer):
                 hidden_cpu_by_layer=dict(hidden_cpu_by_layer),
                 hidden_layer_indices=tuple(hidden_layer_indices),
                 num_hidden_layers=int(num_hidden_layers),
+                pre_mlp_hidden_cpu_by_name=dict(pre_mlp_hidden_cpu_by_name),
+                pre_mlp_reference_hidden_cpu=pre_mlp_reference_hidden_cpu,
             )
             self._last_teacher_target_stats = {
                 "logits_device": "cpu" if logits_required else "none",
                 "hidden_layer_indices": tuple(hidden_layer_indices),
                 "hidden_layer_count": len(hidden_layer_indices),
                 "num_hidden_layers": int(num_hidden_layers),
+                "pre_mlp_hidden_layer_count": len(pre_mlp_hidden_cpu_by_name),
             }
             return targets
         except Exception:
@@ -606,9 +685,17 @@ class VAEDecoderE2ETrainer(Trainer):
             del teacher_outputs, teacher_logits, regions
             raise
 
+        finally:
+            if self.teacher_model_offload == "cpu":
+                self.offload_teacher_to_cpu()
+
     def _compute_choice_kd_loss(self, model, inputs, return_outputs: bool):
         if float(self.hidden_loss_weight) > 0.0:
             raise ValueError("dataset_task=mcqa does not support hidden_loss_weight > 0.")
+        if float(self.pre_mlp_hidden_loss_weight) > 0.0:
+            raise ValueError(
+                "dataset_task=mcqa does not support pre_mlp_hidden_loss_weight > 0."
+            )
         if self.teacher_model is None:
             raise ValueError(f"loss_type={self.loss_type} requires teacher_model for MCQA choice KD.")
 
@@ -635,8 +722,12 @@ class VAEDecoderE2ETrainer(Trainer):
         student_logits = get_output_logits(outputs).reshape(batch_size, choice_count, seq_len, -1)
 
         flat_teacher_inputs = dict(flat_student_inputs)
-        teacher_outputs = self._compute_teacher_outputs(flat_teacher_inputs, output_hidden_states=False)
-        teacher_logits = get_output_logits(teacher_outputs).to(device=student_logits.device)
+        try:
+            teacher_outputs = self._compute_teacher_outputs(flat_teacher_inputs, output_hidden_states=False)
+            teacher_logits = get_output_logits(teacher_outputs).to(device=student_logits.device)
+        finally:
+            if self.teacher_model_offload == "cpu":
+                self.offload_teacher_to_cpu()
         teacher_logits = teacher_logits.reshape(batch_size, choice_count, seq_len, -1)
 
         student_scores = compute_choice_scores_from_logits(student_logits, choice_labels)
@@ -659,12 +750,27 @@ class VAEDecoderE2ETrainer(Trainer):
         # Custom distill losses ignore HF num_items_in_batch scaling.
         student_inputs.pop("num_items_in_batch", None)
         hidden_loss_enabled = float(self.hidden_loss_weight) > 0.0
+        pre_mlp_hidden_loss_enabled = float(self.pre_mlp_hidden_loss_weight) > 0.0
+        pre_mlp_reference_hidden_required = bool(
+            pre_mlp_hidden_loss_enabled
+            and is_adaptive_hidden_alignment_layer_weighting(self.hidden_layer_weighting)
+        )
+        student_pre_mlp_capture_modules = (
+            _resolve_e2e_pre_mlp_capture_modules(model)
+            if pre_mlp_hidden_loss_enabled
+            else ()
+        )
+        student_pre_mlp_capture_ctx = (
+            _capture_pre_mlp_hiddens_from_modules(student_pre_mlp_capture_modules)
+            if pre_mlp_hidden_loss_enabled
+            else nullcontext(None)
+        )
         offload_context = (
             self.saved_tensor_offload.context()
             if self.saved_tensor_offload is not None
             else nullcontext()
         )
-        with offload_context:
+        with offload_context, student_pre_mlp_capture_ctx as captured_student_pre_mlp:
             outputs = model(**student_inputs, output_hidden_states=hidden_loss_enabled)
         logits = get_output_logits(outputs)
 
@@ -677,26 +783,75 @@ class VAEDecoderE2ETrainer(Trainer):
             if ce_loss is None:
                 raise ValueError(f"loss_type={loss_type} requires labels.")
             hidden_loss = None
+            pre_mlp_hidden_loss = None
             loss = ce_loss
-            if hidden_loss_enabled:
+            if hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
                 teacher_inputs = dict(inputs)
                 teacher_inputs.pop("labels", None)
                 teacher_inputs.pop("num_items_in_batch", None)
-                teacher_outputs = self._compute_teacher_outputs(teacher_inputs, output_hidden_states=True)
-                hidden_loss = self._compute_hidden_alignment_loss(
-                    teacher_outputs,
-                    outputs,
-                    inputs,
-                    loss_device=loss.device,
+                teacher_pre_mlp_capture_modules = (
+                    _resolve_e2e_pre_mlp_capture_modules(self.teacher_model)
+                    if pre_mlp_hidden_loss_enabled
+                    else ()
                 )
-                loss = loss + float(self.hidden_loss_weight) * hidden_loss
-            self._store_loss_parts(distill_loss=ce_loss, hidden_loss=hidden_loss)
+                teacher_pre_mlp_capture_ctx = (
+                    _capture_pre_mlp_hiddens_from_modules(teacher_pre_mlp_capture_modules)
+                    if pre_mlp_hidden_loss_enabled
+                    else nullcontext(None)
+                )
+                with teacher_pre_mlp_capture_ctx as captured_teacher_pre_mlp:
+                    teacher_outputs = self._compute_teacher_outputs(
+                        teacher_inputs,
+                        output_hidden_states=(hidden_loss_enabled or pre_mlp_reference_hidden_required),
+                    )
+                if hidden_loss_enabled:
+                    hidden_loss = self._compute_hidden_alignment_loss(
+                        teacher_outputs,
+                        outputs,
+                        inputs,
+                        loss_device=loss.device,
+                    )
+                    loss = loss + float(self.hidden_loss_weight) * hidden_loss
+                if pre_mlp_hidden_loss_enabled:
+                    teacher_reference_hidden = (
+                        teacher_outputs.hidden_states[0]
+                        if pre_mlp_reference_hidden_required
+                        else None
+                    )
+                    pre_mlp_hidden_loss = _compute_named_pre_mlp_hidden_alignment_loss(
+                        teacher_by_name=dict(captured_teacher_pre_mlp),
+                        student_by_name=dict(captured_student_pre_mlp),
+                        attention_mask=inputs.get("attention_mask"),
+                        layer_weighting=self.hidden_layer_weighting,
+                        teacher_reference_hidden=teacher_reference_hidden,
+                        teacher_targets_on_cpu=False,
+                    )
+                    loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
+            self._store_loss_parts(
+                distill_loss=ce_loss,
+                hidden_loss=hidden_loss,
+                pre_mlp_hidden_loss=pre_mlp_hidden_loss,
+            )
             return (loss, outputs) if return_outputs else loss
 
         teacher_inputs = dict(inputs)
         teacher_inputs.pop("labels", None)
         teacher_inputs.pop("num_items_in_batch", None)
-        teacher_outputs = self._compute_teacher_outputs(teacher_inputs, output_hidden_states=hidden_loss_enabled)
+        teacher_pre_mlp_capture_modules = (
+            _resolve_e2e_pre_mlp_capture_modules(self.teacher_model)
+            if pre_mlp_hidden_loss_enabled
+            else ()
+        )
+        teacher_pre_mlp_capture_ctx = (
+            _capture_pre_mlp_hiddens_from_modules(teacher_pre_mlp_capture_modules)
+            if pre_mlp_hidden_loss_enabled
+            else nullcontext(None)
+        )
+        with teacher_pre_mlp_capture_ctx as captured_teacher_pre_mlp:
+            teacher_outputs = self._compute_teacher_outputs(
+                teacher_inputs,
+                output_hidden_states=(hidden_loss_enabled or pre_mlp_reference_hidden_required),
+            )
         teacher_logits = get_output_logits(teacher_outputs).to(device=logits.device)
         regions = self._build_distill_token_regions(inputs, logits)
         telemetry: Dict[str, torch.Tensor] = {}
@@ -715,6 +870,7 @@ class VAEDecoderE2ETrainer(Trainer):
         )
         self._record_eakld_telemetry(telemetry)
         hidden_loss = None
+        pre_mlp_hidden_loss = None
         loss = distill_loss
         if hidden_loss_enabled:
             hidden_loss = self._compute_hidden_alignment_loss(
@@ -724,18 +880,38 @@ class VAEDecoderE2ETrainer(Trainer):
                 loss_device=distill_loss.device,
             )
             loss = loss + float(self.hidden_loss_weight) * hidden_loss
-        self._store_loss_parts(distill_loss=distill_loss, hidden_loss=hidden_loss)
+        if pre_mlp_hidden_loss_enabled:
+            teacher_reference_hidden = (
+                teacher_outputs.hidden_states[0]
+                if pre_mlp_reference_hidden_required
+                else None
+            )
+            pre_mlp_hidden_loss = _compute_named_pre_mlp_hidden_alignment_loss(
+                teacher_by_name=dict(captured_teacher_pre_mlp),
+                student_by_name=dict(captured_student_pre_mlp),
+                attention_mask=inputs.get("attention_mask"),
+                layer_weighting=self.hidden_layer_weighting,
+                teacher_reference_hidden=teacher_reference_hidden,
+                teacher_targets_on_cpu=False,
+            )
+            loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
+        self._store_loss_parts(
+            distill_loss=distill_loss,
+            hidden_loss=hidden_loss,
+            pre_mlp_hidden_loss=pre_mlp_hidden_loss,
+        )
         return (loss, outputs) if return_outputs else loss
 
     def _compute_teacher_first_cpu_loss(self, model, inputs, return_outputs: bool):
         loss_type = self.loss_type
         hidden_required = float(self.hidden_loss_weight) > 0.0
+        pre_mlp_hidden_required = float(self.pre_mlp_hidden_loss_weight) > 0.0
         logits_required = loss_type not in {"sft", "origin"}
         eakld_metadata_required = (
             loss_type in {"eakld", "eakld_kd"}
             or is_eakld_top_loss(loss_type)
         )
-        needs_teacher = hidden_required or logits_required
+        needs_teacher = hidden_required or pre_mlp_hidden_required or logits_required
 
         labels = inputs.get("labels")
         student_inputs = dict(inputs)
@@ -749,6 +925,7 @@ class VAEDecoderE2ETrainer(Trainer):
                     inputs=inputs,
                     logits_required=logits_required,
                     hidden_required=hidden_required,
+                    pre_mlp_hidden_required=pre_mlp_hidden_required,
                     eakld_metadata_required=eakld_metadata_required,
                 )
 
@@ -760,12 +937,26 @@ class VAEDecoderE2ETrainer(Trainer):
                 if hidden_required
                 else nullcontext(None)
             )
+            student_pre_mlp_capture_modules = (
+                _resolve_e2e_pre_mlp_capture_modules(model)
+                if pre_mlp_hidden_required
+                else ()
+            )
+            student_pre_mlp_capture_ctx = (
+                _capture_pre_mlp_hiddens_from_modules(student_pre_mlp_capture_modules)
+                if pre_mlp_hidden_required
+                else nullcontext(None)
+            )
             offload_context = (
                 self.saved_tensor_offload.context()
                 if self.saved_tensor_offload is not None
                 else nullcontext()
             )
-            with offload_context, student_collector_ctx as student_collector:
+            with (
+                offload_context,
+                student_collector_ctx as student_collector,
+                student_pre_mlp_capture_ctx as captured_student_pre_mlp,
+            ):
                 outputs = model(**student_inputs, output_hidden_states=False)
             logits = get_output_logits(outputs)
 
@@ -834,6 +1025,7 @@ class VAEDecoderE2ETrainer(Trainer):
                     self._record_eakld_telemetry(telemetry)
 
             hidden_loss = None
+            pre_mlp_hidden_loss = None
             loss = distill_loss
             if hidden_required:
                 if targets is None or student_collector is None:
@@ -849,7 +1041,26 @@ class VAEDecoderE2ETrainer(Trainer):
                 )
                 loss = loss + float(self.hidden_loss_weight) * hidden_loss
 
-            self._store_loss_parts(distill_loss=distill_loss, hidden_loss=hidden_loss)
+            if pre_mlp_hidden_required:
+                if targets is None or captured_student_pre_mlp is None:
+                    raise RuntimeError(
+                        "pre-MLP hidden alignment requires teacher and student captures."
+                    )
+                pre_mlp_hidden_loss = _compute_named_pre_mlp_hidden_alignment_loss(
+                    teacher_by_name=targets.pre_mlp_hidden_cpu_by_name,
+                    student_by_name=dict(captured_student_pre_mlp),
+                    attention_mask=inputs.get("attention_mask"),
+                    layer_weighting=self.hidden_layer_weighting,
+                    teacher_reference_hidden=targets.pre_mlp_reference_hidden_cpu,
+                    teacher_targets_on_cpu=True,
+                )
+                loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
+
+            self._store_loss_parts(
+                distill_loss=distill_loss,
+                hidden_loss=hidden_loss,
+                pre_mlp_hidden_loss=pre_mlp_hidden_loss,
+            )
 
             if torch.is_grad_enabled() and torch.is_tensor(loss) and bool(loss.requires_grad):
                 self._active_teacher_targets = targets
@@ -924,11 +1135,14 @@ class VAEDecoderE2ETrainer(Trainer):
             )
             logging.getLogger("compressed_e2e_fintuning").info(
                 "Teacher target first-step stats: logits_device=%s hidden_layers=%s "
-                "hidden_layer_count=%d peak_allocated_bytes=%d teacher_weight_offload=false",
+                "hidden_layer_count=%d pre_mlp_hidden_layer_count=%d "
+                "peak_allocated_bytes=%d teacher_model_offload=%s",
                 self._last_teacher_target_stats.get("logits_device", "none"),
                 self._last_teacher_target_stats.get("hidden_layer_indices", ()),
                 int(self._last_teacher_target_stats.get("hidden_layer_count", 0)),
+                int(self._last_teacher_target_stats.get("pre_mlp_hidden_layer_count", 0)),
                 peak_bytes,
+                self.teacher_model_offload,
             )
             self._logged_teacher_target_stats = True
 

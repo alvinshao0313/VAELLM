@@ -29,19 +29,45 @@
 
 ```bash
 --hidden_loss_weight 0.0
---hidden_layer_weighting uniform  # uniform | linear_depth
+--hidden_layer_weighting uniform  # uniform | linear_depth | adaptive_top_k
 ```
 
 `hidden_loss_weight=0` 表示关闭。开启后会在现有 SFT/KD loss 之外，对齐 teacher 和 student 的所有 transformer block 输出 hidden states，即 `hidden_states[1:]`，跳过 embedding hidden state。
 
-`linear_depth` 会让越靠后的层权重越大，并把平均权重归一到 1。当前 `e2e_decoder.sh` 使用较保守的：
+`linear_depth` 会让越靠后的层权重越大，并把平均权重归一到 1。当前 `e2e_decoder.sh` 默认关闭普通 hidden alignment，但保留 `adaptive_top_3` 作为启用 hidden/pre-MLP alignment 时的层选择设置：
 
 ```bash
---hidden_loss_weight 0.003
---hidden_layer_weighting linear_depth
+--hidden_loss_weight 0.0
+--hidden_layer_weighting adaptive_top_3
 ```
 
 这个损失会额外保存 teacher/student hidden states，长序列训练时显存压力会增加。
+
+### Pre-MLP hidden 对齐
+
+端到端训练同时支持：
+
+```bash
+--distill_pre_mlp_hidden_loss_weight 0.0
+```
+
+`0.0` 表示关闭。开启后，teacher/student 都在每个 Transformer block 的 `post_attention_layernorm` **输入端**捕获 hidden，也就是 attention residual 之后、MLP 之前的表示。损失计算直接复用 CAT 压缩训练的 `_compute_named_pre_mlp_hidden_alignment_loss`，因此每层损失、mask、`uniform` / `linear_depth` / `adaptive_top_k` 聚合语义与 CAT 一致：
+
+```text
+L_pre_mlp(layer) = mean_mask((student - teacher)^2) / (mean_mask(teacher^2) + 1e-6)
+L_total += distill_pre_mlp_hidden_loss_weight * L_pre_mlp
+```
+
+`--hidden_layer_weighting` 同时控制普通 hidden alignment 和 pre-MLP hidden alignment。`adaptive_top_k` 时，pre-MLP 层选择也使用 CAT 的同一实现。与 CAT 一致，pre-MLP alignment 使用 `attention_mask` 覆盖整条序列的所有非 padding token，不使用 response-only mask，也不做 causal shift；它与 `prompt_kd_weight` 控制的 logit KD region 是两套独立语义。
+
+### Teacher 权重 CPU offload
+
+```bash
+--teacher_output_offload cpu
+--distill_teacher_model_offload cpu
+```
+
+`--distill_teacher_model_offload none` 为默认值。设为 `cpu` 时，teacher 权重在 teacher forward 前搬到训练设备；本 batch 需要的 logits / hidden targets materialize 到 CPU 后，teacher 权重立即搬回 CPU，再执行 student forward。当前实现要求 teacher model offload 与 `--teacher_output_offload cpu` 一起使用。该模式与 CAT 的 teacher model offload 语义一致：它减少 teacher 权重与 student forward 的显存重叠，但 teacher 本身的一次 forward 仍需完整落在其 forward device 上，并不是 CPU inference 或 teacher layer-wise model parallel。
 
 ## Prompt KD weighting
 

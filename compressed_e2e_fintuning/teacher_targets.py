@@ -22,6 +22,8 @@ class TeacherTargetBatch:
     hidden_cpu_by_layer: Dict[int, torch.Tensor] = field(default_factory=dict)
     hidden_layer_indices: Tuple[int, ...] = ()
     num_hidden_layers: int = 0
+    pre_mlp_hidden_cpu_by_name: Dict[str, torch.Tensor] = field(default_factory=dict)
+    pre_mlp_reference_hidden_cpu: Optional[torch.Tensor] = None
 
     def clear(self) -> None:
         self.logits_cpu = None
@@ -34,6 +36,8 @@ class TeacherTargetBatch:
         self.hidden_cpu_by_layer.clear()
         self.hidden_layer_indices = ()
         self.num_hidden_layers = 0
+        self.pre_mlp_hidden_cpu_by_name.clear()
+        self.pre_mlp_reference_hidden_cpu = None
 
 
 def resolve_transformer_layers(model: nn.Module) -> Sequence[nn.Module]:
@@ -72,6 +76,19 @@ def resolve_transformer_layers(model: nn.Module) -> Sequence[nn.Module]:
         else:
             hook_layers.append(layer)
     return tuple(hook_layers)
+
+
+def resolve_pre_mlp_modules(model: nn.Module) -> Tuple[nn.Module, ...]:
+    modules = []
+    for layer_id, layer in enumerate(resolve_transformer_layers(model)):
+        module = getattr(layer, "post_attention_layernorm", None)
+        if not isinstance(module, nn.Module):
+            raise ValueError(
+                "pre-MLP hidden alignment requires every Transformer layer to expose "
+                f"post_attention_layernorm; missing at layer {layer_id}."
+            )
+        modules.append(module)
+    return tuple(modules)
 
 
 def copy_detached_tensor_to_cpu(

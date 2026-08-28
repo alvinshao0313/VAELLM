@@ -518,7 +518,11 @@ def _ensure_torch_distributed_initialized(log) -> None:
 
 
 def _load_teacher(*, args, hf_args, base_model_path: str, log, device: Optional[torch.device] = None):
-    if not needs_teacher(args.loss_type) and float(getattr(args, "hidden_loss_weight", 0.0)) <= 0.0:
+    if (
+        not needs_teacher(args.loss_type)
+        and float(getattr(args, "hidden_loss_weight", 0.0)) <= 0.0
+        and float(getattr(args, "pre_mlp_hidden_loss_weight", 0.0)) <= 0.0
+    ):
         return None, "disabled"
     teacher_path = str(args.teacher_model_path or base_model_path)
     log.info("Loading teacher model from %s", teacher_path)
@@ -528,7 +532,10 @@ def _load_teacher(*, args, hf_args, base_model_path: str, log, device: Optional[
         teacher_model.config.use_cache = False
     for param in teacher_model.parameters():
         param.requires_grad = False
-    if device is not None:
+    if str(getattr(args, "teacher_model_offload", "none")) == "cpu":
+        teacher_model.to("cpu")
+        log.info("Teacher model offload enabled: initial_device=cpu")
+    elif device is not None:
         teacher_model.to(device)
         log.info("Moved teacher model to %s", device)
     return teacher_model, "external_teacher"
@@ -998,8 +1005,9 @@ def run(args, hf_args, training_args):
     )
     log.info("Teacher source: %s", teacher_source)
     log.info(
-        "Hidden alignment config: weight=%.6f layer_weighting=%s",
+        "Hidden alignment config: weight=%.6f pre_mlp_weight=%.6f layer_weighting=%s",
         float(getattr(args, "hidden_loss_weight", 0.0)),
+        float(getattr(args, "pre_mlp_hidden_loss_weight", 0.0)),
         str(getattr(args, "hidden_layer_weighting", "uniform")),
     )
     log.info(
@@ -1008,10 +1016,11 @@ def run(args, hf_args, training_args):
     )
     log.info(
         "Teacher output config: offload=%s pin_memory=%s chunk_tokens=%d "
-        "teacher_weight_offload=false",
+        "teacher_model_offload=%s",
         str(args.teacher_output_offload),
         str(bool(args.teacher_output_pin_memory)).lower(),
         int(args.teacher_output_chunk_tokens),
+        str(getattr(args, "teacher_model_offload", "none")),
     )
 
     training_args.output_dir = os.path.join(run_output_dir, "trainer_state")
@@ -1054,9 +1063,11 @@ def run(args, hf_args, training_args):
         distill_temperature=args.distill_temperature,
         distill_alpha=args.distill_alpha,
         hidden_loss_weight=float(args.hidden_loss_weight),
+        pre_mlp_hidden_loss_weight=float(args.pre_mlp_hidden_loss_weight),
         prompt_kd_weight=float(args.prompt_kd_weight),
         hidden_layer_weighting=str(args.hidden_layer_weighting),
         teacher_output_offload=str(args.teacher_output_offload),
+        teacher_model_offload=str(args.teacher_model_offload),
         teacher_output_pin_memory=bool(args.teacher_output_pin_memory),
         teacher_output_chunk_tokens=int(args.teacher_output_chunk_tokens),
         eakld_confidence_k=int(args.eakld_confidence_k),

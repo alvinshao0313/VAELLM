@@ -67,6 +67,7 @@ export HF_DATASETS_OFFLINE=1
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
   --output_dir "/root/data/ckpts/result/catlora" \
+  --resume_from_checkpoint "/root/data/ckpts/result/catlora/Qwen_Qwen3-8B_20260825_122546/after_up_proj/" \
   --seed "31" \
   --deterministic "true" \
   --train_device "cuda" \
@@ -143,7 +144,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --outlier_residual_codec "blocked_quantized" \
   --outlier_residual_index_bits "8" \
   --outlier_residual_value_bits "8" \
-  --distill_after_category "remaining_lora" \
+  --distill_after_category "remaining_lora_all_decoder" \
   --distill_dataset "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --lora_rank "default=12" \
   --lora_alpha "default=24" \
@@ -151,7 +152,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --distill_steps "default=5000" \
   --distill_batch_size "default=4" \
   --distill_lr "default=1e-4" \
-  --distill_decoder_lr "default=5e-5" \
+  --distill_decoder_lr "default=1e-5" \
   --distill_weight_decay "default=0.001" \
   --distill_log_every "default=100" \
   --distill_temperature "default=1.0" \
@@ -161,7 +162,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --distill_teacher_logits_cpu_staging "true" \
   --distill_teacher_model_offload "none" \
   --distill_hidden_loss_weight "default=0.1" \
-  --distill_pre_mlp_hidden_loss_weight "default=0.01" \
+  --distill_pre_mlp_hidden_loss_weight "default=0.001" \
   --distill_hidden_alignment_layer_weighting "linear_depth" \
   --lora_use_dora "default=true" \
   --distill_tune_final_norm "true" \
@@ -175,8 +176,9 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" tools/cat_train.py \
   --distill_max_grad_norm "1.3" \
   --distill_warmup_ratio "0.1" \
   --distill_group_by_length "true" \
+  --distill_dynamic_padding "true" \
   --distill_lr_scheduler_type "cosine" \
-  --distill_model_max_length "8192" \
+  --distill_model_max_length "1024" \
   --fp16 "false" \
   --bf16 "true" \
   "$@"
