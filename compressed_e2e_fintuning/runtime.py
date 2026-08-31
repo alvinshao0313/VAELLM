@@ -688,6 +688,8 @@ def _clear_vae_linear_cache(model: torch.nn.Module, log, *, reason: str) -> int:
     from litebsq.vae_linear import clear_model_vae_linear_cache
 
     cleared = clear_model_vae_linear_cache(model)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     log.info("%s: cleared decoded cache for %d VAELinear modules.", reason, int(cleared))
     return int(cleared)
 
@@ -1268,6 +1270,7 @@ def run(args, hf_args, training_args):
             log=log,
             parallel_mode=parallel_mode,
         )
+        _clear_vae_linear_cache(final_model, log, reason="After pre-save final lm-eval")
     _park_model_on_cpu(final_model, log, reason="Before final save")
     if getattr(trainer, "model", None) is not None and trainer.model is not final_model:
         trainer.model.to("cpu")
@@ -1339,6 +1342,7 @@ def run(args, hf_args, training_args):
                     log=log,
                     parallel_mode=parallel_mode,
                 )
+            _clear_vae_linear_cache(final_model, log, reason="After post-save final evaluation")
         else:
             log.info("Skipping final eval prewarm because PPL and post-save lm-eval are both disabled.")
     else:

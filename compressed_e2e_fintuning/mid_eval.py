@@ -13,6 +13,7 @@ from torch import nn
 from transformers import TrainerCallback
 
 from litebsq.vae_linear import VAELinear
+from litebsq.vae_linear_prewarm import clear_model_vae_linear_cache
 from train_utils.eval_utils import merge_lm_eval_results, run_lm_eval
 from train_utils.hif4_act import applied_hif4_act
 from train_utils.lm_eval_partial_io import (
@@ -73,6 +74,14 @@ def temporary_inference_decode_mode(
             model.train()
         else:
             model.eval()
+
+
+def _clear_post_eval_decoded_cache(model: nn.Module, *, eval_tag: str, log) -> int:
+    cleared = int(clear_model_vae_linear_cache(model))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log.info("[%s] cleared decoded cache for %d VAELinear modules after eval.", eval_tag, cleared)
+    return cleared
 
 
 def _offload_optimizer_state_to_cpu(optimizer) -> int:
@@ -410,6 +419,7 @@ class EvalAfterSaveCallback(TrainerCallback):
                 cache_decoded_weight=False,
             )
         finally:
+            _clear_post_eval_decoded_cache(eval_model, eval_tag=eval_tag, log=self.log)
             if trainer is not None:
                 optimizer = getattr(trainer, "optimizer", None)
                 if optimizer is not None and optimizer_device is not None:

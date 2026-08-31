@@ -3,6 +3,7 @@ from typing import Any, List, Optional
 import torch
 from torch import nn
 
+from litebsq.vae_linear_prewarm import clear_model_vae_linear_cache
 from train_utils.eval_utils import calculate_ppl, merge_lm_eval_results, run_lm_eval
 from train_utils.hif4_act import applied_hif4_act
 from train_utils.lm_eval_partial_io import (
@@ -182,6 +183,19 @@ def _eval_after_category_distributed(
     distill_distributed_barrier()
 
 
+def _clear_post_eval_decoded_cache(model: nn.Module, *, category: str, logger: Any) -> int:
+    eval_model = unwrap_distill_model(model)
+    cleared = int(clear_model_vae_linear_cache(eval_model))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info(
+        "类别 %s 评估结束：已清理 %d 个 VAELinear 的 decoded weight cache。",
+        category,
+        cleared,
+    )
+    return cleared
+
+
 def eval_after_category(
     *,
     model: nn.Module,
@@ -222,19 +236,22 @@ def eval_after_category(
                 ",".join(task_names) if run_tasks else "",
                 int(distill_world_size()),
             )
-        _eval_after_category_distributed(
-            model=model,
-            vae_args=vae_args,
-            ppl_limit=ppl_limit,
-            category=category,
-            logger=logger,
-            eval_device=eval_device,
-            eval_hif4_act=eval_hif4_act,
-            eval_ppl=run_ppl,
-            task_names=task_names,
-            tokenizer=tokenizer,
-            run_output_dir=str(resolved_run_output_dir or ""),
-        )
+        try:
+            _eval_after_category_distributed(
+                model=model,
+                vae_args=vae_args,
+                ppl_limit=ppl_limit,
+                category=category,
+                logger=logger,
+                eval_device=eval_device,
+                eval_hif4_act=eval_hif4_act,
+                eval_ppl=run_ppl,
+                task_names=task_names,
+                tokenizer=tokenizer,
+                run_output_dir=str(resolved_run_output_dir or ""),
+            )
+        finally:
+            _clear_post_eval_decoded_cache(model, category=category, logger=logger)
         return
 
     logger.info(
@@ -276,6 +293,7 @@ def eval_after_category(
                 logger=logger,
             )
     finally:
+        _clear_post_eval_decoded_cache(model, category=category, logger=logger)
         if bool(move_model_to_cpu_after_eval):
             model.to("cpu")
             if torch.cuda.is_available():
