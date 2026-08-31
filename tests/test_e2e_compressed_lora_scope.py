@@ -19,6 +19,7 @@ from compressed_e2e_fintuning.runtime import (
     _prepare_compressed_lora_train_model,
 )
 from compressed_e2e_fintuning.trainables import (
+    resolve_compressed_lora_init_spec,
     select_vae_decoder_trainables,
     validate_selected_low_rank_scope,
 )
@@ -178,6 +179,23 @@ def _make_subspace_selected(
     return [(MODULE_NAME, layer)], low_rank_a, low_rank_b
 
 
+def _make_branchless_selected(
+    *,
+    in_features: int = 6,
+    out_features: int = 4,
+    compressed_in: int = 4,
+) -> List[Tuple[str, VAELinear]]:
+    layer = _build_vae_linear(
+        in_features=in_features,
+        out_features=out_features,
+        compressed_in_features=compressed_in,
+        low_rank_a=None,
+        low_rank_b=None,
+        low_rank_scope=LOW_RANK_SCOPE_FULL,
+    )
+    return [(MODULE_NAME, layer)]
+
+
 def _copy_payloads(selected_modules):
     return {
         name: (
@@ -208,6 +226,42 @@ class ValidateSelectedLowRankScopeTests(unittest.TestCase):
             validate_selected_low_rank_scope(mixed)
 
 
+class ResolveCompressedLoraInitSpecTests(unittest.TestCase):
+    def test_branchless_defaults_to_requested_rank_and_scope(self):
+        spec = resolve_compressed_lora_init_spec(
+            _make_branchless_selected(),
+            requested_rank=12,
+            requested_scope=LOW_RANK_SCOPE_FULL,
+        )
+        self.assertEqual(spec.source, "new")
+        self.assertEqual(spec.rank, 12)
+        self.assertEqual(spec.scope, LOW_RANK_SCOPE_FULL)
+
+    def test_existing_always_uses_checkpoint_rank_and_scope(self):
+        selected, _, _ = _make_subspace_selected(rank=3)
+        spec = resolve_compressed_lora_init_spec(
+            selected,
+            requested_rank=12,
+            requested_scope=LOW_RANK_SCOPE_FULL,
+        )
+        self.assertEqual(spec.source, "existing")
+        self.assertEqual(spec.rank, 3)
+        self.assertEqual(spec.scope, LOW_RANK_SCOPE_COMPRESSED_SUBSPACE)
+
+    def test_mixed_presence_is_rejected(self):
+        with_payload = _make_full_selected(rank=2)[0]
+        without_payload = (
+            "model.layers.1.mlp.down_proj",
+            _make_branchless_selected(in_features=4, out_features=4, compressed_in=4)[0][1],
+        )
+        with self.assertRaisesRegex(ValueError, "all have low_rank_a/b or all have none"):
+            resolve_compressed_lora_init_spec(
+                [with_payload, without_payload],
+                requested_rank=12,
+                requested_scope=LOW_RANK_SCOPE_FULL,
+            )
+
+
 class CompressedLoraRouteTests(unittest.TestCase):
     def test_full_route_uses_materialize_and_full_builder(self):
         _require_peft_010()
@@ -224,7 +278,7 @@ class CompressedLoraRouteTests(unittest.TestCase):
         def fake_full_build(model_arg, **kwargs):
             calls["full_build"] += 1
             selection = mock.Mock()
-            selection.target_modules = sorted(kwargs["low_rank_payloads"].keys())
+            selection.target_modules = sorted(kwargs["target_modules"])
             selection.train_mode = "compressed_lora"
             return model_arg, selection
 
@@ -245,7 +299,9 @@ class CompressedLoraRouteTests(unittest.TestCase):
                 target_module_suffixes=["down_proj"],
                 low_rank_scope=LOW_RANK_SCOPE_FULL,
                 low_rank_rank=2,
-                low_rank_payloads=payloads,
+                lora_alpha=4.0,
+                lora_dropout=0.0,
+                initial_low_rank_payloads=payloads,
                 decoder_layer_ids=[0],
                 parallel_stage_decode=False,
                 decode_group_size=1,
@@ -286,7 +342,9 @@ class CompressedLoraRouteTests(unittest.TestCase):
                 target_module_suffixes=["down_proj"],
                 low_rank_scope=LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
                 low_rank_rank=rank,
-                low_rank_payloads=payloads,
+                lora_alpha=4.0,
+                lora_dropout=0.0,
+                initial_low_rank_payloads=payloads,
                 decoder_layer_ids=[0],
                 parallel_stage_decode=False,
                 decode_group_size=1,
@@ -315,6 +373,151 @@ class CompressedLoraRouteTests(unittest.TestCase):
         self.assertTrue(all("lora_" in name for name in selection.trainable_parameter_names))
 
 
+class ExistingCompressedLoraScalingTests(unittest.TestCase):
+    def test_existing_full_preserves_effective_patch_with_nonunit_scaling(self):
+        _require_peft_010()
+        selected = _make_full_selected(rank=2)
+        model = TinyE2ECausalLM(TinyE2EConfig(hidden_size=4), selected[0][1])
+        payloads = _copy_payloads(selected)
+        input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        with torch.no_grad():
+            reference = model(input_ids=input_ids).logits.detach().clone()
+
+        peft_model, selection = _prepare_compressed_lora_train_model(
+            model,
+            selected_modules=selected,
+            target_module_suffixes=["down_proj"],
+            low_rank_scope=LOW_RANK_SCOPE_FULL,
+            low_rank_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            initial_low_rank_payloads=payloads,
+            decoder_layer_ids=[0],
+            parallel_stage_decode=False,
+            decode_group_size=1,
+            decode_device="cpu",
+            log=logging.getLogger("test_e2e_existing_full_scaling"),
+        )
+        with torch.no_grad():
+            actual = peft_model(input_ids=input_ids).logits
+        self.assertTrue(torch.allclose(actual, reference, atol=1e-5, rtol=1e-5))
+        self.assertEqual(selection.resolved_lora_rank, 2)
+        self.assertEqual(selection.resolved_lora_alpha, 4.0)
+        self.assertEqual(selection.resolved_lora_dropout, 0.0)
+
+
+class NewCompressedLoraBranchTests(unittest.TestCase):
+    def test_new_full_lora_is_zero_delta_and_exports_into_branchless_vae(self):
+        _require_peft_010()
+        selected = _make_branchless_selected(in_features=4, out_features=4, compressed_in=4)
+        model = TinyE2ECausalLM(TinyE2EConfig(hidden_size=4), selected[0][1])
+        input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        with torch.no_grad():
+            reference = model(input_ids=input_ids).logits.detach().clone()
+
+        peft_model, selection = _prepare_compressed_lora_train_model(
+            model,
+            selected_modules=selected,
+            target_module_suffixes=["down_proj"],
+            low_rank_scope=LOW_RANK_SCOPE_FULL,
+            low_rank_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            initial_low_rank_payloads=None,
+            decoder_layer_ids=[0],
+            parallel_stage_decode=False,
+            decode_group_size=1,
+            decode_device="cpu",
+            log=logging.getLogger("test_e2e_new_full"),
+        )
+        with torch.no_grad():
+            actual = peft_model(input_ids=input_ids).logits
+        self.assertTrue(torch.allclose(actual, reference, atol=1e-5, rtol=1e-5))
+        self.assertEqual(selection.compressed_lora_source, "new")
+        self.assertEqual(selection.resolved_lora_rank, 2)
+        self.assertEqual(selection.resolved_lora_alpha, 4.0)
+        self.assertEqual(selection.resolved_lora_dropout, 0.0)
+        self.assertEqual(selection.resolved_lora_scope, LOW_RANK_SCOPE_FULL)
+        self.assertTrue(selection.trainable_parameter_names)
+        self.assertTrue(all("lora_" in name for name in selection.trainable_parameter_names))
+
+        payloads = e2e_runtime.extract_low_rank_payloads_from_lora(
+            peft_model,
+            selection.target_modules,
+        )
+        export_selected = _make_branchless_selected(in_features=4, out_features=4, compressed_in=4)
+        export_model = TinyE2ECausalLM(TinyE2EConfig(hidden_size=4), export_selected[0][1])
+        written = write_low_rank_payloads_to_compressed_model(
+            export_model,
+            payloads,
+            expected_scope=LOW_RANK_SCOPE_FULL,
+            allow_create=True,
+        )
+        self.assertEqual(written, 1)
+        restored = export_model.model.layers[0].mlp.down_proj
+        self.assertEqual(restored.low_rank_scope, LOW_RANK_SCOPE_FULL)
+        self.assertEqual(tuple(restored.low_rank_a.shape), (4, 2))
+        self.assertEqual(tuple(restored.low_rank_b.shape), (2, 4))
+        self.assertFalse(restored.low_rank_a.requires_grad)
+        self.assertFalse(restored.low_rank_b.requires_grad)
+
+    def test_new_subspace_lora_is_zero_delta_and_preserves_protected_channels_on_export(self):
+        _require_peft_010()
+        selected = _make_branchless_selected(in_features=6, out_features=4, compressed_in=4)
+        model = TinyE2ECausalLM(TinyE2EConfig(hidden_size=6), selected[0][1])
+        input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        with torch.no_grad():
+            reference = model(input_ids=input_ids).logits.detach().clone()
+
+        peft_model, selection = _prepare_compressed_lora_train_model(
+            model,
+            selected_modules=selected,
+            target_module_suffixes=["down_proj"],
+            low_rank_scope=LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
+            low_rank_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            initial_low_rank_payloads=None,
+            decoder_layer_ids=[0],
+            parallel_stage_decode=False,
+            decode_group_size=1,
+            decode_device="cpu",
+            log=logging.getLogger("test_e2e_new_subspace"),
+        )
+        with torch.no_grad():
+            actual = peft_model(input_ids=input_ids).logits
+        self.assertTrue(torch.allclose(actual, reference, atol=1e-5, rtol=1e-5))
+        self.assertEqual(selection.compressed_lora_source, "new")
+        self.assertEqual(selection.resolved_lora_rank, 2)
+        self.assertEqual(selection.resolved_lora_alpha, 4.0)
+        self.assertEqual(selection.resolved_lora_dropout, 0.0)
+        self.assertEqual(selection.resolved_lora_scope, LOW_RANK_SCOPE_COMPRESSED_SUBSPACE)
+        self.assertTrue(selection.trainable_parameter_names)
+        self.assertTrue(all("lora_" in name for name in selection.trainable_parameter_names))
+
+        payloads = extract_subspace_peft_low_rank_payloads(
+            peft_model,
+            module_names=selection.target_modules,
+        )
+        export_selected = _make_branchless_selected(in_features=6, out_features=4, compressed_in=4)
+        export_model = TinyE2ECausalLM(TinyE2EConfig(hidden_size=6), export_selected[0][1])
+        export_layer = export_model.model.layers[0].mlp.down_proj
+        protected_before = export_layer.protected_input_weight.detach().clone()
+        written = write_low_rank_payloads_to_compressed_model(
+            export_model,
+            payloads,
+            expected_scope=LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
+            allow_create=True,
+        )
+        self.assertEqual(written, 1)
+        self.assertEqual(export_layer.low_rank_scope, LOW_RANK_SCOPE_COMPRESSED_SUBSPACE)
+        self.assertEqual(tuple(export_layer.low_rank_a.shape), (4, 2))
+        self.assertEqual(tuple(export_layer.low_rank_b.shape), (2, 4))
+        self.assertTrue(torch.equal(export_layer.protected_input_weight, protected_before))
+        self.assertFalse(export_layer.low_rank_a.requires_grad)
+        self.assertFalse(export_layer.low_rank_b.requires_grad)
+
+
 class FinalExportRoundtripTests(unittest.TestCase):
     def test_subspace_export_roundtrip_updates_payload_keeps_protection(self):
         _require_peft_010()
@@ -329,8 +532,10 @@ class FinalExportRoundtripTests(unittest.TestCase):
         peft_model, selection = _build_subspace_low_rank_peft_model(
             source_model,
             selected_modules=selected,
-            low_rank_payloads=payloads,
+            initial_low_rank_payloads=payloads,
             rank=int(source_a.shape[1]),
+            alpha=4.0,
+            dropout=0.0,
             decoder_layer_ids=[0],
             target_module_suffixes=["down_proj"],
             parallel_stage_decode=False,
@@ -414,8 +619,10 @@ class SubspaceResumeTests(unittest.TestCase):
         peft_model, selection = _build_subspace_low_rank_peft_model(
             model,
             selected_modules=selected,
-            low_rank_payloads=payloads,
+            initial_low_rank_payloads=payloads,
             rank=int(source_a.shape[1]),
+            alpha=4.0,
+            dropout=0.0,
             decoder_layer_ids=[0],
             target_module_suffixes=["down_proj"],
             parallel_stage_decode=False,
@@ -439,8 +646,10 @@ class SubspaceResumeTests(unittest.TestCase):
             rebuilt, _selection = _build_subspace_low_rank_peft_model(
                 fresh_model,
                 selected_modules=fresh_selected,
-                low_rank_payloads=fresh_payloads,
+                initial_low_rank_payloads=fresh_payloads,
                 rank=int(source_a.shape[1]),
+                alpha=4.0,
+                dropout=0.0,
                 decoder_layer_ids=[0],
                 target_module_suffixes=["down_proj"],
                 parallel_stage_decode=False,

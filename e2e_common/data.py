@@ -207,7 +207,6 @@ VAELLM_EDGERAZOR_SFT_ALIASES = {
     "vaellm_eval_task",
 }
 
-MCQA_DATASET_MIX_ALIASES = {"mmlu", "race", "sciq", "arc", "openbookqa"}
 _MCQA_CONTINUATIONS = [" A", " B", " C", " D"]
 _MMLU_NO_TRAIN_SUBJECTS = (
     "abstract_algebra",
@@ -561,73 +560,6 @@ def record_to_mcqa_example(
         f"MCQA dataset_task does not support text_format={text_format!r}. "
         "Supported formats: mmlu_mcqa, race_mcqa, sciq_qa, arc_mcqa, openbookqa_mcqa."
     )
-
-
-def encode_mcqa_example(
-    example: Dict[str, object],
-    tokenizer,
-    *,
-    block_size: int,
-) -> Dict[str, torch.Tensor]:
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    pad_token_id = getattr(tokenizer, "pad_token_id", None)
-    if eos_token_id is None:
-        raise ValueError("MCQA dataset_task requires tokenizer.eos_token_id.")
-    if pad_token_id is None:
-        raise ValueError("MCQA dataset_task requires tokenizer.pad_token_id.")
-
-    prompt = _stringify_text(example.get("prompt"))
-    continuations = list(example.get("continuations") or [])
-    answer_index = int(example.get("answer_index"))
-    if not prompt or len(continuations) != 4 or not (0 <= answer_index < len(continuations)):
-        raise ValueError("Invalid MCQA example.")
-
-    prompt_ids = [
-        int(token_id)
-        for token_id in tokenizer(
-            prompt,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        ).get("input_ids", [])
-    ]
-    if not prompt_ids:
-        raise ValueError("MCQA prompt tokenization produced no tokens.")
-
-    out_input_ids: List[List[int]] = []
-    out_attention_mask: List[List[int]] = []
-    out_labels: List[List[int]] = []
-    for continuation in continuations:
-        continuation_ids = [
-            int(token_id)
-            for token_id in tokenizer(
-                str(continuation),
-                add_special_tokens=False,
-                return_attention_mask=False,
-                return_token_type_ids=False,
-            ).get("input_ids", [])
-        ]
-        if not continuation_ids:
-            raise ValueError("MCQA continuation tokenization produced no tokens.")
-        input_ids = list(prompt_ids) + continuation_ids + [int(eos_token_id)]
-        labels = [-100] * len(prompt_ids) + list(continuation_ids) + [-100]
-        attention_mask = [1] * len(input_ids)
-        if len(input_ids) > int(block_size):
-            raise ValueError(
-                f"MCQA sample length {len(input_ids)} exceeds --model_max_length={int(block_size)}. "
-                "Increase --model_max_length or remove this over-length sample."
-            )
-        pad_len = int(block_size) - len(input_ids)
-        out_input_ids.append(input_ids + [int(pad_token_id)] * pad_len)
-        out_attention_mask.append(attention_mask + [0] * pad_len)
-        out_labels.append(labels + [-100] * pad_len)
-
-    return {
-        "choice_input_ids": torch.tensor(out_input_ids, dtype=torch.long),
-        "choice_attention_mask": torch.tensor(out_attention_mask, dtype=torch.long),
-        "choice_labels": torch.tensor(out_labels, dtype=torch.long),
-        "answer_index": torch.tensor(answer_index, dtype=torch.long),
-    }
 
 
 def _format_race_record(record: Dict[str, object]) -> Optional[str]:
@@ -1065,10 +997,6 @@ def _set_torch_columns(dataset: Dataset) -> Dataset:
             "input_ids",
             "attention_mask",
             "labels",
-            "choice_input_ids",
-            "choice_attention_mask",
-            "choice_labels",
-            "answer_index",
         )
         if name in dataset.column_names
     ]
@@ -1235,72 +1163,6 @@ def _tokenize_and_pack_sft(
         num_proc=None if int(num_proc) == 1 else int(num_proc),
     )
     return _set_torch_columns(packed)
-
-
-def _records_to_mcqa_batch(
-    examples: Dict[str, Sequence[object]],
-    *,
-    text_format: str,
-    tokenizer,
-    block_size: int,
-) -> Dict[str, List[object]]:
-    if not examples:
-        return {
-            "choice_input_ids": [],
-            "choice_attention_mask": [],
-            "choice_labels": [],
-            "answer_index": [],
-        }
-
-    keys = list(examples.keys())
-    batch_size = len(examples[keys[0]])
-    out_input_ids: List[List[List[int]]] = []
-    out_attention_mask: List[List[List[int]]] = []
-    out_labels: List[List[List[int]]] = []
-    out_answer_index: List[int] = []
-
-    for idx in range(batch_size):
-        record = {key: examples[key][idx] for key in keys}
-        example = record_to_mcqa_example(record, text_format=text_format)
-        if example is None:
-            continue
-        try:
-            encoded = encode_mcqa_example(example, tokenizer, block_size=int(block_size))
-        except ValueError:
-            continue
-        out_input_ids.append(encoded["choice_input_ids"].tolist())
-        out_attention_mask.append(encoded["choice_attention_mask"].tolist())
-        out_labels.append(encoded["choice_labels"].tolist())
-        out_answer_index.append(int(encoded["answer_index"].item()))
-
-    return {
-        "choice_input_ids": out_input_ids,
-        "choice_attention_mask": out_attention_mask,
-        "choice_labels": out_labels,
-        "answer_index": out_answer_index,
-    }
-
-
-def _tokenize_mcqa(
-    dataset: Dataset,
-    tokenizer,
-    *,
-    block_size: int,
-    text_format: str,
-    num_proc: int = 1,
-) -> Dataset:
-    tokenized = dataset.map(
-        lambda batch: _records_to_mcqa_batch(
-            batch,
-            text_format=str(text_format),
-            tokenizer=tokenizer,
-            block_size=int(block_size),
-        ),
-        batched=True,
-        remove_columns=list(dataset.column_names),
-        num_proc=None if int(num_proc) == 1 else int(num_proc),
-    )
-    return _set_torch_columns(tokenized)
 
 
 def _resolve_dataset_num_proc(args) -> int:
@@ -1533,72 +1395,6 @@ def _sample_and_pack_sft_source(
     }
 
 
-def _sample_and_pack_mcqa_source(
-    raw_dataset: Dataset,
-    *,
-    target_rows: int,
-    tokenizer,
-    block_size: int,
-    text_format: str,
-    num_proc: int,
-    seed: int,
-) -> Tuple[Dataset, Dict[str, object]]:
-    if int(target_rows) < 1:
-        raise ValueError(f"target_rows must be >= 1, got {target_rows}")
-
-    raw_rows = int(len(raw_dataset))
-    chunk_size = max(4096, int(num_proc) * 256)
-    shuffled_raw = raw_dataset.shuffle(seed=int(seed))
-    packed_chunks: List[Dataset] = []
-    processed_raw_rows = 0
-    collected_packed_rows = 0
-
-    for start in range(0, raw_rows, chunk_size):
-        stop = min(start + chunk_size, raw_rows)
-        chunk = shuffled_raw.select(range(start, stop))
-        processed_raw_rows += int(len(chunk))
-
-        packed_chunk = _tokenize_mcqa(
-            chunk,
-            tokenizer,
-            block_size=int(block_size),
-            text_format=str(text_format),
-            num_proc=int(num_proc),
-        )
-        if len(packed_chunk) > 0:
-            packed_chunks.append(packed_chunk)
-            collected_packed_rows += int(len(packed_chunk))
-
-        if collected_packed_rows >= int(target_rows):
-            break
-
-    if collected_packed_rows < 1:
-        raise ValueError(
-            "Packed MCQA training dataset for mix source is empty. "
-            "Check the source schema and --model_max_length."
-        )
-
-    collected = packed_chunks[0] if len(packed_chunks) == 1 else concatenate_datasets(packed_chunks)
-    collected = _set_torch_columns(collected.shuffle(seed=int(seed)))
-    resized, repeat_factor = _resize_packed_dataset(
-        collected,
-        target_rows=int(target_rows),
-        seed=int(seed),
-        shuffle=False,
-    )
-    return resized, {
-        "raw_rows": int(raw_rows),
-        "text_rows": int(processed_raw_rows),
-        "packed_rows": int(collected_packed_rows),
-        "target_rows": int(target_rows),
-        "repeat_factor": float(repeat_factor),
-        "processed_raw_rows": int(processed_raw_rows),
-        "limited_preprocessing": bool(processed_raw_rows < raw_rows),
-        "sampling_policy": "shuffled_raw_streaming_mcqa_pack",
-        "collected_packed_rows": int(collected_packed_rows),
-    }
-
-
 def _load_preset_raw_datasets(preset: DatasetMixSourcePreset) -> Tuple[Dataset, Optional[Dataset]]:
     resolved_path = _resolve_dataset_path(str(preset.path))
     if resolved_path.lower().endswith((".jsonl", ".json")):
@@ -1664,16 +1460,6 @@ def _build_mixed_datasets(args, training_args, tokenizer):
                 num_proc=dataset_num_proc,
                 seed=int(source_seed),
             )
-        elif dataset_task == "mcqa":
-            resized_train, train_stats = _sample_and_pack_mcqa_source(
-                train_raw,
-                target_rows=int(target_rows),
-                tokenizer=tokenizer,
-                block_size=int(block_size),
-                text_format=str(preset.text_format),
-                num_proc=dataset_num_proc,
-                seed=int(source_seed),
-            )
         elif dataset_task == "lm":
             resized_train, train_stats = _sample_and_pack_source(
                 train_raw,
@@ -1686,7 +1472,7 @@ def _build_mixed_datasets(args, training_args, tokenizer):
                 seed=int(source_seed),
             )
         else:
-            raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm', 'sft', or 'mcqa'.")
+            raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm' or 'sft'.")
         train_datasets.append(resized_train)
 
         eval_text = None
@@ -1701,17 +1487,6 @@ def _build_mixed_datasets(args, training_args, tokenizer):
         eval_packed_rows = 0
         if dataset_task == "sft" and prepare_eval and eval_raw is not None:
             eval_packed = _tokenize_and_pack_sft(
-                eval_raw,
-                tokenizer,
-                block_size=block_size,
-                text_format=str(preset.text_format),
-                num_proc=dataset_num_proc,
-            )
-            eval_packed_rows = len(eval_packed)
-            if eval_packed_rows > 0:
-                eval_datasets.append(eval_packed)
-        elif dataset_task == "mcqa" and prepare_eval and eval_raw is not None:
-            eval_packed = _tokenize_mcqa(
                 eval_raw,
                 tokenizer,
                 block_size=block_size,
@@ -1793,10 +1568,10 @@ def build_datasets(args, training_args, tokenizer):
         }
 
     dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
-    if dataset_task in {"sft", "mcqa"}:
-        raise ValueError(f"--dataset_task {dataset_task} currently supports --dataset_mix only.")
+    if dataset_task == "sft":
+        raise ValueError("--dataset_task sft currently supports --dataset_mix only.")
     if dataset_task != "lm":
-        raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm', 'sft', or 'mcqa'.")
+        raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm' or 'sft'.")
 
     train_dataset = build_single_file_lazy_dataset(
         train_file=str(args.train_file),

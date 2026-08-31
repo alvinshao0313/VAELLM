@@ -48,11 +48,22 @@ def iter_named_vae_linears(model: nn.Module) -> Iterable[Tuple[str, VAELinear]]:
             yield str(name), module
 
 
+def _resolve_vae_float_device_dtype(module: VAELinear) -> Tuple[torch.device, torch.dtype]:
+    for param in module.parameters():
+        if param.is_floating_point():
+            return param.device, param.dtype
+    for buffer in module.buffers():
+        if buffer.is_floating_point():
+            return buffer.device, buffer.dtype
+    return torch.device("cpu"), torch.float32
+
+
 def write_low_rank_payloads_to_compressed_model(
     model: nn.Module,
     payloads: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
     *,
     expected_scope: Optional[str] = None,
+    allow_create: bool = False,
 ) -> int:
     modules = dict(iter_named_vae_linears(model))
     resolved_expected_scope = None
@@ -63,22 +74,48 @@ def write_low_rank_payloads_to_compressed_model(
         module = modules.get(str(name))
         if module is None:
             raise RuntimeError(f"Cannot export low-rank payload; VAELinear not found: {name}")
-        if getattr(module, "low_rank_a", None) is None or getattr(module, "low_rank_b", None) is None:
-            raise RuntimeError(f"Cannot export low-rank payload; {name} has no low_rank_a/b.")
-        if resolved_expected_scope is not None:
-            module_scope = normalize_low_rank_scope(
-                getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL)
+        existing_a = getattr(module, "low_rank_a", None)
+        existing_b = getattr(module, "low_rank_b", None)
+        if (existing_a is None) != (existing_b is None):
+            raise RuntimeError(f"Cannot export low-rank payload; {name} has incomplete low_rank_a/b.")
+
+        if bool(allow_create):
+            if existing_a is not None or existing_b is not None:
+                raise RuntimeError(f"Cannot create low-rank payload; {name} already has low_rank_a/b.")
+            if resolved_expected_scope is None:
+                raise ValueError("allow_create=True requires expected_scope.")
+            module._validate_low_rank_payload_tensors(
+                low_rank_a,
+                low_rank_b,
+                scope=resolved_expected_scope,
             )
-            if module_scope != resolved_expected_scope:
-                raise RuntimeError(
-                    f"{name}: low_rank_scope={module_scope!r} != expected_scope={resolved_expected_scope!r}."
+            device, dtype = _resolve_vae_float_device_dtype(module)
+            module.low_rank_scope = resolved_expected_scope
+            module.low_rank_a = nn.Parameter(
+                low_rank_a.detach().to(device=device, dtype=dtype).contiguous(),
+                requires_grad=False,
+            )
+            module.low_rank_b = nn.Parameter(
+                low_rank_b.detach().to(device=device, dtype=dtype).contiguous(),
+                requires_grad=False,
+            )
+        else:
+            if existing_a is None or existing_b is None:
+                raise RuntimeError(f"Cannot export low-rank payload; {name} has no low_rank_a/b.")
+            if resolved_expected_scope is not None:
+                module_scope = normalize_low_rank_scope(
+                    getattr(module, "low_rank_scope", LOW_RANK_SCOPE_FULL)
                 )
-        if tuple(module.low_rank_a.shape) != tuple(low_rank_a.shape):
-            raise RuntimeError(f"{name}: low_rank_a shape mismatch: {tuple(module.low_rank_a.shape)} != {tuple(low_rank_a.shape)}.")
-        if tuple(module.low_rank_b.shape) != tuple(low_rank_b.shape):
-            raise RuntimeError(f"{name}: low_rank_b shape mismatch: {tuple(module.low_rank_b.shape)} != {tuple(low_rank_b.shape)}.")
-        module.low_rank_a.data.copy_(low_rank_a.to(device=module.low_rank_a.device, dtype=module.low_rank_a.dtype))
-        module.low_rank_b.data.copy_(low_rank_b.to(device=module.low_rank_b.device, dtype=module.low_rank_b.dtype))
+                if module_scope != resolved_expected_scope:
+                    raise RuntimeError(
+                        f"{name}: low_rank_scope={module_scope!r} != expected_scope={resolved_expected_scope!r}."
+                    )
+            if tuple(existing_a.shape) != tuple(low_rank_a.shape):
+                raise RuntimeError(f"{name}: low_rank_a shape mismatch: {tuple(existing_a.shape)} != {tuple(low_rank_a.shape)}.")
+            if tuple(existing_b.shape) != tuple(low_rank_b.shape):
+                raise RuntimeError(f"{name}: low_rank_b shape mismatch: {tuple(existing_b.shape)} != {tuple(low_rank_b.shape)}.")
+            existing_a.data.copy_(low_rank_a.to(device=existing_a.device, dtype=existing_a.dtype))
+            existing_b.data.copy_(low_rank_b.to(device=existing_b.device, dtype=existing_b.dtype))
         module.clear_decoded_weight_cache()
         written += 1
     return int(written)

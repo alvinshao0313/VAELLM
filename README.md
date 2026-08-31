@@ -31,11 +31,10 @@ export PYTHONPATH=.
 - `compressed_e2e_fintuning/scripts/e2e_decoder.sh`
   - 压缩模型 checkpoint 直接训练 VAELinear 内部参数，最终仍保存压缩 `final_model/`
   - 入口参数是 `--student_checkpoint_dir`，不接受 `--student_model_path`
-  - 支持 `--finetune_mode decoder|lora|both`
-  - `lora` 模式训练 checkpoint 内已有 `low_rank_a/b` 并写回压缩模型，不保存 PEFT adapter
+  - 支持 `--finetune_mode decoder|compressed_lora|both`
+  - `compressed_lora` 可续训已有 `low_rank_a/b`，也可在完全无低秩分支的选中 VAELinear 上新建 LoRA；最终都写回压缩模型，不保存独立 PEFT adapter
+  - plain LoRA 参数支持 `rank / alpha / dropout / scope`；新建默认 `12 / 24 / 0.03 / full`，scope 同时支持 `compressed_subspace`
   - 三种模式说明见 `compressed_e2e_fintuning/README.md`
-- `compressed_e2e_fintuning/scripts/e2e_choice_kd.sh`
-  - 压缩模型 MCQA choice-KD 端到端微调脚本
 - `tools/convert_legacy_checkpoint.py`
   - 把旧格式 e2e checkpoint 转成当前紧凑格式
 - `tools/convert_cat_checkpoint_to_bitpack.py`

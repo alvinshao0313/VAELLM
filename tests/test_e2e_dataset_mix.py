@@ -413,34 +413,113 @@ class VAEE2EPromptKdWeightArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._parse_with_checkpoint(["--prompt_kd_weight", "-0.01"])
 
-    def test_mcqa_allows_zero_prompt_kd_weight(self):
-        args = self._parse_with_checkpoint(
-            [
-                "--dataset_task",
-                "mcqa",
-                "--loss_type",
-                "choice_kd",
-                "--prompt_kd_weight",
-                "0.0",
-            ],
-            dataset_mix="race=1.0",
-        )
-        self.assertEqual(args.prompt_kd_weight, 0.0)
-        self.assertEqual(args.dataset_task, "mcqa")
-
-    def test_mcqa_rejects_nonzero_prompt_kd_weight(self):
+    def test_mcqa_dataset_task_is_rejected(self):
         with self.assertRaises(SystemExit):
             self._parse_with_checkpoint(
-                [
-                    "--dataset_task",
-                    "mcqa",
-                    "--loss_type",
-                    "choice_kd",
-                    "--prompt_kd_weight",
-                    "0.05",
-                ],
+                ["--dataset_task", "mcqa"],
                 dataset_mix="race=1.0",
             )
+
+    def test_choice_kd_loss_types_are_rejected(self):
+        for loss_type in ("choice_kd", "choice_kd_ce"):
+            with self.subTest(loss_type=loss_type):
+                with self.assertRaises(SystemExit):
+                    self._parse_with_checkpoint(
+                        ["--dataset_task", "sft", "--loss_type", loss_type],
+                        dataset_mix="race=1.0",
+                    )
+
+
+class VAEE2ECompressedLoraArgsTest(unittest.TestCase):
+    def _parse_with_checkpoint(self, extra_args):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(f"{tmpdir}/checkpoint_meta.json", "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            args, _hf_args, _training_args = parse_args(
+                [
+                    "--student_checkpoint_dir",
+                    tmpdir,
+                    "--dataset_mix",
+                    "openorca=1.0",
+                    "--max_steps",
+                    "1",
+                    *extra_args,
+                ]
+            )
+        return args
+
+    def test_compressed_lora_defaults_plain_lora_config(self):
+        args = self._parse_with_checkpoint(["--finetune_mode", "compressed_lora"])
+        self.assertEqual(args.lora_rank, 12)
+        self.assertEqual(args.lora_alpha, 24.0)
+        self.assertEqual(args.lora_dropout, 0.03)
+        self.assertEqual(args.compressed_lora_scope, "full")
+
+    def test_compressed_lora_accepts_explicit_lora_config(self):
+        args = self._parse_with_checkpoint(
+            [
+                "--finetune_mode",
+                "compressed_lora",
+                "--lora_rank",
+                "7",
+                "--lora_alpha",
+                "14",
+                "--lora_dropout",
+                "0.1",
+                "--compressed_lora_scope",
+                "compressed_subspace",
+            ]
+        )
+        self.assertEqual(args.lora_rank, 7)
+        self.assertEqual(args.lora_alpha, 14.0)
+        self.assertEqual(args.lora_dropout, 0.1)
+        self.assertEqual(args.compressed_lora_scope, "compressed_subspace")
+
+    def test_decoder_accepts_and_ignores_lora_config(self):
+        args = self._parse_with_checkpoint(
+            [
+                "--finetune_mode",
+                "decoder",
+                "--lora_rank",
+                "0",
+                "--lora_alpha",
+                "0",
+                "--lora_dropout",
+                "2.0",
+                "--compressed_lora_scope",
+                "ignored_in_decoder_mode",
+            ]
+        )
+        self.assertEqual(args.finetune_mode, "decoder")
+
+    def test_compressed_lora_rejects_invalid_plain_lora_config(self):
+        invalid_cases = (
+            ("--lora_rank", "0"),
+            ("--lora_alpha", "0"),
+            ("--lora_dropout", "1.0"),
+            ("--compressed_lora_scope", "invalid"),
+        )
+        for flag, value in invalid_cases:
+            with self.subTest(flag=flag, value=value):
+                with self.assertRaises(SystemExit):
+                    self._parse_with_checkpoint(
+                        ["--finetune_mode", "compressed_lora", flag, value]
+                    )
+
+    def test_compressed_lora_accepts_and_ignores_decoder_trainable_flags(self):
+        args = self._parse_with_checkpoint(
+            [
+                "--finetune_mode",
+                "compressed_lora",
+                "--tune_final_norm",
+                "true",
+                "--use_post_norm_head_linear",
+                "true",
+                "--vae_tune_bias",
+                "true",
+            ]
+        )
+        self.assertEqual(args.finetune_mode, "compressed_lora")
 
 
 class VAEE2ETrainerPromptKdMaskHelperTest(unittest.TestCase):
@@ -1448,7 +1527,6 @@ def test_e2e_sft_dynamic_padding_forwards_to_shared_collator():
     ) as mock_collator:
         result = e2e_runtime._build_training_data_collator(
             tokenizer=tokenizer,
-            dataset_task="sft",
             block_size=1024,
             dynamic_padding=True,
         )
@@ -1472,7 +1550,6 @@ def test_e2e_lm_fixed_padding_forwards_false():
     ) as mock_collator:
         result = e2e_runtime._build_training_data_collator(
             tokenizer=tokenizer,
-            dataset_task="lm",
             block_size=1024,
             dynamic_padding=False,
         )
@@ -1482,26 +1559,6 @@ def test_e2e_lm_fixed_padding_forwards_false():
         dynamic_padding=False,
     )
     assert result is sentinel
-
-
-def test_e2e_mcqa_ignores_dynamic_padding_and_keeps_default_collator():
-    from transformers import default_data_collator
-
-    from compressed_e2e_fintuning import runtime as e2e_runtime
-
-    tokenizer = object()
-    with mock.patch.object(
-        e2e_runtime,
-        "build_edgerazor_data_collator",
-    ) as mock_collator:
-        result = e2e_runtime._build_training_data_collator(
-            tokenizer=tokenizer,
-            dataset_task="mcqa",
-            block_size=1024,
-            dynamic_padding=True,
-        )
-    mock_collator.assert_not_called()
-    assert result is default_data_collator
 
 
 if __name__ == "__main__":

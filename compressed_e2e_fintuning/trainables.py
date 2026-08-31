@@ -10,6 +10,13 @@ from rotation.model_utils import get_model_type, get_pre_head_layernorm
 from train_utils.utils import extract_layer_idx
 
 
+@dataclass(frozen=True)
+class CompressedLoraInitSpec:
+    source: str
+    rank: int
+    scope: str
+
+
 @dataclass
 class VAEDecoderTrainableSelection:
     decoder_layer_ids: List[int]
@@ -23,6 +30,11 @@ class VAEDecoderTrainableSelection:
     trainable_parameter_count: int
     parallel_stage_decode: bool
     train_mode: str
+    compressed_lora_source: Optional[str] = None
+    resolved_lora_rank: Optional[int] = None
+    resolved_lora_alpha: Optional[float] = None
+    resolved_lora_dropout: Optional[float] = None
+    resolved_lora_scope: Optional[str] = None
 
 
 def resolve_target_layer_ids(requested: Optional[Sequence[int]], num_layers: int) -> List[int]:
@@ -154,6 +166,51 @@ def validate_selected_low_rank_scope(
     if len(unique_scopes) != 1:
         raise ValueError(f"Selected VAELinear modules have mixed low-rank scopes: {unique_scopes}.")
     return unique_scopes[0]
+
+
+def resolve_compressed_lora_init_spec(
+    selected_modules: Sequence[Tuple[str, VAELinear]],
+    *,
+    requested_rank: int,
+    requested_scope: str,
+) -> CompressedLoraInitSpec:
+    if not selected_modules:
+        raise ValueError("No selected VAELinear modules found for compressed LoRA training.")
+
+    present = 0
+    for name, module in selected_modules:
+        has_a = getattr(module, "low_rank_a", None) is not None
+        has_b = getattr(module, "low_rank_b", None) is not None
+        if has_a != has_b:
+            raise ValueError(f"{name}: low_rank_a/low_rank_b payload is incomplete.")
+        present += int(has_a and has_b)
+
+    if present == 0:
+        rank = int(requested_rank)
+        if rank < 1:
+            raise ValueError(f"--lora_rank must be >= 1, got {rank}.")
+        return CompressedLoraInitSpec(
+            source="new",
+            rank=rank,
+            scope=normalize_low_rank_scope(requested_scope),
+        )
+
+    if present != len(selected_modules):
+        raise ValueError(
+            "Selected VAELinear modules must either all have low_rank_a/b or all have none; "
+            f"found {present}/{len(selected_modules)} with complete payloads."
+        )
+
+    checkpoint_rank = validate_selected_low_rank_payloads(
+        selected_modules,
+        require_uniform_rank=True,
+    )
+    checkpoint_scope = validate_selected_low_rank_scope(selected_modules)
+    return CompressedLoraInitSpec(
+        source="existing",
+        rank=int(checkpoint_rank),
+        scope=str(checkpoint_scope),
+    )
 
 
 def _enable_low_rank_params(module: VAELinear, *, name: str) -> None:

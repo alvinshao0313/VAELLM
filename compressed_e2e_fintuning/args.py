@@ -7,7 +7,8 @@ from typing import List, Optional, Sequence, Tuple
 
 from transformers import HfArgumentParser
 
-from e2e_common.data import MCQA_DATASET_MIX_ALIASES, VAELLM_EDGERAZOR_SFT_ALIASES, normalize_dataset_mix_spec
+from e2e_common.data import VAELLM_EDGERAZOR_SFT_ALIASES, normalize_dataset_mix_spec
+from litebsq.low_rank_scope import normalize_low_rank_scope
 from e2e_common.e2e_args import parse_decoder_layers, parse_target_modules
 from train_utils.lora_training import parse_distill_hidden_alignment_layer_weighting
 from train_utils.model_checkpoint_io import resolve_checkpoint_dir
@@ -16,16 +17,12 @@ from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_l
 
 _DEFAULT_RUN_ROOT = ".result/compressed_e2e_fintuning"
 _SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"} | VAELLM_EDGERAZOR_SFT_ALIASES
-_MCQA_LOSS_TYPES = {"choice_kd", "choice_kd_ce"}
 _VALID_FINETUNE_MODES = {"decoder", "compressed_lora", "both"}
 _VALID_VAE_TRAIN_MODES = {"decoder", "compressed_lora", "both"}
 _VALID_PARALLEL_MODES = {"layer_mp", "dp"}
 _VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
 _DISALLOWED_DENSE_LORA_FLAGS = {
     "--lora_variant",
-    "--lora_rank",
-    "--lora_alpha",
-    "--lora_dropout",
     "--lora_tune_bias",
     "--lora_init_mode",
     "--lora_hif4_act",
@@ -63,6 +60,10 @@ class VAEDecoderE2EArguments:
     decoder_layers: str = "all"
     target_modules: str = "all"
     finetune_mode: str = "decoder"
+    lora_rank: int = 12
+    lora_alpha: float = 24.0
+    lora_dropout: float = 0.03
+    compressed_lora_scope: str = "full"
     decode_device: str = "auto"
     decode_group_size: int = 8
     parallel_mode: str = "layer_mp"
@@ -117,13 +118,22 @@ def _collect_explicit_cli_flags(argv: Sequence[str]) -> List[str]:
     return sorted(flag for flag in flags if flag)
 
 
+def _parse_compressed_e2e_loss_type(value: str) -> str:
+    parsed = _parse_lora_loss_type(value)
+    if parsed in {"choice_kd", "choice_kd_ce"}:
+        raise argparse.ArgumentTypeError(
+            "compressed_e2e_fintuning no longer supports choice_kd/choice_kd_ce (MCQA training was removed)."
+        )
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="End-to-end fine-tune compressed checkpoints.")
     parser.add_argument("--student_checkpoint_dir", type=str, required=True)
     parser.add_argument("--run_root_dir", type=str, default=_DEFAULT_RUN_ROOT)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--teacher_model_path", type=str, default=None)
-    parser.add_argument("--loss_type", type=_parse_lora_loss_type, default="sft")
+    parser.add_argument("--loss_type", type=_parse_compressed_e2e_loss_type, default="sft")
     parser.add_argument("--distill_temperature", type=float, default=1.0)
     parser.add_argument("--distill_alpha", type=float, default=0.5)
     parser.add_argument("--hidden_loss_weight", type=float, default=0.0)
@@ -163,6 +173,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
     parser.add_argument("--finetune_mode", type=str, default="decoder")
+    parser.add_argument("--lora_rank", type=int, default=12)
+    parser.add_argument("--lora_alpha", type=float, default=24.0)
+    parser.add_argument("--lora_dropout", type=float, default=0.03)
+    parser.add_argument("--compressed_lora_scope", type=str, default="full")
     parser.add_argument("--decode_device", type=str, default="auto")
     parser.add_argument("--decode_group_size", type=int, default=8)
     parser.add_argument("--parallel_mode", type=str, default="layer_mp")
@@ -280,8 +294,8 @@ def validate_args(
         parser.error(str(exc))
 
     dataset_task = str(args.dataset_task or "lm").strip().lower()
-    if dataset_task not in {"lm", "sft", "mcqa"}:
-        parser.error("--dataset_task must be one of: lm | sft | mcqa.")
+    if dataset_task not in {"lm", "sft"}:
+        parser.error("--dataset_task must be one of: lm | sft.")
     args.dataset_task = dataset_task
 
     _validate_dataset_inputs(parser, args)
@@ -295,31 +309,6 @@ def validate_args(
                 + ",".join(sorted(_SFT_DATASET_MIX_ALIASES))
                 + ". Unsupported: "
                 + ",".join(unsupported)
-            )
-    if args.dataset_task == "mcqa":
-        if not args.dataset_mix_spec:
-            parser.error("--dataset_task mcqa requires --dataset_mix.")
-        unsupported = sorted(set(args.dataset_mix_sources or []) - MCQA_DATASET_MIX_ALIASES)
-        if unsupported:
-            parser.error(
-                "--dataset_task mcqa supports only these dataset_mix aliases: "
-                + ",".join(sorted(MCQA_DATASET_MIX_ALIASES))
-                + ". Unsupported: "
-                + ",".join(unsupported)
-            )
-        if str(args.loss_type).strip().lower() not in _MCQA_LOSS_TYPES:
-            parser.error("--dataset_task mcqa requires --loss_type choice_kd or choice_kd_ce.")
-        if float(args.hidden_loss_weight) > 0.0:
-            parser.error("--dataset_task mcqa does not support --hidden_loss_weight > 0.")
-        if float(args.pre_mlp_hidden_loss_weight) > 0.0:
-            parser.error(
-                "--dataset_task mcqa does not support "
-                "--distill_pre_mlp_hidden_loss_weight > 0."
-            )
-        if float(args.prompt_kd_weight) != 0.0:
-            parser.error(
-                "--dataset_task mcqa does not support --prompt_kd_weight != 0 "
-                "(choice KD has no token mask)."
             )
     if float(args.distill_temperature) <= 0.0:
         parser.error("--distill_temperature must be > 0.")
@@ -372,6 +361,17 @@ def validate_args(
     if finetune_mode not in _VALID_FINETUNE_MODES:
         parser.error("--finetune_mode must be one of: decoder | compressed_lora | both.")
     args.finetune_mode = finetune_mode
+    if finetune_mode == "compressed_lora":
+        if int(args.lora_rank) < 1:
+            parser.error("--lora_rank must be >= 1.")
+        if float(args.lora_alpha) <= 0.0:
+            parser.error("--lora_alpha must be > 0.")
+        if not (0.0 <= float(args.lora_dropout) < 1.0):
+            parser.error("--lora_dropout must satisfy 0 <= dropout < 1.")
+        try:
+            args.compressed_lora_scope = normalize_low_rank_scope(args.compressed_lora_scope)
+        except ValueError as exc:
+            parser.error(str(exc))
     if finetune_mode not in _VALID_VAE_TRAIN_MODES:
         parser.error("Internal error: invalid --finetune_mode.")
     args.vae_train_mode = finetune_mode
@@ -382,13 +382,6 @@ def validate_args(
     args.decode_device = decode_device
     if int(args.decode_group_size) < 1:
         parser.error("--decode_group_size must be >= 1.")
-    if finetune_mode == "compressed_lora":
-        if bool(args.vae_tune_bias):
-            parser.error("--finetune_mode compressed_lora does not support --vae_tune_bias=true.")
-        if bool(args.tune_final_norm):
-            parser.error("--finetune_mode compressed_lora does not support --tune_final_norm=true.")
-        if bool(args.use_post_norm_head_linear):
-            parser.error("--finetune_mode compressed_lora does not support --use_post_norm_head_linear=true.")
     if int(args.ppl_seqlen) < 1:
         parser.error("--ppl_seqlen must be >= 1.")
     if int(args.ppl_limit) == 0 or int(args.ppl_limit) < -1:

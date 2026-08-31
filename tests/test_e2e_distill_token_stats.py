@@ -2,8 +2,7 @@
 
 Mirrors tests/test_lora_distill_token_stats_callback.py for the E2E trainer:
 - boundary / window_start_step / reduce-before-rank0 / resume semantics
-- compute_loss updates telemetry exactly once before choice/dense/CPU dispatch
-- MCQA (choice_input_ids) skips telemetry because ordinary labels are absent
+- compute_loss updates telemetry exactly once before dense/CPU dispatch
 - CPU-offload path produces the same totals as the dense path for identical batches
 - teacher-target construction (_build_cpu_teacher_targets) adds zero extra counts
 """
@@ -403,30 +402,6 @@ def test_compute_loss_teacher_target_construction_adds_zero_extra(tmp_path, monk
     # Exactly one update from the top-level compute_loss; teacher-target
     # construction must not call update.
     assert update_calls["n"] == 1
-
-
-def test_compute_loss_skips_telemetry_for_mcqa_choice_inputs(tmp_path):
-    trainer, student, _teacher = _build_e2e_trainer(
-        tmp_path, teacher_output_offload="none", loss_type="choice_kd"
-    )
-    # MCQA-style inputs: no ordinary `labels`, only choice_* tensors.
-    choice_input_ids = torch.tensor([[[1, 2, 3], [4, 5, 6]]], dtype=torch.long)
-    choice_labels = torch.tensor([[[-100, 1, 2], [-100, 3, 4]]], dtype=torch.long)
-    answer_index = torch.tensor([0], dtype=torch.long)
-    inputs = {
-        "choice_input_ids": choice_input_ids,
-        "choice_attention_mask": torch.ones_like(choice_input_ids),
-        "choice_labels": choice_labels,
-        "answer_index": answer_index,
-    }
-    student.train()
-    trainer.compute_loss(student, inputs)
-
-    # No ordinary labels -> telemetry skipped; consume returns None.
-    stats = trainer.distill_token_stats.consume_global(
-        _FakeAccelerator(torch.device("cpu"))
-    )
-    assert stats is None
 
 
 def test_compute_loss_does_not_update_when_model_not_training(tmp_path):

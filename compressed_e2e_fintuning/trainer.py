@@ -255,66 +255,6 @@ def _dense_loss_requires_ce(loss_type: str) -> bool:
     )
 
 
-def compute_choice_scores_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    if logits.ndim != 4:
-        raise ValueError(f"choice logits must have shape [B, C, L, V], got {tuple(logits.shape)}.")
-    if labels.ndim != 3:
-        raise ValueError(f"choice labels must have shape [B, C, L], got {tuple(labels.shape)}.")
-    if tuple(logits.shape[:3]) != tuple(labels.shape):
-        raise ValueError(
-            f"choice logits/labels shape mismatch: {tuple(logits.shape[:3])} vs {tuple(labels.shape)}."
-        )
-
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].to(device=shift_logits.device).contiguous()
-    valid_mask = shift_labels.ne(-100)
-    safe_labels = shift_labels.masked_fill(~valid_mask, 0)
-    log_probs = F.log_softmax(shift_logits.float(), dim=-1)
-    token_log_probs = log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-    return (token_log_probs * valid_mask.to(dtype=token_log_probs.dtype)).sum(dim=-1)
-
-
-def compute_choice_kd_loss_from_scores(
-    *,
-    student_scores: torch.Tensor,
-    teacher_scores: Optional[torch.Tensor],
-    answer_index: torch.Tensor,
-    loss_type: str,
-    temperature: float,
-    alpha: float,
-) -> torch.Tensor:
-    norm = str(loss_type or "").strip().lower()
-    if norm not in {"choice_kd", "choice_kd_ce"}:
-        raise ValueError(f"Unsupported choice KD loss_type={loss_type!r}.")
-    if teacher_scores is None:
-        raise ValueError(f"loss_type={norm} requires teacher_scores.")
-    if student_scores.ndim != 2 or teacher_scores.ndim != 2:
-        raise ValueError("student_scores and teacher_scores must have shape [B, C].")
-    if tuple(student_scores.shape) != tuple(teacher_scores.shape):
-        raise ValueError(
-            f"student/teacher choice score shape mismatch: {tuple(student_scores.shape)} vs {tuple(teacher_scores.shape)}."
-        )
-
-    temperature = float(temperature)
-    if temperature <= 0.0:
-        raise ValueError(f"temperature must be > 0, got {temperature}.")
-    alpha = float(alpha)
-    if not (0.0 <= alpha <= 1.0):
-        raise ValueError(f"alpha must satisfy 0 <= alpha <= 1, got {alpha}.")
-
-    teacher_scores = teacher_scores.detach().to(device=student_scores.device)
-    answer_index = answer_index.to(device=student_scores.device, dtype=torch.long)
-    kd_loss = F.kl_div(
-        F.log_softmax(student_scores.float() / temperature, dim=-1),
-        F.softmax(teacher_scores.float() / temperature, dim=-1),
-        reduction="batchmean",
-    ) * (temperature * temperature)
-    if norm == "choice_kd":
-        return kd_loss
-    ce_loss = F.cross_entropy(student_scores.float(), answer_index)
-    return ce_loss * (1.0 - alpha) + kd_loss * alpha
-
-
 class VAEDecoderE2ETrainer(Trainer):
     def __init__(
         self,
@@ -724,60 +664,6 @@ class VAEDecoderE2ETrainer(Trainer):
             if self.teacher_model_offload == "cpu":
                 self.offload_teacher_to_cpu()
 
-    def _compute_choice_kd_loss(self, model, inputs, return_outputs: bool):
-        if float(self.hidden_loss_weight) > 0.0:
-            raise ValueError("dataset_task=mcqa does not support hidden_loss_weight > 0.")
-        if float(self.pre_mlp_hidden_loss_weight) > 0.0:
-            raise ValueError(
-                "dataset_task=mcqa does not support pre_mlp_hidden_loss_weight > 0."
-            )
-        if self.teacher_model is None:
-            raise ValueError(f"loss_type={self.loss_type} requires teacher_model for MCQA choice KD.")
-
-        choice_input_ids = inputs["choice_input_ids"]
-        choice_attention_mask = inputs.get("choice_attention_mask")
-        choice_labels = inputs["choice_labels"]
-        answer_index = inputs["answer_index"]
-        if choice_input_ids.ndim != 3:
-            raise ValueError(f"choice_input_ids must have shape [B, C, L], got {tuple(choice_input_ids.shape)}.")
-        batch_size, choice_count, seq_len = choice_input_ids.shape
-        flat_student_inputs = {
-            "input_ids": choice_input_ids.reshape(batch_size * choice_count, seq_len),
-        }
-        if choice_attention_mask is not None:
-            flat_student_inputs["attention_mask"] = choice_attention_mask.reshape(batch_size * choice_count, seq_len)
-
-        offload_context = (
-            self.saved_tensor_offload.context()
-            if self.saved_tensor_offload is not None
-            else nullcontext()
-        )
-        with offload_context:
-            outputs = model(**flat_student_inputs, output_hidden_states=False)
-        student_logits = get_output_logits(outputs).reshape(batch_size, choice_count, seq_len, -1)
-
-        flat_teacher_inputs = dict(flat_student_inputs)
-        try:
-            teacher_outputs = self._compute_teacher_outputs(flat_teacher_inputs, output_hidden_states=False)
-            teacher_logits = get_output_logits(teacher_outputs).to(device=student_logits.device)
-        finally:
-            if self.teacher_model_offload == "cpu":
-                self.offload_teacher_to_cpu()
-        teacher_logits = teacher_logits.reshape(batch_size, choice_count, seq_len, -1)
-
-        student_scores = compute_choice_scores_from_logits(student_logits, choice_labels)
-        teacher_scores = compute_choice_scores_from_logits(teacher_logits, choice_labels.to(device=teacher_logits.device))
-        loss = compute_choice_kd_loss_from_scores(
-            student_scores=student_scores,
-            teacher_scores=teacher_scores,
-            answer_index=answer_index,
-            loss_type=self.loss_type,
-            temperature=self.distill_temperature,
-            alpha=self.distill_alpha,
-        )
-        self._store_loss_parts(distill_loss=loss)
-        return (loss, outputs) if return_outputs else loss
-
     def _compute_legacy_dense_loss(self, model, inputs, return_outputs: bool):
         labels = inputs.get("labels")
         student_inputs = dict(inputs)
@@ -1157,16 +1043,13 @@ class VAEDecoderE2ETrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         del num_items_in_batch, kwargs
         # Record token-window telemetry exactly once from original labels before
-        # dispatching to choice/dense/CPU paths. MCQA requests expose no
-        # ordinary rank-2 `labels`; skip them explicitly rather than fabricating.
+        # dispatching to the dense/CPU paths.
         if bool(getattr(model, "training", False)):
             original_labels = inputs.get("labels")
             if isinstance(original_labels, torch.Tensor):
                 self.distill_token_stats.update(
                     original_labels, inputs.get("attention_mask")
                 )
-        if "choice_input_ids" in inputs:
-            return self._compute_choice_kd_loss(model, inputs, return_outputs=bool(return_outputs))
         if self.selective_student_topk:
             return self._compute_teacher_first_cpu_loss(model, inputs, return_outputs=bool(return_outputs))
         if self.teacher_output_offload == "none":

@@ -25,9 +25,7 @@ from e2e_common.data import (
     _load_preset_raw_datasets,
     _normalize_edgerazor_messages,
     _record_to_text,
-    encode_mcqa_example,
     normalize_dataset_mix_spec,
-    record_to_mcqa_example,
 )
 
 IGNORE_ID = -100
@@ -178,25 +176,6 @@ def encode_text_lm_record(
     }
 
 
-def encode_mcqa_record(
-    record: Dict[str, object],
-    tokenizer,
-    *,
-    max_seq_len: int,
-    text_format: str,
-) -> Dict[str, torch.Tensor]:
-    example = record_to_mcqa_example(record, text_format=str(text_format))
-    if example is None:
-        raise ValueError("Record has no usable MCQA fields.")
-    encoded = encode_mcqa_example(example, tokenizer, block_size=int(max_seq_len))
-    return {
-        "choice_input_ids": encoded["choice_input_ids"],
-        "choice_attention_mask": encoded["choice_attention_mask"],
-        "choice_labels": encoded["choice_labels"],
-        "answer_index": encoded["answer_index"],
-    }
-
-
 class ReasoningDataset(Dataset):
     """EdgeRazor ReasoningDataset with self.dataset assignment fix."""
 
@@ -254,33 +233,6 @@ class LazyTextLMDataset(Dataset):
             self.tokenizer,
             max_seq_len=self.max_seq_len,
             text_field=self.text_field,
-            text_format=self.text_format,
-        )
-
-
-class LazyMCQADataset(Dataset):
-    def __init__(
-        self,
-        dataset,
-        tokenizer,
-        *,
-        max_seq_len: int,
-        text_format: str,
-    ) -> None:
-        super().__init__()
-        self.dataset = dataset
-        self.tokenizer = tokenizer
-        self.max_seq_len = int(max_seq_len)
-        self.text_format = str(text_format)
-
-    def __len__(self) -> int:
-        return int(len(self.dataset))
-
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        return encode_mcqa_record(
-            self.dataset[int(index)],
-            self.tokenizer,
-            max_seq_len=self.max_seq_len,
             text_format=self.text_format,
         )
 
@@ -419,13 +371,6 @@ class _LazyPresetIterableDataset(IterableDataset):
                 self.tokenizer,
                 max_seq_len=self.max_seq_len,
                 text_field=str(preset.text_field),
-                text_format=str(preset.text_format),
-            )
-        if self.task == "mcqa":
-            return encode_mcqa_record(
-                record,
-                self.tokenizer,
-                max_seq_len=self.max_seq_len,
                 text_format=str(preset.text_format),
             )
         raise ValueError(f"Unsupported lazy dataset task: {self.task!r}")
@@ -711,13 +656,6 @@ def build_mixed_lazy_dataset(
                 tokenizer,
                 max_seq_len=int(max_seq_len),
                 text_field=str(preset.text_field),
-                text_format=str(preset.text_format),
-            )
-        elif task_norm == "mcqa":
-            dataset = LazyMCQADataset(
-                raw_dataset,
-                tokenizer,
-                max_seq_len=int(max_seq_len),
                 text_format=str(preset.text_format),
             )
         else:

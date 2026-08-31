@@ -21,7 +21,7 @@
 --dynamic_padding true    # pad 到本 micro-batch 最长样本，再向上对齐到 8 的倍数
 ```
 
-`--model_max_length` 始终是单样本截断上限。仅对 `dataset_task=sft/lm` 的 shared sequence collator 生效；`mcqa` 不受影响。
+`--model_max_length` 始终是单样本截断上限。当前 compressed E2E 只支持 `dataset_task=sft/lm`，两者共用该 sequence collator。
 
 ## Packed VQ decoder first-linear kernel
 
@@ -111,8 +111,6 @@ EAKLD 在 response / prompt region 上**分别**计算 teacher entropy 与 gamma
 
 padding 与序列最后一个无 next-token 的 logits 不计入任一 region。预测 EOS 的 logits 仍属于 response region。
 
-`--dataset_task mcqa` 不支持 `prompt_kd_weight != 0`。
-
 以下数值仅作实验示例，**不是**推荐最优值，也**未**经对照实验验证下游收益：
 
 ```bash
@@ -165,54 +163,62 @@ bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
 
 ## 2. `compressed_lora`
 
-只训练已有低秩分支，不训练 decoder。
+只训练 compressed LoRA，不训练 decoder。选中的 VAELinear 可以全部已经有 `low_rank_a/b`，也可以全部没有；不允许同一次训练里混合“部分已有、部分没有”。
 
-运行方式：
+直接通过同一个脚本切换模式：
+
+```bash
+bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
+  --finetune_mode compressed_lora
+```
+
+脚本只区分 `dp / layer_mp`，不会解析训练模式。LoRA 参数与其它 CLI 参数一样直接传给 Python，`"$@"` 位于最后，因此可以直接覆盖脚本默认值：
 
 ```bash
 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh \
   --finetune_mode compressed_lora \
-  --decode_device auto \
-  --decode_group_size 8 \
-  --tune_final_norm false \
-  --use_post_norm_head_linear false \
-  --vae_tune_bias false
+  --lora_rank 12 \
+  --lora_alpha 24 \
+  --lora_dropout 0.03 \
+  --compressed_lora_scope compressed_subspace
 ```
 
-输入要求：
+模式参数语义：
 
-- 输入 checkpoint 必须已经带有 `low_rank_a` 和 `low_rank_b`
-- 被 `--decoder_layers` 和 `--target_modules` 选中的 VAELinear 必须全部有完整低秩分支
-- 选中模块的低秩 rank 必须一致
-- 选中模块的 `low_rank_scope` 必须一致（`full` 或 `compressed_subspace`）；E2E **不新增**第二套 scope CLI，自动沿用 checkpoint 中的 scope
+- `decoder`：`--lora_rank / --lora_alpha / --lora_dropout / --compressed_lora_scope` 可以存在，但全部忽略。
+- `compressed_lora`：只训练 PEFT LoRA；`--tune_final_norm / --use_post_norm_head_linear / --vae_tune_bias` 即使脚本中存在也不会进入 trainable 集合。
+- `both`：保持原来的 decoder + checkpoint 已有 `low_rank_a/b` 直接联合训练；PEFT LoRA 配置参数忽略。
+
+输入与 LoRA 参数：
+
+- **全新 LoRA**：选中的 VAELinear 全部没有 `low_rank_a/b` 时，使用 CLI 的 `rank/alpha/dropout/scope` 创建 LoRA。默认 `rank=12`、`alpha=24`、`dropout=0.03`、`scope=full`。
+- `--compressed_lora_scope` 支持 `full` 和 `compressed_subspace`。
+- `full` 新建 shape：`low_rank_a=[out_features, rank]`，`low_rank_b=[rank, in_features]`。
+- `compressed_subspace` 新建 shape：`low_rank_a=[compressed_out_features, rank]`，`low_rank_b=[rank, compressed_in_features]`。
+- **续训已有 LoRA**：选中的 VAELinear 全部已有完整 `low_rank_a/b` 时，rank/scope 始终从 checkpoint 推断，不被脚本中的默认 `12/full` 覆盖。
+- existing 路径仍使用当前 `--lora_alpha / --lora_dropout` 构造 PEFT；初始化时会按 PEFT scaling 反算 B，使训练开始前的 effective low-rank patch 与 checkpoint 完全一致。
+- 选中模块存在 A/B 单边缺失、部分模块有分支而部分没有、已有 rank 不统一或已有 scope 不统一时，直接报错。
 
 训练逻辑：
 
-- `full`（默认/旧 checkpoint）：先把选中的 VAELinear 解码成 dense `nn.Linear`（含 VAE decoder 与固定 sparse residual，不含 low-rank patch），再 `get_peft_model` 包完整权重并训练 LoRA
-- `compressed_subspace`：把选中模块包成 `CompressedSubspacePeftProxy` + O(1) PEFT carrier，再 `get_peft_model` 得到 root `PeftModel`，只在压缩子空间训练 LoRA
-- 两种 scope 都保持 root `PeftModel`，继续共用现有 Trainer checkpoint/resume
-- 用 checkpoint 里的 effective `low_rank_a/b` 初始化 LoRA（scaling 固定为 1）
-- 训练结束后，把 LoRA 写回压缩模型的 `low_rank_a/b`，并校验 `expected_scope`
+- `full`：先把选中的 VAELinear 解码成 dense `nn.Linear`（含 VAE reconstruction 与固定 sparse residual，不含 low-rank patch），再由 root PEFT LoRA 训练完整 Linear 的低秩增量。
+- `compressed_subspace`：把选中模块包成 `CompressedSubspacePeftProxy`，只在真正的 compressed subspace 上训练 LoRA，不修改 protected channels。
+- 新建 LoRA 使用 PEFT default init，初始 LoRA delta 为 0；挂载新 LoRA 前后 student 输出应保持一致。
+- 两种 scope 都只允许 LoRA 参数训练；base model、VAE decoder、bias、norm、protected weights 和 sparse residual 保持冻结。
+- 训练结束后重新加载原 compressed checkpoint，并把训练后的 effective LoRA 写回 `VAELinear.low_rank_a/b`；新建模式创建分支，续训模式覆盖原分支。
+- 最终只保存完整 compressed checkpoint，不保存独立 PEFT adapter。
 
-说明：本功能只覆盖最终写回 `VAELinear.low_rank_a/b` 的 compressed LoRA；block-level PEFT LoRA 不在此范围。
+说明：本功能只覆盖最终写回 `VAELinear.low_rank_a/b` 的 plain LoRA；DoRA/AdaLoRA 不能等价表示为当前两矩阵 payload，因此不在此模式内。
 
 限制：
 
-- 不允许同时打开 `--vae_tune_bias true`
-- 不允许同时打开 `--tune_final_norm true`
-- 不允许同时打开 `--use_post_norm_head_linear true`
-
-适合场景：
-
-- VAE decoder 已经够稳定
-- 只想快速优化离群值低秩补偿
-- 希望训练时借用 dense LoRA 的速度，但最终仍保存压缩模型
+- `finetune_mode=both` 本轮不扩展：没有 low-rank 分支的 checkpoint 仍不能用 `both` 自动创建 LoRA
 
 输出：
 
 - `run_dir/final_model/`
-- 仍是压缩 checkpoint
-- 更新的是 VAELinear 内部 `low_rank_a/b`
+- 仍是单一完整压缩 checkpoint
+- 新建或更新的是 VAELinear 内部 `low_rank_a/b`
 - 不保存 LoRA adapter
 
 ## 3. `both`

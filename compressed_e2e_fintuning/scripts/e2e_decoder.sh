@@ -6,7 +6,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 SEED="${SEED:-0}"
 export PYTHONHASHSEED="${SEED}"
-export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export TOKENIZERS_PARALLELISM=false
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
@@ -14,14 +14,13 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
 MAX_STEPS="${MAX_STEPS:-5000}"
 STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora/Qwen_Qwen3-8B_20260828_183213/final_model/}"
-# 用 ${VAR-default}：仅在未设置时填默认；允许 EVAL_TASKS="" 关闭最终 lm-eval。
 EVAL_TASKS="${EVAL_TASKS-boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu}"
 EVAL_DEVICE="${EVAL_DEVICE:-cuda}"
 EVAL_PREWARM_GROUP_SIZE="${EVAL_PREWARM_GROUP_SIZE:-8}"
-PARALLEL_MODE="${PARALLEL_MODE:-dp}"   # layer_mp | dp
+PARALLEL_MODE="${PARALLEL_MODE:-dp}"   # dp | layer_mp
 NPROC="${NPROC:-8}"
 EVAL_AFTER_SAVE="${EVAL_AFTER_SAVE:-true}"
-# 分卡 lm-eval（尤其 mmlu）gather 等待；对齐 catlora_distill_4gpu_res0.sh
+
 export DISTILL_NCCL_TIMEOUT_SEC="${DISTILL_NCCL_TIMEOUT_SEC:-10800}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-10800}"
 
@@ -36,29 +35,15 @@ if [[ "${DISABLE_PROXY:-1}" == "1" ]]; then
 fi
 
 # 说明：
-# - packed 压缩 checkpoint -> 直接端到端微调 VAELinear 多阶 decoder -> 保存新的 packed final_model。
-# - 训练超参以 DP 分支为准；layer_mp 与 DP 同步（仅启动方式 / parallel_mode / layer_device_map 不同）。
-# - 默认 --finetune_mode both；不训练 final norm / post-norm head linear；VAELinear bias 不训练。
-# - PARALLEL_MODE=layer_mp：单进程层级模型并行，不用 torchrun；多卡切分由 --layer_device_map 控制。
-# - PARALLEL_MODE=dp：torchrun 数据并行；每卡一份完整 student + teacher，忽略 --layer_device_map。
-# - 当前默认 --offload_mode none（层常驻 GPU）。若改 streaming，只能配合 layer_mp。
-#   --offload_mode 控制 student activation/layer offload，与 teacher-output offload 无关。
-# - --distill_teacher_model_offload none：teacher 权重常驻训练设备；改为 cpu 时，
-#   teacher forward 前搬到训练设备、targets 落 CPU 后搬回 CPU。
-# - CPU output 模式先 teacher forward，再把 logits 和必要 hidden targets 放到 CPU。
-# - EAKLD 每次只回传 8 个 token 的完整词表 teacher logits。
-# - 普通 hidden alignment 的 adaptive_top_3 仅保留 3 个 student hidden states；
-#   pre-MLP alignment 为保持与 CAT 数值一致，会先捕获全部 pre-MLP hidden，再按同一 CAT 规则选层。
-# - auto（layer_mp）会按当前 CUDA_VISIBLE_DEVICES 内可见 GPU 均分 Transformer layers。
-# - 训练保存 final_model 后会跑 lm-eval：${EVAL_TASKS}
-# - 冒烟建议：
-#   MAX_STEPS=30 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --skip_ppl_eval true --eval_tasks ""
-# - 关闭 VAE decoder activation checkpoint（用显存换速度）：
-#   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --vae_decoder_checkpoint false
-# - DP 示例：
-#   PARALLEL_MODE=dp NPROC=4 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh
-# - 保存中间 ckpt 后再分卡 lm-eval：
-#   EVAL_AFTER_SAVE=true PARALLEL_MODE=dp NPROC=4 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --save_steps 1000
+# - 脚本只区分 dp / layer_mp；训练模式和其余参数都直接交给 Python 解析。
+# - "$@" 位于最后，可覆盖脚本中的默认参数。
+# - decoder / both 会忽略 PEFT LoRA 配置参数；compressed_lora 会使用 rank/alpha/dropout/scope。
+# - compressed_lora 只训练 LoRA；脚本里 decoder 相关 trainable 开关即使存在也不会生效。
+# - 无 low_rank 分支时 compressed_lora 新建 LoRA；已有 low_rank 分支时 rank/scope 从 checkpoint 推断。
+# - compressed_lora 示例：
+#   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --finetune_mode compressed_lora
+# - subspace 示例：
+#   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --finetune_mode compressed_lora --compressed_lora_scope compressed_subspace
 
 if [[ "${PARALLEL_MODE}" == "dp" ]]; then
   torchrun --standalone --nproc_per_node="${NPROC}" -m compressed_e2e_fintuning.main \
@@ -88,9 +73,13 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --selective_student_topk true \
     --selective_student_topk_chunk_rows 32 \
     --dynamic_padding true \
-    --model_max_length "1024" \
+    --model_max_length 1024 \
     --decoder_layers 0-35 \
     --target_modules all \
+    --lora_rank 12 \
+    --lora_alpha 24 \
+    --lora_dropout 0.03 \
+    --compressed_lora_scope full \
     --parallel_stage_decode true \
     --vae_decoder_checkpoint true \
     --tune_final_norm true \
@@ -151,9 +140,13 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --selective_student_topk true \
     --selective_student_topk_chunk_rows 32 \
     --dynamic_padding true \
-    --model_max_length "1024" \
+    --model_max_length 1024 \
     --decoder_layers 0-35 \
     --target_modules all \
+    --lora_rank 12 \
+    --lora_alpha 24 \
+    --lora_dropout 0.03 \
+    --compressed_lora_scope full \
     --layer_device_map auto \
     --parallel_stage_decode true \
     --vae_decoder_checkpoint true \
@@ -188,6 +181,6 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --max_steps "${MAX_STEPS}" \
     "$@"
 else
-  echo "Unsupported PARALLEL_MODE=${PARALLEL_MODE}. Expected layer_mp or dp." >&2
+  echo "Unsupported PARALLEL_MODE=${PARALLEL_MODE}. Expected dp or layer_mp." >&2
   exit 1
 fi
