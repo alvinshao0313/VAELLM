@@ -63,8 +63,8 @@ if _TRITON_AVAILABLE:
         P: tl.constexpr,
         BLOCK_Q: tl.constexpr,
     ):
-        bank = tl.program_id(0)
-        pid_q = tl.program_id(1)
+        pid_q = tl.program_id(0)
+        bank = tl.program_id(1)
         q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
         n_bits = tl.load(n_bits_ptr + bank).to(tl.int64)
         n_active = tl.load(n_active_ptr + bank).to(tl.int64)
@@ -121,8 +121,8 @@ if _TRITON_AVAILABLE:
         P: tl.constexpr,
         BLOCK_Q: tl.constexpr,
     ):
-        bank = tl.program_id(0)
-        pid_q = tl.program_id(1)
+        pid_q = tl.program_id(0)
+        bank = tl.program_id(1)
         q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
         n_bits = tl.load(n_bits_ptr + bank).to(tl.int64)
         n_active = tl.load(n_active_ptr + bank).to(tl.int64)
@@ -281,8 +281,8 @@ if _TRITON_AVAILABLE:
         BLOCK_Q: tl.constexpr,
         BLOCK_H: tl.constexpr,
     ):
-        bank = tl.program_id(0)
-        pid_q = tl.program_id(1)
+        pid_q = tl.program_id(0)
+        bank = tl.program_id(1)
         q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
         n_bits = tl.load(n_bits_ptr + bank).to(tl.int64)
         n_active = tl.load(n_active_ptr + bank).to(tl.int64)
@@ -365,8 +365,8 @@ if _TRITON_AVAILABLE:
         LR: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        bank = tl.program_id(0)
-        pid = tl.program_id(1)
+        pid = tl.program_id(0)
+        bank = tl.program_id(1)
         n_active = tl.load(n_active_ptr + bank).to(tl.int64)
         start = tl.load(score_offset_ptr + bank).to(tl.int64)
         q = pid * BLOCK + tl.arange(0, BLOCK)
@@ -400,8 +400,8 @@ if _TRITON_AVAILABLE:
         USE_ADAMW: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        bank = tl.program_id(0)
-        pid = tl.program_id(1)
+        pid = tl.program_id(0)
+        bank = tl.program_id(1)
         n_active = tl.load(n_active_ptr + bank).to(tl.int64)
         start = tl.load(score_offset_ptr + bank).to(tl.int64)
         q = pid * BLOCK + tl.arange(0, BLOCK)
@@ -427,6 +427,20 @@ if _TRITON_AVAILABLE:
         tl.store(score_ptr + idx, updated_fp16, mask=mask)
 
 
+def _q_bank_grid(max_active: int, block: int, num_banks: int) -> tuple[int, int]:
+    max_active_i = int(max_active)
+    block_i = int(block)
+    num_banks_i = int(num_banks)
+    if max_active_i < 1:
+        raise ValueError(f"max_active must be >=1, got {max_active_i}.")
+    if block_i < 1:
+        raise ValueError(f"block must be >=1, got {block_i}.")
+    if num_banks_i < 1:
+        raise ValueError(f"num_banks must be >=1, got {num_banks_i}.")
+    q_tiles = (max_active_i + block_i - 1) // block_i
+    return q_tiles, num_banks_i
+
+
 def _require_triton() -> None:
     if not sparse_bit_triton_available():
         raise RuntimeError("Sparse Bit Tuning requires CUDA + Triton for the production path.")
@@ -440,7 +454,7 @@ def launch_init_scores(
     _require_triton()
     max_active = int(meta.max_active)
     block = 256
-    grid = (int(meta.num_banks), triton.cdiv(max_active, block))
+    grid = _q_bank_grid(max_active, block, int(meta.num_banks))
     _init_scores_kernel[grid](
         packed,
         score_span,
@@ -478,7 +492,7 @@ def launch_set_scores(
     else:
         flip_counter.zero_()
     block = 256
-    grid = (int(meta.num_banks), triton.cdiv(int(meta.max_active), block))
+    grid = _q_bank_grid(int(meta.max_active), block, int(meta.num_banks))
     _set_scores_full_words_kernel[grid](
         packed,
         score_span,
@@ -539,7 +553,7 @@ def launch_dscore(
     _require_triton()
     block_q = 32
     block_h = 128
-    grid = (int(meta.num_banks), triton.cdiv(int(meta.max_active), block_q))
+    grid = _q_bank_grid(int(meta.max_active), block_q, int(meta.num_banks))
     _dscore_kernel[grid](
         grad_out,
         weight,
@@ -595,7 +609,7 @@ def launch_rms_sgd_update(
         num_warps=8,
     )
     block = 256
-    _rms_sgd_update_kernel[(int(meta.num_banks), triton.cdiv(int(meta.max_active), block))](
+    _rms_sgd_update_kernel[_q_bank_grid(int(meta.max_active), block, int(meta.num_banks))](
         score,
         grad,
         rms,
@@ -636,7 +650,7 @@ def launch_adam_update(
     bias1 = 1.0 - float(beta1) ** t
     bias2 = 1.0 - float(beta2) ** t
     block = 256
-    _adam_update_kernel[(int(meta.num_banks), triton.cdiv(int(meta.max_active), block))](
+    _adam_update_kernel[_q_bank_grid(int(meta.max_active), block, int(meta.num_banks))](
         score,
         grad,
         exp_avg,
