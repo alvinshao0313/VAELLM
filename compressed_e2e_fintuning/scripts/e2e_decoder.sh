@@ -44,6 +44,8 @@ fi
 #   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --finetune_mode compressed_lora
 # - subspace 示例：
 #   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --finetune_mode compressed_lora --compressed_lora_scope compressed_subspace
+# - Sparse Bit 参数直接写在下面的训练命令中；将 --sparse_bit_tuning 改为 true 即可开启。
+# - "$@" 仍位于最后，因此也可以临时从命令行覆盖这些默认值。
 
 if [[ "${PARALLEL_MODE}" == "dp" ]]; then
   torchrun --standalone --nproc_per_node="${NPROC}" -m compressed_e2e_fintuning.main \
@@ -76,6 +78,12 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --model_max_length 1024 \
     --decoder_layers 0-35 \
     --target_modules all \
+    --sparse_bit_tuning true \
+    --bit_active_ratio 0.03 \
+    --bit_optimizer rms_sgd \
+    --bit_lr auto \
+    --bit_weight_decay 0.0 \
+    --bit_round_steps auto \
     --lora_rank 12 \
     --lora_alpha 24 \
     --lora_dropout 0.03 \
@@ -98,7 +106,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --ppl_limit -1 \
     --save_tokenizer true \
     --bf16 true \
-    --per_device_train_batch_size 4 \
+    --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 1 \
     --learning_rate 1e-5 \
     --lr_scheduler_type cosine \
@@ -143,6 +151,12 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --model_max_length 1024 \
     --decoder_layers 0-35 \
     --target_modules all \
+    --sparse_bit_tuning false \
+    --bit_active_ratio 0.01 \
+    --bit_optimizer rms_sgd \
+    --bit_lr auto \
+    --bit_weight_decay 0.0 \
+    --bit_round_steps auto \
     --lora_rank 12 \
     --lora_alpha 24 \
     --lora_dropout 0.03 \

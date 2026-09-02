@@ -498,9 +498,48 @@ def _prepare_compressed_lora_train_model(
     decode_group_size: int,
     decode_device: str,
     log,
+    sparse_bit_tuning: bool = False,
 ) -> Tuple[nn.Module, VAEDecoderTrainableSelection]:
     """Route compressed_lora setup by resolved low-rank scope."""
     if low_rank_scope == LOW_RANK_SCOPE_FULL:
+        if bool(sparse_bit_tuning):
+            from sparse_bit_tuning.full_lora_proxy import build_full_compressed_peft_model
+
+            peft_model = build_full_compressed_peft_model(
+                model,
+                selected_modules=selected_modules,
+                initial_low_rank_payloads=initial_low_rank_payloads,
+                rank=int(low_rank_rank),
+                alpha=float(lora_alpha),
+                dropout=float(lora_dropout),
+            )
+            for _name, module in selected_modules:
+                module.enable_sparse_bit_decode_graph(parallel_stage_decode=bool(parallel_stage_decode))
+            trainable_names = sorted(name for name, param in peft_model.named_parameters() if bool(param.requires_grad))
+            trainable_count = int(
+                sum(int(param.numel()) for _name, param in peft_model.named_parameters() if bool(param.requires_grad))
+            )
+            if trainable_count < 1:
+                raise RuntimeError("No trainable full-proxy LoRA parameters found.")
+            target_modules = sorted(str(name) for name, _module in selected_modules)
+            return peft_model, VAEDecoderTrainableSelection(
+                decoder_layer_ids=[int(idx) for idx in decoder_layer_ids],
+                target_modules=target_modules,
+                target_module_suffixes=list(target_module_suffixes),
+                bias_modules=[],
+                final_norm_modules=[],
+                post_norm_head_modules=[],
+                low_rank_modules=target_modules,
+                trainable_parameter_names=trainable_names,
+                trainable_parameter_count=trainable_count,
+                parallel_stage_decode=bool(parallel_stage_decode),
+                train_mode="compressed_lora",
+                compressed_lora_source="existing" if initial_low_rank_payloads is not None else "new",
+                resolved_lora_rank=int(low_rank_rank),
+                resolved_lora_alpha=float(lora_alpha),
+                resolved_lora_dropout=float(lora_dropout),
+                resolved_lora_scope=LOW_RANK_SCOPE_FULL,
+            )
         decode_device_diag = get_decode_device_diagnostics(str(decode_device))
         resolved_decode_device = str(decode_device_diag["resolved_device"])
         log.info(
@@ -833,6 +872,27 @@ def _build_run_meta(
 
 
 def run(args, hf_args, training_args):
+    if bool(getattr(args, "sparse_bit_tuning", False)):
+        unsupported = []
+        if getattr(training_args, "deepspeed", None):
+            unsupported.append("DeepSpeed")
+        fsdp = getattr(training_args, "fsdp", None)
+        if fsdp and str(fsdp).strip().lower() not in {"", "[]", "none"}:
+            unsupported.append("FSDP")
+        if int(getattr(training_args, "tp_size", 1) or 1) > 1:
+            unsupported.append("HF tensor parallel (tp_size>1)")
+        if bool(getattr(training_args, "torch_compile", False)):
+            unsupported.append("torch_compile")
+        if bool(getattr(training_args, "auto_find_batch_size", False)):
+            unsupported.append("auto_find_batch_size")
+        if bool(getattr(training_args, "load_best_model_at_end", False)):
+            unsupported.append("load_best_model_at_end")
+        if unsupported:
+            raise ValueError(
+                "Sparse Bit Tuning v1 does not support Trainer modes that rewrite model/optimizer/checkpoint lifecycle: "
+                + ", ".join(unsupported)
+                + ". Disable them or run with --sparse_bit_tuning false."
+            )
     stage = str(getattr(args, "e2e_stage", "compressed_e2e_fintuning"))
     parallel_mode = str(getattr(args, "parallel_mode", "layer_mp")).strip().lower()
     # Temporary logger before run dir exists; replaced after output dir is ready.
@@ -894,6 +954,11 @@ def run(args, hf_args, training_args):
     low_rank_scope: Optional[str] = None
     low_rank_rank: Optional[int] = None
     compressed_lora_source: Optional[str] = None
+    sparse_bit_targets: List[Tuple[str, VAELinear]] = []
+    sparse_bit_manager: Optional[object] = None
+    sparse_bit_payloads_for_export = None
+    compressed_lora_aux_params: Dict[str, nn.Parameter] = {}
+    compressed_lora_aux_payload_for_export = None
     if train_mode in {"compressed_lora", "both"}:
         selected_modules, target_module_suffixes = collect_selected_vae_linears(
             model,
@@ -943,8 +1008,36 @@ def run(args, hf_args, training_args):
             parallel_stage_decode=bool(args.parallel_stage_decode),
             decode_group_size=int(args.decode_group_size),
             decode_device=str(getattr(args, "decode_device", "auto")),
+            sparse_bit_tuning=bool(args.sparse_bit_tuning),
             log=log,
         )
+        if bool(args.sparse_bit_tuning) and low_rank_scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
+            for _name, module in selected_modules:
+                module.enable_sparse_bit_decode_graph(parallel_stage_decode=bool(args.parallel_stage_decode))
+        if bool(args.vae_tune_bias) or bool(args.tune_final_norm) or bool(args.use_post_norm_head_linear):
+            from compressed_e2e_fintuning.aux_trainables import (
+                enable_compressed_lora_auxiliary_trainables,
+            )
+
+            aux_selection = enable_compressed_lora_auxiliary_trainables(
+                model,
+                selected_vae_modules=selected_modules,
+                low_rank_scope=str(low_rank_scope),
+                sparse_bit_tuning=bool(args.sparse_bit_tuning),
+                vae_tune_bias=bool(args.vae_tune_bias),
+                tune_final_norm=bool(args.tune_final_norm),
+                use_post_norm_head_linear=bool(args.use_post_norm_head_linear),
+            )
+            compressed_lora_aux_params = dict(aux_selection.parameters)
+            selection.bias_modules = list(aux_selection.bias_modules)
+            selection.final_norm_modules = list(aux_selection.final_norm_modules)
+            selection.post_norm_head_modules = list(aux_selection.post_norm_head_modules)
+            selection.trainable_parameter_names = sorted(
+                name for name, param in model.named_parameters() if bool(param.requires_grad)
+            )
+            selection.trainable_parameter_count = int(
+                sum(int(param.numel()) for param in model.parameters() if bool(param.requires_grad))
+            )
     else:
         selection = select_vae_decoder_trainables(
             model,
@@ -954,8 +1047,26 @@ def run(args, hf_args, training_args):
             tune_final_norm=bool(args.tune_final_norm),
             use_post_norm_head_linear=bool(args.use_post_norm_head_linear),
             vae_tune_bias=bool(args.vae_tune_bias),
+            sparse_bit_tuning=bool(args.sparse_bit_tuning),
             train_mode=train_mode,
         )
+    if bool(args.sparse_bit_tuning):
+        if train_mode == "compressed_lora":
+            sparse_bit_targets = list(selected_modules)
+        else:
+            sparse_bit_targets, _unused_suffixes = collect_selected_vae_linears(
+                model,
+                decoder_layer_ids=decoder_layer_ids,
+                target_module_names=args.target_module_names,
+            )
+        resolved_bit_names = sorted(str(name) for name, _module in sparse_bit_targets)
+        if resolved_bit_names != sorted(selection.target_modules):
+            raise RuntimeError(
+                "Sparse Bit target resolution disagrees with trainable selection: "
+                f"bit={resolved_bit_names} selection={sorted(selection.target_modules)}"
+            )
+        if not sparse_bit_targets:
+            raise RuntimeError("Sparse Bit tuning requested but no VAELinear targets were resolved.")
     log.info(
         "Selected VAE trainables: mode=%s layers=%s targets=%d suffixes=%s bias_modules=%d low_rank_modules=%d final_norm=%s post_norm_head=%s trainable_tensors=%d trainable_params=%d parallel_stage_decode=%s",
         selection.train_mode,
@@ -976,6 +1087,7 @@ def run(args, hf_args, training_args):
     saved_tensor_offload = None
     hook_handles = []
     dp_local_device: Optional[torch.device] = None
+    resolved_layer_device_map: Optional[Dict[int, torch.device]] = None
     if parallel_mode == "dp":
         if str(args.layer_device_map).strip().lower() not in {"", "auto"}:
             log.info(
@@ -1042,6 +1154,46 @@ def run(args, hf_args, training_args):
             json.dumps(hf_device_map, ensure_ascii=False, sort_keys=True),
             int(args.offload_min_tensor_bytes),
             str(bool(args.offload_pin_memory)).lower(),
+        )
+    if bool(args.sparse_bit_tuning):
+        from sparse_bit_tuning.config import SparseBitTuningConfig
+        from sparse_bit_tuning.manager import SparseBitTuningManager
+        from sparse_bit_tuning.runtime_integration import resolve_target_devices
+
+        target_devices = resolve_target_devices(
+            sparse_bit_targets,
+            parallel_mode=parallel_mode,
+            dp_local_device=dp_local_device,
+            offload_mode=offload_mode,
+            layer_device_map=resolved_layer_device_map,
+        )
+        sparse_bit_config = SparseBitTuningConfig(
+            enabled=True,
+            active_ratio=float(args.bit_active_ratio),
+            optimizer=str(args.bit_optimizer),
+            bit_lr=args.bit_lr,
+            weight_decay=float(args.bit_weight_decay),
+            round_steps=args.bit_round_steps,
+        ).normalized()
+        sparse_bit_manager = SparseBitTuningManager(
+            root_model=model,
+            targets=sparse_bit_targets,
+            target_devices=target_devices,
+            training_seed=int(getattr(training_args, "seed", 42)),
+            config=sparse_bit_config,
+            streaming=offload_mode == "streaming",
+        )
+        log.info(
+            "Sparse Bit initialized: targets=%d banks=%d logical_bits=%d active_bits=%d "
+            "active_ratio=%.8f optimizer=%s bit_lr=%.8g streaming=%s",
+            len(sparse_bit_targets),
+            len(sparse_bit_manager.bank_specs),
+            sum(int(spec.n_bits) for spec in sparse_bit_manager.bank_specs),
+            sum(int(spec.n_active) for spec in sparse_bit_manager.bank_specs),
+            float(sparse_bit_config.active_ratio),
+            str(sparse_bit_config.optimizer),
+            float(sparse_bit_config.resolved_lr()),
+            str(offload_mode == "streaming").lower(),
         )
     sparse_residual_prewarm = _prewarm_sparse_residual_cache(
         model,
@@ -1180,6 +1332,8 @@ def run(args, hf_args, training_args):
         eakld_confidence_k=int(args.eakld_confidence_k),
         saved_tensor_offload=saved_tensor_offload,
         streaming_offload_manager=streaming_manager,
+        sparse_bit_manager=sparse_bit_manager,
+        aux_trainable_parameters=compressed_lora_aux_params,
         callbacks=trainer_callbacks,
     )
     replace_progress_log_callback(trainer)
@@ -1196,6 +1350,23 @@ def run(args, hf_args, training_args):
         raise
 
     final_model = trainer.accelerator.unwrap_model(trainer.model) if getattr(trainer, "accelerator", None) else trainer.model
+    if sparse_bit_manager is not None:
+        from sparse_bit_tuning.runtime_integration import collect_packed_payloads
+
+        sparse_bit_manager.final_commit()
+        sparse_bit_payloads_for_export = collect_packed_payloads(sparse_bit_targets)
+        sparse_bit_manager.detach_runtime()
+        log.info(
+            "Sparse Bit final commit: targets=%d packed_banks=%d runtime_detached=true",
+            len(sparse_bit_payloads_for_export),
+            sum(len(banks) for banks in sparse_bit_payloads_for_export.values()),
+        )
+    if compressed_lora_aux_params:
+        from compressed_e2e_fintuning.aux_trainables import snapshot_auxiliary_trainables
+
+        compressed_lora_aux_payload_for_export = snapshot_auxiliary_trainables(
+            compressed_lora_aux_params
+        )
     final_model.eval()
     if hasattr(trainer, "offload_teacher_to_cpu"):
         previous_teacher_device = trainer.offload_teacher_to_cpu()
@@ -1214,10 +1385,18 @@ def run(args, hf_args, training_args):
         log.info("Unwrapped %d streaming offload layers before final save.", unwrapped_streaming)
     if train_mode == "compressed_lora":
         if low_rank_scope == LOW_RANK_SCOPE_FULL:
-            low_rank_payloads_for_export = extract_low_rank_payloads_from_lora(
-                final_model,
-                selection.target_modules,
-            )
+            if bool(args.sparse_bit_tuning):
+                from sparse_bit_tuning.full_lora_proxy import extract_full_proxy_low_rank_payloads
+
+                low_rank_payloads_for_export = extract_full_proxy_low_rank_payloads(
+                    final_model,
+                    module_names=selection.target_modules,
+                )
+            else:
+                low_rank_payloads_for_export = extract_low_rank_payloads_from_lora(
+                    final_model,
+                    selection.target_modules,
+                )
         elif low_rank_scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
             low_rank_payloads_for_export = extract_subspace_peft_low_rank_payloads(
                 final_model,
@@ -1241,6 +1420,27 @@ def run(args, hf_args, training_args):
             written,
             low_rank_scope,
         )
+        if sparse_bit_payloads_for_export is not None:
+            from sparse_bit_tuning.runtime_integration import write_packed_payloads
+
+            packed_written = write_packed_payloads(export_model, sparse_bit_payloads_for_export)
+            log.info(
+                "Exported trained Sparse Bit packed payloads to reloaded compressed model: written_banks=%d",
+                int(packed_written),
+            )
+        if compressed_lora_aux_payload_for_export is not None:
+            if bool(args.use_post_norm_head_linear):
+                ensure_post_norm_head_linear(export_model)
+            from compressed_e2e_fintuning.aux_trainables import (
+                apply_auxiliary_payload_to_compressed_model,
+            )
+
+            aux_written = apply_auxiliary_payload_to_compressed_model(
+                export_model, compressed_lora_aux_payload_for_export
+            )
+            log.info(
+                "Exported compressed-LoRA auxiliary trainables: written=%d", int(aux_written)
+            )
         final_model = export_model
         if hasattr(final_model, "config"):
             final_model.config.use_cache = False

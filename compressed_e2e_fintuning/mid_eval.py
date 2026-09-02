@@ -58,6 +58,23 @@ def temporary_inference_decode_mode(
     retained on GPU alongside optimizer/teacher memory.
     """
     enabled_modules = list(_iter_trainable_decode_modules(model))
+    restore_modes = []
+    for module in enabled_modules:
+        sparse_binding = getattr(module, "_sparse_bit_binding", None)
+        packed_decoder = getattr(module, "_parallel_stage_decoder", None)
+        if packed_decoder is not None:
+            decoder_trainable = any(bool(p.requires_grad) for p in packed_decoder.parameters())
+        else:
+            decoder_trainable = False
+            for stage_idx in range(int(module.residual_stages)):
+                for part_idx in range(int(module.parallel_parts)):
+                    decoder = module.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+                    if any(bool(p.requires_grad) for p in decoder.parameters()):
+                        decoder_trainable = True
+                        break
+                if decoder_trainable:
+                    break
+        restore_modes.append((module, sparse_binding is not None, decoder_trainable))
     was_training = bool(model.training)
     model.eval()
     for module in enabled_modules:
@@ -68,8 +85,11 @@ def temporary_inference_decode_mode(
     try:
         yield
     finally:
-        for module in enabled_modules:
-            module.enable_trainable_decode(parallel_stage_decode=bool(parallel_stage_decode))
+        for module, has_sparse_binding, decoder_trainable in restore_modes:
+            if has_sparse_binding and not decoder_trainable:
+                module.enable_sparse_bit_decode_graph(parallel_stage_decode=bool(parallel_stage_decode))
+            else:
+                module.enable_trainable_decode(parallel_stage_decode=bool(parallel_stage_decode))
         if was_training:
             model.train()
         else:
@@ -382,6 +402,7 @@ class EvalAfterSaveCallback(TrainerCallback):
         trainer = self._trainer
         previous_teacher_device = None
         optimizer_device = None
+        optimizer_state_token = None
         if trainer is not None:
             if hasattr(trainer, "offload_teacher_to_cpu"):
                 previous_teacher_device = trainer.offload_teacher_to_cpu()
@@ -392,15 +413,21 @@ class EvalAfterSaveCallback(TrainerCallback):
                     )
             optimizer = getattr(trainer, "optimizer", None)
             if optimizer is not None:
-                if previous_teacher_device is not None and previous_teacher_device.type != "cpu":
-                    optimizer_device = previous_teacher_device
-                else:
-                    optimizer_device = torch.device(
-                        get_distill_local_device(fallback=str(self.e2e_args.eval_device))
+                if hasattr(optimizer, "offload_training_state_for_eval"):
+                    optimizer_state_token = optimizer.offload_training_state_for_eval()
+                    self.log.info(
+                        "Offloaded Composite/Bit optimizer training state to CPU for eval-after-save."
                     )
-                moved = _offload_optimizer_state_to_cpu(optimizer)
-                if moved > 0:
-                    self.log.info("Offloaded %d optimizer state tensors to CPU for eval-after-save.", moved)
+                else:
+                    if previous_teacher_device is not None and previous_teacher_device.type != "cpu":
+                        optimizer_device = previous_teacher_device
+                    else:
+                        optimizer_device = torch.device(
+                            get_distill_local_device(fallback=str(self.e2e_args.eval_device))
+                        )
+                    moved = _offload_optimizer_state_to_cpu(optimizer)
+                    if moved > 0:
+                        self.log.info("Offloaded %d optimizer state tensors to CPU for eval-after-save.", moved)
             if hasattr(eval_model, "zero_grad"):
                 eval_model.zero_grad(set_to_none=True)
             if torch.cuda.is_available():
@@ -422,7 +449,16 @@ class EvalAfterSaveCallback(TrainerCallback):
             _clear_post_eval_decoded_cache(eval_model, eval_tag=eval_tag, log=self.log)
             if trainer is not None:
                 optimizer = getattr(trainer, "optimizer", None)
-                if optimizer is not None and optimizer_device is not None:
+                if (
+                    optimizer is not None
+                    and optimizer_state_token is not None
+                    and hasattr(optimizer, "restore_training_state_after_eval")
+                ):
+                    optimizer.restore_training_state_after_eval(optimizer_state_token)
+                    self.log.info(
+                        "Restored Composite/Bit optimizer training state to original devices after eval-after-save."
+                    )
+                elif optimizer is not None and optimizer_device is not None:
                     moved = _restore_optimizer_state_to_device(optimizer, torch.device(optimizer_device))
                     if moved > 0:
                         self.log.info(

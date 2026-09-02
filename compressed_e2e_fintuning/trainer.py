@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 from contextlib import nullcontext
 from typing import Dict, Optional
 
@@ -276,6 +277,8 @@ class VAEDecoderE2ETrainer(Trainer):
         teacher_output_chunk_tokens: int = 8,
         selective_student_topk: bool = False,
         selective_student_topk_chunk_rows: int = 32,
+        sparse_bit_manager=None,
+        aux_trainable_parameters=None,
         **kwargs,
     ):
         self.loss_type = str(loss_type).strip().lower()
@@ -334,6 +337,11 @@ class VAEDecoderE2ETrainer(Trainer):
         self._teacher_device = None
         self.saved_tensor_offload = saved_tensor_offload
         self.streaming_offload_manager = streaming_offload_manager
+        self.sparse_bit_manager = sparse_bit_manager
+        self.aux_trainable_parameters = dict(aux_trainable_parameters or {})
+        self._sparse_bit_main_optimizer = None
+        self._sparse_bit_main_parameters = ()
+        self._last_sparse_bit_telemetry: Dict[str, float] = {}
         self._last_loss_parts: Dict[str, float] = {}
         # Rank-local EAKLD telemetry accumulator (reset on each training log flush).
         self._eakld_telemetry_weighted_sums: Dict[str, float] = {}
@@ -343,6 +351,22 @@ class VAEDecoderE2ETrainer(Trainer):
         # Logging-window token telemetry; consumed by E2EDistillTokenStatsCallback.
         self.distill_token_stats = DistillTokenStatsAccumulator()
         super().__init__(*args, **kwargs)
+        if self.sparse_bit_manager is not None:
+            if int(getattr(self.args, 'n_gpu', 0)) > 1 and int(getattr(self.accelerator, 'num_processes', 1)) == 1 and not bool(getattr(self, 'is_model_parallel', False)):
+                raise RuntimeError(
+                    'Sparse Bit Tuning does not support single-process torch.nn.DataParallel. '
+                    'For DP, launch with torchrun/DDP so each process owns one GPU.'
+                )
+            from sparse_bit_tuning.amp import install_main_grad_clip_filter, install_sparse_bit_grad_scaler
+
+            bit_param_ids = self.sparse_bit_manager.score_module.bit_parameter_ids()
+            self._sparse_bit_main_parameters = tuple(
+                param
+                for param in self.model.parameters()
+                if bool(param.requires_grad) and id(param) not in bit_param_ids
+            )
+            install_sparse_bit_grad_scaler(self.accelerator)
+            install_main_grad_clip_filter(self.accelerator, self._sparse_bit_main_parameters)
         # Custom compute_loss returns token-mean losses. HF treats models with
         # forward(**kwargs) as accepting num_items_in_batch and then skips
         # dividing by gradient_accumulation_steps, which inflates logged loss
@@ -350,6 +374,200 @@ class VAEDecoderE2ETrainer(Trainer):
         self.model_accepts_loss_kwargs = False
         if self.model is not None:
             self.model.accepts_loss_kwargs = False
+
+    def _sparse_bit_optimizer_step(self) -> None:
+        if self.sparse_bit_manager is None:
+            raise RuntimeError("Sparse Bit optimizer callback executed without a manager.")
+        telemetry = self.sparse_bit_manager.optimizer_step()
+        self._last_sparse_bit_telemetry = {
+            "bit/round": float(telemetry.global_bit_round),
+            "bit/round_step": float(telemetry.bit_round_step),
+            "bit/step_flip_count": float(telemetry.step_flip_count),
+            "bit/cumulative_flip_count": float(telemetry.cumulative_flip_count),
+            "bit/stable_counter": float(telemetry.stable_counter),
+            "bit/stable_steps": float(telemetry.stable_steps),
+            "bit/had_flip": float(bool(telemetry.had_flip)),
+            "bit/round_ended": float(bool(telemetry.round_ended)),
+        }
+
+    def create_optimizer(self):
+        if self.sparse_bit_manager is None:
+            return super().create_optimizer()
+        from sparse_bit_tuning.optimizer import SparseBitCompositeOptimizer
+
+        if isinstance(self.optimizer, SparseBitCompositeOptimizer):
+            return self.optimizer
+        if self.optimizer is not None:
+            raise RuntimeError(
+                "Sparse Bit E2E does not accept a pre-built external optimizer; "
+                "let Trainer create the continuous optimizer and Composite wrapper."
+            )
+
+        bit_params = tuple(self.sparse_bit_manager.score_module.bit_parameters())
+        bit_param_ids = {id(param) for param in bit_params}
+        main_params = tuple(self._sparse_bit_main_parameters)
+        if any(id(param) in bit_param_ids for param in main_params):
+            raise RuntimeError("Sparse Bit score/main optimizer parameter sets overlap.")
+
+        main_optimizer = None
+        if main_params:
+            old_requires_grad = [bool(param.requires_grad) for param in bit_params]
+            try:
+                for param in bit_params:
+                    param.requires_grad_(False)
+                main_optimizer = super().create_optimizer()
+            finally:
+                for param, requires_grad in zip(bit_params, old_requires_grad):
+                    param.requires_grad_(requires_grad)
+            optimized_ids = {
+                id(param)
+                for group in main_optimizer.param_groups
+                for param in group.get("params", ())
+            }
+            overlap = optimized_ids & bit_param_ids
+            if overlap:
+                raise RuntimeError(f"Main optimizer unexpectedly owns {len(overlap)} Sparse Bit score parameters.")
+
+        self._sparse_bit_main_optimizer = main_optimizer
+        self.optimizer = SparseBitCompositeOptimizer(
+            main_optimizer=main_optimizer,
+            bit_manager=self.sparse_bit_manager.bit_optimizer,
+            step_callback=self._sparse_bit_optimizer_step,
+        )
+        return self.optimizer
+
+    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        if self.sparse_bit_manager is None:
+            return super().create_scheduler(num_training_steps, optimizer=optimizer)
+        from sparse_bit_tuning.optimizer import make_noop_scheduler
+
+        self.sparse_bit_manager.configure_schedule(total_optimizer_steps=int(num_training_steps))
+        self.sparse_bit_manager.initialize_scores()
+        if self._sparse_bit_main_optimizer is None:
+            if self.lr_scheduler is None:
+                self.lr_scheduler = make_noop_scheduler()
+                self._created_lr_scheduler = True
+            return self.lr_scheduler
+        return super().create_scheduler(
+            num_training_steps,
+            optimizer=self._sparse_bit_main_optimizer,
+        )
+
+    def _save(self, output_dir=None, state_dict=None):
+        if self.sparse_bit_manager is None:
+            return super()._save(output_dir=output_dir, state_dict=state_dict)
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        filtered = {
+            key: value
+            for key, value in state_dict.items()
+            if not str(key).startswith("sparse_bit_tuning.")
+        }
+        return super()._save(output_dir=output_dir, state_dict=filtered)
+
+    def _save_checkpoint(self, model, trial):
+        if self.sparse_bit_manager is None and not self.aux_trainable_parameters:
+            return super()._save_checkpoint(model, trial)
+        packed_snapshot = None
+        coverage_snapshot = None
+        aux_snapshot = None
+        if bool(getattr(self.args, "should_save", True)):
+            if self.sparse_bit_manager is not None:
+                packed_snapshot = self.sparse_bit_manager.checkpoint_packed_snapshot()
+                coverage_snapshot = self.sparse_bit_manager.coverage_metadata()
+            if self.aux_trainable_parameters:
+                from compressed_e2e_fintuning.aux_trainables import snapshot_auxiliary_trainables
+
+                aux_snapshot = snapshot_auxiliary_trainables(self.aux_trainable_parameters)
+        result = super()._save_checkpoint(model, trial)
+        if packed_snapshot is not None:
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            from sparse_bit_tuning.checkpoint import save_sidecar
+
+            run_dir = self._get_output_dir(trial=trial)
+            output_dir = os.path.join(
+                run_dir, f"{PREFIX_CHECKPOINT_DIR}-{int(self.state.global_step)}"
+            )
+            save_sidecar(
+                output_dir,
+                packed_banks=packed_snapshot,
+                coverage=coverage_snapshot,
+            )
+        if aux_snapshot is not None:
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            from compressed_e2e_fintuning.aux_trainables import save_auxiliary_sidecar
+
+            run_dir = self._get_output_dir(trial=trial)
+            output_dir = os.path.join(
+                run_dir, f"{PREFIX_CHECKPOINT_DIR}-{int(self.state.global_step)}"
+            )
+            save_auxiliary_sidecar(output_dir, aux_snapshot)
+        return result
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        sidecar_path = os.path.join(str(resume_from_checkpoint), "sparse_bit_tuning")
+        aux_path = os.path.join(str(resume_from_checkpoint), "e2e_aux_trainables.pt")
+        if self.sparse_bit_manager is None:
+            if os.path.isdir(sidecar_path):
+                raise RuntimeError(
+                    "Checkpoint contains Sparse Bit sidecar but sparse_bit_tuning=false. "
+                    "Resume from a final committed compressed model instead of a Bit intermediate checkpoint."
+                )
+            if not self.aux_trainable_parameters:
+                if os.path.isfile(aux_path):
+                    raise RuntimeError(
+                        "Checkpoint contains auxiliary sidecar but no auxiliary trainables are enabled."
+                    )
+                return super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+            if not os.path.isfile(aux_path):
+                raise RuntimeError(f"Compressed LoRA auxiliary resume requires sidecar: {aux_path}.")
+            result = super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+            from compressed_e2e_fintuning.aux_trainables import (
+                load_auxiliary_sidecar,
+                restore_auxiliary_trainables,
+            )
+
+            aux_payload = load_auxiliary_sidecar(str(resume_from_checkpoint))
+            restore_auxiliary_trainables(self.aux_trainable_parameters, aux_payload)
+            return result
+
+        from sparse_bit_tuning.checkpoint import load_sidecar, sidecar_complete
+
+        if not sidecar_complete(str(resume_from_checkpoint)):
+            raise RuntimeError(
+                f"Sparse Bit resume requires complete sidecar under {sidecar_path}."
+            )
+        if self.aux_trainable_parameters and not os.path.isfile(aux_path):
+            raise RuntimeError(f"Compressed LoRA auxiliary resume requires sidecar: {aux_path}.")
+        if not self.aux_trainable_parameters and os.path.isfile(aux_path):
+            raise RuntimeError(
+                "Checkpoint contains auxiliary sidecar but no auxiliary trainables are enabled."
+            )
+        result = super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        packed_banks, coverage = load_sidecar(str(resume_from_checkpoint))
+        self.sparse_bit_manager.restore_checkpoint_packed(packed_banks)
+        self.sparse_bit_manager.restore_coverage_metadata(coverage)
+        if self.aux_trainable_parameters:
+            from compressed_e2e_fintuning.aux_trainables import (
+                load_auxiliary_sidecar,
+                restore_auxiliary_trainables,
+            )
+
+            aux_payload = load_auxiliary_sidecar(str(resume_from_checkpoint))
+            restore_auxiliary_trainables(self.aux_trainable_parameters, aux_payload)
+        return result
+
+    def _issue_warnings_after_load(self, load_result):
+        if self.sparse_bit_manager is None:
+            return super()._issue_warnings_after_load(load_result)
+        missing_keys = getattr(load_result, "missing_keys", None)
+        if isinstance(missing_keys, list):
+            missing_keys[:] = [
+                key
+                for key in missing_keys
+                if not str(key).startswith("sparse_bit_tuning.")
+            ]
+        return super()._issue_warnings_after_load(load_result)
 
     def _ensure_teacher_device(self, device: torch.device) -> None:
         if self.teacher_model is None:
@@ -455,6 +673,8 @@ class VAEDecoderE2ETrainer(Trainer):
 
     def log(self, logs, start_time=None):
         for key, value in getattr(self, "_last_loss_parts", {}).items():
+            logs.setdefault(key, value)
+        for key, value in getattr(self, "_last_sparse_bit_telemetry", {}).items():
             logs.setdefault(key, value)
         # Rank-local telemetry merge into the existing training log event.
         for key, value in self._consume_eakld_telemetry_logs().items():

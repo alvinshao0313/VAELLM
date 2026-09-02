@@ -1728,6 +1728,33 @@ class VAELinear(nn.Module):
         if self.parallel_stage_decode:
             self.pack_parallel_stage_decoder_(trainable=True)
 
+    def enable_sparse_bit_decode_graph(self, *, parallel_stage_decode: bool = False) -> None:
+        """Keep packed decode in the autograd graph without training decoder params.
+
+        This is intentionally separate from ``enable_trainable_decode``: pure Bit and
+        LoRA+Bit modes need gradients to the score proxy while decoder parameters stay
+        frozen.  The method is only called by Sparse Bit integration; legacy paths do
+        not use it.
+        """
+        self.trainable_decode = True
+        self.cache_decoded_weight = False
+        self.clear_decoded_weight_cache()
+        self.parallel_stage_decode = bool(parallel_stage_decode)
+        if self.parallel_stage_decode:
+            self.pack_parallel_stage_decoder_(trainable=False)
+        decoder_modules = []
+        packed_decoder = getattr(self, "_parallel_stage_decoder", None)
+        if packed_decoder is not None:
+            decoder_modules.append(packed_decoder)
+        else:
+            for stage_idx in range(int(self.residual_stages)):
+                for part_idx in range(int(self.parallel_parts)):
+                    decoder_modules.append(
+                        self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+                    )
+        for decoder in decoder_modules:
+            decoder.requires_grad_(False)
+
     def disable_trainable_decode(self) -> None:
         self.trainable_decode = False
         self.cache_decoded_weight = True
@@ -1925,17 +1952,29 @@ class VAELinear(nn.Module):
         *,
         logical_shape: Sequence[int],
         activation_dtype: torch.dtype,
+        sparse_bit_stage_idx: Optional[int] = None,
+        sparse_bit_part_idx: Optional[int] = None,
+        sparse_bit_grouped: bool = False,
     ) -> Optional[torch.Tensor]:
+        sparse_bit_binding = getattr(self, "_sparse_bit_binding", None)
+
+        def _unsupported(reason: str) -> Optional[torch.Tensor]:
+            if sparse_bit_binding is not None:
+                raise RuntimeError(f"Sparse Bit packed decode is unavailable: {reason}.")
+            return None
+
+        # Legacy fast-path: with no Sparse Bit binding these checks retain the old
+        # return-None dense fallback semantics exactly.
         if not bool(getattr(self, "packed_vq_decoder_linear", False)):
-            return None
+            return _unsupported("packed_vq_decoder_linear=false")
         if not packed_u8_linear_available():
-            return None
+            return _unsupported("packed_u8_linear is unavailable")
         logical = tuple(int(v) for v in logical_shape)
         if len(logical) != 3:
-            return None
+            return _unsupported(f"logical_shape must be rank-3, got {logical}")
         B, M, logical_in = logical
         if B < 0 or M < 1 or logical_in < 1:
-            return None
+            return _unsupported(f"invalid logical_shape={logical}")
 
         param = next(decoder.parameters(), None)
         decode_device = param.device if param is not None else packed_vq.device
@@ -1945,29 +1984,69 @@ class VAELinear(nn.Module):
             else (param.dtype if param is not None else activation_dtype)
         )
         if torch.device(decode_device).type != "cuda":
-            return None
+            return _unsupported(f"decoder device must be CUDA, got {decode_device}")
         if int(getattr(decoder, "num_models", 0)) != M:
-            return None
+            return _unsupported(
+                f"decoder num_models={int(getattr(decoder, 'num_models', 0))} != logical M={M}"
+            )
         if int(getattr(decoder, "in_dim", 0)) != logical_in:
-            return None
+            return _unsupported(
+                f"decoder in_dim={int(getattr(decoder, 'in_dim', 0))} != logical_in={logical_in}"
+            )
         expected_packed_shape = (B, M, (logical_in + 7) // 8)
         if packed_vq.dtype != torch.uint8 or tuple(int(v) for v in packed_vq.shape) != expected_packed_shape:
-            return None
+            return _unsupported(
+                f"packed dtype/shape={packed_vq.dtype}/{tuple(packed_vq.shape)} != uint8/{expected_packed_shape}"
+            )
         packed_input = packed_vq.to(device=decode_device, dtype=torch.uint8, non_blocking=True)
 
         decoder_type = str(getattr(decoder, "decoder_type", "")).strip().lower()
 
-        def _forward_from_packed(packed_tensor: torch.Tensor) -> torch.Tensor:
-            if decoder_type == "linear":
-                linear = getattr(decoder, "linear", None)
-                if linear is None:
-                    raise RuntimeError("linear decoder is missing decoder.linear.")
+        def _first_linear(
+            packed_tensor: torch.Tensor,
+            linear: nn.Module,
+        ) -> torch.Tensor:
+            if sparse_bit_binding is None:
                 return packed_u8_parallel_linear(
                     packed_tensor,
                     linear,
                     logical_in_dim=logical_in,
                     activation_dtype=compute_dtype,
                 )
+            score_span, bit_meta = sparse_bit_binding.prepare_forward(
+                packed_tensor,
+                grouped=bool(sparse_bit_grouped),
+                stage_idx=sparse_bit_stage_idx,
+                part_idx=sparse_bit_part_idx,
+                training=bool(self.training),
+                grad_enabled=bool(torch.is_grad_enabled()),
+            )
+            if bool(self.training) and torch.is_grad_enabled():
+                # Lazy import is deliberate: normal VAELinear import/inference must not
+                # import or initialize Sparse Bit Triton code.
+                from sparse_bit_tuning.packed_ops import bit_aware_packed_parallel_linear
+
+                return bit_aware_packed_parallel_linear(
+                    packed_tensor,
+                    linear,
+                    score_span,
+                    bit_meta,
+                    logical_in_dim=logical_in,
+                    activation_dtype=compute_dtype,
+                )
+            return packed_u8_parallel_linear(
+                packed_tensor,
+                linear,
+                logical_in_dim=logical_in,
+                activation_dtype=compute_dtype,
+            )
+
+        def _forward_from_packed(packed_tensor: torch.Tensor) -> torch.Tensor:
+            if decoder_type == "linear":
+                linear = getattr(decoder, "linear", None)
+                if linear is None:
+                    raise RuntimeError("linear decoder is missing decoder.linear.")
+                return _first_linear(packed_tensor, linear)
 
             if decoder_type not in {"symmetric", "asymmetric"}:
                 raise RuntimeError(f"Unsupported decoder_type={decoder_type!r} for packed VQ decoder linear.")
@@ -1977,12 +2056,7 @@ class VAELinear(nn.Module):
             linear_out = getattr(decoder, "linear_out", None)
             if linear_in is None or blocks is None or norm_out is None or linear_out is None:
                 raise RuntimeError(f"decoder_type={decoder_type!r} is missing decoder submodules.")
-            h = packed_u8_parallel_linear(
-                packed_tensor,
-                linear_in,
-                logical_in_dim=logical_in,
-                activation_dtype=compute_dtype,
-            )
+            h = _first_linear(packed_tensor, linear_in)
             for block in blocks:
                 h = block(h)
             h = norm_out(h)
@@ -2079,6 +2153,9 @@ class VAELinear(nn.Module):
             storage,
             logical_shape=tuple(int(v) for v in spec["logical_shape"]),
             activation_dtype=dtype,
+            sparse_bit_stage_idx=int(stage_idx),
+            sparse_bit_part_idx=int(part_idx),
+            sparse_bit_grouped=False,
         )
         if packed_out is not None:
             return packed_out.permute(1, 0, 2).contiguous().view(-1)
@@ -2200,6 +2277,7 @@ class VAELinear(nn.Module):
             grouped_packed,
             logical_shape=tuple(int(v) for v in logical_shape),
             activation_dtype=dtype,
+            sparse_bit_grouped=True,
         )
         if stage_out is not None:
             self._record_fuse_hit()

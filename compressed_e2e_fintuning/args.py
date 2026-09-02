@@ -17,8 +17,8 @@ from train_utils.train_args import HFArguments, TrainingArguments, _parse_bool_l
 
 _DEFAULT_RUN_ROOT = ".result/compressed_e2e_fintuning"
 _SFT_DATASET_MIX_ALIASES = {"openorca", "alpaca", "longalpaca", "longalign", "race", "sciq"} | VAELLM_EDGERAZOR_SFT_ALIASES
-_VALID_FINETUNE_MODES = {"decoder", "compressed_lora", "both"}
-_VALID_VAE_TRAIN_MODES = {"decoder", "compressed_lora", "both"}
+_VALID_FINETUNE_MODES = {"none", "decoder", "compressed_lora", "both"}
+_VALID_VAE_TRAIN_MODES = {"none", "decoder", "compressed_lora", "both"}
 _VALID_PARALLEL_MODES = {"layer_mp", "dp"}
 _VALID_DECODE_DEVICE_PATTERN = re.compile(r"^(auto|cpu|cuda(?::\d+)?)$", re.IGNORECASE)
 _DISALLOWED_DENSE_LORA_FLAGS = {
@@ -70,6 +70,12 @@ class VAEDecoderE2EArguments:
     layer_device_map: str = "auto"
     parallel_stage_decode: bool = True
     packed_vq_decoder_linear: bool = True
+    sparse_bit_tuning: bool = False
+    bit_active_ratio: float = 0.01
+    bit_optimizer: str = "rms_sgd"
+    bit_lr: str = "auto"
+    bit_weight_decay: float = 0.0
+    bit_round_steps: str = "auto"
     vae_decoder_checkpoint: bool = True
     tune_final_norm: bool = False
     use_post_norm_head_linear: bool = False
@@ -191,6 +197,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=lambda v: _parse_bool_like(v, arg_name="--packed_vq_decoder_linear"),
         default=True,
     )
+    parser.add_argument(
+        "--sparse_bit_tuning",
+        type=lambda v: _parse_bool_like(v, arg_name="--sparse_bit_tuning"),
+        default=False,
+    )
+    parser.add_argument("--bit_active_ratio", type=float, default=0.01)
+    parser.add_argument("--bit_optimizer", type=str, default="rms_sgd")
+    parser.add_argument("--bit_lr", type=str, default="auto")
+    parser.add_argument("--bit_weight_decay", type=float, default=0.0)
+    parser.add_argument("--bit_round_steps", type=str, default="auto")
     parser.add_argument(
         "--vae_decoder_checkpoint",
         type=lambda v: _parse_bool_like(v, arg_name="--vae_decoder_checkpoint"),
@@ -359,7 +375,7 @@ def validate_args(
         parser.error("--selective_student_topk true requires --loss_type kl_top[_K].")
     finetune_mode = str(args.finetune_mode or "").strip().lower()
     if finetune_mode not in _VALID_FINETUNE_MODES:
-        parser.error("--finetune_mode must be one of: decoder | compressed_lora | both.")
+        parser.error("--finetune_mode must be one of: none | decoder | compressed_lora | both.")
     args.finetune_mode = finetune_mode
     if finetune_mode == "compressed_lora":
         if int(args.lora_rank) < 1:
@@ -376,6 +392,41 @@ def validate_args(
         parser.error("Internal error: invalid --finetune_mode.")
     args.vae_train_mode = finetune_mode
     args.internal_vae_train_mode = finetune_mode
+
+    if bool(args.sparse_bit_tuning):
+        from sparse_bit_tuning.config import SparseBitTuningConfig
+
+        try:
+            normalized_bit = SparseBitTuningConfig(
+                enabled=True,
+                active_ratio=float(args.bit_active_ratio),
+                optimizer=str(args.bit_optimizer),
+                bit_lr=str(args.bit_lr),
+                weight_decay=float(args.bit_weight_decay),
+                round_steps=str(args.bit_round_steps),
+            ).normalized()
+        except ValueError as exc:
+            parser.error(str(exc))
+        if not bool(args.packed_vq_decoder_linear):
+            parser.error("--sparse_bit_tuning true requires --packed_vq_decoder_linear true.")
+        args.bit_active_ratio = float(normalized_bit.active_ratio)
+        args.bit_optimizer = str(normalized_bit.optimizer)
+        args.bit_lr = str(normalized_bit.bit_lr)
+        args.bit_weight_decay = float(normalized_bit.weight_decay)
+        args.bit_round_steps = str(normalized_bit.round_steps)
+
+    if (
+        finetune_mode == "none"
+        and not bool(args.sparse_bit_tuning)
+        and not bool(args.tune_final_norm)
+        and not bool(args.use_post_norm_head_linear)
+        and not bool(args.vae_tune_bias)
+    ):
+        parser.error(
+            "--finetune_mode none requires at least one trainable branch: "
+            "--sparse_bit_tuning, --tune_final_norm, --use_post_norm_head_linear, or --vae_tune_bias."
+        )
+
     decode_device = str(args.decode_device or "").strip().lower()
     if not _VALID_DECODE_DEVICE_PATTERN.fullmatch(decode_device):
         parser.error("--decode_device only supports: auto | cpu | cuda | cuda:<index>.")

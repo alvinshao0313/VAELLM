@@ -228,11 +228,12 @@ def select_vae_decoder_trainables(
     tune_final_norm: bool = False,
     use_post_norm_head_linear: bool = False,
     vae_tune_bias: bool = False,
+    sparse_bit_tuning: bool = False,
     train_mode: str = "decoder",
 ) -> VAEDecoderTrainableSelection:
     _freeze_all(model)
     train_mode = str(train_mode or "decoder").strip().lower()
-    if train_mode not in {"decoder", "compressed_lora", "both"}:
+    if train_mode not in {"none", "decoder", "compressed_lora", "both"}:
         raise ValueError(f"Invalid train_mode={train_mode!r}.")
 
     selected_modules, target_module_suffixes = collect_selected_vae_linears(
@@ -243,10 +244,15 @@ def select_vae_decoder_trainables(
     target_modules: List[str] = []
     bias_modules: List[str] = []
     low_rank_modules: List[str] = []
+    requires_vae_targets = bool(sparse_bit_tuning) or bool(vae_tune_bias) or train_mode != "none"
+    if requires_vae_targets and not selected_modules:
+        raise ValueError("No eligible VAELinear modules found for requested decoder_layers / target_modules.")
     for name, module in selected_modules:
         if train_mode in {"decoder", "both"}:
             module.enable_trainable_decode(parallel_stage_decode=bool(parallel_stage_decode))
             _enable_only_decoder_params(module)
+        elif bool(sparse_bit_tuning):
+            module.enable_sparse_bit_decode_graph(parallel_stage_decode=bool(parallel_stage_decode))
         if bool(vae_tune_bias) and module.bias is not None:
             module.bias.requires_grad = True
             bias_modules.append(name)
@@ -257,10 +263,8 @@ def select_vae_decoder_trainables(
                 module.clear_decoded_weight_cache()
             _enable_low_rank_params(module, name=name)
             low_rank_modules.append(name)
-        target_modules.append(name)
-
-    if not target_modules:
-        raise ValueError("No eligible VAELinear modules found for requested decoder_layers / target_modules.")
+        if requires_vae_targets:
+            target_modules.append(name)
 
     final_norm_modules: List[str] = []
     if bool(tune_final_norm):
@@ -281,8 +285,8 @@ def select_vae_decoder_trainables(
 
     trainable_names = sorted(name for name, param in model.named_parameters() if bool(param.requires_grad))
     trainable_count = int(sum(int(param.numel()) for _name, param in model.named_parameters() if bool(param.requires_grad)))
-    if trainable_count < 1:
-        raise RuntimeError("No trainable decoder parameters found.")
+    if trainable_count < 1 and not bool(sparse_bit_tuning):
+        raise RuntimeError("No trainable continuous parameters found.")
 
     return VAEDecoderTrainableSelection(
         decoder_layer_ids=[int(idx) for idx in decoder_layer_ids],
