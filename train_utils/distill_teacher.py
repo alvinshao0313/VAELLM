@@ -3,7 +3,10 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
-from train_utils.base_reference import load_frozen_base_reference_model
+from train_utils.base_reference import (
+    load_frozen_base_reference_model,
+    load_frozen_base_reference_model_distributed,
+)
 
 
 def distill_loss_requires_teacher(loss_type: str) -> bool:
@@ -72,12 +75,21 @@ class DistillTeacherRuntime:
                     str(initial_device),
                     str(self.dtype),
                 )
-            self._model = load_frozen_base_reference_model(
-                self.model_path,
-                access_token=self.access_token,
-                device=initial_device,
-                dtype=self.dtype,
-            )
+            if self.model_offload == "none" and self.forward_device.type == "cuda":
+                self._model = load_frozen_base_reference_model_distributed(
+                    self.model_path,
+                    access_token=self.access_token,
+                    device=self.forward_device,
+                    dtype=self.dtype,
+                    logger=self.logger,
+                )
+            else:
+                self._model = load_frozen_base_reference_model(
+                    self.model_path,
+                    access_token=self.access_token,
+                    device=initial_device,
+                    dtype=self.dtype,
+                )
         return self._model
 
     def prepare_for_forward(self) -> nn.Module:

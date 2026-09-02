@@ -48,6 +48,9 @@ from train_utils.model_checkpoint_io import (
     _build_distributed_run_output_dir,
     save_model_checkpoint,
 )
+from train_utils.base_reference import (
+    load_frozen_base_reference_model_distributed_from_hf_args,
+)
 from train_utils.utils import get_logger
 from compressed_e2e_fintuning.device_map import apply_boundary_device_map, apply_layer_device_map, resolve_layer_device_map
 from compressed_e2e_fintuning.mid_eval import EvalAfterSaveCallback, run_e2e_lm_eval
@@ -634,6 +637,19 @@ def _load_teacher(*, args, hf_args, base_model_path: str, log, device: Optional[
     ):
         return None, "disabled"
     teacher_path = str(args.teacher_model_path or base_model_path)
+    teacher_model_offload = str(getattr(args, "teacher_model_offload", "none"))
+    if teacher_model_offload != "cpu" and device is not None:
+        teacher_model = load_frozen_base_reference_model_distributed_from_hf_args(
+            teacher_path,
+            hf_args,
+            device=device,
+            logger=log,
+        )
+        log.info(
+            "Teacher model ready on %s (rank0 checkpoint load + distributed broadcast when DP is active)",
+            device,
+        )
+        return teacher_model, "external_teacher"
     log.info("Loading teacher model from %s", teacher_path)
     teacher_model = get_model(teacher_path, hf_args.access_token)
     teacher_model.eval()
