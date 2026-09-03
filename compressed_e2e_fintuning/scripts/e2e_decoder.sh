@@ -40,6 +40,7 @@ fi
 # - "$@" 位于最后，可覆盖脚本中的默认参数。
 # - decoder / both 会忽略 PEFT LoRA 配置参数；compressed_lora 会使用 rank/alpha/dropout/scope。
 # - compressed_lora 只训练 LoRA；脚本里 decoder 相关 trainable 开关即使存在也不会生效。
+# - --decoder_lr 仅用于 decoder / both；不传时继承 --learning_rate，compressed_lora 会忽略它。
 # - 无 low_rank 分支时 compressed_lora 新建 LoRA；已有 low_rank 分支时 rank/scope 从 checkpoint 推断。
 # - compressed_lora 示例：
 #   bash compressed_e2e_fintuning/scripts/e2e_decoder.sh --finetune_mode compressed_lora
@@ -109,6 +110,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --bf16 true \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 1 \
+    --decoder_lr 1e-5 \
     --learning_rate 1e-5 \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \
@@ -183,6 +185,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --bf16 true \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 1 \
+    --decoder_lr 3e-6 \
     --learning_rate 3e-6 \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \

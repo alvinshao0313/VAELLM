@@ -64,7 +64,15 @@ class _FakeManager:
         )
 
 
-def _trainer(model, manager, output_dir, *, max_grad_norm=1.0):
+def _trainer(
+    model,
+    manager,
+    output_dir,
+    *,
+    max_grad_norm=1.0,
+    decoder_param_ids=None,
+    decoder_lr=None,
+):
     args = TrainingArguments(
         output_dir=output_dir,
         use_cpu=True,
@@ -76,6 +84,8 @@ def _trainer(model, manager, output_dir, *, max_grad_norm=1.0):
         model=model,
         args=args,
         loss_type="sft",
+        decoder_param_ids=decoder_param_ids,
+        decoder_lr=decoder_lr,
         sparse_bit_manager=manager,
     )
 
@@ -100,6 +110,28 @@ def test_composite_optimizer_excludes_bit_scores_from_main_optimizer():
         assert manager.configured_steps == 17
         assert manager.initialized
         assert getattr(scheduler, "optimizer", None) is optimizer.main_optimizer
+
+
+def test_composite_optimizer_preserves_decoder_specific_lr():
+    with tempfile.TemporaryDirectory() as tmp:
+        model = _TinyModel(train_main=True)
+        manager = _FakeManager(model)
+        trainer = _trainer(
+            model,
+            manager,
+            tmp,
+            decoder_param_ids=(id(model.main),),
+            decoder_lr=2e-4,
+        )
+        optimizer = trainer.create_optimizer()
+        assert isinstance(optimizer, SparseBitCompositeOptimizer)
+        assert optimizer.main_optimizer is not None
+        main_group = next(
+            group
+            for group in optimizer.main_optimizer.param_groups
+            if any(param is model.main for param in group["params"])
+        )
+        assert main_group["lr"] == pytest.approx(2e-4)
 
 
 def test_pure_bit_has_no_main_optimizer_and_uses_lifecycle_scheduler():

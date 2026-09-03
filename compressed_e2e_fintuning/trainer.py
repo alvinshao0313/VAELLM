@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 from contextlib import nullcontext
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -277,6 +277,8 @@ class VAEDecoderE2ETrainer(Trainer):
         teacher_output_chunk_tokens: int = 8,
         selective_student_topk: bool = False,
         selective_student_topk_chunk_rows: int = 32,
+        decoder_param_ids: Optional[Sequence[int]] = None,
+        decoder_lr: Optional[float] = None,
         sparse_bit_manager=None,
         aux_trainable_parameters=None,
         **kwargs,
@@ -337,6 +339,8 @@ class VAEDecoderE2ETrainer(Trainer):
         self._teacher_device = None
         self.saved_tensor_offload = saved_tensor_offload
         self.streaming_offload_manager = streaming_offload_manager
+        self.decoder_param_ids = frozenset(int(v) for v in (decoder_param_ids or ()))
+        self.decoder_lr = None if decoder_lr is None else float(decoder_lr)
         self.sparse_bit_manager = sparse_bit_manager
         self.aux_trainable_parameters = dict(aux_trainable_parameters or {})
         self._sparse_bit_main_optimizer = None
@@ -392,6 +396,10 @@ class VAEDecoderE2ETrainer(Trainer):
 
     def create_optimizer(self):
         if self.sparse_bit_manager is None:
+            if self.decoder_param_ids:
+                from compressed_e2e_fintuning.optimizer_grouping import create_decoder_grouped_optimizer
+
+                return create_decoder_grouped_optimizer(self)
             return super().create_optimizer()
         from sparse_bit_tuning.optimizer import SparseBitCompositeOptimizer
 
@@ -415,7 +423,12 @@ class VAEDecoderE2ETrainer(Trainer):
             try:
                 for param in bit_params:
                     param.requires_grad_(False)
-                main_optimizer = super().create_optimizer()
+                if self.decoder_param_ids:
+                    from compressed_e2e_fintuning.optimizer_grouping import create_decoder_grouped_optimizer
+
+                    main_optimizer = create_decoder_grouped_optimizer(self)
+                else:
+                    main_optimizer = super().create_optimizer()
             finally:
                 for param, requires_grad in zip(bit_params, old_requires_grad):
                     param.requires_grad_(requires_grad)

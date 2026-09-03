@@ -148,6 +148,48 @@ class DatasetMixArgsTest(unittest.TestCase):
         self.assertEqual(e2e_args.dataset_mix_spec, "openorca=0.75,fineweb_edu=0.25")
         self.assertEqual(training_args.max_steps, 10)
 
+    def test_parse_args_decoder_lr_defaults_to_none_and_accepts_override(self):
+        default_args, _hf_args, _training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--max_steps",
+                "10",
+            ]
+        )
+        self.assertIsNone(default_args.decoder_lr)
+
+        explicit_args, _hf_args, _training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--decoder_lr",
+                "2e-4",
+                "--max_steps",
+                "10",
+            ]
+        )
+        self.assertAlmostEqual(explicit_args.decoder_lr, 2e-4)
+
+    def test_parse_args_rejects_nonpositive_decoder_lr_for_decoder_mode(self):
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--student_checkpoint_dir",
+                    self._checkpoint_dir(),
+                    "--dataset_mix",
+                    "openorca=1",
+                    "--decoder_lr",
+                    "0",
+                    "--max_steps",
+                    "10",
+                ]
+            )
+
     def test_parse_args_rejects_duplicate_alias(self):
         with self.assertRaises(SystemExit):
             parse_args(

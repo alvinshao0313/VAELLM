@@ -63,6 +63,7 @@ from compressed_e2e_fintuning.offload import (
 from train_utils.lora_utils import ensure_distill_process_group_initialized, is_distill_distributed
 from compressed_e2e_fintuning.trainables import (
     VAEDecoderTrainableSelection,
+    collect_decoder_parameter_ids,
     collect_selected_vae_linears,
     resolve_compressed_lora_init_spec,
     resolve_target_layer_ids,
@@ -1083,6 +1084,22 @@ def run(args, hf_args, training_args):
             )
         if not sparse_bit_targets:
             raise RuntimeError("Sparse Bit tuning requested but no VAELinear targets were resolved.")
+    decoder_param_ids = frozenset()
+    resolved_decoder_lr = None
+    if train_mode in {"decoder", "both"}:
+        decoder_param_ids = frozenset(
+            collect_decoder_parameter_ids(
+                model,
+                target_module_names=selection.target_modules,
+            )
+        )
+        if not decoder_param_ids:
+            raise RuntimeError("Decoder finetuning resolved no decoder parameters for optimizer grouping.")
+        resolved_decoder_lr = (
+            float(training_args.learning_rate)
+            if args.decoder_lr is None
+            else float(args.decoder_lr)
+        )
     log.info(
         "Selected VAE trainables: mode=%s layers=%s targets=%d suffixes=%s bias_modules=%d low_rank_modules=%d final_norm=%s post_norm_head=%s trainable_tensors=%d trainable_params=%d parallel_stage_decode=%s",
         selection.train_mode,
@@ -1096,6 +1113,12 @@ def run(args, hf_args, training_args):
         len(selection.trainable_parameter_names),
         int(selection.trainable_parameter_count),
         str(selection.parallel_stage_decode).lower(),
+    )
+    log.info(
+        "Optimizer LR config: learning_rate=%g decoder_lr=%s resolved_decoder_lr=%s",
+        float(training_args.learning_rate),
+        str(args.decoder_lr),
+        str(resolved_decoder_lr),
     )
 
     offload_mode = str(args.offload_mode).strip().lower()
@@ -1346,6 +1369,8 @@ def run(args, hf_args, training_args):
         selective_student_topk=bool(args.selective_student_topk),
         selective_student_topk_chunk_rows=int(args.selective_student_topk_chunk_rows),
         eakld_confidence_k=int(args.eakld_confidence_k),
+        decoder_param_ids=tuple(decoder_param_ids),
+        decoder_lr=resolved_decoder_lr,
         saved_tensor_offload=saved_tensor_offload,
         streaming_offload_manager=streaming_manager,
         sparse_bit_manager=sparse_bit_manager,

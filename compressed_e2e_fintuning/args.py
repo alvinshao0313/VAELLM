@@ -60,6 +60,7 @@ class VAEDecoderE2EArguments:
     decoder_layers: str = "all"
     target_modules: str = "all"
     finetune_mode: str = "decoder"
+    decoder_lr: Optional[float] = None
     lora_rank: int = 12
     lora_alpha: float = 24.0
     lora_dropout: float = 0.03
@@ -179,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder_layers", type=str, default="all")
     parser.add_argument("--target_modules", type=str, default="all")
     parser.add_argument("--finetune_mode", type=str, default="decoder")
+    parser.add_argument("--decoder_lr", type=float, default=None)
     parser.add_argument("--lora_rank", type=int, default=12)
     parser.add_argument("--lora_alpha", type=float, default=24.0)
     parser.add_argument("--lora_dropout", type=float, default=0.03)
@@ -377,6 +379,8 @@ def validate_args(
     if finetune_mode not in _VALID_FINETUNE_MODES:
         parser.error("--finetune_mode must be one of: none | decoder | compressed_lora | both.")
     args.finetune_mode = finetune_mode
+    if finetune_mode in {"decoder", "both"} and args.decoder_lr is not None and float(args.decoder_lr) <= 0.0:
+        parser.error("--decoder_lr must be > 0 when --finetune_mode is decoder or both.")
     if finetune_mode == "compressed_lora":
         if int(args.lora_rank) < 1:
             parser.error("--lora_rank must be >= 1.")

@@ -82,6 +82,28 @@ def collect_selected_vae_linears(
     return target_modules, sorted(target_suffixes)
 
 
+def collect_decoder_parameter_ids(
+    model: nn.Module,
+    *,
+    target_module_names: Sequence[str],
+) -> Set[int]:
+    """Collect VAE decoder parameter ids for the selected VAELinear modules."""
+    selected_names = {str(name) for name in target_module_names}
+    decoder_param_ids: Set[int] = set()
+    for name, module in _iter_named_vae_linears(model):
+        if name not in selected_names:
+            continue
+        packed_decoder = getattr(module, "_parallel_stage_decoder", None)
+        if packed_decoder is not None:
+            decoder_param_ids.update(id(param) for param in packed_decoder.parameters())
+            continue
+        for stage_idx in range(int(module.residual_stages)):
+            for part_idx in range(int(module.parallel_parts)):
+                decoder = module.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+                decoder_param_ids.update(id(param) for param in decoder.parameters())
+    return decoder_param_ids
+
+
 def _find_module_name(model: nn.Module, target: nn.Module, fallback: str) -> str:
     for name, module in model.named_modules():
         if module is target:
