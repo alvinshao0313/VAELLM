@@ -605,8 +605,9 @@ class FusedMultistageSymmetricDecode(torch.autograd.Function):
         w_out: Tensor,
         b_out: Tensor,
         eps: float,
+        grad_enabled: bool,
     ) -> Tensor:
-        need_grad = any(
+        need_grad = bool(grad_enabled) and any(
             bool(getattr(t, "requires_grad", False))
             for t in (x, w_in, b_in, ln_w, ln_b, w_out, b_out)
         )
@@ -643,7 +644,7 @@ class FusedMultistageSymmetricDecode(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy: Tensor):
         if not bool(getattr(ctx, "need_grad", False)):
-            return (None,) * 8
+            return (None,) * 9
         x, w_in, b_in, ln_w, ln_b, w_out, b_out, h_pre, h_act = ctx.saved_tensors
         eps = float(ctx.eps)
         gx, g_w_in, g_b_in, g_ln_w, g_ln_b, g_w_out, g_b_out = _fused_backward_batched(
@@ -660,7 +661,7 @@ class FusedMultistageSymmetricDecode(torch.autograd.Function):
         )
         if not x.requires_grad:
             gx = None
-        return gx, g_w_in, g_b_in, g_ln_w, g_ln_b, g_w_out, g_b_out, None
+        return gx, g_w_in, g_b_in, g_ln_w, g_ln_b, g_w_out, g_b_out, None, None
 
 
 def fused_multistage_symmetric_decode(
@@ -674,8 +675,9 @@ def fused_multistage_symmetric_decode(
     *,
     eps: float = 1e-5,
 ) -> Tensor:
+    grad_enabled = torch.is_grad_enabled()
     return FusedMultistageSymmetricDecode.apply(
-        x, w_in, b_in, ln_w, ln_b, w_out, b_out, float(eps)
+        x, w_in, b_in, ln_w, ln_b, w_out, b_out, float(eps), grad_enabled
     )
 
 
