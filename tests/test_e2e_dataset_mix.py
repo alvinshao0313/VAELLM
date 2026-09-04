@@ -5,6 +5,7 @@ from unittest import mock
 
 from datasets import Dataset, DatasetDict
 import torch
+from torch.utils.data import IterableDataset
 from transformers.trainer_utils import IntervalStrategy
 
 from compressed_e2e_fintuning.args import parse_args
@@ -13,9 +14,12 @@ from compressed_e2e_fintuning.trainer import (
     compute_vae_hidden_alignment_loss,
 )
 from e2e_common.data import DatasetMixSourcePreset, _record_to_text, build_datasets
+from e2e_common import lazy_datasets as lazy_module
 from e2e_common.lazy_datasets import (
     _LazyPresetIterableDataset,
     _iter_raw_records_for_worker,
+    build_mixed_lazy_dataset,
+    encode_text_lm_record,
     is_iterable_training_dataset,
 )
 from train_utils.lora_data import build_calibration_input_ids, prepare_distill_datasets
@@ -913,11 +917,12 @@ class DatasetMixBuilderTest(unittest.TestCase):
         self.assertEqual(data_info["dataset_mix_sources"], ["openorca", "alpaca"])
         self.assertTrue(data_info["lazy_iterable"])
         self.assertEqual(len(data_info["source_stats"]), 2)
-        self.assertGreater(len(train_dataset), 0)
+        self.assertGreater(len(list(train_dataset)), 0)
         self.assertIsNone(eval_dataset)
         for source_stat in data_info["source_stats"]:
             self.assertEqual(source_stat["sampling_policy"], "lazy_streaming")
             self.assertGreaterEqual(source_stat["processed_raw_rows"], 1)
+            self.assertNotIn("packed_rows", source_stat)
 
     def test_build_datasets_mix_limits_train_preprocessing(self):
         args = SimpleNamespace(
@@ -1045,7 +1050,7 @@ class DatasetMixBuilderTest(unittest.TestCase):
         for source_stat in data_info["source_stats"]:
             self.assertEqual(source_stat["processed_raw_rows"], source_stat["raw_rows"])
             self.assertFalse(source_stat["limited_preprocessing"])
-            self.assertEqual(source_stat["packed_rows"], source_stat["raw_rows"])
+            self.assertNotIn("packed_rows", source_stat)
 
     def test_build_datasets_mix_rejects_empty_packed_source(self):
         args = SimpleNamespace(
@@ -1105,7 +1110,7 @@ class DatasetMixBuilderTest(unittest.TestCase):
 
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
             train_dataset, eval_dataset, data_info = build_datasets(args, training_args, self.tokenizer)
-        self.assertGreater(len(train_dataset), 0)
+        self.assertGreater(len(list(train_dataset)), 0)
         self.assertIsNone(eval_dataset)
         self.assertEqual(len(data_info["source_stats"]), 2)
 
@@ -1158,11 +1163,11 @@ class DatasetMixBuilderTest(unittest.TestCase):
         self.assertEqual(data_info["dataset_mode"], "mix")
         self.assertEqual(data_info["dataset_mix_sources"], ["longalpaca", "longalign"])
         self.assertIsNone(eval_dataset)
-        self.assertGreater(len(train_dataset), 0)
+        self.assertGreater(len(list(train_dataset)), 0)
         self.assertEqual(len(data_info["source_stats"]), 2)
         for source_stat in data_info["source_stats"]:
             self.assertIn(source_stat["alias"], {"longalpaca", "longalign"})
-            self.assertGreaterEqual(source_stat["packed_rows"], 1)
+            self.assertNotIn("packed_rows", source_stat)
 
     def test_build_datasets_single_skips_eval_when_eval_strategy_is_no(self):
         args = SimpleNamespace(
@@ -1253,7 +1258,7 @@ class DatasetMixBuilderTest(unittest.TestCase):
         with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
             train_dataset, eval_dataset, data_info = build_datasets(args, training_args, self.tokenizer)
 
-        self.assertGreater(len(train_dataset), 0)
+        self.assertGreater(len(list(train_dataset)), 0)
         self.assertIsNone(eval_dataset)
         self.assertTrue(data_info["lazy_iterable"])
         self.assertEqual(len(data_info["source_stats"]), 2)
@@ -1284,10 +1289,11 @@ class DistillDataTest(unittest.TestCase):
         self.assertIsNone(eval_ds)
         for source_info in source_stats:
             self.assertEqual(source_info["raw_rows"], 5000)
-            self.assertIsNotNone(source_info["actual_rows"])
+            self.assertIsNone(source_info["actual_rows"])
             self.assertFalse(source_info["limited_preprocessing"])
             self.assertEqual(source_info["sampling_policy"], "lazy_streaming")
             self.assertTrue(source_info["is_iterable"])
+            self.assertNotIn("packed_rows", source_info)
 
     def test_prepare_distill_datasets_single_source_is_indexed(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
@@ -1555,6 +1561,191 @@ class LazyIterableWorkerAndRawCacheTest(unittest.TestCase):
 
         self.assertEqual(cached31_sig, signature(uncached31))
         self.assertEqual(cached32_sig, signature(uncached32))
+
+
+def _make_fineweb_dataset(count: int):
+    return Dataset.from_dict(
+        {"text": [f"fineweb unique marker {idx} document text" for idx in range(count)]}
+    )
+
+
+def _make_race_dataset(count: int):
+    return Dataset.from_dict(
+        {
+            "article": [f"race passage {idx}" for idx in range(count)],
+            "question": [f"race question {idx}" for idx in range(count)],
+            "options": [["alpha", "beta", "gamma", "delta"] for _ in range(count)],
+            "answer": ["B" for _ in range(count)],
+        }
+    )
+
+
+def _make_sciq_dataset(count: int):
+    return Dataset.from_dict(
+        {
+            "support": [f"sciq support {idx}" for idx in range(count)],
+            "question": [f"sciq question {idx}" for idx in range(count)],
+            "correct_answer": [f"sciq answer {idx}" for idx in range(count)],
+        }
+    )
+
+
+def _make_longalign_dataset(count: int):
+    return Dataset.from_dict(
+        {
+            "messages": [
+                [
+                    {"role": "user", "content": f"longalign question {idx}"},
+                    {"role": "assistant", "content": f"longalign answer {idx}"},
+                ]
+                for idx in range(count)
+            ]
+        }
+    )
+
+
+class LazyHeterogeneousLmMixTest(unittest.TestCase):
+    def _patch_raw_loaders(self, raw_by_alias):
+        def load_raw(preset):
+            alias = str(preset.alias)
+            if alias not in raw_by_alias:
+                raise AssertionError(f"unexpected preset {alias}")
+            return raw_by_alias[alias], None
+
+        return mock.patch.object(lazy_module, "_load_preset_raw_datasets", side_effect=load_raw)
+
+    def test_lm_heterogeneous_mix_builds_iterable_dataset(self):
+        raw_by_alias = {
+            "openorca": _make_openorca_dataset(8),
+            "alpaca": _make_alpaca_dataset(8),
+        }
+        with self._patch_raw_loaders(raw_by_alias):
+            _spec, _stats, dataset, is_iterable = build_mixed_lazy_dataset(
+                "openorca=0.5,alpaca=0.5",
+                task="lm",
+                tokenizer=ContentTokenizer(),
+                max_seq_len=32,
+                seed=31,
+            )
+
+        self.assertTrue(is_iterable)
+        self.assertIsInstance(dataset, IterableDataset)
+        first = next(iter(dataset))
+        self.assertIn("input_ids", first)
+        self.assertIn("labels", first)
+        self.assertEqual(first["input_ids"].tolist(), first["labels"].tolist())
+
+    def test_lm_heterogeneous_mix_uses_each_source_preset(self):
+        tokenizer = ContentTokenizer()
+        openorca_raw = _make_openorca_dataset(16)
+        fineweb_raw = _make_fineweb_dataset(16)
+        raw_by_alias = {
+            "openorca": openorca_raw,
+            "fineweb_edu": fineweb_raw,
+        }
+
+        expected_openorca = {
+            tuple(
+                encode_text_lm_record(
+                    dict(row),
+                    tokenizer,
+                    max_seq_len=64,
+                    text_field="text",
+                    text_format="openorca",
+                )["input_ids"].tolist()
+            )
+            for row in openorca_raw
+        }
+        expected_fineweb = {
+            tuple(
+                encode_text_lm_record(
+                    dict(row),
+                    tokenizer,
+                    max_seq_len=64,
+                    text_field="text",
+                    text_format="text",
+                )["input_ids"].tolist()
+            )
+            for row in fineweb_raw
+        }
+        self.assertTrue(expected_openorca.isdisjoint(expected_fineweb))
+
+        with self._patch_raw_loaders(raw_by_alias):
+            _spec, _stats, dataset, _is_iterable = build_mixed_lazy_dataset(
+                "openorca=0.5,fineweb_edu=0.5",
+                task="lm",
+                tokenizer=tokenizer,
+                max_seq_len=64,
+                seed=31,
+            )
+
+        seen_openorca = 0
+        seen_fineweb = 0
+        for row in dataset:
+            signature = tuple(int(token) for token in row["input_ids"].tolist())
+            if signature in expected_openorca:
+                seen_openorca += 1
+            elif signature in expected_fineweb:
+                seen_fineweb += 1
+            else:
+                self.fail(f"sample was not encoded by either source preset: {signature}")
+            self.assertEqual(row["input_ids"].tolist(), row["labels"].tolist())
+
+        self.assertGreater(seen_openorca, 0)
+        self.assertGreater(seen_fineweb, 0)
+
+    def test_sft_and_messages_heterogeneous_mix_still_rejected(self):
+        raw_by_alias = {
+            "openorca": _make_openorca_dataset(4),
+            "alpaca": _make_alpaca_dataset(4),
+        }
+        for task in ("sft", "messages"):
+            with self.subTest(task=task):
+                with self._patch_raw_loaders(raw_by_alias):
+                    with self.assertRaisesRegex(ValueError, "multiple text_format"):
+                        build_mixed_lazy_dataset(
+                            "openorca=0.5,alpaca=0.5",
+                            task=task,
+                            tokenizer=ContentTokenizer(),
+                            max_seq_len=16,
+                            seed=0,
+                        )
+
+    def test_requested_seven_source_lm_mix_can_enter_training(self):
+        raw_by_alias = {
+            "openorca": _make_openorca_dataset(4),
+            "fineweb_edu": _make_fineweb_dataset(4),
+            "race": _make_race_dataset(4),
+            "sciq": _make_sciq_dataset(4),
+            "alpaca": _make_alpaca_dataset(4),
+            "longalpaca": _make_alpaca_dataset(4),
+            "longalign": _make_longalign_dataset(4),
+        }
+        mix_spec = "openorca=0.20,fineweb_edu=0.18,race=0.24,sciq=0.14,alpaca=0.04,longalpaca=0.10,longalign=0.10"
+        tokenizer = ContentTokenizer()
+
+        with self._patch_raw_loaders(raw_by_alias):
+            _spec, source_stats, dataset, is_iterable = build_mixed_lazy_dataset(
+                mix_spec,
+                task="lm",
+                tokenizer=tokenizer,
+                max_seq_len=64,
+                seed=31,
+            )
+
+        self.assertTrue(is_iterable)
+        self.assertEqual(
+            [item["alias"] for item in source_stats],
+            ["openorca", "fineweb_edu", "race", "sciq", "alpaca", "longalpaca", "longalign"],
+        )
+        for item in source_stats:
+            self.assertNotIn("packed_rows", item)
+
+        rows = list(dataset)
+        self.assertGreater(len(rows), 0)
+        for row in rows:
+            self.assertGreater(int(row["input_ids"].numel()), 0)
+            self.assertEqual(row["input_ids"].tolist(), row["labels"].tolist())
 
 
 def test_e2e_sft_dynamic_padding_forwards_to_shared_collator():

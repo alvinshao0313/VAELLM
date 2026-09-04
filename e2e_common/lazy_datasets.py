@@ -315,6 +315,53 @@ def _iter_raw_records_for_worker(raw_dataset):
             yield record
 
 
+class _LazyMixedTextLMIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        raw_dataset,
+        tokenizer,
+        *,
+        max_seq_len: int,
+        presets: Sequence[DatasetMixSourcePreset],
+    ) -> None:
+        super().__init__()
+        self.raw_dataset = raw_dataset
+        self.tokenizer = tokenizer
+        self.max_seq_len = int(max_seq_len)
+        self.presets = list(presets)
+        raw_source_count = len(getattr(raw_dataset, "raw_datasets", ()))
+        if raw_source_count != len(self.presets):
+            raise ValueError(
+                "LM mix presets must align with _IndexedMixedRawStream.raw_datasets. "
+                f"Got {len(self.presets)} presets and {raw_source_count} raw sources."
+            )
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        worker_info = get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = int(worker_info.id)
+            num_workers = int(worker_info.num_workers)
+
+        for source_idx, record in self.raw_dataset.iter_worker_with_source(
+            worker_id=worker_id,
+            num_workers=num_workers,
+        ):
+            preset = self.presets[int(source_idx)]
+            try:
+                yield encode_text_lm_record(
+                    dict(record),
+                    self.tokenizer,
+                    max_seq_len=self.max_seq_len,
+                    text_field=str(preset.text_field),
+                    text_format=str(preset.text_format),
+                )
+            except (ValueError, KeyError):
+                continue
+
+
 class _LazyPresetIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -478,7 +525,7 @@ class _IndexedMixedRawStream:
             if int(len(raw_dataset)) != int(len(permutation)):
                 raise ValueError("raw dataset/permutation length mismatch.")
 
-    def iter_worker(self, *, worker_id: int, num_workers: int):
+    def iter_worker_with_source(self, *, worker_id: int, num_workers: int):
         worker_id = int(worker_id)
         num_workers = int(num_workers)
         if num_workers < 1:
@@ -515,9 +562,16 @@ class _IndexedMixedRawStream:
             cursors[source_idx] = cursor
 
             if global_position % num_workers == worker_id:
-                yield self.raw_datasets[source_idx][raw_index]
+                yield source_idx, self.raw_datasets[source_idx][raw_index]
 
             global_position += 1
+
+    def iter_worker(self, *, worker_id: int, num_workers: int):
+        for _source_idx, record in self.iter_worker_with_source(
+            worker_id=worker_id,
+            num_workers=num_workers,
+        ):
+            yield record
 
     def __iter__(self):
         yield from self.iter_worker(worker_id=0, num_workers=1)
@@ -662,10 +716,19 @@ def build_mixed_lazy_dataset(
             raise ValueError(f"Unsupported lazy dataset task: {task_norm!r}")
         return normalized_spec, source_stats, dataset, is_iterable
 
+    if task_norm == "lm" and mix_kind == "mix":
+        dataset = _LazyMixedTextLMIterableDataset(
+            raw_dataset,
+            tokenizer,
+            max_seq_len=int(max_seq_len),
+            presets=presets,
+        )
+        return normalized_spec, source_stats, dataset, True
+
     if len(set(str(preset.text_format) for preset in presets)) != 1:
         raise ValueError(
-            "Weighted lazy mix with multiple text_format values is not supported in one iterable dataset. "
-            "Use a single-format mix or one source."
+            "Weighted lazy SFT/messages mix with multiple text_format values is not supported "
+            "in one iterable dataset. Use a single-format mix or one source."
         )
 
     preset = presets[0]

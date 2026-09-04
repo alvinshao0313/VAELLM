@@ -354,6 +354,36 @@ class RemainingLoraDataRegressionCleanupTests(unittest.TestCase):
         self.assertEqual(worker0, baseline[0::2])
         self.assertEqual(worker1, baseline[1::2])
 
+    def test_iter_worker_with_source_preserves_record_sequence(self):
+        raw_a = _raw_dataset("A", 12)
+        raw_b = _raw_dataset("B", 8)
+        stream = _IndexedMixedRawStream(
+            (raw_a, raw_b),
+            (
+                _build_permutation_indices(len(raw_a), seed=31),
+                _build_permutation_indices(len(raw_b), seed=31),
+            ),
+            (0.6, 0.4),
+            seed=31,
+        )
+
+        records = list(stream.iter_worker(worker_id=0, num_workers=1))
+        tagged = list(stream.iter_worker_with_source(worker_id=0, num_workers=1))
+        self.assertEqual(_record_signature(records), _record_signature(row for _idx, row in tagged))
+        self.assertTrue(all(int(source_idx) in {0, 1} for source_idx, _row in tagged))
+        self.assertEqual({int(source_idx) for source_idx, _row in tagged}, {0, 1})
+
+        tagged0 = list(stream.iter_worker_with_source(worker_id=0, num_workers=2))
+        tagged1 = list(stream.iter_worker_with_source(worker_id=1, num_workers=2))
+        self.assertEqual(
+            _record_signature(row for _idx, row in tagged0),
+            _record_signature(records)[0::2],
+        )
+        self.assertEqual(
+            _record_signature(row for _idx, row in tagged1),
+            _record_signature(records)[1::2],
+        )
+
     def test_mixed_lazy_dataset_rejects_multiple_text_formats(self):
         raw_a = _raw_dataset("A", 8)
         raw_b = _raw_dataset("B", 8)
