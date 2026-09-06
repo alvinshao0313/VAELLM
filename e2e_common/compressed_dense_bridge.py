@@ -6,11 +6,11 @@ from typing import Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 
-from e2e_common.checkpoint_io import load_e2e_model_checkpoint
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import NamedVAELinearDecodeTarget, decode_named_vae_linear_weights
-from train_utils.model_checkpoint_io import META_FILENAME, resolve_checkpoint_dir
+from train_utils.checkpoint_v6 import META_FILENAME, resolve_v6_checkpoint_dir
+from train_utils.v6_model_loader import load_v6_model_checkpoint
 
 
 def _resolve_reference_dtype(module: nn.Module) -> torch.dtype:
@@ -30,7 +30,7 @@ def _iter_named_vae_linears(model: nn.Module) -> Iterable[Tuple[str, VAELinear]]
 
 
 def load_checkpoint_meta(student_checkpoint_dir: str) -> Tuple[str, Dict[str, object]]:
-    resolved_dir = resolve_checkpoint_dir(student_checkpoint_dir)
+    resolved_dir = resolve_v6_checkpoint_dir(student_checkpoint_dir)
     meta_path = os.path.join(resolved_dir, META_FILENAME)
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"Missing checkpoint meta: {meta_path}")
@@ -143,14 +143,12 @@ def load_compressed_student_checkpoint(
 ) -> Tuple[nn.Module, Dict[str, object], str]:
     resolved_dir, meta = load_checkpoint_meta(student_checkpoint_dir)
     reject_checkpoint_with_adapters(meta)
-    model, loaded_meta, _load_result = load_e2e_model_checkpoint(
+    model, loaded_meta, _load_result = load_v6_model_checkpoint(
         resolved_dir,
         access_token=access_token,
         base_model_path=base_model_path,
         map_location="cpu",
         strict=True,
-        materialize_proxy_decoded_linears=False,
-        proxy_logger=logger,
     )
     return model, loaded_meta, resolved_dir
 

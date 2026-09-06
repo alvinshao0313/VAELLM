@@ -229,7 +229,7 @@ class _FakeOutput:
         return getattr(self, key)
 
 
-class _MseFakeCausalLM(nn.Module):
+class _KlFakeCausalLM(nn.Module):
     def __init__(self, *, vocab_size: int = 11, hidden_size: int = 4):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
@@ -260,18 +260,20 @@ class _StaticTeacherRuntime:
         return None
 
 
-def _build_mse_trainer(model: _MseFakeCausalLM) -> CustomSFTTrainer:
+def _build_kl_trainer(model: _KlFakeCausalLM) -> CustomSFTTrainer:
     trainer = CustomSFTTrainer.__new__(CustomSFTTrainer)
     trainer.args = SimpleNamespace(bf16=False, fp16=False)
-    trainer.loss_type = "mse"
+    trainer.loss_type = "kl"
     trainer.temperature = 1.0
     trainer.loss_alpha = 0.5
     trainer.hidden_loss_weight = 0.0
     trainer.pre_mlp_hidden_loss_weight = 0.0
     trainer.prompt_kd_weight = 0.0
     trainer.hidden_alignment_layer_weighting = "uniform"
-    trainer.eakld_confidence_k = 16
     trainer.teacher_logits_cpu_staging = False
+    trainer.selective_student_topk = False
+    trainer.selective_student_topk_chunk_rows = 32
+    trainer.selective_teacher_topk_chunk_tokens = 8
     trainer.distill_hif4_act_controller = None
     trainer.teacher_runtime = _StaticTeacherRuntime(model)
     trainer.teacher_required = True
@@ -301,8 +303,8 @@ def _grad_accum_micro_batch_b():
 
 
 def test_gradient_accumulation_factor_two_includes_both_micro_batches(tmp_path):
-    model = _MseFakeCausalLM()
-    trainer = _build_mse_trainer(model)
+    model = _KlFakeCausalLM()
+    trainer = _build_kl_trainer(model)
 
     # simulate 10 optimizer steps with grad accum 2: two compute_loss calls per step
     for _ in range(10):
@@ -326,8 +328,8 @@ def test_gradient_accumulation_factor_two_includes_both_micro_batches(tmp_path):
 
 
 def test_compute_loss_does_not_update_when_model_not_training(tmp_path):
-    model = _MseFakeCausalLM()
-    trainer = _build_mse_trainer(model)
+    model = _KlFakeCausalLM()
+    trainer = _build_kl_trainer(model)
 
     model.eval()
     trainer.compute_loss(model, _grad_accum_micro_batch_a())

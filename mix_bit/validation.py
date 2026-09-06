@@ -47,12 +47,12 @@ from mix_bit.model_inventory import ModelInventory
 from mix_bit.schema import ResolvedRunConfig, sha256_file
 from mix_bit.solver import OBJECTIVE_MATCH_REL, bit_to_units, load_cost_table_for_solve
 from mix_bit.teacher_cache import validate_teacher_cache_against_inputs
-from train_utils.eval_utils import calculate_ppl, run_lm_eval
-from train_utils.model_checkpoint_io import (
+from train_utils.eval_utils import calculate_ppl, pick_task_metric, run_lm_eval
+from train_utils.checkpoint_v6 import (
     META_FILENAME,
     STATE_DICT_FILENAME,
-    load_model_checkpoint,
 )
+from train_utils.v6_model_loader import load_v6_model_checkpoint
 from transformers import AutoTokenizer
 
 RELATIVE_GAP_EPS = 1e-12
@@ -798,12 +798,16 @@ def _summary_rows_from_eval_block(block: Mapping[str, Any] | None) -> list[Mappi
     keys = lm.get("task_metric_keys") if isinstance(lm.get("task_metric_keys"), Mapping) else {}
     out: list[Mapping[str, Any]] = []
     for task, metric in metrics.items():
+        metric_key = str(keys.get(task, "") or "")
+        if isinstance(metric, Mapping):
+            metric_key, metric = pick_task_metric(metric)
+        score_percent = "N/A" if metric is None else _score_percent_from_row({"metric": metric})
         out.append(
             {
                 "task": str(task),
-                "metric_key": str(keys.get(task, "") or ""),
+                "metric_key": metric_key,
                 "metric": metric,
-                "score_percent": _score_percent_from_row({"metric": metric}),
+                "score_percent": score_percent,
             }
         )
     return out
@@ -1033,7 +1037,7 @@ def validate_mixed_model(
     )
     final_tokenizer = _load_tokenizer_from_final_dir(out_dir)
 
-    model, meta, _load_result = load_model_checkpoint(
+    model, meta, _load_result = load_v6_model_checkpoint(
         str(out_dir),
         access_token=access_token,
         map_location=device,

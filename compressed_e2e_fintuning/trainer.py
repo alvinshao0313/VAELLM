@@ -1,11 +1,10 @@
 import argparse
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Dict, Optional, Sequence
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import Trainer, TrainerCallback
 
@@ -27,28 +26,20 @@ from e2e_common.dense_loss import (
     get_output_logits,
 )
 from e2e_common.selective_topk_head import (
-    compute_selected_teacher_topk_kl,
     extract_teacher_topk_targets,
     is_selective_student_topk_loss,
     move_teacher_topk_targets_to_device,
     parse_selective_student_topk_k,
     selective_student_lm_head,
 )
+from train_utils.distill_loss_core import (
+    compute_selected_kl_top_model_level_loss,
+    normalize_model_level_loss_type,
+)
+from train_utils.config.configs import DistillLossConfig
 from train_utils.distill_losses import (
     DistillTokenRegions,
     build_distill_token_regions,
-    compute_teacher_entropy_mean_and_gamma,
-    is_eakld_top_loss,
-)
-
-# Rank-local EAKLD telemetry keys (no all_reduce; logging-rank microbatch stats).
-_EAKLD_WEIGHTED_KEYS = (
-    "teacher_entropy_mean",
-    "gamma_reverse",
-    "lambda_forward",
-    "forward_kl",
-    "reverse_kl",
-    "eakld_total",
 )
 from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.lora_training import (
@@ -237,37 +228,18 @@ def compute_vae_hidden_alignment_loss(
     return loss.to(device=torch.device(loss_device))
 
 
-def _causal_lm_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].to(device=shift_logits.device).contiguous()
-    return F.cross_entropy(
-        shift_logits.view(-1, int(shift_logits.shape[-1])),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    )
-
-
-def _dense_loss_requires_ce(loss_type: str) -> bool:
-    norm = str(loss_type or "").strip().lower()
-    return (
-        norm in {"sft", "origin", "kd", "dual_kd", "eakld_kd"}
-        or norm.startswith("kd_top")
-        or norm.startswith("dual_kd_top")
-    )
-
-
 class VAEDecoderE2ETrainer(Trainer):
     def __init__(
         self,
         *args,
         loss_type: str = "sft",
+        top_k: int = 100,
         teacher_model: Optional[nn.Module] = None,
         distill_temperature: float = 1.0,
         distill_alpha: float = 0.5,
         hidden_loss_weight: float = 0.0,
         pre_mlp_hidden_loss_weight: float = 0.0,
         prompt_kd_weight: float = 0.0,
-        eakld_confidence_k: int = 16,
         hidden_layer_weighting: str = "uniform",
         saved_tensor_offload=None,
         streaming_offload_manager=None,
@@ -278,33 +250,41 @@ class VAEDecoderE2ETrainer(Trainer):
         selective_student_topk: bool = False,
         selective_student_topk_chunk_rows: int = 32,
         decoder_param_ids: Optional[Sequence[int]] = None,
+        distill_hif4_act_controller=None,
         decoder_lr: Optional[float] = None,
         sparse_bit_manager=None,
         aux_trainable_parameters=None,
+        loss_config: Optional[DistillLossConfig] = None,
         **kwargs,
     ):
-        self.loss_type = str(loss_type).strip().lower()
-        self.teacher_model = teacher_model
-        self.distill_temperature = float(distill_temperature)
-        self.distill_alpha = float(distill_alpha)
-        self.hidden_loss_weight = float(hidden_loss_weight)
-        if self.hidden_loss_weight < 0.0:
-            raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
-        self.pre_mlp_hidden_loss_weight = float(pre_mlp_hidden_loss_weight)
-        if self.pre_mlp_hidden_loss_weight < 0.0:
-            raise ValueError(
-                "pre_mlp_hidden_loss_weight must be >= 0, "
-                f"got {self.pre_mlp_hidden_loss_weight}."
+        if loss_config is not None:
+            loss_config.validate()
+            self.loss_config = loss_config
+        else:
+            self.loss_config = DistillLossConfig(
+                loss_type=normalize_model_level_loss_type(loss_type),
+                top_k=int(top_k),
+                temperature=float(distill_temperature),
+                alpha=float(distill_alpha),
+                prompt_loss_weight=float(prompt_kd_weight),
+                hidden_loss_weight=float(hidden_loss_weight),
+                pre_mlp_hidden_loss_weight=float(pre_mlp_hidden_loss_weight),
+                hidden_layer_weighting=str(hidden_layer_weighting),
+                selective_student_topk=bool(selective_student_topk),
+                selective_student_topk_chunk_rows=int(selective_student_topk_chunk_rows),
             )
-        self.prompt_kd_weight = float(prompt_kd_weight)
-        if self.prompt_kd_weight < 0.0:
-            raise ValueError(f"prompt_kd_weight must be >= 0, got {self.prompt_kd_weight}.")
-        self.eakld_confidence_k = int(eakld_confidence_k)
-        if self.eakld_confidence_k < 2:
-            raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
+            self.loss_config.validate()
+        self.loss_type = str(self.loss_config.loss_type)
+        self.top_k = int(self.loss_config.top_k)
+        self.teacher_model = teacher_model
+        self.distill_temperature = float(self.loss_config.temperature)
+        self.distill_alpha = float(self.loss_config.alpha)
+        self.hidden_loss_weight = float(self.loss_config.hidden_loss_weight)
+        self.pre_mlp_hidden_loss_weight = float(self.loss_config.pre_mlp_hidden_loss_weight)
+        self.prompt_kd_weight = float(self.loss_config.prompt_loss_weight)
         try:
             self.hidden_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
-                str(hidden_layer_weighting)
+                str(self.loss_config.hidden_layer_weighting)
             )
         except (ValueError, argparse.ArgumentTypeError) as exc:
             raise ValueError(
@@ -327,12 +307,10 @@ class VAEDecoderE2ETrainer(Trainer):
         self.teacher_output_chunk_tokens = int(teacher_output_chunk_tokens)
         if self.teacher_output_chunk_tokens < 1:
             raise ValueError("teacher_output_chunk_tokens must be >= 1.")
-        self.selective_student_topk = bool(selective_student_topk)
-        self.selective_student_topk_chunk_rows = int(selective_student_topk_chunk_rows)
-        if self.selective_student_topk_chunk_rows < 1:
-            raise ValueError("selective_student_topk_chunk_rows must be >= 1.")
+        self.selective_student_topk = bool(self.loss_config.selective_student_topk)
+        self.selective_student_topk_chunk_rows = int(self.loss_config.selective_student_topk_chunk_rows)
         if self.selective_student_topk and not is_selective_student_topk_loss(self.loss_type):
-            raise ValueError("selective_student_topk only supports loss_type=kl_top[_K].")
+            raise ValueError("selective_student_topk only supports loss_type=kl_top.")
         self._active_teacher_targets: Optional[TeacherTargetBatch] = None
         self._last_teacher_target_stats: Dict[str, object] = {}
         self._logged_teacher_target_stats = False
@@ -340,6 +318,7 @@ class VAEDecoderE2ETrainer(Trainer):
         self.saved_tensor_offload = saved_tensor_offload
         self.streaming_offload_manager = streaming_offload_manager
         self.decoder_param_ids = frozenset(int(v) for v in (decoder_param_ids or ()))
+        self.distill_hif4_act_controller = distill_hif4_act_controller
         self.decoder_lr = None if decoder_lr is None else float(decoder_lr)
         self.sparse_bit_manager = sparse_bit_manager
         self.aux_trainable_parameters = dict(aux_trainable_parameters or {})
@@ -347,11 +326,11 @@ class VAEDecoderE2ETrainer(Trainer):
         self._sparse_bit_main_parameters = ()
         self._last_sparse_bit_telemetry: Dict[str, float] = {}
         self._last_loss_parts: Dict[str, float] = {}
-        # Rank-local EAKLD telemetry accumulator (reset on each training log flush).
-        self._eakld_telemetry_weighted_sums: Dict[str, float] = {}
-        self._eakld_telemetry_weight = 0.0
-        self._eakld_gamma_zero_weight = 0.0
-        self._eakld_gamma_one_weight = 0.0
+        # Task-9 v6 exact-step checkpointing is opt-in. Legacy callers keep the
+        # existing checkpoint lifecycle until runtime_v6 explicitly configures it.
+        self._v6_step_checkpoint_context = None
+        self._v6_selected_vae_modules = ()
+        self._v6_exact_resume_loaded = False
         # Logging-window token telemetry; consumed by E2EDistillTokenStatsCallback.
         self.distill_token_stats = DistillTokenStatsAccumulator()
         super().__init__(*args, **kwargs)
@@ -379,6 +358,59 @@ class VAEDecoderE2ETrainer(Trainer):
         if self.model is not None:
             self.model.accepts_loss_kwargs = False
 
+    def configure_v6_step_checkpoint(self, *, context: dict, selected_vae_modules) -> None:
+        """Enable lightweight v6 optimizer-step checkpoints for the active E2E run."""
+        if not isinstance(context, dict):
+            raise TypeError(f"v6 step checkpoint context must be dict, got {type(context)}.")
+        required = {
+            "round_base_dir",
+            "round_base_checkpoint_id",
+            "train_mode",
+            "compressed_targets",
+            "pending_dense_targets",
+            "skip_targets",
+            "norm_train_mode",
+            "lm_head_train_mode",
+            "lora_config",
+            "resolved_learning_rates",
+            "target_layers",
+            "target_modules",
+            "immutable_resume_contract",
+            "base_model_path",
+        }
+        missing = sorted(required - set(context))
+        if missing:
+            raise ValueError(f"v6 step checkpoint context missing required fields: {missing}")
+        round_base_dir = os.path.abspath(str(context["round_base_dir"]))
+        if not os.path.isdir(round_base_dir):
+            raise FileNotFoundError(f"v6 round_base_dir does not exist: {round_base_dir}")
+        if not str(context["round_base_checkpoint_id"]).strip():
+            raise ValueError("v6 round_base_checkpoint_id must be non-empty.")
+        if bool(getattr(self.args, "save_only_model", False)):
+            raise ValueError(
+                "v6 exact-step resume requires save_only_model=false so optimizer/RNG state is retained."
+            )
+        if bool(getattr(self.args, "ignore_data_skip", False)):
+            raise ValueError("v6 exact-step resume requires ignore_data_skip=false.")
+        normalized = dict(context)
+        normalized["round_base_dir"] = round_base_dir
+        self._v6_step_checkpoint_context = normalized
+        self._v6_selected_vae_modules = tuple(selected_vae_modules or ())
+        self._v6_exact_resume_loaded = False
+
+    def _v6_step_checkpoint_enabled(self) -> bool:
+        return isinstance(self._v6_step_checkpoint_context, dict)
+
+    def save_model(self, output_dir=None, _internal_call: bool = False):
+        # Trainer._save_checkpoint always calls save_model first. In v6 exact-step
+        # mode round_base owns the frozen/full model, so checkpoint-N must not
+        # duplicate full model or PEFT adapter weights.
+        if self._v6_step_checkpoint_enabled() and bool(_internal_call):
+            target = output_dir if output_dir is not None else self.args.output_dir
+            os.makedirs(target, exist_ok=True)
+            return None
+        return super().save_model(output_dir=output_dir, _internal_call=_internal_call)
+
     def _sparse_bit_optimizer_step(self) -> None:
         if self.sparse_bit_manager is None:
             raise RuntimeError("Sparse Bit optimizer callback executed without a manager.")
@@ -396,7 +428,7 @@ class VAEDecoderE2ETrainer(Trainer):
 
     def create_optimizer(self):
         if self.sparse_bit_manager is None:
-            if self.decoder_param_ids:
+            if getattr(self, "model_level_trainable_selection", None) is not None or self.decoder_param_ids:
                 from compressed_e2e_fintuning.optimizer_grouping import create_decoder_grouped_optimizer
 
                 return create_decoder_grouped_optimizer(self)
@@ -423,7 +455,7 @@ class VAEDecoderE2ETrainer(Trainer):
             try:
                 for param in bit_params:
                     param.requires_grad_(False)
-                if self.decoder_param_ids:
+                if getattr(self, "model_level_trainable_selection", None) is not None or self.decoder_param_ids:
                     from compressed_e2e_fintuning.optimizer_grouping import create_decoder_grouped_optimizer
 
                     main_optimizer = create_decoder_grouped_optimizer(self)
@@ -478,7 +510,78 @@ class VAEDecoderE2ETrainer(Trainer):
         }
         return super()._save(output_dir=output_dir, state_dict=filtered)
 
+    def _save_v6_step_checkpoint(self, model, trial):
+        from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+        from compressed_e2e_fintuning.v6_runtime_state import collect_e2e_mutable_state
+        from train_utils.checkpoint_v6 import save_v6_training_step_payload
+
+        context = dict(self._v6_step_checkpoint_context or {})
+        result = super()._save_checkpoint(model, trial)
+
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(
+            run_dir, f"{PREFIX_CHECKPOINT_DIR}-{int(self.state.global_step)}"
+        )
+        is_main = bool(self.is_world_process_zero())
+        distributed_barrier = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            distributed_barrier = torch.distributed.barrier
+
+        if is_main and self.sparse_bit_manager is not None:
+            from sparse_bit_tuning.exact_checkpoint import save_exact_sidecar
+
+            save_exact_sidecar(output_dir, self.sparse_bit_manager)
+
+        unwrapped = (
+            self.accelerator.unwrap_model(self.model)
+            if getattr(self, "accelerator", None) is not None
+            else self.model
+        )
+        selection = getattr(self, "model_level_trainable_selection", None)
+        mutable_state, _component_classes, manifest = collect_e2e_mutable_state(
+            unwrapped,
+            selection=selection,
+            selected_vae_modules=self._v6_selected_vae_modules,
+        )
+        round_base_ref = os.path.relpath(
+            str(context["round_base_dir"]),
+            start=os.path.abspath(output_dir),
+        )
+        save_v6_training_step_payload(
+            output_dir,
+            round_base_ref=round_base_ref,
+            round_base_checkpoint_id=str(context["round_base_checkpoint_id"]),
+            mutable_state=mutable_state,
+            mutable_state_manifest=manifest,
+            train_mode=str(context["train_mode"]),
+            compressed_targets=tuple(context["compressed_targets"]),
+            pending_dense_targets=tuple(context["pending_dense_targets"]),
+            skip_targets=tuple(context["skip_targets"]),
+            legacy_original_only_sources=tuple(context.get("legacy_original_only_sources", ())),
+            norm_train_mode=str(context["norm_train_mode"]),
+            lm_head_train_mode=str(context["lm_head_train_mode"]),
+            lora_config=(
+                None
+                if context.get("lora_config") is None
+                else dict(context["lora_config"])
+            ),
+            resolved_learning_rates=dict(context["resolved_learning_rates"]),
+            compression_categories=tuple(context.get("compression_categories", ())),
+            target_layers=tuple(int(v) for v in context["target_layers"]),
+            target_modules=tuple(str(v) for v in context["target_modules"]),
+            immutable_resume_contract=dict(context["immutable_resume_contract"]),
+            runtime_audit=dict(context.get("runtime_audit", {})),
+            base_model_path=str(context["base_model_path"]),
+            hf_artifact_refs=dict(context.get("hf_artifact_refs", {})),
+            is_main_process=is_main,
+            distributed_barrier=distributed_barrier,
+        )
+        return result
+
     def _save_checkpoint(self, model, trial):
+        if self._v6_step_checkpoint_enabled():
+            return self._save_v6_step_checkpoint(model, trial)
         if self.sparse_bit_manager is None and not self.aux_trainable_parameters:
             return super()._save_checkpoint(model, trial)
         packed_snapshot = None
@@ -517,7 +620,93 @@ class VAEDecoderE2ETrainer(Trainer):
             save_auxiliary_sidecar(output_dir, aux_snapshot)
         return result
 
+    def _load_v6_exact_step_checkpoint(self, resume_from_checkpoint, model=None):
+        from compressed_e2e_fintuning.v6_runtime_state import (
+            restore_e2e_mutable_state,
+            validate_e2e_immutable_resume_contract,
+        )
+        from train_utils.checkpoint_v6 import (
+            load_v6_training_model_state,
+            load_v6_training_step_meta,
+            resolve_training_step_round_base_ref,
+        )
+
+        context = dict(self._v6_step_checkpoint_context or {})
+        checkpoint_dir = os.path.abspath(str(resume_from_checkpoint))
+        meta = load_v6_training_step_meta(checkpoint_dir)
+        _resolved_base, base_meta = resolve_training_step_round_base_ref(checkpoint_dir, meta)
+        expected_base_id = str(context["round_base_checkpoint_id"])
+        actual_base_id = str(base_meta["checkpoint_id"])
+        if actual_base_id != expected_base_id:
+            raise ValueError(
+                "E2E v6 resume round-base mismatch: "
+                f"checkpoint={actual_base_id!r} current={expected_base_id!r}."
+            )
+
+        expected_topology = {
+            "train_mode": str(context["train_mode"]),
+            "compressed_targets": list(context["compressed_targets"]),
+            "pending_dense_targets": list(context["pending_dense_targets"]),
+            "skip_targets": list(context["skip_targets"]),
+            "norm_train_mode": str(context["norm_train_mode"]),
+            "lm_head_train_mode": str(context["lm_head_train_mode"]),
+            "target_layers": [int(v) for v in context["target_layers"]],
+            "target_modules": [str(v) for v in context["target_modules"]],
+        }
+        for key, expected in expected_topology.items():
+            actual = meta.get(key)
+            if actual != expected:
+                raise ValueError(
+                    f"E2E v6 resume topology mismatch for {key}: "
+                    f"checkpoint={actual!r} current={expected!r}."
+                )
+        validate_e2e_immutable_resume_contract(
+            meta.get("immutable_resume_contract") or {},
+            context["immutable_resume_contract"],
+        )
+
+        checkpoint_state, checkpoint_manifest = load_v6_training_model_state(
+            checkpoint_dir,
+            map_location="cpu",
+        )
+        target_model = self.model if model is None else model
+        unwrapped = (
+            self.accelerator.unwrap_model(target_model)
+            if getattr(self, "accelerator", None) is not None
+            else target_model
+        )
+        restore_e2e_mutable_state(
+            unwrapped,
+            selection=getattr(self, "model_level_trainable_selection", None),
+            selected_vae_modules=self._v6_selected_vae_modules,
+            checkpoint_state=checkpoint_state,
+            checkpoint_manifest=checkpoint_manifest,
+        )
+
+        sparse_dir = os.path.join(checkpoint_dir, "sparse_bit_tuning")
+        if self.sparse_bit_manager is not None:
+            from sparse_bit_tuning.exact_checkpoint import (
+                exact_sidecar_complete,
+                restore_exact_sidecar,
+            )
+
+            if not exact_sidecar_complete(checkpoint_dir):
+                raise FileNotFoundError(
+                    f"Sparse Bit exact resume requires exact sidecar under {sparse_dir}."
+                )
+            restore_exact_sidecar(checkpoint_dir, self.sparse_bit_manager)
+        elif os.path.isdir(sparse_dir):
+            raise RuntimeError(
+                "E2E v6 checkpoint contains Sparse Bit state but current train_mode "
+                "does not enable Sparse Bit."
+            )
+
+        self._v6_exact_resume_loaded = True
+        return None
+
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        if self._v6_step_checkpoint_enabled():
+            return self._load_v6_exact_step_checkpoint(resume_from_checkpoint, model=model)
         sidecar_path = os.path.join(str(resume_from_checkpoint), "sparse_bit_tuning")
         aux_path = os.path.join(str(resume_from_checkpoint), "e2e_aux_trainables.pt")
         if self.sparse_bit_manager is None:
@@ -608,6 +797,19 @@ class VAEDecoderE2ETrainer(Trainer):
             return
         self._ensure_teacher_device(device)
 
+    @contextmanager
+    def _student_hif4_act_context(self):
+        controller = self.distill_hif4_act_controller
+        if controller is None:
+            yield
+            return
+        previous = bool(getattr(controller, "enabled", False))
+        controller.enabled = True
+        try:
+            yield
+        finally:
+            controller.enabled = previous
+
     def _compute_teacher_outputs(self, teacher_inputs: Dict[str, torch.Tensor], *, output_hidden_states: bool = False):
         if self.teacher_model is None:
             raise RuntimeError("当前 loss_type 需要 teacher，但 trainer.teacher_model 为空。")
@@ -641,56 +843,10 @@ class VAEDecoderE2ETrainer(Trainer):
             )
         self._last_loss_parts = parts
 
-    def _record_eakld_telemetry(self, telemetry: Dict[str, torch.Tensor]) -> None:
-        if not telemetry:
-            return
-        valid_tokens = float(telemetry["valid_tokens"].detach().float().item())
-        weight = max(valid_tokens, 1.0)
-        for key in _EAKLD_WEIGHTED_KEYS:
-            value = float(telemetry[key].detach().float().item())
-            self._eakld_telemetry_weighted_sums[key] = (
-                self._eakld_telemetry_weighted_sums.get(key, 0.0) + value * weight
-            )
-        self._eakld_telemetry_weight += weight
-        gamma_reverse = float(telemetry["gamma_reverse"].detach().float().item())
-        if gamma_reverse <= 1e-6:
-            self._eakld_gamma_zero_weight += weight
-        if gamma_reverse >= 1.0 - 1e-6:
-            self._eakld_gamma_one_weight += weight
-
-    def _consume_eakld_telemetry_logs(self) -> Dict[str, float]:
-        # Rank-local telemetry: no all_reduce (avoids deadlock if only some ranks log).
-        total_weight = float(self._eakld_telemetry_weight)
-        if total_weight <= 0.0:
-            return {}
-        sums = self._eakld_telemetry_weighted_sums
-        logs = {
-            "eakld/teacher_entropy_mean": sums["teacher_entropy_mean"] / total_weight,
-            "eakld/gamma_reverse_mean": sums["gamma_reverse"] / total_weight,
-            "eakld/lambda_forward_mean": sums["lambda_forward"] / total_weight,
-            "eakld/gamma_reverse_zero_fraction": (
-                self._eakld_gamma_zero_weight / total_weight
-            ),
-            "eakld/gamma_reverse_one_fraction": (
-                self._eakld_gamma_one_weight / total_weight
-            ),
-            "eakld/forward_kl_mean": sums["forward_kl"] / total_weight,
-            "eakld/reverse_kl_mean": sums["reverse_kl"] / total_weight,
-            "eakld/total_mean": sums["eakld_total"] / total_weight,
-        }
-        self._eakld_telemetry_weighted_sums = {}
-        self._eakld_telemetry_weight = 0.0
-        self._eakld_gamma_zero_weight = 0.0
-        self._eakld_gamma_one_weight = 0.0
-        return logs
-
     def log(self, logs, start_time=None):
         for key, value in getattr(self, "_last_loss_parts", {}).items():
             logs.setdefault(key, value)
         for key, value in getattr(self, "_last_sparse_bit_telemetry", {}).items():
-            logs.setdefault(key, value)
-        # Rank-local telemetry merge into the existing training log event.
-        for key, value in self._consume_eakld_telemetry_logs().items():
             logs.setdefault(key, value)
         return super().log(logs, start_time=start_time)
 
@@ -718,7 +874,6 @@ class VAEDecoderE2ETrainer(Trainer):
         logits_required: bool,
         hidden_required: bool,
         pre_mlp_hidden_required: bool,
-        eakld_metadata_required: bool,
     ) -> TeacherTargetBatch:
         if self._active_teacher_targets is not None:
             raise RuntimeError(
@@ -768,65 +923,20 @@ class VAEDecoderE2ETrainer(Trainer):
 
             logits_cpu = None
             selective_topk = None
-            gamma_cpu = None
-            entropy_mean_cpu = None
-            valid_count_cpu = None
-            prompt_gamma_cpu = None
-            prompt_entropy_mean_cpu = None
-            prompt_valid_count_cpu = None
             if logits_required:
                 teacher_logits = get_output_logits(teacher_outputs)
                 if self.selective_student_topk:
                     selective_topk = extract_teacher_topk_targets(
                         teacher_logits,
-                        k=parse_selective_student_topk_k(self.loss_type),
+                        k=parse_selective_student_topk_k(self.loss_type, top_k=self.top_k),
                         sequence_chunk_size=self.teacher_output_chunk_tokens,
                         pin_memory=self.teacher_output_pin_memory,
                     )
                 else:
-                    # Single CPU copy of full teacher logits, reused for EAKLD metadata.
                     logits_cpu = copy_detached_tensor_to_cpu(
                         teacher_logits,
                         pin_memory=self.teacher_output_pin_memory,
                     )
-                if eakld_metadata_required:
-                    regions = self._build_distill_token_regions(inputs, teacher_logits)
-                    entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
-                        logits_cpu,
-                        regions.response_mask,
-                        confidence_k=self.eakld_confidence_k,
-                    )
-                    gamma_cpu = gamma.detach().reshape(()).to(device="cpu", dtype=torch.float32)
-                    entropy_mean_cpu = entropy_mean.detach().reshape(()).to(
-                        device="cpu",
-                        dtype=torch.float32,
-                    )
-                    valid_count_cpu = valid_count.detach().reshape(()).to(
-                        device="cpu",
-                        dtype=torch.float32,
-                    )
-                    if self.prompt_kd_weight > 0.0:
-                        (
-                            prompt_entropy_mean,
-                            prompt_gamma,
-                            prompt_valid_count,
-                        ) = compute_teacher_entropy_mean_and_gamma(
-                            logits_cpu,
-                            regions.prompt_mask,
-                            confidence_k=self.eakld_confidence_k,
-                        )
-                        prompt_gamma_cpu = prompt_gamma.detach().reshape(()).to(
-                            device="cpu",
-                            dtype=torch.float32,
-                        )
-                        prompt_entropy_mean_cpu = prompt_entropy_mean.detach().reshape(()).to(
-                            device="cpu",
-                            dtype=torch.float32,
-                        )
-                        prompt_valid_count_cpu = prompt_valid_count.detach().reshape(()).to(
-                            device="cpu",
-                            dtype=torch.float32,
-                        )
 
             hidden_layer_indices: tuple = ()
             hidden_cpu_by_layer: Dict[int, torch.Tensor] = {}
@@ -868,12 +978,6 @@ class VAEDecoderE2ETrainer(Trainer):
             targets = TeacherTargetBatch(
                 logits_cpu=logits_cpu,
                 selective_topk=selective_topk,
-                eakld_gamma_cpu=gamma_cpu,
-                teacher_entropy_mean_cpu=entropy_mean_cpu,
-                teacher_valid_token_count_cpu=valid_count_cpu,
-                eakld_prompt_gamma_cpu=prompt_gamma_cpu,
-                teacher_prompt_entropy_mean_cpu=prompt_entropy_mean_cpu,
-                teacher_prompt_valid_token_count_cpu=prompt_valid_count_cpu,
                 hidden_cpu_by_layer=dict(hidden_cpu_by_layer),
                 hidden_layer_indices=tuple(hidden_layer_indices),
                 num_hidden_layers=int(num_hidden_layers),
@@ -898,7 +1002,16 @@ class VAEDecoderE2ETrainer(Trainer):
                 self.offload_teacher_to_cpu()
 
     def _compute_legacy_dense_loss(self, model, inputs, return_outputs: bool):
+        input_ids = inputs.get("input_ids")
         labels = inputs.get("labels")
+        attention_mask = inputs.get("attention_mask")
+        if not isinstance(input_ids, torch.Tensor):
+            raise ValueError("model-level loss requires input_ids.")
+        if not isinstance(labels, torch.Tensor):
+            raise ValueError("model-level loss requires labels.")
+        if not isinstance(attention_mask, torch.Tensor):
+            raise ValueError("model-level loss requires attention_mask.")
+
         student_inputs = dict(inputs)
         student_inputs.pop("labels", None)
         # Custom distill losses ignore HF num_items_in_batch scaling.
@@ -924,109 +1037,58 @@ class VAEDecoderE2ETrainer(Trainer):
             if self.saved_tensor_offload is not None
             else nullcontext()
         )
-        with offload_context, student_pre_mlp_capture_ctx as captured_student_pre_mlp:
-            outputs = model(**student_inputs, output_hidden_states=hidden_loss_enabled)
+        with self._student_hif4_act_context():
+            with offload_context, student_pre_mlp_capture_ctx as captured_student_pre_mlp:
+                outputs = model(**student_inputs, output_hidden_states=hidden_loss_enabled)
         logits = get_output_logits(outputs)
 
-        loss_type = self.loss_type
-        ce_loss = None
-        if labels is not None and _dense_loss_requires_ce(loss_type):
-            ce_loss = _causal_lm_cross_entropy(logits, labels)
+        canonical_loss = normalize_model_level_loss_type(self.loss_config.loss_type)
+        resolved_top_k = int(self.loss_config.top_k)
+        need_teacher_logits = canonical_loss != "sft"
+        teacher_outputs = None
+        captured_teacher_pre_mlp = None
+        teacher_logits = None
 
-        if loss_type in {"sft", "origin"}:
-            if ce_loss is None:
-                raise ValueError(f"loss_type={loss_type} requires labels.")
-            hidden_loss = None
-            pre_mlp_hidden_loss = None
-            loss = ce_loss
-            if hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
-                teacher_inputs = dict(inputs)
-                teacher_inputs.pop("labels", None)
-                teacher_inputs.pop("num_items_in_batch", None)
-                teacher_pre_mlp_capture_modules = (
-                    _resolve_e2e_pre_mlp_capture_modules(self.teacher_model)
-                    if pre_mlp_hidden_loss_enabled
-                    else ()
-                )
-                teacher_pre_mlp_capture_ctx = (
-                    _capture_pre_mlp_hiddens_from_modules(teacher_pre_mlp_capture_modules)
-                    if pre_mlp_hidden_loss_enabled
-                    else nullcontext(None)
-                )
-                with teacher_pre_mlp_capture_ctx as captured_teacher_pre_mlp:
-                    teacher_outputs = self._compute_teacher_outputs(
-                        teacher_inputs,
-                        output_hidden_states=(hidden_loss_enabled or pre_mlp_reference_hidden_required),
-                    )
-                if hidden_loss_enabled:
-                    hidden_loss = self._compute_hidden_alignment_loss(
-                        teacher_outputs,
-                        outputs,
-                        inputs,
-                        loss_device=loss.device,
-                    )
-                    loss = loss + float(self.hidden_loss_weight) * hidden_loss
-                if pre_mlp_hidden_loss_enabled:
-                    teacher_reference_hidden = (
-                        teacher_outputs.hidden_states[0]
-                        if pre_mlp_reference_hidden_required
-                        else None
-                    )
-                    pre_mlp_hidden_loss = _compute_named_pre_mlp_hidden_alignment_loss(
-                        teacher_by_name=dict(captured_teacher_pre_mlp),
-                        student_by_name=dict(captured_student_pre_mlp),
-                        attention_mask=inputs.get("attention_mask"),
-                        layer_weighting=self.hidden_layer_weighting,
-                        teacher_reference_hidden=teacher_reference_hidden,
-                        teacher_targets_on_cpu=False,
-                    )
-                    loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
-            self._store_loss_parts(
-                distill_loss=ce_loss,
-                hidden_loss=hidden_loss,
-                pre_mlp_hidden_loss=pre_mlp_hidden_loss,
+        if need_teacher_logits or hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
+            teacher_inputs = dict(inputs)
+            teacher_inputs.pop("labels", None)
+            teacher_inputs.pop("num_items_in_batch", None)
+            teacher_pre_mlp_capture_modules = (
+                _resolve_e2e_pre_mlp_capture_modules(self.teacher_model)
+                if pre_mlp_hidden_loss_enabled
+                else ()
             )
-            return (loss, outputs) if return_outputs else loss
+            teacher_pre_mlp_capture_ctx = (
+                _capture_pre_mlp_hiddens_from_modules(teacher_pre_mlp_capture_modules)
+                if pre_mlp_hidden_loss_enabled
+                else nullcontext(None)
+            )
+            with teacher_pre_mlp_capture_ctx as captured_teacher_pre_mlp:
+                teacher_outputs = self._compute_teacher_outputs(
+                    teacher_inputs,
+                    output_hidden_states=(hidden_loss_enabled or pre_mlp_reference_hidden_required),
+                )
+            if need_teacher_logits:
+                teacher_logits = get_output_logits(teacher_outputs).to(device=logits.device)
 
-        teacher_inputs = dict(inputs)
-        teacher_inputs.pop("labels", None)
-        teacher_inputs.pop("num_items_in_batch", None)
-        teacher_pre_mlp_capture_modules = (
-            _resolve_e2e_pre_mlp_capture_modules(self.teacher_model)
-            if pre_mlp_hidden_loss_enabled
-            else ()
-        )
-        teacher_pre_mlp_capture_ctx = (
-            _capture_pre_mlp_hiddens_from_modules(teacher_pre_mlp_capture_modules)
-            if pre_mlp_hidden_loss_enabled
-            else nullcontext(None)
-        )
-        with teacher_pre_mlp_capture_ctx as captured_teacher_pre_mlp:
-            teacher_outputs = self._compute_teacher_outputs(
-                teacher_inputs,
-                output_hidden_states=(hidden_loss_enabled or pre_mlp_reference_hidden_required),
-            )
-        teacher_logits = get_output_logits(teacher_outputs).to(device=logits.device)
-        regions = self._build_distill_token_regions(inputs, logits)
-        telemetry: Dict[str, torch.Tensor] = {}
         distill_loss = compute_dense_loss_from_logits(
-            loss_type=loss_type,
+            loss_type=canonical_loss,
             student_logits=logits,
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
             teacher_logits=teacher_logits,
-            ce_loss=ce_loss,
-            mask=regions.response_mask,
-            temperature=self.distill_temperature,
-            alpha=self.distill_alpha,
-            eakld_confidence_k=int(self.eakld_confidence_k),
-            telemetry_out=telemetry,
-            prompt_mask=regions.prompt_mask,
-            prompt_kd_weight=self.prompt_kd_weight,
+            temperature=float(self.loss_config.temperature),
+            alpha=float(self.loss_config.alpha),
+            top_k=resolved_top_k,
+            prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
         )
-        self._record_eakld_telemetry(telemetry)
         hidden_loss = None
         pre_mlp_hidden_loss = None
         loss = distill_loss
         if hidden_loss_enabled:
+            if teacher_outputs is None:
+                raise RuntimeError("hidden alignment requires teacher outputs.")
             hidden_loss = self._compute_hidden_alignment_loss(
                 teacher_outputs,
                 outputs,
@@ -1035,6 +1097,8 @@ class VAEDecoderE2ETrainer(Trainer):
             )
             loss = loss + float(self.hidden_loss_weight) * hidden_loss
         if pre_mlp_hidden_loss_enabled:
+            if teacher_outputs is None or captured_teacher_pre_mlp is None:
+                raise RuntimeError("pre-MLP hidden alignment requires teacher captures.")
             teacher_reference_hidden = (
                 teacher_outputs.hidden_states[0]
                 if pre_mlp_reference_hidden_required
@@ -1057,14 +1121,11 @@ class VAEDecoderE2ETrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def _compute_teacher_first_cpu_loss(self, model, inputs, return_outputs: bool):
-        loss_type = self.loss_type
-        hidden_required = float(self.hidden_loss_weight) > 0.0
-        pre_mlp_hidden_required = float(self.pre_mlp_hidden_loss_weight) > 0.0
-        logits_required = loss_type not in {"sft", "origin"}
-        eakld_metadata_required = (
-            loss_type in {"eakld", "eakld_kd"}
-            or is_eakld_top_loss(loss_type)
-        )
+        canonical_loss = normalize_model_level_loss_type(self.loss_config.loss_type)
+        resolved_top_k = int(self.loss_config.top_k)
+        hidden_required = float(self.loss_config.hidden_loss_weight) > 0.0
+        pre_mlp_hidden_required = float(self.loss_config.pre_mlp_hidden_loss_weight) > 0.0
+        logits_required = canonical_loss != "sft"
         needs_teacher = hidden_required or pre_mlp_hidden_required or logits_required
 
         labels = inputs.get("labels")
@@ -1080,7 +1141,6 @@ class VAEDecoderE2ETrainer(Trainer):
                     logits_required=logits_required,
                     hidden_required=hidden_required,
                     pre_mlp_hidden_required=pre_mlp_hidden_required,
-                    eakld_metadata_required=eakld_metadata_required,
                 )
 
             selective_indices = None
@@ -1128,6 +1188,7 @@ class VAEDecoderE2ETrainer(Trainer):
             )
             with (
                 offload_context,
+                self._student_hif4_act_context(),
                 selective_head_ctx,
                 student_collector_ctx as student_collector,
                 student_pre_mlp_capture_ctx as captured_student_pre_mlp,
@@ -1135,89 +1196,57 @@ class VAEDecoderE2ETrainer(Trainer):
                 outputs = model(**student_inputs, output_hidden_states=False)
             logits = get_output_logits(outputs)
 
-            ce_loss = None
-            if labels is not None and _dense_loss_requires_ce(loss_type):
-                ce_loss = _causal_lm_cross_entropy(logits, labels)
+            input_ids = inputs.get("input_ids")
+            labels = inputs.get("labels")
+            attention_mask = inputs.get("attention_mask")
+            if not isinstance(input_ids, torch.Tensor):
+                raise ValueError("model-level loss requires input_ids.")
+            if not isinstance(labels, torch.Tensor):
+                raise ValueError("model-level loss requires labels.")
+            if not isinstance(attention_mask, torch.Tensor):
+                raise ValueError("model-level loss requires attention_mask.")
 
             if self.selective_student_topk:
                 if selective_teacher_logits is None:
                     raise RuntimeError("selective student top-k teacher logits are missing.")
-                regions = self._build_distill_token_regions(inputs, logits)
-                response_loss = compute_selected_teacher_topk_kl(
+                distill_loss = compute_selected_kl_top_model_level_loss(
                     student_selected_logits=logits,
-                    teacher_topk_logits=selective_teacher_logits,
-                    mask=regions.response_mask,
-                    temperature=self.distill_temperature,
+                    teacher_selected_logits=selective_teacher_logits,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    temperature=float(self.loss_config.temperature),
+                    prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
                 )
-                if self.prompt_kd_weight > 0.0:
-                    prompt_loss = compute_selected_teacher_topk_kl(
-                        student_selected_logits=logits,
-                        teacher_topk_logits=selective_teacher_logits,
-                        mask=regions.prompt_mask,
-                        temperature=self.distill_temperature,
-                    )
-                    distill_loss = response_loss + self.prompt_kd_weight * prompt_loss
-                else:
-                    distill_loss = response_loss
-            elif loss_type in {"sft", "origin"}:
-                if ce_loss is None:
-                    raise ValueError(f"loss_type={loss_type} requires labels.")
+            elif canonical_loss == "sft":
                 if targets is not None and targets.logits_cpu is not None:
-                    raise RuntimeError("sft/origin must not cache teacher logits.")
-                distill_loss = ce_loss
+                    raise RuntimeError("sft must not cache teacher logits.")
+                distill_loss = compute_dense_loss_from_logits(
+                    loss_type="sft",
+                    student_logits=logits,
+                    input_ids=input_ids,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    temperature=float(self.loss_config.temperature),
+                    prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
+                )
             else:
                 if targets is None or targets.logits_cpu is None:
                     raise RuntimeError(
                         "Dense distillation with teacher_output_offload=cpu requires teacher logits on CPU."
                     )
-                if eakld_metadata_required and (
-                    targets.eakld_gamma_cpu is None
-                    or targets.teacher_entropy_mean_cpu is None
-                    or targets.teacher_valid_token_count_cpu is None
-                ):
-                    raise RuntimeError(
-                        "EAKLD-family loss requires teacher logits, gamma, and "
-                        "entropy scalars on CPU."
-                    )
-                regions = self._build_distill_token_regions(inputs, logits)
-                if eakld_metadata_required and self.prompt_kd_weight > 0.0 and (
-                    targets.eakld_prompt_gamma_cpu is None
-                    or targets.teacher_prompt_entropy_mean_cpu is None
-                    or targets.teacher_prompt_valid_token_count_cpu is None
-                ):
-                    raise RuntimeError(
-                        "prompt_kd_weight > 0 requires prompt-region teacher "
-                        "scalars on CPU."
-                    )
-                telemetry: Dict[str, torch.Tensor] = {}
                 distill_loss = compute_dense_loss_from_offloaded_teacher(
-                    loss_type=loss_type,
+                    loss_type=canonical_loss,
                     student_logits=logits,
                     teacher_logits_cpu=targets.logits_cpu,
-                    teacher_gamma_cpu=targets.eakld_gamma_cpu,
-                    teacher_entropy_mean_cpu=targets.teacher_entropy_mean_cpu,
-                    teacher_valid_token_count_cpu=(
-                        targets.teacher_valid_token_count_cpu
-                    ),
-                    ce_loss=ce_loss,
-                    mask=regions.response_mask,
-                    temperature=self.distill_temperature,
-                    alpha=self.distill_alpha,
-                    eakld_confidence_k=int(self.eakld_confidence_k),
-                    sequence_chunk_size=int(self.teacher_output_chunk_tokens),
-                    telemetry_out=telemetry if eakld_metadata_required else None,
-                    prompt_mask=regions.prompt_mask,
-                    prompt_kd_weight=self.prompt_kd_weight,
-                    teacher_prompt_gamma_cpu=targets.eakld_prompt_gamma_cpu,
-                    teacher_prompt_entropy_mean_cpu=(
-                        targets.teacher_prompt_entropy_mean_cpu
-                    ),
-                    teacher_prompt_valid_token_count_cpu=(
-                        targets.teacher_prompt_valid_token_count_cpu
-                    ),
+                    input_ids=input_ids,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    temperature=float(self.loss_config.temperature),
+                    alpha=float(self.loss_config.alpha),
+                    top_k=resolved_top_k,
+                    prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
+                    teacher_output_chunk_tokens=int(self.teacher_output_chunk_tokens),
                 )
-                if eakld_metadata_required:
-                    self._record_eakld_telemetry(telemetry)
 
             hidden_loss = None
             pre_mlp_hidden_loss = None

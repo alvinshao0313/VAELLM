@@ -3,7 +3,18 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+import torch
+
 import rotation.model_utils as model_utils
+
+
+def _torch_init_functions():
+    return (
+        torch.nn.init.kaiming_uniform_,
+        torch.nn.init.uniform_,
+        torch.nn.init.normal_,
+    )
 
 
 def test_known_qwen_path_keeps_existing_loader_branch():
@@ -26,6 +37,7 @@ def test_unknown_model_path_uses_auto_causal_lm_fallback():
 
 
 def test_auto_fallback_passes_dtype_and_low_cpu_mem_usage():
+    original_init = _torch_init_functions()
     captured = {}
 
     def fake_from_pretrained(name, **kwargs):
@@ -49,6 +61,37 @@ def test_auto_fallback_passes_dtype_and_low_cpu_mem_usage():
     assert captured["kwargs"]["trust_remote_code"] is False
     assert captured["kwargs"]["token"] == "abc"
     assert model.seqlen == 4096
+    assert _torch_init_functions() == original_init
+
+
+def test_auto_fallback_restores_torch_initializers_after_load_error():
+    original_init = _torch_init_functions()
+    with patch.object(
+        model_utils.transformers.AutoModelForCausalLM,
+        "from_pretrained",
+        side_effect=RuntimeError("load failed"),
+    ):
+        with pytest.raises(RuntimeError, match="load failed"):
+            model_utils.get_auto_causal_lm("org/Broken", hf_token=None)
+    assert _torch_init_functions() == original_init
+
+
+def test_loader_scope_does_not_poison_later_linear_initialization():
+    model = MagicMock()
+    model.config = SimpleNamespace(max_position_embeddings=32, model_type="x")
+    model.__class__.__name__ = "X"
+    with patch.object(
+        model_utils.transformers.AutoModelForCausalLM,
+        "from_pretrained",
+        return_value=model,
+    ):
+        model_utils.get_auto_causal_lm("org/X", hf_token=None)
+
+    torch.manual_seed(123)
+    linear = torch.nn.Linear(8, 8)
+    assert bool(torch.isfinite(linear.weight).all())
+    assert bool(torch.isfinite(linear.bias).all())
+    assert int(torch.count_nonzero(linear.weight)) > 0
 
 
 def test_auto_fallback_sets_seqlen_from_config():

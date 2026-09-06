@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -9,7 +10,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from e2e_common.peft_proxy import PeftVAELinearProxy
 from litebsq.misc import set_module_by_name
 from litebsq.sparse_residual import (
     SPARSE_RESIDUAL_FORMAT_BLOCKED_QUANTIZED,
@@ -24,40 +24,79 @@ from litebsq.vae_linear_prewarm import (
 )
 from train_utils.activation_utils import collect_activation_stats_for_linears
 from train_utils.cat_data_prep import compute_channel_rank_score, select_outlier_channel_indices_from_scores
-from train_utils.cat_train_args import ResolvedCategoryRuntimeConfig
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.cat_train_runtime import normalize_cat_runtime_vae_original_state
+from train_utils.cat_train_runtime import build_cat_run_output_dir as _build_run_output_dir
 from train_utils.base_reference import (
     clone_frozen_linear_from_reference,
     get_reference_module,
     load_frozen_base_reference_model,
 )
 from train_utils.cat_train_pipeline import (
+    _apply_stage_norm,
+    _build_block_data_loaders,
+    _compute_stage_norm_stats,
+    _fuse_norm_into_decoder,
+    _fuse_q_scale_into_decoder,
     _resolve_train_dtype,
-    _train_protected_residual_vae_payload,
-    _train_shared_protected_residual_vae_payloads,
+    _restore_stage_norm,
 )
 from train_utils.cat_train_residual_protection import (
     RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX,
     RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN,
     build_sparse_residual_payload,
 )
-from train_utils.model_checkpoint_io import (
+from train_utils.checkpoint_v6 import (
     META_FILENAME,
-    _build_run_output_dir,
-    get_shared_protected_residual_decoder_registry,
-    load_model_checkpoint,
-    register_shared_protected_residual_decoder,
-    resolve_checkpoint_dir,
-    save_model_checkpoint,
+    resolve_v6_checkpoint_dir,
+    save_v6_full_checkpoint,
 )
-from train_utils.train_args import _parse_bool_like
+from train_utils.shared_protected_residual import (
+    get_shared_protected_residual_decoder_registry,
+    register_shared_protected_residual_decoder,
+)
+from train_utils.v6_model_loader import load_v6_model_checkpoint
+from train_utils.train_args import _parse_bool_like, create_optimizer
 from train_utils.utils import (
+    clone_namespace as _clone_namespace,
     configure_deterministic_mode,
     get_logger,
     set_seed,
     split_csv,
 )
+from litebsq.vae_args import apply_autoencoder_arch_defaults
+
+
+@dataclass(frozen=True)
+class _ResidualVAERuntimeConfig:
+    category: str
+    residual_stages: int
+    steps: int
+    intra_part_sort_mode: str
+    codebook_bits: int
+    codebook_dim: int
+    outlier_protect_count: int
+    outlier_residual_top_p: float
+    outlier_residual_vae_stages: int
+    outlier_residual_vae_codebook_bits: int
+    outlier_residual_vae_codebook_dim: int
+    recon_loss_type: str
+    base_ch: int
+    num_res_blocks: int
+    decoder_base_ch: Optional[int]
+    decoder_num_res_blocks: Optional[int]
+    norm_type: str
+    activation_type: str
+    decoder_type: str
+
+
+def _safe_shared_decoder_ref(value: str) -> str:
+    text = str(value).strip()
+    chars = [ch if (ch.isalnum() or ch == "_") else "_" for ch in text]
+    out = "".join(chars).strip("_")
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out or "shared_protected_residual_decoder"
 
 
 _SPARSE_METRICS = {
@@ -523,11 +562,7 @@ def _iter_runtime_vae_targets(model: nn.Module) -> List[_RuntimeVAETarget]:
     for name, module in model.named_modules():
         if any(name == prefix or name.startswith(f"{prefix}.") for prefix in skip_prefixes):
             continue
-        if isinstance(module, PeftVAELinearProxy):
-            skip_prefixes.append(f"{name}.base_layer")
-            skip_prefixes.append(f"{name}.per_decoded_linear")
-            base_layer = module.base_layer
-        elif isinstance(module, VAELinear):
+        if isinstance(module, VAELinear):
             base_layer = module
         else:
             continue
@@ -600,16 +635,16 @@ def _apply_residual_from_base_residency(
                 vae_module = residency.stashed_vae_modules.pop(name)
                 set_module_by_name(model, name, vae_module)
                 module = vae_module
-            if not isinstance(module, (VAELinear, PeftVAELinearProxy)):
+            if not isinstance(module, VAELinear):
                 raise TypeError(f"{name}: expected active VAELinear, got {type(module)}.")
-            base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+            base_layer = module
             base_layer.clear_decoded_weight_cache()
             module.to(device)
             prewarm_targets.append(NamedVAELinearTarget(name=name, base_layer=base_layer))
             active_vae += 1
         else:
-            if isinstance(module, (VAELinear, PeftVAELinearProxy)):
-                base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+            if isinstance(module, VAELinear):
+                base_layer = module
                 base_layer.clear_decoded_weight_cache()
                 module.to("cpu")
                 residency.stashed_vae_modules[name] = module
@@ -655,7 +690,7 @@ def _restore_all_residual_from_base_vae(
 ) -> None:
     restored = 0
     for name, module in list(residency.stashed_vae_modules.items()):
-        base_layer = module.base_layer if isinstance(module, PeftVAELinearProxy) else module
+        base_layer = module
         base_layer.clear_decoded_weight_cache()
         set_module_by_name(model, name, module)
         del residency.stashed_vae_modules[name]
@@ -904,9 +939,9 @@ def _select_channel_plan(
     plan, selection_stats = select_outlier_channel_indices_from_scores(
         scores_by_name=scores_by_name,
         linear_names=[target.name for target in targets],
-        outlier_protect_count=int(args.outlier_protect_count),
-        outlier_protect_min_per_layer=int(args.outlier_protect_min_per_layer),
-        outlier_channel_scope=str(args.outlier_channel_scope),
+        channel_protect_count=int(args.outlier_protect_count),
+        channel_min_per_layer=int(args.outlier_protect_min_per_layer),
+        channel_scope=str(args.outlier_channel_scope),
     )
 
     score_values = torch.cat([score.reshape(-1).to(dtype=torch.float32) for score in scores_by_name.values()])
@@ -922,7 +957,7 @@ def _select_channel_plan(
     }
 
 
-def _build_runtime_cfg(category: str, args: argparse.Namespace, *, inferred_codebook_dim: int) -> ResolvedCategoryRuntimeConfig:
+def _build_runtime_cfg(category: str, args: argparse.Namespace, *, inferred_codebook_dim: int) -> _ResidualVAERuntimeConfig:
     codebook_dim = int(args.codebook_dim) if int(args.codebook_dim) > 0 else int(inferred_codebook_dim)
     codebook_bits = int(args.codebook_bits)
     residual_codebook_bits = (
@@ -935,7 +970,7 @@ def _build_runtime_cfg(category: str, args: argparse.Namespace, *, inferred_code
         if int(args.outlier_residual_vae_codebook_dim) > 0
         else int(codebook_dim)
     )
-    return ResolvedCategoryRuntimeConfig(
+    return _ResidualVAERuntimeConfig(
         category=str(category),
         residual_stages=1,
         steps=int(args.outlier_residual_vae_steps or 1),
@@ -999,6 +1034,288 @@ def _install_sparse_residual_payload(module: VAELinear, payload: Optional[Dict[s
     for key, value in payload.items():
         setattr(module, key, value)
     module.clear_decoded_weight_cache()
+
+
+def _train_protected_residual_vae_payload(
+    *,
+    linear_name: str,
+    residual_slice: torch.Tensor,
+    runtime_cfg: _ResidualVAERuntimeConfig,
+    vae_args,
+    training_args,
+    train_device: str,
+    train_dtype: torch.dtype,
+    batch_size: int,
+    steps: int,
+    lr: float,
+    log_every: int,
+    deterministic: bool,
+    shuffle_seed: int,
+) -> Optional[Dict[str, object]]:
+    from litebsq.llm_vae import MultiLayerVAE
+
+    protected_steps = int(steps)
+    if protected_steps <= 0:
+        return None
+    protected_lr = float(lr)
+    if protected_lr <= 0.0:
+        raise ValueError(f"{linear_name}: protected residual VAE lr must be > 0, got {protected_lr}.")
+    recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
+    codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
+    stages = int(runtime_cfg.outlier_residual_vae_stages)
+    residual = residual_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if residual.ndim != 2:
+        raise ValueError(f"{linear_name}: protected residual slice must be 2D, got shape={tuple(residual.shape)}.")
+    if int(residual.numel()) == 0:
+        return None
+    if int(residual.numel()) % codebook_dim != 0:
+        raise ValueError(
+            f"{linear_name}: protected residual numel={int(residual.numel())} is not divisible by "
+            f"codebook_dim={codebook_dim}."
+        )
+
+    current = residual.view(-1, 1, codebook_dim).contiguous()
+    initial_rms = float(current.float().pow(2).mean().sqrt().item())
+    stage_bits: List[torch.Tensor] = []
+    stage_decoders: List[nn.Module] = []
+    stage_codebook_dims: List[int] = []
+    last_loss = None
+    last_recon = None
+    last_commit = None
+    shared_stage_args = _clone_namespace(
+        vae_args,
+        parallel_layers=1,
+        residual_stages=int(stages),
+        codebook_bits=int(runtime_cfg.outlier_residual_vae_codebook_bits),
+        codebook_dim=int(codebook_dim),
+        base_ch=int(runtime_cfg.base_ch),
+        num_res_blocks=int(runtime_cfg.num_res_blocks),
+        norm_type=str(runtime_cfg.norm_type),
+        activation_type=str(runtime_cfg.activation_type),
+        decoder_type=str(runtime_cfg.decoder_type),
+        decoder_base_ch=(
+            None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch)
+        ),
+        decoder_num_res_blocks=(
+            None if runtime_cfg.decoder_num_res_blocks is None else int(runtime_cfg.decoder_num_res_blocks)
+        ),
+        recon_loss_type=recon_loss,
+    )
+    apply_autoencoder_arch_defaults(shared_stage_args)
+    use_stage_norm = bool(getattr(shared_stage_args, "normalize_weight", False))
+
+    for stage_idx in range(stages):
+        stage_tag = f"{linear_name}/protected_residual_stage{stage_idx + 1}"
+        residual_data = current.detach().clone().contiguous()
+        if use_stage_norm:
+            stage_norm_mean, stage_norm_scale = _compute_stage_norm_stats(residual_data)
+            stage_train_data = _apply_stage_norm(residual_data, mean=stage_norm_mean, scale=stage_norm_scale)
+        else:
+            stage_norm_mean = None
+            stage_norm_scale = None
+            stage_train_data = residual_data
+
+        effective_batch_size = min(max(1, int(batch_size)), int(stage_train_data.shape[0]))
+        train_loader, eval_loader = _build_block_data_loaders(
+            stage_train_data,
+            batch_size=int(effective_batch_size),
+            shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
+        )
+        vae = MultiLayerVAE(shared_stage_args).to(train_device)
+        optimizer = create_optimizer(vae.parameters(), shared_stage_args, protected_lr)
+        lr_scheduler = None
+        lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "constant")).strip().lower()
+        if lr_scheduler_name != "constant":
+            import transformers
+
+            lr_scheduler = transformers.get_scheduler(
+                lr_scheduler_name,
+                optimizer,
+                num_warmup_steps=int(getattr(shared_stage_args, "lr_warmup_steps", 0)),
+                num_training_steps=int(protected_steps),
+            )
+        start = time.time()
+        train_iter = iter(train_loader)
+        vae.train()
+        for step in range(int(protected_steps)):
+            try:
+                x_cpu, _idx = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                x_cpu, _idx = next(train_iter)
+            x = x_cpu.to(device=train_device, dtype=train_dtype, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            _x_recon, loss_dict = vae(x, is_train=True)
+            loss = loss_dict["loss"]
+            loss.backward()
+            optimizer.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+            last_loss = float(loss.detach().float().item())
+            recon_value = loss_dict.get("train/recon_loss")
+            if isinstance(recon_value, torch.Tensor):
+                last_recon = float(recon_value.detach().float().item())
+            commit_value = loss_dict.get("train/commitment_loss")
+            if isinstance(commit_value, torch.Tensor):
+                last_commit = float(commit_value.detach().float().item())
+            if log_every > 0 and (step + 1) % int(log_every) == 0:
+                speed = (time.time() - start) / int(log_every)
+                log.info(
+                    "[%s] step=%d/%d loss=%.4e speed=%.4fs/it",
+                    stage_tag,
+                    step + 1,
+                    int(protected_steps),
+                    float(loss.detach().float().item()),
+                    speed,
+                )
+                start = time.time()
+
+        # 训完立刻释放 Adam 状态，降低随后全量重构的显存尖峰。
+        del optimizer
+        optimizer = None
+        if lr_scheduler is not None:
+            del lr_scheduler
+            lr_scheduler = None
+        torch.cuda.empty_cache()
+
+        vae.eval()
+        recon_chunks: List[torch.Tensor] = []
+        bit_chunks: List[torch.Tensor] = []
+        with torch.no_grad():
+            for x_cpu, _idx in eval_loader:
+                x = x_cpu.to(device=train_device, dtype=train_dtype, non_blocking=True)
+                x_recon, bit_idx = vae(x, is_train=False)
+                recon_chunks.append(x_recon.detach().to(device="cpu", dtype=stage_train_data.dtype))
+                bit_chunks.append(bit_idx.detach().to(device="cpu"))
+        stage_recon_norm = torch.cat(recon_chunks, dim=0)
+        stage_recon = (
+            _restore_stage_norm(stage_recon_norm, mean=stage_norm_mean, scale=stage_norm_scale)
+            if stage_norm_mean is not None and stage_norm_scale is not None
+            else stage_recon_norm
+        )
+        current = (current - stage_recon.to(dtype=current.dtype)).contiguous()
+        stage_bits.append(torch.cat(bit_chunks, dim=0).contiguous())
+        stage_codebook_dims.append(int(codebook_dim))
+
+        decoder_in_dim = int(getattr(vae.model.decoder, "in_dim"))
+        use_new_quant = bool(getattr(shared_stage_args, "new_quant", False))
+        quant_q_scale = (1.0 / math.sqrt(decoder_in_dim)) if use_new_quant else 1.0
+        dec = vae.model.decoder.get_sub_decoder(0)
+        _fuse_q_scale_into_decoder(dec, q_scale=float(quant_q_scale))
+        if use_stage_norm:
+            if stage_norm_mean is None or stage_norm_scale is None:
+                raise RuntimeError(f"{stage_tag}: stage norm stats missing while normalize_weight=True")
+            _fuse_norm_into_decoder(
+                dec,
+                mean=float(stage_norm_mean[0].item()),
+                std=float(stage_norm_scale[0].item()),
+            )
+        dec.to("cpu")
+        stage_decoders.append(dec)
+        del vae, train_loader, eval_loader
+        torch.cuda.empty_cache()
+
+    return {
+        "stage_vq_weights": stage_bits,
+        "stage_decoders": stage_decoders,
+        "stage_codebook_dims": stage_codebook_dims,
+        "metrics": {
+            "protected_residual_rms_before": float(initial_rms),
+            "protected_residual_rms_after": float(current.float().pow(2).mean().sqrt().item()),
+            "residual_vae_final_loss": last_loss,
+            "residual_vae_final_recon": last_recon,
+            "residual_vae_final_commit": last_commit,
+        },
+    }
+
+
+def _train_shared_protected_residual_vae_payloads(
+    *,
+    group_tag: str,
+    residual_slices_by_name: Dict[str, torch.Tensor],
+    runtime_cfg: _ResidualVAERuntimeConfig,
+    vae_args,
+    training_args,
+    train_device: str,
+    train_dtype: torch.dtype,
+    batch_size: int,
+    steps: int,
+    lr: float,
+    log_every: int,
+    deterministic: bool,
+    shuffle_seed: int,
+) -> Dict[str, Dict[str, object]]:
+    if not residual_slices_by_name:
+        return {}
+    codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
+    ordered_items = list(residual_slices_by_name.items())
+    block_counts: Dict[str, int] = {}
+    flat_chunks: List[torch.Tensor] = []
+    for linear_name, residual_slice in ordered_items:
+        residual = residual_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if residual.ndim != 2:
+            raise ValueError(f"{linear_name}: protected residual slice must be 2D, got shape={tuple(residual.shape)}.")
+        if int(residual.numel()) == 0:
+            continue
+        if int(residual.numel()) % codebook_dim != 0:
+            raise ValueError(
+                f"{linear_name}: protected residual numel={int(residual.numel())} is not divisible by "
+                f"codebook_dim={codebook_dim}."
+            )
+        blocks = int(residual.numel()) // int(codebook_dim)
+        block_counts[linear_name] = blocks
+        flat_chunks.append(residual.view(blocks, codebook_dim))
+    if not flat_chunks:
+        return {}
+
+    combined = torch.cat(flat_chunks, dim=0).contiguous()
+    shared_payload = _train_protected_residual_vae_payload(
+        linear_name=f"{group_tag}/shared_protected_residual",
+        residual_slice=combined,
+        runtime_cfg=runtime_cfg,
+        vae_args=vae_args,
+        training_args=training_args,
+        train_device=train_device,
+        train_dtype=train_dtype,
+        batch_size=batch_size,
+        steps=int(steps),
+        lr=float(lr),
+        log_every=log_every,
+        deterministic=deterministic,
+        shuffle_seed=shuffle_seed,
+    )
+    if shared_payload is None:
+        return {}
+
+    stage_bits_all = shared_payload["stage_vq_weights"]
+    shared_stage_decoders = shared_payload["stage_decoders"]
+    stage_codebook_dims = shared_payload["stage_codebook_dims"]
+    refs = [
+        _safe_shared_decoder_ref(f"{group_tag}.protected_residual.stage{stage_idx}")
+        for stage_idx in range(len(shared_stage_decoders))
+    ]
+
+    out: Dict[str, Dict[str, object]] = {}
+    offset = 0
+    for linear_name, _residual_slice in ordered_items:
+        blocks = int(block_counts.get(linear_name, 0))
+        if blocks <= 0:
+            continue
+        per_linear_stage_bits = [
+            stage_bits[offset: offset + blocks].contiguous()
+            for stage_bits in stage_bits_all
+        ]
+        offset += blocks
+        out[linear_name] = {
+            "stage_vq_weights": per_linear_stage_bits,
+            "shared_decoder_refs": list(refs),
+            "shared_stage_decoders": shared_stage_decoders,
+            "stage_codebook_dims": stage_codebook_dims,
+            "metrics": shared_payload.get("metrics"),
+        }
+    return out
+
+
 
 
 def _process_channel_residual_vae_category(
@@ -1301,7 +1618,7 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
     if not run_any_eval:
         logger.info("跳过 residual-from-base 评估：--eval_ppl=false 且 --eval_tasks 为空。")
 
-    checkpoint_dir = resolve_checkpoint_dir(str(args.base_vae_checkpoint))
+    checkpoint_dir = resolve_v6_checkpoint_dir(str(args.base_vae_checkpoint))
     planned_checkpoint_out = os.path.join(args.output_dir, "checkpoint")
     if os.path.abspath(planned_checkpoint_out) == os.path.abspath(checkpoint_dir):
         raise ValueError(
@@ -1312,13 +1629,12 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
     with open(meta_path, "r", encoding="utf-8") as handle:
         base_meta = json.load(handle)
 
-    model, load_meta, load_result = load_model_checkpoint(
+    model, load_meta, load_result = load_v6_model_checkpoint(
         checkpoint_dir,
         access_token=args.access_token,
         base_model_path=str(args.model_path),
         map_location="cpu",
         strict=True,
-        preserve_original_weights_from_base=False,
     )
     stripped = normalize_cat_runtime_vae_original_state(model)
     reference_model = load_frozen_base_reference_model(
@@ -1518,9 +1834,23 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
         torch.cuda.empty_cache()
 
     _restore_all_residual_from_base_vae(model=model, residency=residency, logger=logger)
-    save_paths = save_model_checkpoint(
+    compressed_targets = tuple(
+        sorted(name for name, module in model.named_modules() if isinstance(module, VAELinear))
+    )
+    save_paths = save_v6_full_checkpoint(
         model,
         planned_checkpoint_out,
+        checkpoint_kind="final_model",
+        compressed_targets=compressed_targets,
+        pending_dense_targets=tuple(load_meta.get("pending_dense_targets") or ()),
+        skip_targets=tuple(load_meta.get("skip_targets") or ()),
+        legacy_original_only_sources=tuple(load_meta.get("legacy_original_only_sources") or ()),
+        train_mode="none",
+        lora_config=None,
+        completed_categories=tuple(load_meta.get("completed_categories") or ()),
+        compression_categories=tuple(load_meta.get("compression_categories") or ()),
+        target_layers=load_meta.get("target_layers"),
+        target_modules=tuple(load_meta.get("target_modules") or ()),
         base_model_path=str(args.model_path),
         tokenizer=None,
         save_config=True,
@@ -1529,7 +1859,6 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
             "source_base_vae_checkpoint": os.path.abspath(checkpoint_dir),
             "source_base_checkpoint_created_at_utc": base_meta.get("created_at_utc"),
         },
-        unload_vae_original_weights=False,
     )
 
     train_time_sec = float(time.time() - run_start)

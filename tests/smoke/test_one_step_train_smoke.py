@@ -17,10 +17,8 @@ from torch import nn
 from compressed_e2e_fintuning.trainer import VAEDecoderE2ETrainer
 from litebsq.autoencoder import MultiLayerVAE
 from litebsq.vae_args import apply_autoencoder_arch_defaults
-from train_utils.cat_train_args import (
-    process_cat_train_args,
-    resolve_category_runtime_configs,
-)
+from train_utils.cat_category_runtime import resolve_category_runtime_configs
+from train_utils.cat_runtime_adapter import parse_cat_runtime_args
 from train_utils.lora_training import (
     CustomSFTTrainer,
     compute_distill_pre_mlp_hidden_alignment_loss,
@@ -29,17 +27,6 @@ from train_utils.lora_training import (
 from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.train_args import TrainingArguments, create_optimizer
 
-
-EAKLD_LOG_KEYS = {
-    "eakld/teacher_entropy_mean",
-    "eakld/gamma_reverse_mean",
-    "eakld/lambda_forward_mean",
-    "eakld/gamma_reverse_zero_fraction",
-    "eakld/gamma_reverse_one_fraction",
-    "eakld/forward_kl_mean",
-    "eakld/reverse_kl_mean",
-    "eakld/total_mean",
-}
 
 class _TinyBlock(nn.Module):
     def __init__(self, hidden_size: int) -> None:
@@ -230,12 +217,11 @@ def _build_e2e_trainer(
     trainer = VAEDecoderE2ETrainer(
         model=student,
         args=args,
-        loss_type="eakld",
+        loss_type="kl",
         teacher_model=teacher,
         distill_temperature=1.0,
         hidden_loss_weight=0.0,
         prompt_kd_weight=float(prompt_kd_weight),
-        eakld_confidence_k=16,
         hidden_layer_weighting="uniform",
         teacher_output_offload=teacher_output_offload,
         teacher_output_pin_memory=False,
@@ -243,21 +229,6 @@ def _build_e2e_trainer(
     )
     trainer._teacher_device = torch.device("cpu")
     return trainer, student, teacher
-
-
-def _assert_eakld_telemetry_logs(logs: dict) -> None:
-    assert set(EAKLD_LOG_KEYS).issubset(set(logs))
-    gamma = float(logs["eakld/gamma_reverse_mean"])
-    lam = float(logs["eakld/lambda_forward_mean"])
-    assert abs(gamma + lam - 1.0) < 1e-5
-    for key in (
-        "eakld/teacher_entropy_mean",
-        "eakld/forward_kl_mean",
-        "eakld/reverse_kl_mean",
-        "eakld/total_mean",
-    ):
-        assert abs(float(logs[key])) < float("inf")
-        assert float(logs[key]) == float(logs[key])  # not NaN
 
 
 @pytest.fixture(autouse=True)
@@ -268,8 +239,8 @@ def _patch_tiny_get_layers(monkeypatch):
     )
 
 
-def test_dense_eakld_one_step_trainer_smoke(tmp_path) -> None:
-    """Step 1: dense EAKLD path through real VAEDecoderE2ETrainer."""
+def test_dense_kl_one_step_trainer_smoke(tmp_path) -> None:
+    """Step 1: dense KL path through real VAEDecoderE2ETrainer."""
     trainer, student, _teacher = _build_e2e_trainer(
         tmp_path,
         teacher_output_offload="none",
@@ -292,31 +263,9 @@ def test_dense_eakld_one_step_trainer_smoke(tmp_path) -> None:
     assert not torch.equal(student.lm_head.weight.detach(), before)
     assert trainer._active_teacher_targets is None
 
-    # telemetry was recorded during compute_loss; flush via log()
-    logs: dict = {}
-    trainer.log(logs)
-    _assert_eakld_telemetry_logs(logs)
 
-
-def test_cpu_offload_eakld_one_step_trainer_smoke(tmp_path, monkeypatch) -> None:
-    """Step 2: CPU teacher-output-offload EAKLD one-step."""
-    entropy_calls = {"n": 0}
-    original_entropy = (
-        __import__(
-            "compressed_e2e_fintuning.trainer",
-            fromlist=["compute_teacher_entropy_mean_and_gamma"],
-        ).compute_teacher_entropy_mean_and_gamma
-    )
-
-    def counting_entropy(*args, **kwargs):
-        entropy_calls["n"] += 1
-        return original_entropy(*args, **kwargs)
-
-    monkeypatch.setattr(
-        "compressed_e2e_fintuning.trainer.compute_teacher_entropy_mean_and_gamma",
-        counting_entropy,
-    )
-
+def test_cpu_offload_kl_one_step_trainer_smoke(tmp_path) -> None:
+    """Step 2: CPU teacher-output-offload KL one-step."""
     trainer, student, _teacher = _build_e2e_trainer(
         tmp_path,
         teacher_output_offload="cpu",
@@ -339,14 +288,6 @@ def test_cpu_offload_eakld_one_step_trainer_smoke(tmp_path, monkeypatch) -> None
 
     assert not torch.equal(student.lm_head.weight.detach(), before)
     assert trainer._active_teacher_targets is None
-    # Entropy/gamma computed twice when building CPU targets (response + prompt
-    # regions) for positive prompt weight — not recomputed via a second
-    # full-vocab softmax during the offloaded loss path.
-    assert entropy_calls["n"] == 2
-
-    logs: dict = {}
-    trainer.log(logs)
-    _assert_eakld_telemetry_logs(logs)
 
 
 def _build_pre_mlp_trainer(
@@ -368,8 +309,10 @@ def _build_pre_mlp_trainer(
     trainer.hidden_alignment_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
         hidden_alignment_layer_weighting
     )
-    trainer.eakld_confidence_k = 16
     trainer.teacher_logits_cpu_staging = False
+    trainer.selective_student_topk = False
+    trainer.selective_student_topk_chunk_rows = 32
+    trainer.selective_teacher_topk_chunk_tokens = 8
     trainer.teacher_runtime = _StaticTeacherRuntime(teacher)
     trainer.distill_hif4_act_controller = None
     trainer.teacher_param_snapshots = []
@@ -466,13 +409,17 @@ def _tiny_vae_args() -> SimpleNamespace:
 
 def test_vae_mse_one_step_smoke() -> None:
     """Step 4: VAE one-step with recon_loss_type=mse and BSQ."""
-    cat_args, _hf, _training, vae_args = process_cat_train_args(
+    cat_args, _hf, _training, vae_args = parse_cat_runtime_args(
         [
+            "--model_path",
+            "toy-model",
+            "--compression_categories",
+            "q_proj",
             "--recon_loss_type",
             "default=mse",
             "--quantizer_type",
             "BSQ",
-            "--steps_per_category",
+            "--vae_steps",
             "default=1",
         ]
     )

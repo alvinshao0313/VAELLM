@@ -283,7 +283,7 @@ def _build_e2e_trainer(
     *,
     teacher_output_offload,
     prompt_kd_weight=0.0,
-    loss_type="eakld",
+    loss_type="kl",
 ):
     teacher = _TinyCausalLM()
     student = _TinyCausalLM()
@@ -311,7 +311,6 @@ def _build_e2e_trainer(
         distill_temperature=1.0,
         hidden_loss_weight=0.0,
         prompt_kd_weight=float(prompt_kd_weight),
-        eakld_confidence_k=16,
         hidden_layer_weighting="uniform",
         teacher_output_offload=teacher_output_offload,
         teacher_output_pin_memory=False,

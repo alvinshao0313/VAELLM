@@ -497,6 +497,11 @@ def decode_named_vae_linear_weights(
                         compute_device=requested_compute_device,
                     )
                 except Exception as exc:
+                    from train_utils.decoder_execution import is_retryable_decode_capacity_error
+
+                    # Capacity/OOM must remain retryable by the group-size fallback helper.
+                    if is_retryable_decode_capacity_error(exc):
+                        raise
                     raise RuntimeError(
                         f"Grouped VAELinear decode failed for category={category}, chunk_index={category_chunk_index}, "
                         f"chunk_linears={len(chunk)}, parts_per_linear={int(chunk[0].base_layer.parallel_parts)}: {exc}"
@@ -601,8 +606,17 @@ def prime_named_vae_linear_cache(
         for target in normalized_targets:
             target.base_layer.clear_decoded_weight_cache()
     try:
+        cache_targets = [
+            NamedVAELinearDecodeTarget(
+                name=str(target.name),
+                base_layer=target.base_layer,
+                target_dtype=dtype,
+                include_low_rank=False,
+            )
+            for target in normalized_targets
+        ]
         decoded_results = decode_named_vae_linear_weights(
-            normalized_targets,
+            cache_targets,
             dtype=dtype,
             group_size=group_size,
             compute_device=compute_device,
@@ -610,6 +624,10 @@ def prime_named_vae_linear_cache(
             respect_cache_policy=True,
         )
     except Exception as exc:
+        from train_utils.decoder_execution import is_retryable_decode_capacity_error
+
+        if is_retryable_decode_capacity_error(exc):
+            raise
         raise RuntimeError(f"VAELinear prewarm failed: {exc}") from exc
     for result in decoded_results:
         result.base_layer._cached_weight = result.decoded_weight

@@ -51,12 +51,46 @@ class DummyTokenizer:
 
 
 class ContentTokenizer(DummyTokenizer):
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        del tokenize
-        parts = [str(message.get("content", "")) for message in messages]
+    # Non-empty sentinel so render_messages allows apply_chat_template fallback path.
+    chat_template = "content-join"
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        return_dict=False,
+        return_assistant_tokens_mask=False,
+        **_kwargs,
+    ):
+        parts = []
+        ids = []
+        mask = []
+        for message in messages:
+            role = str(message.get("role", ""))
+            content = str(message.get("content", ""))
+            role_text = f"<|{role}|>"
+            parts.append(f"{role_text} {content}")
+            role_ids = self._encode(role_text)
+            content_ids = self._encode(content)
+            ids.extend(role_ids)
+            ids.extend(content_ids)
+            mask.extend([False] * len(role_ids))
+            mask.extend([role == "assistant"] * len(content_ids))
         if add_generation_prompt:
-            parts.append("assistant")
-        return " ".join(parts)
+            parts.append("<|assistant|>")
+            prompt_ids = self._encode("<|assistant|>")
+            ids.extend(prompt_ids)
+            mask.extend([False] * len(prompt_ids))
+        text = "\n".join(parts)
+        if not tokenize:
+            return text
+        if return_assistant_tokens_mask:
+            # Unsupported in this stub: force distill_data prefix-boundary fallback.
+            raise TypeError("assistant mask unsupported")
+        if return_dict:
+            return {"input_ids": ids}
+        return ids
 
     @staticmethod
     def _encode(text):
@@ -142,14 +176,14 @@ class DatasetMixArgsTest(unittest.TestCase):
                 self._checkpoint_dir(),
                 "--dataset_mix",
                 "openorca=3,fineweb_edu=1",
-                "--max_steps",
+                "--steps",
                 "10",
             ]
         )
-        self.assertEqual(e2e_args.dataset_mix_sources, ["openorca", "fineweb_edu"])
-        self.assertEqual(len(e2e_args.dataset_mix_weights), 2)
-        self.assertAlmostEqual(sum(e2e_args.dataset_mix_weights), 1.0)
-        self.assertEqual(e2e_args.dataset_mix_spec, "openorca=0.75,fineweb_edu=0.25")
+        self.assertEqual(e2e_args.data.dataset_mix_sources, ("openorca", "fineweb_edu"))
+        self.assertEqual(len(e2e_args.data.dataset_mix_weights), 2)
+        self.assertAlmostEqual(sum(e2e_args.data.dataset_mix_weights), 1.0)
+        self.assertEqual(e2e_args.data.dataset_mix, "openorca=0.75,fineweb_edu=0.25")
         self.assertEqual(training_args.max_steps, 10)
 
     def test_parse_args_decoder_lr_defaults_to_none_and_accepts_override(self):
@@ -159,11 +193,11 @@ class DatasetMixArgsTest(unittest.TestCase):
                 self._checkpoint_dir(),
                 "--dataset_mix",
                 "openorca=1",
-                "--max_steps",
+                "--steps",
                 "10",
             ]
         )
-        self.assertIsNone(default_args.decoder_lr)
+        self.assertIsNone(default_args.opt.decoder_lr)
 
         explicit_args, _hf_args, _training_args = parse_args(
             [
@@ -173,26 +207,11 @@ class DatasetMixArgsTest(unittest.TestCase):
                 "openorca=1",
                 "--decoder_lr",
                 "2e-4",
-                "--max_steps",
+                "--steps",
                 "10",
             ]
         )
-        self.assertAlmostEqual(explicit_args.decoder_lr, 2e-4)
-
-    def test_parse_args_rejects_nonpositive_decoder_lr_for_decoder_mode(self):
-        with self.assertRaises(SystemExit):
-            parse_args(
-                [
-                    "--student_checkpoint_dir",
-                    self._checkpoint_dir(),
-                    "--dataset_mix",
-                    "openorca=1",
-                    "--decoder_lr",
-                    "0",
-                    "--max_steps",
-                    "10",
-                ]
-            )
+        self.assertAlmostEqual(explicit_args.opt.decoder_lr, 2e-4)
 
     def test_parse_args_rejects_duplicate_alias(self):
         with self.assertRaises(SystemExit):
@@ -202,25 +221,25 @@ class DatasetMixArgsTest(unittest.TestCase):
                     self._checkpoint_dir(),
                     "--dataset_mix",
                     "openorca=1,openorca=1",
-                    "--max_steps",
+                    "--steps",
                     "10",
                 ]
             )
 
-    def test_parse_args_rejects_explicit_single_source_args(self):
-        with self.assertRaises(SystemExit):
-            parse_args(
-                [
-                    "--student_checkpoint_dir",
-                    self._checkpoint_dir(),
-                    "--dataset_mix",
-                    "openorca=1",
-                    "--text_field",
-                    "text",
-                    "--max_steps",
-                    "10",
-                ]
-            )
+    def test_parse_args_accepts_shared_text_field_with_dataset_mix(self):
+        e2e_args, _hf_args, _training_args = parse_args(
+            [
+                "--student_checkpoint_dir",
+                self._checkpoint_dir(),
+                "--dataset_mix",
+                "openorca=1",
+                "--text_field",
+                "text",
+                "--steps",
+                "10",
+            ]
+        )
+        self.assertEqual(e2e_args.data.text_field, "text")
 
     def test_parse_args_accepts_long_dataset_aliases(self):
         e2e_args, _hf_args, _training_args = parse_args(
@@ -229,12 +248,12 @@ class DatasetMixArgsTest(unittest.TestCase):
                 self._checkpoint_dir(),
                 "--dataset_mix",
                 "longalpaca=2,longalign=1",
-                "--max_steps",
+                "--steps",
                 "10",
             ]
         )
-        self.assertEqual(e2e_args.dataset_mix_sources, ["longalpaca", "longalign"])
-        self.assertEqual(e2e_args.dataset_mix_spec, "longalpaca=0.666666666667,longalign=0.333333333333")
+        self.assertEqual(e2e_args.data.dataset_mix_sources, ("longalpaca", "longalign"))
+        self.assertEqual(e2e_args.data.dataset_mix, "longalpaca=0.666666666667,longalign=0.333333333333")
 
     def test_parse_args_accepts_parallel_mode_dp(self):
         e2e_args, _hf_args, _training_args = parse_args(
@@ -247,11 +266,11 @@ class DatasetMixArgsTest(unittest.TestCase):
                 "dp",
                 "--offload_mode",
                 "none",
-                "--max_steps",
+                "--steps",
                 "10",
             ]
         )
-        self.assertEqual(e2e_args.parallel_mode, "dp")
+        self.assertEqual(e2e_args.runtime.parallel_mode, "dp")
 
     def test_parse_args_accepts_pre_mlp_and_teacher_model_offload(self):
         e2e_args, _hf_args, _training_args = parse_args(
@@ -260,19 +279,19 @@ class DatasetMixArgsTest(unittest.TestCase):
                 self._checkpoint_dir(),
                 "--dataset_mix",
                 "openorca=1",
-                "--distill_pre_mlp_hidden_loss_weight",
+                "--pre_mlp_hidden_loss_weight",
                 "0.01",
                 "--teacher_output_offload",
                 "cpu",
-                "--distill_teacher_model_offload",
+                "--teacher_model_offload",
                 "cpu",
-                "--max_steps",
+                "--steps",
                 "10",
             ]
         )
-        self.assertEqual(e2e_args.pre_mlp_hidden_loss_weight, 0.01)
-        self.assertEqual(e2e_args.teacher_output_offload, "cpu")
-        self.assertEqual(e2e_args.teacher_model_offload, "cpu")
+        self.assertEqual(e2e_args.loss.pre_mlp_hidden_loss_weight, 0.01)
+        self.assertEqual(e2e_args.runtime.teacher_output_offload, "cpu")
+        self.assertEqual(e2e_args.runtime.teacher_model_offload, "cpu")
 
     def test_parse_args_rejects_negative_pre_mlp_hidden_loss_weight(self):
         with self.assertRaises(SystemExit):
@@ -282,9 +301,9 @@ class DatasetMixArgsTest(unittest.TestCase):
                     self._checkpoint_dir(),
                     "--dataset_mix",
                     "openorca=1",
-                    "--distill_pre_mlp_hidden_loss_weight",
+                    "--pre_mlp_hidden_loss_weight",
                     "-0.01",
-                    "--max_steps",
+                    "--steps",
                     "10",
                 ]
             )
@@ -297,9 +316,9 @@ class DatasetMixArgsTest(unittest.TestCase):
                     self._checkpoint_dir(),
                     "--dataset_mix",
                     "openorca=1",
-                    "--distill_teacher_model_offload",
+                    "--teacher_model_offload",
                     "cpu",
-                    "--max_steps",
+                    "--steps",
                     "10",
                 ]
             )
@@ -315,7 +334,7 @@ class DatasetMixArgsTest(unittest.TestCase):
                         "openorca=1",
                         "--parallel_mode",
                         "layer_mp",
-                        "--max_steps",
+                        "--steps",
                         "10",
                     ]
                 )
@@ -332,7 +351,7 @@ class DatasetMixArgsTest(unittest.TestCase):
                     "dp",
                     "--offload_mode",
                     "streaming",
-                    "--max_steps",
+                    "--steps",
                     "10",
                 ]
             )
@@ -352,7 +371,7 @@ class DatasetMixArgsTest(unittest.TestCase):
                     "steps",
                     "--save_steps",
                     "100",
-                    "--max_steps",
+                    "--steps",
                     "10",
                 ]
             )
@@ -368,11 +387,11 @@ class DatasetMixArgsTest(unittest.TestCase):
                 "steps",
                 "--save_steps",
                 "100",
-                "--max_steps",
+                "--steps",
                 "10",
             ]
         )
-        self.assertEqual(e2e_args.eval_tasks, "boolq,rte")
+        self.assertEqual(e2e_args.runtime.evaluation.eval_tasks, "boolq,rte")
         self.assertEqual(training_args.save_steps, 100)
 
     def test_parse_args_rejects_removed_dataset_cli_flags(self):
@@ -391,23 +410,23 @@ class DatasetMixArgsTest(unittest.TestCase):
                             "openorca=1",
                             flag,
                             value,
-                            "--max_steps",
+                            "--steps",
                             "10",
                         ]
                     )
 
-    def test_parse_args_dynamic_padding_defaults_false(self):
+    def test_parse_args_dynamic_padding_defaults_true(self):
         e2e_args, _hf_args, _training_args = parse_args(
             [
                 "--student_checkpoint_dir",
                 self._checkpoint_dir(),
                 "--dataset_mix",
                 "openorca=1",
-                "--max_steps",
+                "--steps",
                 "1",
             ]
         )
-        self.assertFalse(e2e_args.dynamic_padding)
+        self.assertTrue(e2e_args.data.dynamic_padding)
 
     def test_parse_args_accepts_dynamic_padding_true(self):
         e2e_args, _hf_args, _training_args = parse_args(
@@ -418,14 +437,14 @@ class DatasetMixArgsTest(unittest.TestCase):
                 "openorca=1",
                 "--dynamic_padding",
                 "true",
-                "--max_steps",
+                "--steps",
                 "1",
             ]
         )
-        self.assertTrue(e2e_args.dynamic_padding)
+        self.assertTrue(e2e_args.data.dynamic_padding)
 
 
-class VAEE2EPromptKdWeightArgsTest(unittest.TestCase):
+class VAEE2EPromptLossWeightArgsTest(unittest.TestCase):
     def _parse_with_checkpoint(self, extra_args, *, dataset_mix="openorca=1.0"):
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(f"{tmpdir}/checkpoint_meta.json", "w", encoding="utf-8") as handle:
@@ -436,28 +455,32 @@ class VAEE2EPromptKdWeightArgsTest(unittest.TestCase):
                     tmpdir,
                     "--dataset_mix",
                     dataset_mix,
-                    "--max_steps",
+                    "--steps",
                     "1",
                     *extra_args,
                 ]
             )
         return args
 
-    def test_prompt_kd_weight_defaults_to_zero(self):
+    def test_prompt_loss_weight_defaults_to_zero(self):
         args = self._parse_with_checkpoint([])
-        self.assertEqual(args.prompt_kd_weight, 0.0)
+        self.assertEqual(args.loss.prompt_loss_weight, 0.0)
 
-    def test_prompt_kd_weight_accepts_fractional_value(self):
-        args = self._parse_with_checkpoint(["--prompt_kd_weight", "0.05"])
-        self.assertEqual(args.prompt_kd_weight, 0.05)
+    def test_prompt_loss_weight_accepts_fractional_value(self):
+        args = self._parse_with_checkpoint(["--prompt_loss_weight", "0.05"])
+        self.assertEqual(args.loss.prompt_loss_weight, 0.05)
 
-    def test_prompt_kd_weight_accepts_value_above_one(self):
-        args = self._parse_with_checkpoint(["--prompt_kd_weight", "2.0"])
-        self.assertEqual(args.prompt_kd_weight, 2.0)
+    def test_prompt_loss_weight_accepts_value_above_one(self):
+        args = self._parse_with_checkpoint(["--prompt_loss_weight", "2.0"])
+        self.assertEqual(args.loss.prompt_loss_weight, 2.0)
 
-    def test_prompt_kd_weight_rejects_negative_weight(self):
+    def test_prompt_loss_weight_rejects_negative_weight(self):
         with self.assertRaises(SystemExit):
-            self._parse_with_checkpoint(["--prompt_kd_weight", "-0.01"])
+            self._parse_with_checkpoint(["--prompt_loss_weight", "-0.01"])
+
+    def test_legacy_prompt_kd_weight_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse_with_checkpoint(["--prompt_kd_weight", "0.05"])
 
     def test_mcqa_dataset_task_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -476,7 +499,7 @@ class VAEE2EPromptKdWeightArgsTest(unittest.TestCase):
                     )
 
 
-class VAEE2ECompressedLoraArgsTest(unittest.TestCase):
+class VAEE2EModelLevelLoraArgsTest(unittest.TestCase):
     def _parse_with_checkpoint(self, extra_args):
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(f"{tmpdir}/checkpoint_meta.json", "w", encoding="utf-8") as handle:
@@ -487,85 +510,78 @@ class VAEE2ECompressedLoraArgsTest(unittest.TestCase):
                     tmpdir,
                     "--dataset_mix",
                     "openorca=1.0",
-                    "--max_steps",
+                    "--steps",
                     "1",
                     *extra_args,
                 ]
             )
         return args
 
-    def test_compressed_lora_defaults_plain_lora_config(self):
-        args = self._parse_with_checkpoint(["--finetune_mode", "compressed_lora"])
-        self.assertEqual(args.lora_rank, 12)
-        self.assertEqual(args.lora_alpha, 24.0)
-        self.assertEqual(args.lora_dropout, 0.03)
-        self.assertEqual(args.compressed_lora_scope, "full")
+    def test_lora_mode_defaults_plain_full_space_config(self):
+        args = self._parse_with_checkpoint(["--train_mode", "lora"])
+        self.assertEqual(args.train_mode, "lora")
+        self.assertEqual(args.lora.rank, 12)
+        self.assertEqual(args.lora.alpha, 24.0)
+        self.assertEqual(args.lora.dropout, 0.03)
 
-    def test_compressed_lora_accepts_explicit_lora_config(self):
+    def test_lora_mode_accepts_explicit_structural_config(self):
         args = self._parse_with_checkpoint(
             [
-                "--finetune_mode",
-                "compressed_lora",
+                "--train_mode",
+                "lora",
                 "--lora_rank",
                 "7",
                 "--lora_alpha",
                 "14",
                 "--lora_dropout",
                 "0.1",
-                "--compressed_lora_scope",
-                "compressed_subspace",
             ]
         )
-        self.assertEqual(args.lora_rank, 7)
-        self.assertEqual(args.lora_alpha, 14.0)
-        self.assertEqual(args.lora_dropout, 0.1)
-        self.assertEqual(args.compressed_lora_scope, "compressed_subspace")
+        self.assertEqual(args.lora.rank, 7)
+        self.assertEqual(args.lora.alpha, 14.0)
+        self.assertEqual(args.lora.dropout, 0.1)
+        self.assertTrue(args.lora.rank_explicit)
+        self.assertTrue(args.lora.alpha_explicit)
+        self.assertTrue(args.lora.dropout_explicit)
 
-    def test_decoder_accepts_and_ignores_lora_config(self):
+    def test_decoder_mode_retains_valid_inactive_lora_structure_without_changing_mode(self):
         args = self._parse_with_checkpoint(
             [
-                "--finetune_mode",
+                "--train_mode",
                 "decoder",
                 "--lora_rank",
-                "0",
+                "12",
                 "--lora_alpha",
-                "0",
+                "24",
                 "--lora_dropout",
-                "2.0",
-                "--compressed_lora_scope",
-                "ignored_in_decoder_mode",
+                "0.03",
             ]
         )
-        self.assertEqual(args.finetune_mode, "decoder")
+        self.assertEqual(args.train_mode, "decoder")
+        self.assertEqual(args.lora.rank, 12)
 
-    def test_compressed_lora_rejects_invalid_plain_lora_config(self):
-        invalid_cases = (
+    def test_lora_config_rejects_invalid_structural_values(self):
+        for flag, value in (
             ("--lora_rank", "0"),
             ("--lora_alpha", "0"),
             ("--lora_dropout", "1.0"),
-            ("--compressed_lora_scope", "invalid"),
-        )
-        for flag, value in invalid_cases:
+        ):
             with self.subTest(flag=flag, value=value):
                 with self.assertRaises(SystemExit):
-                    self._parse_with_checkpoint(
-                        ["--finetune_mode", "compressed_lora", flag, value]
-                    )
+                    self._parse_with_checkpoint(["--train_mode", "lora", flag, value])
 
-    def test_compressed_lora_accepts_and_ignores_decoder_trainable_flags(self):
-        args = self._parse_with_checkpoint(
-            [
-                "--finetune_mode",
-                "compressed_lora",
-                "--tune_final_norm",
-                "true",
-                "--use_post_norm_head_linear",
-                "true",
-                "--vae_tune_bias",
-                "true",
-            ]
+    def test_removed_lora_and_decoder_aux_flags_are_rejected(self):
+        removed = (
+            ("--finetune_mode", "compressed_lora"),
+            ("--compressed_lora_scope", "full"),
+            ("--tune_final_norm", "true"),
+            ("--use_post_norm_head_linear", "true"),
+            ("--vae_tune_bias", "true"),
         )
-        self.assertEqual(args.finetune_mode, "compressed_lora")
+        for flag, value in removed:
+            with self.subTest(flag=flag):
+                with self.assertRaises(SystemExit):
+                    self._parse_with_checkpoint([flag, value])
 
 
 class VAEE2ETrainerPromptKdMaskHelperTest(unittest.TestCase):
@@ -618,7 +634,7 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
                     tmpdir,
                     "--dataset_mix",
                     "openorca=1.0",
-                    "--max_steps",
+                    "--steps",
                     "1",
                     *extra_args,
                 ]
@@ -628,8 +644,8 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
     def test_hidden_loss_defaults_to_disabled_uniform(self):
         args = self._parse_with_checkpoint([])
 
-        self.assertEqual(args.hidden_loss_weight, 0.0)
-        self.assertEqual(args.hidden_layer_weighting, "uniform")
+        self.assertEqual(args.loss.hidden_loss_weight, 0.0)
+        self.assertEqual(args.loss.hidden_layer_weighting, "uniform")
 
     def test_hidden_loss_accepts_linear_depth(self):
         args = self._parse_with_checkpoint(
@@ -641,8 +657,8 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(args.hidden_loss_weight, 0.003)
-        self.assertEqual(args.hidden_layer_weighting, "linear_depth")
+        self.assertEqual(args.loss.hidden_loss_weight, 0.003)
+        self.assertEqual(args.loss.hidden_layer_weighting, "linear_depth")
 
     def test_hidden_loss_accepts_adaptive_top_3(self):
         args = self._parse_with_checkpoint(
@@ -654,8 +670,8 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(args.hidden_loss_weight, 0.1)
-        self.assertEqual(args.hidden_layer_weighting, "adaptive_top_3")
+        self.assertEqual(args.loss.hidden_loss_weight, 0.1)
+        self.assertEqual(args.loss.hidden_layer_weighting, "adaptive_top_3")
 
     def test_hidden_loss_rejects_negative_weight(self):
         with self.assertRaises(SystemExit):
@@ -676,9 +692,9 @@ class VAEE2EHiddenLossArgsTest(unittest.TestCase):
                 "8",
             ]
         )
-        self.assertEqual(args.teacher_output_offload, "cpu")
-        self.assertTrue(args.teacher_output_pin_memory)
-        self.assertEqual(args.teacher_output_chunk_tokens, 8)
+        self.assertEqual(args.runtime.teacher_output_offload, "cpu")
+        self.assertTrue(args.runtime.teacher_output_pin_memory)
+        self.assertEqual(args.runtime.teacher_output_chunk_tokens, 8)
 
     def test_teacher_output_offload_rejects_invalid_mode(self):
         with self.assertRaises(SystemExit):
@@ -800,7 +816,7 @@ class VAEE2EHiddenLossTest(unittest.TestCase):
 
 class DatasetMixBuilderTest(unittest.TestCase):
     def setUp(self):
-        self.tokenizer = DummyTokenizer()
+        self.tokenizer = ContentTokenizer()
         self.training_args = SimpleNamespace(
             model_max_length=4,
             max_steps=3,
@@ -1179,10 +1195,14 @@ class DatasetMixBuilderTest(unittest.TestCase):
             text_field="text",
             max_train_samples=None,
             dataset_mix_spec=None,
+            dataset_task="lm",
         )
         training_args = SimpleNamespace(
             model_max_length=4,
             eval_strategy=IntervalStrategy.NO,
+            seed=0,
+            data_seed=0,
+            group_by_length=True,
         )
 
         dataset = DatasetDict(
@@ -1191,12 +1211,12 @@ class DatasetMixBuilderTest(unittest.TestCase):
                 "validation": Dataset.from_dict({"text": ["eval words words words", "more eval words words"]}),
             }
         )
-        with mock.patch("e2e_common.data.load_dataset", return_value=dataset):
+        with mock.patch("datasets.load_dataset", return_value=dataset):
             train_dataset, eval_dataset, data_info = build_datasets(args, training_args, self.tokenizer)
 
         self.assertGreater(len(train_dataset), 0)
         self.assertIsNone(eval_dataset)
-        self.assertEqual(data_info["dataset_mode"], "single")
+        self.assertEqual(data_info["dataset_mode"], "file")
 
     def test_build_datasets_mix_skips_eval_when_eval_strategy_is_no(self):
         args = SimpleNamespace(
@@ -1295,7 +1315,7 @@ class DistillDataTest(unittest.TestCase):
             self.assertTrue(source_info["is_iterable"])
             self.assertNotIn("packed_rows", source_info)
 
-    def test_prepare_distill_datasets_single_source_is_indexed(self):
+    def test_prepare_distill_datasets_single_source_is_lazy_iterable(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
             if path == "Open-Orca/OpenOrca":
                 return DatasetDict({"train": _make_openorca_dataset(128)})
@@ -1309,11 +1329,12 @@ class DistillDataTest(unittest.TestCase):
                 max_seq_len=32,
             )
 
-        self.assertEqual(len(train_ds), 128)
-        self.assertFalse(is_iterable_training_dataset(train_ds))
+        self.assertTrue(is_iterable_training_dataset(train_ds))
         self.assertIsNone(eval_ds)
-        self.assertEqual(source_stats[0]["actual_rows"], 128)
-        self.assertFalse(source_stats[0]["is_iterable"])
+        self.assertIsNone(source_stats[0]["actual_rows"])
+        self.assertTrue(source_stats[0]["is_iterable"])
+        first = next(iter(train_ds))
+        self.assertIn("input_ids", first)
 
     def test_prepare_distill_datasets_is_deterministic_for_same_seed(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
@@ -1336,7 +1357,9 @@ class DistillDataTest(unittest.TestCase):
                 max_seq_len=32,
             )
 
-        self.assertTrue(torch.equal(train_a[0]["input_ids"], train_b[0]["input_ids"]))
+        first_a = next(iter(train_a))
+        first_b = next(iter(train_b))
+        self.assertTrue(torch.equal(first_a["input_ids"], first_b["input_ids"]))
         self.assertEqual(stats_a, stats_b)
 
     def test_prepare_distill_datasets_changes_with_different_seed(self):
@@ -1360,8 +1383,8 @@ class DistillDataTest(unittest.TestCase):
                 max_seq_len=32,
             )
 
-        pairs_a = [train_a[idx]["input_ids"].tolist() for idx in range(8)]
-        pairs_b = [train_b[idx]["input_ids"].tolist() for idx in range(8)]
+        pairs_a = [row["input_ids"].tolist() for row, _ in zip(train_a, range(8))]
+        pairs_b = [row["input_ids"].tolist() for row, _ in zip(train_b, range(8))]
         self.assertNotEqual(pairs_a, pairs_b)
 
     def test_prepare_distill_datasets_rejects_empty_source(self):
@@ -1439,6 +1462,8 @@ class LazyIterableWorkerAndRawCacheTest(unittest.TestCase):
             eval_split=None,
             text_field="messages",
             text_format="edgerazor_messages",
+            supports_lm=True,
+            supports_sft=True,
         )
 
     def test_iterable_worker_shard_indexable_dataset_has_no_duplicates(self):
@@ -1507,7 +1532,7 @@ class LazyIterableWorkerAndRawCacheTest(unittest.TestCase):
             return raw_dataset, None
 
         def signature(dataset):
-            return [dataset[idx]["input_ids"].tolist() for idx in range(8)]
+            return _dataset_signature(dataset, limit=8)
 
         with mock.patch.dict(
             "e2e_common.lazy_datasets.DATASET_MIX_SOURCE_PRESETS",
@@ -1636,6 +1661,8 @@ class LazyHeterogeneousLmMixTest(unittest.TestCase):
         self.assertEqual(first["input_ids"].tolist(), first["labels"].tolist())
 
     def test_lm_heterogeneous_mix_uses_each_source_preset(self):
+        from train_utils.distill_data import encode_canonical_record
+
         tokenizer = ContentTokenizer()
         openorca_raw = _make_openorca_dataset(16)
         fineweb_raw = _make_fineweb_dataset(16)
@@ -1646,24 +1673,26 @@ class LazyHeterogeneousLmMixTest(unittest.TestCase):
 
         expected_openorca = {
             tuple(
-                encode_text_lm_record(
+                encode_canonical_record(
                     dict(row),
                     tokenizer,
-                    max_seq_len=64,
-                    text_field="text",
                     text_format="openorca",
+                    text_field="text",
+                    task="lm",
+                    model_max_length=64,
                 )["input_ids"].tolist()
             )
             for row in openorca_raw
         }
         expected_fineweb = {
             tuple(
-                encode_text_lm_record(
+                encode_canonical_record(
                     dict(row),
                     tokenizer,
-                    max_seq_len=64,
-                    text_field="text",
                     text_format="text",
+                    text_field="text",
+                    task="lm",
+                    model_max_length=64,
                 )["input_ids"].tolist()
             )
             for row in fineweb_raw
@@ -1694,22 +1723,30 @@ class LazyHeterogeneousLmMixTest(unittest.TestCase):
         self.assertGreater(seen_openorca, 0)
         self.assertGreater(seen_fineweb, 0)
 
-    def test_sft_and_messages_heterogeneous_mix_still_rejected(self):
+    def test_sft_heterogeneous_mix_is_source_aware(self):
         raw_by_alias = {
             "openorca": _make_openorca_dataset(4),
             "alpaca": _make_alpaca_dataset(4),
         }
-        for task in ("sft", "messages"):
-            with self.subTest(task=task):
-                with self._patch_raw_loaders(raw_by_alias):
-                    with self.assertRaisesRegex(ValueError, "multiple text_format"):
-                        build_mixed_lazy_dataset(
-                            "openorca=0.5,alpaca=0.5",
-                            task=task,
-                            tokenizer=ContentTokenizer(),
-                            max_seq_len=16,
-                            seed=0,
-                        )
+        tokenizer = ContentTokenizer()
+        with self._patch_raw_loaders(raw_by_alias):
+            _spec, _stats, dataset, is_iterable = build_mixed_lazy_dataset(
+                "openorca=0.5,alpaca=0.5",
+                task="sft",
+                tokenizer=tokenizer,
+                max_seq_len=64,
+                seed=0,
+            )
+        self.assertTrue(is_iterable)
+        rows = []
+        for idx, row in enumerate(dataset):
+            rows.append(row)
+            if idx >= 5:
+                break
+        self.assertGreater(len(rows), 0)
+        for row in rows:
+            self.assertEqual(set(row.keys()), {"input_ids", "attention_mask", "labels"})
+            self.assertTrue(any(int(v) != -100 for v in row["labels"].tolist()))
 
     def test_requested_seven_source_lm_mix_can_enter_training(self):
         raw_by_alias = {
@@ -1746,52 +1783,6 @@ class LazyHeterogeneousLmMixTest(unittest.TestCase):
         for row in rows:
             self.assertGreater(int(row["input_ids"].numel()), 0)
             self.assertEqual(row["input_ids"].tolist(), row["labels"].tolist())
-
-
-def test_e2e_sft_dynamic_padding_forwards_to_shared_collator():
-    from compressed_e2e_fintuning import runtime as e2e_runtime
-
-    tokenizer = object()
-    sentinel = object()
-    with mock.patch.object(
-        e2e_runtime,
-        "build_edgerazor_data_collator",
-        return_value=sentinel,
-    ) as mock_collator:
-        result = e2e_runtime._build_training_data_collator(
-            tokenizer=tokenizer,
-            block_size=1024,
-            dynamic_padding=True,
-        )
-    mock_collator.assert_called_once_with(
-        tokenizer,
-        max_seq_len=1024,
-        dynamic_padding=True,
-    )
-    assert result is sentinel
-
-
-def test_e2e_lm_fixed_padding_forwards_false():
-    from compressed_e2e_fintuning import runtime as e2e_runtime
-
-    tokenizer = object()
-    sentinel = object()
-    with mock.patch.object(
-        e2e_runtime,
-        "build_edgerazor_data_collator",
-        return_value=sentinel,
-    ) as mock_collator:
-        result = e2e_runtime._build_training_data_collator(
-            tokenizer=tokenizer,
-            block_size=1024,
-            dynamic_padding=False,
-        )
-    mock_collator.assert_called_once_with(
-        tokenizer,
-        max_seq_len=1024,
-        dynamic_padding=False,
-    )
-    assert result is sentinel
 
 
 if __name__ == "__main__":

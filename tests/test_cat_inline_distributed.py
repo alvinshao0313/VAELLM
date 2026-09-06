@@ -11,7 +11,7 @@ import torch.multiprocessing as mp
 from torch import nn
 
 import train_utils.cat_inline_distributed as cat_inline_distributed
-from train_utils.cat_train_pipeline import _validate_inline_distill_after_category
+from train_utils.cat_train_pipeline import _validate_inline_after_category_mode
 from train_utils.cat_inline_distributed import (
     _pack_bool_tensors_for_transport,
     _resolve_cat_inline_vae_wait_timeout_sec,
@@ -159,32 +159,30 @@ class CatInlineDistributedTests(unittest.TestCase):
 
     def test_gpu_launcher_validation_and_count(self):
         script = "scripts/catlora_simple2.sh"
-        prefix = "source <(sed -n '3,27p' \"$1\"); printf '%s:%s' \"$CUDA_VISIBLE_DEVICES\" \"$NPROC_PER_NODE\""
-        for value, expected in (("5", "5:1"), ("5,6,7,8", "5,6,7,8:4"), ("0,2,4", "0,2,4:3")):
-            result = subprocess.run(
-                ["bash", "-c", prefix, "bash", script],
-                env={**os.environ, "DISTILL_GPUS": value},
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, expected)
-        for value in ("5,", "5, 6", "5,5"):
-            result = subprocess.run(
-                ["bash", "-c", prefix, "bash", script],
-                env={**os.environ, "DISTILL_GPUS": value},
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertNotEqual(result.returncode, 0)
+        text = open(script, "r", encoding="utf-8").read()
+        self.assertIn("export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7", text)
+        self.assertIn("torchrun --standalone --nproc_per_node=8 tools/cat_train.py", text)
+        result = subprocess.run(["bash", "-n", script], text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_inline_distill_after_category_allows_remaining_family(self):
-        for mode in ("remaining_lora", "remaining_lora_decoder", "remaining_lora_all_decoder"):
-            _validate_inline_distill_after_category(mode)
+    def test_inline_after_category_mode_allows_remaining_family(self):
+        for mode in (
+            "remaining_lora",
+            "remaining_lora_current_decoder",
+            "remaining_lora_prefix_decoder",
+        ):
+            _validate_inline_after_category_mode(mode)
 
-    def test_inline_distill_after_category_rejects_compressed_modes(self):
-        for mode in ("compressed_lora", "decoder", "both"):
+    def test_inline_after_category_mode_rejects_compressed_modes(self):
+        for mode in (
+            "current_lora",
+            "current_decoder",
+            "current_lora_decoder",
+            "compressed_lora",
+            "decoder",
+            "both",
+            "remaining_lora_decoder",
+            "remaining_lora_all_decoder",
+        ):
             with self.assertRaises(ValueError):
-                _validate_inline_distill_after_category(mode)
+                _validate_inline_after_category_mode(mode)

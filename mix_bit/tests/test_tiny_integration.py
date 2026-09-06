@@ -262,8 +262,8 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
         values={
             "seed": 31,
             "deterministic": True,
-            "steps_per_category": 10,
-            "batch_size": 8,
+            "vae_steps": 10,
+            "vae_batch_size": 8,
             "base_ch": 8,
             "num_res_blocks": 0,
             "decoder_base_ch": 8,
@@ -277,13 +277,13 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
             "gamma": 1.0,
             "zeta": 1.0,
             "inv_temperature": 100.0,
-            "lr": 0.001,
+            "vae_learning_rate": 0.001,
             "beta1": 0.9,
             "beta2": 0.95,
-            "weight_decay": 0.0,
-            "optimizer": "adamw",
-            "lr_scheduler": "linear",
-            "lr_warmup_steps": 0,
+            "vae_weight_decay": 0.0,
+            "vae_optim": "adamw",
+            "vae_lr_scheduler_type": "linear",
+            "vae_warmup_ratio": 0,
             "l1_weight": 1.0,
             "lfq_weight": 1.0,
             "commitment_loss_weight": 0.25,
@@ -294,11 +294,11 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
             "log_every": 1,
             "eval_every": 0,
             "eval_blocks": 8,
-            "outlier_protect_mode": "channel",
-            "outlier_protect_count": 0,
-            "outlier_protect_min_per_layer": 0,
-            "distill_after_category": "none",
-            "eval_ppl": False,
+            "channel_protect_mode": "channel",
+            "channel_protect_count": 0,
+            "channel_min_per_layer": 0,
+            "after_category_mode": "none",
+            "skip_ppl_eval": True,
             "eval_tasks": "",
             "rot_llm": False,
             "fp16": False,
@@ -394,7 +394,7 @@ def _patch_reload_model(monkeypatch: pytest.MonkeyPatch, template: nn.Module) ->
     def _get_model(_path, _token=None):
         return copy.deepcopy(template)
 
-    monkeypatch.setattr("train_utils.model_checkpoint_io.get_model", _get_model)
+    monkeypatch.setattr("train_utils.v6_model_loader.get_model", _get_model)
     monkeypatch.setattr("rotation.model_utils.get_model", _get_model)
 
 
@@ -459,7 +459,7 @@ def test_tiny_offline_end_to_end_integration(tmp_path: Path, monkeypatch: pytest
         solve_mixed_bit_allocation,
         write_allocation_outputs,
     )
-    from train_utils.model_checkpoint_io import META_FILENAME, load_checkpoint_into_model
+    from train_utils.checkpoint_v6 import META_FILENAME, load_v6_full_checkpoint_into_model
 
     torch.manual_seed(0)
     profile = _toy_profile()
@@ -721,7 +721,7 @@ def test_tiny_offline_end_to_end_integration(tmp_path: Path, monkeypatch: pytest
 
     adapter = get_model_adapter(resolved.config.model_profile.adapter)
     reloaded = adapter.load_model(resolved.config.model_profile)
-    load_checkpoint_into_model(model=reloaded, model_dir=str(out), map_location="cpu", strict=True)
+    load_v6_full_checkpoint_into_model(reloaded, str(out), map_location="cpu", strict=True)
     for name, mode in selected.items():
         module = reloaded.get_submodule(name)
         assert isinstance(module, VAELinear)

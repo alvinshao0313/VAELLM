@@ -21,8 +21,8 @@ EXPECTED_DEFAULT_RECIPE_KEYS = {
     "recipe_id",
     "seed",
     "deterministic",
-    "steps_per_category",
-    "batch_size",
+    "vae_steps",
+    "vae_batch_size",
     "base_ch",
     "num_res_blocks",
     "decoder_base_ch",
@@ -36,13 +36,13 @@ EXPECTED_DEFAULT_RECIPE_KEYS = {
     "gamma",
     "zeta",
     "inv_temperature",
-    "lr",
+    "vae_learning_rate",
     "beta1",
     "beta2",
-    "weight_decay",
-    "optimizer",
-    "lr_scheduler",
-    "lr_warmup_steps",
+    "vae_weight_decay",
+    "vae_optim",
+    "vae_lr_scheduler_type",
+    "vae_warmup_ratio",
     "l1_weight",
     "lfq_weight",
     "commitment_loss_weight",
@@ -53,11 +53,11 @@ EXPECTED_DEFAULT_RECIPE_KEYS = {
     "log_every",
     "eval_every",
     "eval_blocks",
-    "outlier_protect_mode",
-    "outlier_protect_count",
-    "outlier_protect_min_per_layer",
-    "distill_after_category",
-    "eval_ppl",
+    "channel_protect_mode",
+    "channel_protect_count",
+    "channel_min_per_layer",
+    "after_category_mode",
+    "skip_ppl_eval",
     "eval_tasks",
     "rot_llm",
     "fp16",
@@ -138,8 +138,8 @@ def test_training_recipe_rejects_unknown_keys():
 
 def test_training_recipe_disables_distill_eval_rotation_and_full_checkpoint_save():
     recipe = load_training_recipe(str(TRAINING_RECIPE_PATH))
-    assert recipe.values["distill_after_category"] == "none"
-    assert recipe.values["eval_ppl"] is False
+    assert recipe.values["after_category_mode"] == "none"
+    assert recipe.values["skip_ppl_eval"] is True
     assert recipe.values["eval_tasks"] == ""
     assert recipe.values["rot_llm"] is False
     assert recipe.values["eval_every"] == 0
@@ -214,7 +214,7 @@ def test_resume_rejects_changed_referenced_config_hash():
         )
         validate_resolved_run_config_resume(first)
 
-        recipe_src["lr"] = 0.001
+        recipe_src["vae_learning_rate"] = 0.001
         recipe_path.write_text(json.dumps(recipe_src), encoding="utf-8")
         second = resolve_run_config(
             str(run_path),

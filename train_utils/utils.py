@@ -265,7 +265,7 @@ class LinearRef:
     transpose: bool
 
 
-def is_decoder_layer_projection(name: str, target_categories: Sequence[str]) -> bool:
+def is_decoder_layer_projection(name: str, categories: Sequence[str]) -> bool:
     # Llama/Mistral/Qwen: "model.layers.{i}.<...>.<proj>"
     # OPT: "model.decoder.layers.{i}.<...>.<proj>"
     in_decoder_layers = (
@@ -276,7 +276,7 @@ def is_decoder_layer_projection(name: str, target_categories: Sequence[str]) -> 
     )
     if not in_decoder_layers:
         return False
-    return any(name.endswith(f".{category}") or name.endswith(category) for category in target_categories)
+    return any(name.endswith(f".{category}") or name.endswith(category) for category in categories)
 
 
 def collect_linears(
@@ -284,10 +284,10 @@ def collect_linears(
     transpose_modules: Sequence[str],
     *,
     only_decoder_projections: bool,
-    target_categories: Sequence[str],
+    categories: Sequence[str],
 ) -> List[LinearRef]:
     transpose_set = set(transpose_modules)
-    target_set = set(target_categories)
+    target_set = set(categories)
     out: List[LinearRef] = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
@@ -296,7 +296,7 @@ def collect_linears(
         if category not in target_set:
             continue
         if only_decoder_projections:
-            if not is_decoder_layer_projection(name, target_categories):
+            if not is_decoder_layer_projection(name, categories):
                 continue
         out.append(
             LinearRef(

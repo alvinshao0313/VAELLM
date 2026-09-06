@@ -31,6 +31,8 @@ def _message_preset(alias: str, path: str) -> DatasetMixSourcePreset:
         eval_split=None,
         text_field="messages",
         text_format="edgerazor_messages",
+        supports_lm=True,
+        supports_sft=True,
     )
 
 
@@ -384,7 +386,7 @@ class RemainingLoraDataRegressionCleanupTests(unittest.TestCase):
             _record_signature(records)[1::2],
         )
 
-    def test_mixed_lazy_dataset_rejects_multiple_text_formats(self):
+    def test_mixed_lazy_dataset_rejects_sft_unsupported_source(self):
         raw_a = _raw_dataset("A", 8)
         raw_b = _raw_dataset("B", 8)
         preset_a = _message_preset("tiny_a", "tiny/a")
@@ -396,6 +398,8 @@ class RemainingLoraDataRegressionCleanupTests(unittest.TestCase):
             eval_split=None,
             text_field="messages",
             text_format="plain",
+            supports_lm=True,
+            supports_sft=False,
         )
         presets = {"tiny_a": preset_a, "tiny_other": preset_b}
 
@@ -408,7 +412,7 @@ class RemainingLoraDataRegressionCleanupTests(unittest.TestCase):
 
         with mock.patch.dict(lazy_module.DATASET_MIX_SOURCE_PRESETS, presets, clear=False):
             with mock.patch.object(lazy_module, "_load_preset_raw_datasets", side_effect=load_raw):
-                with self.assertRaisesRegex(ValueError, "multiple text_format"):
+                with self.assertRaisesRegex(ValueError, "supports_sft"):
                     build_mixed_lazy_dataset(
                         "tiny_a=0.5,tiny_other=0.5",
                         task="messages",

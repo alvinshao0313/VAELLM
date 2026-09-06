@@ -15,7 +15,8 @@ if _REPO_ROOT not in sys.path:
 
 from litebsq.vae_linear import NamedVAELinearTarget, VAELinear, prime_named_vae_linear_cache
 from train_utils.eval_utils import run_lm_eval
-from train_utils.model_checkpoint_io import META_FILENAME, load_model_checkpoint, resolve_checkpoint_dir
+from train_utils.checkpoint_v6 import META_FILENAME, resolve_v6_checkpoint_dir
+from train_utils.v6_model_loader import load_v6_model_checkpoint
 
 
 DEFAULT_CATEGORY_SWEEP = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
@@ -160,15 +161,8 @@ def _ordered_categories_from_targets(targets_by_category: Dict[str, List[str]]) 
 def _validate_cat_checkpoint(meta: Dict[str, Any], checkpoint_dir: str) -> None:
     adapter_count = int(meta.get("adapter_module_count", 0) or 0)
     adapter_modules = meta.get("adapter_modules")
-    extra = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
-    stage = str(extra.get("stage", "")).strip().lower()
     if adapter_count > 0 or (isinstance(adapter_modules, list) and adapter_modules):
         raise ValueError("Cat category prefix eval does not support adapter/e2e checkpoints.")
-    if stage in {"block_vae_lora_final", "e2e_fintuning", "dense_e2e_fintuning"}:
-        raise ValueError(
-            f"Cat category prefix eval expects a cat final_model checkpoint, got extra_meta.stage={stage!r} "
-            f"at {checkpoint_dir}."
-        )
 
 
 def _validate_original_weights_available(
@@ -408,7 +402,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     logger.info("Cat category prefix eval log file: %s", log_path)
     logger.info("Input args:\n%s", json.dumps(vars(args), ensure_ascii=False, indent=2))
 
-    checkpoint_dir = resolve_checkpoint_dir(args.checkpoint_dir)
+    checkpoint_dir = resolve_v6_checkpoint_dir(args.checkpoint_dir)
     meta_preview = _read_checkpoint_meta(checkpoint_dir)
     _validate_cat_checkpoint(meta_preview, checkpoint_dir)
     targets_by_category = _resolve_targets_by_category_from_meta(meta_preview)
@@ -426,13 +420,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         pass
 
     logger.info("Loading cat checkpoint with original weights preserved: %s", checkpoint_dir)
-    model, meta, load_result = load_model_checkpoint(
+    model, meta, load_result = load_v6_model_checkpoint(
         checkpoint_dir,
         access_token=args.access_token,
         base_model_path=args.base_model_path,
         map_location=args.map_location,
         strict=bool(args.strict),
-        preserve_original_weights_from_base=True,
     )
     logger.info(
         "Checkpoint loaded. missing_keys=%d unexpected_keys=%d converted_module_count=%s",

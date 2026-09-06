@@ -74,7 +74,7 @@ def test_mid_eval_restores_pure_bit_parallel_decode_without_unfreezing_decoder()
     assert layer._parallel_stage_decoder is not None
     assert all(not p.requires_grad for p in layer._parallel_stage_decoder.parameters())
 
-    with temporary_inference_decode_mode(root, parallel_stage_decode=True, cache_decoded_weight=False):
+    with temporary_inference_decode_mode(root, cache_decoded_weight=False):
         assert not layer.trainable_decode
         assert all(not p.requires_grad for p in layer._parallel_stage_decoder.parameters())
 

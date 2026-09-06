@@ -28,7 +28,7 @@ from mix_bit.schema import (
 
 _OVERRIDE_RECIPE_KEYS = frozenset(
     {
-        "steps_per_category",
+        "vae_steps",
         "base_ch",
         "num_res_blocks",
         "decoder_base_ch",
@@ -37,7 +37,7 @@ _OVERRIDE_RECIPE_KEYS = frozenset(
         "activation_type",
         "decoder_type",
         "recon_loss_type",
-        "outlier_protect_count",
+        "channel_protect_count",
     }
 )
 _STORE_TRUE_RECIPE_KEYS = frozenset({"normalize_weight", "new_quant"})
@@ -45,7 +45,7 @@ _BOOL_STRING_RECIPE_KEYS = frozenset(
     {
         "deterministic",
         "vae_decoder_checkpoint",
-        "eval_ppl",
+        "skip_ppl_eval",
         "rot_llm",
         "fp16",
         "bf16",
@@ -53,17 +53,17 @@ _BOOL_STRING_RECIPE_KEYS = frozenset(
 )
 _ALWAYS_FIXED_ARGS: tuple[tuple[str, str | None], ...] = (
     ("--convert", None),
-    ("--save_candidate_artifact", None),
+    ("--save_candidate_artifact", "true"),
     ("--train_device", "cuda"),
     ("--convert_device", "cuda"),
     ("--skip_layers", ""),
-    ("--distill_after_category", "none"),
-    ("--eval_ppl", "false"),
+    ("--after_category_mode", "none"),
+    ("--skip_ppl_eval", "true"),
     ("--eval_tasks", ""),
     ("--rot_llm", "false"),
-    ("--outlier_protect_mode", "channel"),
-    ("--outlier_protect_count", "default=0"),
-    ("--outlier_protect_min_per_layer", "0"),
+    ("--channel_protect_mode", "channel"),
+    ("--channel_protect_count", "default=0"),
+    ("--channel_min_per_layer", "0"),
     ("--bf16", "true"),
     ("--fp16", "false"),
 )
@@ -216,11 +216,11 @@ def build_trial_command(trial: TrialSpec, resolved: ResolvedRunConfig, gpu_id: s
 
     recipe_values = dict(resolved.config.training_recipe.values)
     # Forced candidate-pool values win over recipe.
-    recipe_values["outlier_protect_mode"] = "channel"
-    recipe_values["outlier_protect_count"] = 0
-    recipe_values["outlier_protect_min_per_layer"] = 0
-    recipe_values["distill_after_category"] = "none"
-    recipe_values["eval_ppl"] = False
+    recipe_values["channel_protect_mode"] = "channel"
+    recipe_values["channel_protect_count"] = 0
+    recipe_values["channel_min_per_layer"] = 0
+    recipe_values["after_category_mode"] = "none"
+    recipe_values["skip_ppl_eval"] = True
     recipe_values["eval_tasks"] = ""
     recipe_values["rot_llm"] = False
     recipe_values["bf16"] = True
@@ -261,7 +261,7 @@ def build_trial_command(trial: TrialSpec, resolved: ResolvedRunConfig, gpu_id: s
         [
             "--model_path",
             profile.model_path,
-            "--target_categories",
+            "--compression_categories",
             trial.target_module_suffix,
             "--transpose_modules",
             ",".join(trial.transpose_module_suffixes),
@@ -510,7 +510,7 @@ def preflight_loader_inventory(
             model,
             transpose_suffixes,
             only_decoder_projections=bool(profile.only_decoder_projections),
-            target_categories=concrete_suffixes,
+            categories=concrete_suffixes,
         )
         unsupported: list[str] = []
         targets: list[TargetLinearSpec] = []

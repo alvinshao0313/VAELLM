@@ -350,16 +350,13 @@ class _LazyMixedTextLMIterableDataset(IterableDataset):
             num_workers=num_workers,
         ):
             preset = self.presets[int(source_idx)]
-            try:
-                yield encode_text_lm_record(
-                    dict(record),
-                    self.tokenizer,
-                    max_seq_len=self.max_seq_len,
-                    text_field=str(preset.text_field),
-                    text_format=str(preset.text_format),
-                )
-            except (ValueError, KeyError):
-                continue
+            yield encode_text_lm_record(
+                dict(record),
+                self.tokenizer,
+                max_seq_len=self.max_seq_len,
+                text_field=str(preset.text_field),
+                text_format=str(preset.text_format),
+            )
 
 
 class _LazyPresetIterableDataset(IterableDataset):
@@ -424,10 +421,8 @@ class _LazyPresetIterableDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         for record in _iter_raw_records_for_worker(self.raw_dataset):
-            try:
-                yield self._encode_record(dict(record))
-            except (ValueError, KeyError):
-                continue
+            # Structural encode errors must propagate; do not broad-catch.
+            yield self._encode_record(dict(record))
 
 
 def _normalize_weights(weights: Sequence[float]) -> List[float]:
@@ -623,7 +618,9 @@ def _load_indexed_raw_mix(
     presets: List[DatasetMixSourcePreset] = []
 
     for alias, weight in zip(sources, normalized_weights):
-        preset = DATASET_MIX_SOURCE_PRESETS[str(alias)]
+        from e2e_common import data as data_module
+
+        preset = data_module.DATASET_MIX_SOURCE_PRESETS[str(alias)]
         cache_key = _raw_dataset_cache_key(preset)
 
         if raw_dataset_cache is not None and cache_key in raw_dataset_cache:
@@ -689,57 +686,78 @@ def build_mixed_lazy_dataset(
     is_iterable = mix_kind == "mix" or isinstance(raw_dataset, HFIterableDataset)
 
     if not is_iterable:
-        preset = presets[0]
-        if task_norm in {"messages", "sft"} and str(preset.text_format) == "edgerazor_messages":
-            dataset: Union[Dataset, IterableDataset] = ReasoningDataset(
-                raw_dataset,
-                tokenizer,
-                max_seq_len=int(max_seq_len),
-                add_system_prompt=bool(add_system_prompt),
-            )
-        elif task_norm in {"messages", "sft"}:
-            dataset = LazySFTDataset(
-                raw_dataset,
-                tokenizer,
-                max_seq_len=int(max_seq_len),
-                text_format=str(preset.text_format),
-            )
-        elif task_norm == "lm":
-            dataset = LazyTextLMDataset(
-                raw_dataset,
-                tokenizer,
-                max_seq_len=int(max_seq_len),
-                text_field=str(preset.text_field),
-                text_format=str(preset.text_format),
-            )
-        else:
-            raise ValueError(f"Unsupported lazy dataset task: {task_norm!r}")
-        return normalized_spec, source_stats, dataset, is_iterable
+        from train_utils.distill_data import _CanonicalMapDataset, _LazySinglePresetIterable
 
-    if task_norm == "lm" and mix_kind == "mix":
-        dataset = _LazyMixedTextLMIterableDataset(
+        preset = presets[0]
+        if task_norm in {"messages", "sft"} and not bool(getattr(preset, "supports_sft", False)):
+            raise ValueError(
+                f"dataset source {preset.alias!r} does not support dataset_task=sft "
+                "(supports_sft=False)."
+            )
+        if task_norm == "lm" and not bool(getattr(preset, "supports_lm", True)):
+            raise ValueError(
+                f"dataset source {preset.alias!r} does not support dataset_task=lm "
+                "(supports_lm=False)."
+            )
+        resolved_task = "sft" if task_norm in {"messages", "sft"} else "lm"
+        # SFT skip-invalid semantics require lazy iterable; never eager-tokenize scan.
+        if resolved_task == "sft":
+            dataset = _LazySinglePresetIterable(
+                raw_dataset,
+                tokenizer,
+                task=resolved_task,
+                preset=preset,
+                model_max_length=int(max_seq_len),
+            )
+            return normalized_spec, source_stats, dataset, True
+        dataset = _CanonicalMapDataset(
             raw_dataset,
             tokenizer,
-            max_seq_len=int(max_seq_len),
+            task=resolved_task,
+            preset=preset,
+            model_max_length=int(max_seq_len),
+        )
+        return normalized_spec, source_stats, dataset, False
+
+    if task_norm == "lm" and mix_kind == "mix":
+        from train_utils.distill_data import _CanonicalMixedIterableDataset
+
+        dataset = _CanonicalMixedIterableDataset(
+            raw_dataset,
+            tokenizer,
+            task="lm",
             presets=presets,
+            model_max_length=int(max_seq_len),
         )
         return normalized_spec, source_stats, dataset, True
 
-    if len(set(str(preset.text_format) for preset in presets)) != 1:
-        raise ValueError(
-            "Weighted lazy SFT/messages mix with multiple text_format values is not supported "
-            "in one iterable dataset. Use a single-format mix or one source."
+    if mix_kind == "mix":
+        from train_utils.distill_data import _CanonicalMixedIterableDataset
+
+        for preset in presets:
+            if task_norm in {"messages", "sft"} and not bool(getattr(preset, "supports_sft", False)):
+                raise ValueError(
+                    f"dataset source {preset.alias!r} does not support dataset_task=sft "
+                    "(supports_sft=False)."
+                )
+        dataset = _CanonicalMixedIterableDataset(
+            raw_dataset,
+            tokenizer,
+            task="sft" if task_norm in {"messages", "sft"} else str(task_norm),
+            presets=presets,
+            model_max_length=int(max_seq_len),
         )
+        return normalized_spec, source_stats, dataset, True
+
+    from train_utils.distill_data import _LazySinglePresetIterable
 
     preset = presets[0]
-    dataset = _LazyPresetIterableDataset(
+    dataset = _LazySinglePresetIterable(
         raw_dataset,
         tokenizer,
-        max_seq_len=int(max_seq_len),
-        task=task_norm,
+        task="sft" if task_norm in {"messages", "sft"} else "lm",
         preset=preset,
-        seed=int(seed),
-        add_system_prompt=bool(add_system_prompt),
+        model_max_length=int(max_seq_len),
     )
     return normalized_spec, source_stats, dataset, True
 

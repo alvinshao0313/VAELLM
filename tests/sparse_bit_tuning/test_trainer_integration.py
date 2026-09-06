@@ -113,6 +113,12 @@ def test_composite_optimizer_excludes_bit_scores_from_main_optimizer():
 
 
 def test_composite_optimizer_preserves_decoder_specific_lr():
+    from train_utils.model_level_optimizer import (
+        ModelLevelOptimizerLRConfig,
+        attach_model_level_optimizer_contract,
+        selection_from_component_parameters,
+    )
+
     with tempfile.TemporaryDirectory() as tmp:
         model = _TinyModel(train_main=True)
         manager = _FakeManager(model)
@@ -122,6 +128,17 @@ def test_composite_optimizer_preserves_decoder_specific_lr():
             tmp,
             decoder_param_ids=(id(model.main),),
             decoder_lr=2e-4,
+        )
+        attach_model_level_optimizer_contract(
+            trainer,
+            selection=selection_from_component_parameters(
+                decoder_parameters={"decoder::main": model.main},
+            ),
+            lr_config=ModelLevelOptimizerLRConfig(
+                learning_rate=1e-3,
+                weight_decay=0.0,
+                decoder_lr=2e-4,
+            ),
         )
         optimizer = trainer.create_optimizer()
         assert isinstance(optimizer, SparseBitCompositeOptimizer)

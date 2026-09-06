@@ -7,13 +7,9 @@ from torch import nn
 
 from litebsq.autoencoder import Decoder
 from litebsq.vae_linear import VAELinear
-from train_utils import lora_utils
 from train_utils.lora_training import _DistillOptimizerGroupingMixin
 from train_utils.lora_utils import (
     _LoraTrainerLogCallback,
-    _collect_remaining_decoder_frozen_vae_prewarm_targets,
-    _prewarm_remaining_decoder_frozen_vae_linears,
-    _resolve_effective_decoder_lr,
 )
 from train_utils.distill_decoder import (
     NamedMainDecoderTarget,
@@ -219,25 +215,52 @@ def test_optimizer_no_decoder_uses_legacy_create_optimizer_path():
 
 
 def test_optimizer_decoder_group_has_independent_lr_and_zero_weight_decay():
+    from train_utils.model_level_optimizer import (
+        GROUP_DECODER,
+        GROUP_LORA,
+        GROUP_NORM,
+        ModelLevelOptimizerLRConfig,
+        attach_model_level_optimizer_contract,
+        selection_from_component_parameters,
+    )
+
     model = _OptimizerToyModel()
-    decoder_params = tuple(model.decoder.parameters())
     trainer = _DummyGroupedTrainer(
         model=model,
         args=SimpleNamespace(weight_decay=0.1, learning_rate=1e-3),
-        decoder_param_ids=[id(param) for param in decoder_params],
+        decoder_param_ids=[id(param) for param in model.decoder.parameters()],
         decoder_lr=5e-5,
+    )
+    selection = selection_from_component_parameters(
+        lora_parameters={"lora": model.lora.weight},
+        decoder_parameters={
+            "decoder::w": model.decoder.weight,
+            "decoder::b": model.decoder.bias,
+        },
+        norm_parameters={"norm::w": model.extra_norm.weight, "norm::b": model.extra_norm.bias},
+    )
+    # Toy Linear bias may be None depending on defaults; Linear(3,3) has bias.
+    if model.lora.bias is not None:
+        model.lora.bias.requires_grad_(False)
+    attach_model_level_optimizer_contract(
+        trainer,
+        selection=selection,
+        lr_config=ModelLevelOptimizerLRConfig(
+            learning_rate=1e-3,
+            weight_decay=0.1,
+            decoder_lr=5e-5,
+        ),
     )
 
     optimizer = trainer.create_optimizer()
 
     groups = {group["group_name"]: group for group in optimizer.param_groups}
-    assert list(groups) == ["nondecoder_decay", "nondecoder_no_decay", "decoder"]
-    assert groups["nondecoder_decay"]["lr"] == pytest.approx(1e-3)
-    assert groups["nondecoder_decay"]["weight_decay"] == pytest.approx(0.1)
-    assert groups["nondecoder_no_decay"]["lr"] == pytest.approx(1e-3)
-    assert groups["nondecoder_no_decay"]["weight_decay"] == pytest.approx(0.0)
-    assert groups["decoder"]["lr"] == pytest.approx(5e-5)
-    assert groups["decoder"]["weight_decay"] == pytest.approx(0.0)
+    assert set(groups) == {GROUP_LORA, GROUP_DECODER, GROUP_NORM}
+    assert groups[GROUP_LORA]["lr"] == pytest.approx(1e-3)
+    assert groups[GROUP_LORA]["weight_decay"] == pytest.approx(0.1)
+    assert groups[GROUP_DECODER]["lr"] == pytest.approx(5e-5)
+    assert groups[GROUP_DECODER]["weight_decay"] == pytest.approx(0.0)
+    assert groups[GROUP_NORM]["weight_decay"] == pytest.approx(0.0)
 
     grouped_param_ids = [
         id(param)
@@ -249,130 +272,44 @@ def test_optimizer_decoder_group_has_independent_lr_and_zero_weight_decay():
     assert len(grouped_param_ids) == len(set(grouped_param_ids))
 
 
-def test_optimizer_decoder_lr_none_inherits_distill_lr_and_zero_without_decoder_is_ignored():
-    cfg = SimpleNamespace(lr=1e-4, decoder_lr=None)
-    model = _OptimizerToyModel()
-
-    assert _resolve_effective_decoder_lr(cfg, tuple(model.decoder.parameters())) == pytest.approx(1e-4)
-    assert _resolve_effective_decoder_lr(SimpleNamespace(lr=1e-4, decoder_lr=0.0), ()) is None
-
-
-def test_optimizer_decoder_lr_zero_with_decoder_params_errors():
-    model = _OptimizerToyModel()
-
-    with pytest.raises(ValueError, match="decoder lr"):
-        _resolve_effective_decoder_lr(
-            SimpleNamespace(lr=1e-4, decoder_lr=0.0),
-            tuple(model.decoder.parameters()),
-        )
-
-
-def test_prewarm_excludes_current_trainable_decoder_by_identity(monkeypatch):
-    model = _TwoVaeModel()
-    decoder_targets = [NamedMainDecoderTarget(name="renamed.current", base_layer=model.current)]
-    captured = {}
-
-    def fake_prime(targets, **_kwargs):
-        captured["targets"] = tuple(targets)
-        return {"total": len(targets), "warmed": len(targets), "skipped": 0, "failed": 0}
-
-    monkeypatch.setattr(lora_utils, "prime_named_vae_linear_cache", fake_prime)
-
-    stats = _prewarm_remaining_decoder_frozen_vae_linears(
-        model,
-        decoder_targets=decoder_targets,
-        compute_device="cpu",
-        logger=logging.getLogger("test"),
-    )
-
-    assert stats["warmed"] == 1
-    assert [target.base_layer for target in captured["targets"]] == [model.historical]
-
-
-def test_prewarm_all_decoder_prefix_excludes_all_selected_objects(monkeypatch):
-    model = _TwoVaeModel()
-    decoder_targets = [
-        NamedMainDecoderTarget(name="historical", base_layer=model.historical),
-        NamedMainDecoderTarget(name="current", base_layer=model.current),
-    ]
-
-    def fail_prime(*_args, **_kwargs):
-        raise AssertionError("all selected decoder objects must be excluded")
-
-    monkeypatch.setattr(lora_utils, "prime_named_vae_linear_cache", fail_prime)
-
-    stats = _prewarm_remaining_decoder_frozen_vae_linears(
-        model,
-        decoder_targets=decoder_targets,
-        compute_device="cpu",
-        logger=logging.getLogger("test"),
-    )
-
-    assert stats == {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
-
-
-def test_prewarm_skips_valid_existing_cache():
-    model = _TwoVaeModel()
-    model.historical._cached_weight = torch.zeros(
-        model.historical.out_features,
-        model.historical.in_features,
-        dtype=torch.float32,
-    )
-
-    targets = _collect_remaining_decoder_frozen_vae_prewarm_targets(
-        model,
-        decoder_targets=[NamedMainDecoderTarget(name="current", base_layer=model.current)],
-    )
-
-    assert [target.base_layer for target in targets] == []
-
-
-def test_prewarm_rewarms_stale_cache_device_or_dtype():
-    model = _TwoVaeModel()
-    model.historical._cached_weight = torch.zeros(
-        model.historical.out_features,
-        model.historical.in_features,
-        dtype=torch.float64,
-    )
-
-    targets = _collect_remaining_decoder_frozen_vae_prewarm_targets(
-        model,
-        decoder_targets=[NamedMainDecoderTarget(name="current", base_layer=model.current)],
-    )
-
-    assert [target.base_layer for target in targets] == [model.historical]
-
-
-def test_plain_remaining_lora_does_not_add_prewarm(monkeypatch):
-    model = _TwoVaeModel()
-
-    def fail_prime(*_args, **_kwargs):
-        raise AssertionError("plain remaining_lora must not prewarm through decoder helper")
-
-    monkeypatch.setattr(lora_utils, "prime_named_vae_linear_cache", fail_prime)
-
-    stats = _prewarm_remaining_decoder_frozen_vae_linears(
-        model,
-        decoder_targets=(),
-        compute_device="cpu",
-        logger=logging.getLogger("test"),
-    )
-
-    assert stats == {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
-
-
 def test_optimizer_telemetry_reads_actual_group_lrs(tmp_path):
+    from train_utils.model_level_optimizer import (
+        ModelLevelOptimizerLRConfig,
+        attach_model_level_optimizer_contract,
+        selection_from_component_parameters,
+    )
+
     model = _OptimizerToyModel()
+    if model.lora.bias is not None:
+        model.lora.bias.requires_grad_(False)
     trainer = _DummyGroupedTrainer(
         model=model,
         args=SimpleNamespace(weight_decay=0.1, learning_rate=1e-3),
         decoder_param_ids=[id(param) for param in model.decoder.parameters()],
         decoder_lr=5e-5,
     )
+    attach_model_level_optimizer_contract(
+        trainer,
+        selection=selection_from_component_parameters(
+            lora_parameters={"lora": model.lora.weight},
+            decoder_parameters={
+                "decoder::w": model.decoder.weight,
+                "decoder::b": model.decoder.bias,
+            },
+            norm_parameters={"norm::w": model.extra_norm.weight, "norm::b": model.extra_norm.bias},
+        ),
+        lr_config=ModelLevelOptimizerLRConfig(
+            learning_rate=1e-3,
+            weight_decay=0.1,
+            decoder_lr=5e-5,
+        ),
+    )
     optimizer = trainer.create_optimizer()
-    optimizer.param_groups[0]["lr"] = 5e-4
-    optimizer.param_groups[1]["lr"] = 5e-4
-    optimizer.param_groups[2]["lr"] = 2.5e-5
+    # group order: lora, decoder, norm
+    by_name = {g["group_name"]: g for g in optimizer.param_groups}
+    by_name["lora"]["lr"] = 5e-4
+    by_name["decoder"]["lr"] = 2.5e-5
+    by_name["norm"]["lr"] = 5e-4
 
     log_path = tmp_path / "train.log"
     logger = logging.getLogger(f"decoder_optimizer_telemetry_{id(tmp_path)}")

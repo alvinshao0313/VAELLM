@@ -77,5 +77,7 @@ def parse_target_modules(value: Optional[str]) -> Optional[List[str]]:
 
 
 def needs_teacher(loss_type: str) -> bool:
-    norm = str(loss_type or "").strip().lower()
-    return norm not in {"", "sft", "origin"}
+    """Legacy thin adapter: delegate to shared teacher-required truth source."""
+    from train_utils.distill_teacher import distill_loss_requires_teacher
+
+    return bool(distill_loss_requires_teacher(loss_type))

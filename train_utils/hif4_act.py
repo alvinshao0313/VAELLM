@@ -11,9 +11,7 @@ _HIF4_GPU_ROOT = os.path.join(_REPO_ROOT, "HiFloat4", "hif4_gpu")
 _HIF4_ACT_QUANTIZER: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 _VAE_LINEAR_TYPE = None
 _PEFT_LORA_LINEAR_TYPE = None
-_PEFT_VAE_PROXY_TYPE = None
-_COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE = None
-_PEFT_PROXY_ADAPTER_PREDICATE = None
+_FULL_COMPRESSED_PEFT_PROXY_TYPE = None
 
 
 class Hif4ActController:
@@ -96,58 +94,26 @@ def _is_peft_lora_linear(module: nn.Module) -> bool:
     return peft_linear_type is not None and isinstance(module, peft_linear_type)
 
 
-def _get_peft_vae_proxy_type():
-    global _PEFT_VAE_PROXY_TYPE
-    if _PEFT_VAE_PROXY_TYPE is None:
+def _get_full_compressed_peft_proxy_type():
+    global _FULL_COMPRESSED_PEFT_PROXY_TYPE
+    if _FULL_COMPRESSED_PEFT_PROXY_TYPE is None:
         try:
-            from e2e_common.peft_proxy import PeftVAELinearProxy
+            from e2e_common.full_lora import FullCompressedPeftProxy
         except Exception:
-            _PEFT_VAE_PROXY_TYPE = False
+            _FULL_COMPRESSED_PEFT_PROXY_TYPE = False
         else:
-            _PEFT_VAE_PROXY_TYPE = PeftVAELinearProxy
-    return None if _PEFT_VAE_PROXY_TYPE is False else _PEFT_VAE_PROXY_TYPE
-
-
-def _get_compressed_subspace_peft_proxy_type():
-    global _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE
-    if _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE is None:
-        try:
-            from e2e_common.compressed_subspace_lora import CompressedSubspacePeftProxy
-        except Exception:
-            _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE = False
-        else:
-            _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE = CompressedSubspacePeftProxy
-    return None if _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE is False else _COMPRESSED_SUBSPACE_PEFT_PROXY_TYPE
-
-
-def _get_peft_proxy_adapter_predicate():
-    global _PEFT_PROXY_ADAPTER_PREDICATE
-    if _PEFT_PROXY_ADAPTER_PREDICATE is None:
-        try:
-            from e2e_common.peft_proxy import is_peft_proxy_adapter_linear
-        except Exception:
-            _PEFT_PROXY_ADAPTER_PREDICATE = False
-        else:
-            _PEFT_PROXY_ADAPTER_PREDICATE = is_peft_proxy_adapter_linear
-    return None if _PEFT_PROXY_ADAPTER_PREDICATE is False else _PEFT_PROXY_ADAPTER_PREDICATE
-
-
-def _is_peft_proxy_adapter_linear(module: nn.Module) -> bool:
-    predicate = _get_peft_proxy_adapter_predicate()
-    return False if predicate is None else bool(predicate(module))
+            _FULL_COMPRESSED_PEFT_PROXY_TYPE = FullCompressedPeftProxy
+    return None if _FULL_COMPRESSED_PEFT_PROXY_TYPE is False else _FULL_COMPRESSED_PEFT_PROXY_TYPE
 
 
 def _is_hif4_wrapped_module(module: nn.Module) -> bool:
     vae_linear_type = _get_vae_linear_type()
     if vae_linear_type is not None and isinstance(module, vae_linear_type):
         return True
-    peft_vae_proxy_type = _get_peft_vae_proxy_type()
-    if peft_vae_proxy_type is not None and isinstance(module, peft_vae_proxy_type):
+    full_proxy_type = _get_full_compressed_peft_proxy_type()
+    if full_proxy_type is not None and isinstance(module, full_proxy_type):
         return True
-    subspace_proxy_type = _get_compressed_subspace_peft_proxy_type()
-    if subspace_proxy_type is not None and isinstance(module, subspace_proxy_type):
-        return True
-    return _is_peft_lora_linear(module) or _is_peft_proxy_adapter_linear(module)
+    return _is_peft_lora_linear(module)
 
 
 def collect_hif4_act_modules(model: nn.Module) -> List[Tuple[str, nn.Module]]:

@@ -25,6 +25,8 @@ class DatasetMixSourcePreset:
     eval_split: Optional[str]
     text_field: str
     text_format: str
+    supports_lm: bool = True
+    supports_sft: bool = False
 
 
 DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
@@ -36,6 +38,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="text",
         text_format="text",
+        supports_lm=True,
+        supports_sft=False,
     ),
     "wikitext2": DatasetMixSourcePreset(
         alias="wikitext2",
@@ -45,6 +49,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="text",
         text_format="text",
+        supports_lm=True,
+        supports_sft=False,
     ),
     "openorca": DatasetMixSourcePreset(
         alias="openorca",
@@ -54,6 +60,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="text",
         text_format="openorca",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "fineweb_edu": DatasetMixSourcePreset(
         alias="fineweb_edu",
@@ -63,6 +71,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="text",
         text_format="text",
+        supports_lm=True,
+        supports_sft=False,
     ),
     "redpajama": DatasetMixSourcePreset(
         alias="redpajama",
@@ -72,6 +82,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="text",
         text_format="text",
+        supports_lm=True,
+        supports_sft=False,
     ),
     "alpaca": DatasetMixSourcePreset(
         alias="alpaca",
@@ -81,6 +93,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="text",
         text_format="alpaca",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "longalpaca": DatasetMixSourcePreset(
         alias="longalpaca",
@@ -90,6 +104,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="text",
         text_format="alpaca",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "longalign": DatasetMixSourcePreset(
         alias="longalign",
@@ -99,6 +115,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="messages",
         text_format="longalign_chat",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "race": DatasetMixSourcePreset(
         alias="race",
@@ -108,6 +126,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="article",
         text_format="race_mcqa",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "sciq": DatasetMixSourcePreset(
         alias="sciq",
@@ -117,6 +137,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="support",
         text_format="sciq_qa",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "mmlu": DatasetMixSourcePreset(
         alias="mmlu",
@@ -126,6 +148,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="question",
         text_format="mmlu_mcqa",
+        supports_lm=True,
+        supports_sft=False,
     ),
     "arc": DatasetMixSourcePreset(
         alias="arc",
@@ -135,6 +159,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="question",
         text_format="arc_mcqa",
+        supports_lm=True,
+        supports_sft=False,
     ),
     "openbookqa": DatasetMixSourcePreset(
         alias="openbookqa",
@@ -144,6 +170,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split="validation",
         text_field="question_stem",
         text_format="openbookqa_mcqa",
+        supports_lm=True,
+        supports_sft=False,
     ),
     "edgerazor_ii_7m": DatasetMixSourcePreset(
         alias="edgerazor_ii_7m",
@@ -153,6 +181,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="messages",
         text_format="edgerazor_messages",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "edgerazor_ii_gen": DatasetMixSourcePreset(
         alias="edgerazor_ii_gen",
@@ -162,6 +192,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="messages",
         text_format="edgerazor_messages",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "edgerazor_tulu": DatasetMixSourcePreset(
         alias="edgerazor_tulu",
@@ -171,6 +203,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="messages",
         text_format="edgerazor_messages",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "edgerazor_am": DatasetMixSourcePreset(
         alias="edgerazor_am",
@@ -180,6 +214,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="messages",
         text_format="edgerazor_messages",
+        supports_lm=True,
+        supports_sft=True,
     ),
     "vaellm_eval_task": DatasetMixSourcePreset(
         alias="vaellm_eval_task",
@@ -189,6 +225,8 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
         eval_split=None,
         text_field="messages",
         text_format="edgerazor_messages",
+        supports_lm=True,
+        supports_sft=True,
     ),
 }
 
@@ -1537,34 +1575,35 @@ def _build_mixed_datasets(args, training_args, tokenizer):
 
 
 def build_datasets(args, training_args, tokenizer):
-    from e2e_common.lazy_datasets import (
-        build_mixed_lazy_dataset,
-        build_single_file_lazy_dataset,
-        dataset_length_or_none,
-        is_iterable_training_dataset,
-    )
+    from train_utils.config.configs import DistillDataConfig
+    from train_utils.distill_data import build_distill_dataset
+    from e2e_common.lazy_datasets import dataset_length_or_none
 
     block_size = int(training_args.model_max_length)
     if getattr(args, "dataset_mix_spec", None):
         dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
-        normalized_spec, source_stats, train_dataset, train_is_iterable = build_mixed_lazy_dataset(
-            str(args.dataset_mix_spec),
-            task=dataset_task,
-            tokenizer=tokenizer,
-            max_seq_len=int(block_size),
+        cfg = DistillDataConfig(
+            dataset_mix=str(args.dataset_mix_spec),
+            dataset_task=dataset_task,
+            model_max_length=int(block_size),
             seed=int(getattr(training_args, "seed", 0)),
+            data_seed=int(getattr(training_args, "data_seed", getattr(training_args, "seed", 0))),
+            dynamic_padding=bool(getattr(args, "dynamic_padding", True)),
+            group_by_length=bool(getattr(training_args, "group_by_length", True)),
         )
-        eval_dataset = None
-        return train_dataset, eval_dataset, {
+        bundle = build_distill_dataset(cfg, tokenizer)
+        return bundle.train_dataset, bundle.eval_dataset, {
             "dataset_mode": "mix",
             "dataset_task": str(dataset_task),
             "block_size": int(block_size),
-            "dataset_mix_spec": str(normalized_spec),
-            "dataset_mix_sources": [str(item["alias"]) for item in source_stats],
-            "dataset_mix_weights": [float(item["weight"]) for item in source_stats],
-            "lazy_iterable": bool(train_is_iterable),
-            "dataset_length": dataset_length_or_none(train_dataset),
-            "source_stats": source_stats,
+            "dataset_mix_spec": str(bundle.dataset_mix_spec),
+            "dataset_mix_sources": [str(item["alias"]) for item in bundle.source_stats],
+            "dataset_mix_weights": [float(item["weight"]) for item in bundle.source_stats],
+            "lazy_iterable": bool(bundle.is_iterable),
+            "dataset_length": dataset_length_or_none(bundle.train_dataset),
+            "source_stats": bundle.source_stats,
+            "cache_key": list(bundle.cache_key),
+            "group_by_length": bool(bundle.group_by_length),
         }
 
     dataset_task = str(getattr(args, "dataset_task", "lm")).strip().lower()
@@ -1573,21 +1612,26 @@ def build_datasets(args, training_args, tokenizer):
     if dataset_task != "lm":
         raise ValueError(f"Unsupported dataset_task={dataset_task!r}. Expected 'lm' or 'sft'.")
 
-    train_dataset = build_single_file_lazy_dataset(
+    cfg = DistillDataConfig(
         train_file=str(args.train_file),
-        task="lm",
-        tokenizer=tokenizer,
-        max_seq_len=int(block_size),
-        text_field=str(args.text_field),
-        text_format="auto",
-        max_train_samples=getattr(args, "max_train_samples", None),
+        text_field=str(getattr(args, "text_field", "text")),
+        dataset_task="lm",
+        model_max_length=int(block_size),
+        seed=int(getattr(training_args, "seed", 0)),
+        data_seed=int(getattr(training_args, "data_seed", getattr(training_args, "seed", 0))),
+        dynamic_padding=bool(getattr(args, "dynamic_padding", True)),
+        group_by_length=bool(getattr(training_args, "group_by_length", True)),
     )
-    eval_dataset = None
-    return train_dataset, eval_dataset, {
-        "dataset_mode": "single",
-        "dataset_task": str(dataset_task),
+    bundle = build_distill_dataset(cfg, tokenizer)
+    return bundle.train_dataset, bundle.eval_dataset, {
+        "dataset_mode": "file",
+        "dataset_task": "lm",
         "block_size": int(block_size),
-        "lazy_iterable": is_iterable_training_dataset(train_dataset),
-        "dataset_length": dataset_length_or_none(train_dataset),
-        "source_stats": [],
+        "train_file": str(args.train_file),
+        "text_field": str(getattr(args, "text_field", "text")),
+        "lazy_iterable": bool(bundle.is_iterable),
+        "dataset_length": dataset_length_or_none(bundle.train_dataset),
+        "source_stats": bundle.source_stats,
+        "cache_key": list(bundle.cache_key),
+        "group_by_length": bool(bundle.group_by_length),
     }

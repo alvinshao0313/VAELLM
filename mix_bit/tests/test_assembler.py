@@ -236,8 +236,8 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
         values={
             "seed": 31,
             "deterministic": True,
-            "steps_per_category": 10,
-            "batch_size": 8,
+            "vae_steps": 10,
+            "vae_batch_size": 8,
             "base_ch": 8,
             "num_res_blocks": 0,
             "decoder_base_ch": 8,
@@ -251,13 +251,13 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
             "gamma": 1.0,
             "zeta": 1.0,
             "inv_temperature": 100.0,
-            "lr": 0.001,
+            "vae_learning_rate": 0.001,
             "beta1": 0.9,
             "beta2": 0.95,
-            "weight_decay": 0.0,
-            "optimizer": "adamw",
-            "lr_scheduler": "linear",
-            "lr_warmup_steps": 0,
+            "vae_weight_decay": 0.0,
+            "vae_optim": "adamw",
+            "vae_lr_scheduler_type": "linear",
+            "vae_warmup_ratio": 0,
             "l1_weight": 1.0,
             "lfq_weight": 1.0,
             "commitment_loss_weight": 0.25,
@@ -268,11 +268,11 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
             "log_every": 1,
             "eval_every": 0,
             "eval_blocks": 8,
-            "outlier_protect_mode": "channel",
-            "outlier_protect_count": 0,
-            "outlier_protect_min_per_layer": 0,
-            "distill_after_category": "none",
-            "eval_ppl": False,
+            "channel_protect_mode": "channel",
+            "channel_protect_count": 0,
+            "channel_min_per_layer": 0,
+            "after_category_mode": "none",
+            "skip_ppl_eval": True,
             "eval_tasks": "",
             "rot_llm": False,
             "fp16": False,
@@ -745,13 +745,13 @@ def test_full_checkpoint_save_is_called_only_by_explicit_final_save_path(
     tmp_path = assembled_world["tmp_path"]
 
     save_calls: list[str] = []
-    real_save = assembler.save_model_checkpoint
+    real_save = assembler.save_v6_full_checkpoint
 
     def _spy_save(model, output_dir, **kwargs):
         save_calls.append(str(output_dir))
         return real_save(model, output_dir, **kwargs)
 
-    monkeypatch.setattr(assembler, "save_model_checkpoint", _spy_save)
+    monkeypatch.setattr(assembler, "save_v6_full_checkpoint", _spy_save)
 
     prepare_uniform_baseline_overlay(
         resolved=resolved,
@@ -769,7 +769,7 @@ def test_full_checkpoint_save_is_called_only_by_explicit_final_save_path(
     def _get_model(_path, _token=None):
         return copy.deepcopy(template)
 
-    monkeypatch.setattr("train_utils.model_checkpoint_io.get_model", _get_model)
+    monkeypatch.setattr("train_utils.v6_model_loader.get_model", _get_model)
     monkeypatch.setattr("rotation.model_utils.get_model", _get_model)
 
     save_full_checkpoint_from_assignments(
@@ -926,7 +926,7 @@ def _patch_reload_model(monkeypatch: pytest.MonkeyPatch, template: nn.Module) ->
     def _get_model(_path, _token=None):
         return copy.deepcopy(template)
 
-    monkeypatch.setattr("train_utils.model_checkpoint_io.get_model", _get_model)
+    monkeypatch.setattr("train_utils.v6_model_loader.get_model", _get_model)
     monkeypatch.setattr("rotation.model_utils.get_model", _get_model)
 
 
@@ -1109,7 +1109,7 @@ def test_allocation_hash_or_inventory_mismatch_is_rejected(assembled_world, monk
 def test_checkpoint_extra_meta_contains_full_provenance(assembled_world, monkeypatch):
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint, derive_mixed_model_dir
     from mix_bit.schema import sha256_file
-    from train_utils.model_checkpoint_io import META_FILENAME
+    from train_utils.checkpoint_v6 import META_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1173,7 +1173,7 @@ def test_final_checkpoint_contains_unchanged_embedding_norm_and_lm_head_once(
     assembled_world, monkeypatch
 ):
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint
-    from train_utils.model_checkpoint_io import STATE_DICT_FILENAME
+    from train_utils.checkpoint_v6 import STATE_DICT_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1215,7 +1215,7 @@ def test_final_checkpoint_target_linears_store_uint8_packed_codes_not_dense_weig
     assembled_world, monkeypatch
 ):
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint
-    from train_utils.model_checkpoint_io import STATE_DICT_FILENAME
+    from train_utils.checkpoint_v6 import STATE_DICT_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1259,7 +1259,7 @@ def test_final_checkpoint_target_linears_store_uint8_packed_codes_not_dense_weig
 
 def test_saved_checkpoint_has_no_original_weight_payload(assembled_world, monkeypatch):
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint
-    from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME
+    from train_utils.checkpoint_v6 import META_FILENAME, STATE_DICT_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1297,7 +1297,7 @@ def test_no_complete_model_checkpoint_exists_before_final_assembly(
         assemble_optimal_mixed_checkpoint,
         prepare_uniform_baseline_overlay,
     )
-    from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME
+    from train_utils.checkpoint_v6 import META_FILENAME, STATE_DICT_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1349,7 +1349,7 @@ def test_no_complete_model_checkpoint_exists_before_final_assembly(
 def test_reloaded_mixed_checkpoint_has_same_assignments(assembled_world, monkeypatch):
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint
     from mix_bit.model_adapter import get_model_adapter
-    from train_utils.model_checkpoint_io import META_FILENAME, load_checkpoint_into_model
+    from train_utils.checkpoint_v6 import META_FILENAME, load_v6_full_checkpoint_into_model
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1381,7 +1381,7 @@ def test_reloaded_mixed_checkpoint_has_same_assignments(assembled_world, monkeyp
 
     adapter = get_model_adapter(resolved.config.model_profile.adapter)
     reloaded = adapter.load_model(resolved.config.model_profile)
-    load_checkpoint_into_model(model=reloaded, model_dir=str(out), map_location="cpu", strict=True)
+    load_v6_full_checkpoint_into_model(reloaded, str(out), map_location="cpu", strict=True)
     for name in assignments:
         module = reloaded.get_submodule(name)
         assert isinstance(module, VAELinear)
@@ -1392,7 +1392,7 @@ def test_existing_output_without_mix_bit_provenance_requires_overwrite(
     assembled_world, monkeypatch
 ):
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint, derive_mixed_model_dir
-    from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME
+    from train_utils.checkpoint_v6 import META_FILENAME, STATE_DICT_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1555,12 +1555,12 @@ def test_final_checkpoint_writes_state_fingerprint_manifest_and_returns_path(
 
     # Fingerprint key count must equal the reload model state key count.
     from mix_bit.model_adapter import get_model_adapter
-    from train_utils.model_checkpoint_io import load_checkpoint_into_model
+    from train_utils.checkpoint_v6 import load_v6_full_checkpoint_into_model
 
     reloaded = get_model_adapter(resolved.config.model_profile.adapter).load_model(
         resolved.config.model_profile
     )
-    load_checkpoint_into_model(model=reloaded, model_dir=str(out), map_location="cpu", strict=True)
+    load_v6_full_checkpoint_into_model(reloaded, str(out), map_location="cpu", strict=True)
     assert manifest["key_count"] == len(reloaded.state_dict())
 
     # save_full_checkpoint_from_assignments must no longer clone the full state dict.
@@ -1666,12 +1666,12 @@ def test_skip_identical_rejects_tampered_fingerprint_manifest(assembled_world, m
     # reload fingerprint comparison fails.
     from mix_bit.model_adapter import get_model_adapter
     from mix_bit.state_fingerprint import fingerprint_model_state
-    from train_utils.model_checkpoint_io import load_checkpoint_into_model
+    from train_utils.checkpoint_v6 import load_v6_full_checkpoint_into_model
 
     reloaded = get_model_adapter(resolved.config.model_profile.adapter).load_model(
         resolved.config.model_profile
     )
-    load_checkpoint_into_model(model=reloaded, model_dir=str(out_dir), map_location="cpu", strict=True)
+    load_v6_full_checkpoint_into_model(reloaded, str(out_dir), map_location="cpu", strict=True)
     valid_manifest = fingerprint_model_state(reloaded)
     first_key = next(iter(valid_manifest["entries"]))
     valid_manifest["entries"][first_key]["sha256"] = "0" * 64
@@ -1742,7 +1742,7 @@ def test_final_checkpoint_saves_and_reloads_tokenizer_with_matching_fingerprint(
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint
     from mix_bit.calibration import compute_tokenizer_config_sha256
     from mix_bit.model_adapter import AutoTokenizer, normalize_tokenizer_for_mix_bit
-    from train_utils.model_checkpoint_io import META_FILENAME
+    from train_utils.checkpoint_v6 import META_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1823,7 +1823,7 @@ def test_skip_identical_rejects_missing_tokenizer_files(assembled_world, monkeyp
 
 def test_skip_identical_rejects_legacy_tokenizer_fingerprint_version(assembled_world, monkeypatch):
     from mix_bit.assembler import assemble_optimal_mixed_checkpoint
-    from train_utils.model_checkpoint_io import META_FILENAME
+    from train_utils.checkpoint_v6 import META_FILENAME
 
     resolved = assembled_world["resolved"]
     inventory = assembled_world["inventory"]
@@ -1904,4 +1904,3 @@ def test_skip_identical_rejects_tampered_tokenizer_content(assembled_world, monk
             allocation_path=str(alloc_path),
             device="cpu",
         )
-

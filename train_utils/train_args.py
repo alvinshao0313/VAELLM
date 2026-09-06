@@ -1,10 +1,8 @@
-import argparse
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 import transformers
-
 
 @dataclass
 class HFArguments:
@@ -24,62 +22,6 @@ class TrainingArguments(transformers.TrainingArguments):
             "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)"
         },
     )
-
-
-def _parse_lora_loss_type(value: str) -> str:
-    raw = str(value).strip().lower()
-    static_choices = {
-        "sft",
-        "origin",
-        "rkl",
-        "dual_rkl",
-        "kl",
-        "mse",
-        "kd",
-        "kd_top",
-        "dual_kd_top",
-        "dual_kl",
-        "dual_kd",
-        "eakld",
-        "eakld_kd",
-        "eakld_top",
-        "eakld_topk",
-        "r_kl_top",
-        "dual_r_kl_top",
-        "kl_top",
-        "dual_kl_top",
-        "choice_kd",
-        "choice_kd_ce",
-    }
-    if raw in static_choices:
-        return raw
-    for prefix in (
-        "dual_r_kl_top_",
-        "r_kl_top_",
-        "kd_top_",
-        "dual_kd_top_",
-        "eakld_topk_",
-        "eakld_top_",
-        "kl_top_",
-        "dual_kl_top_",
-    ):
-        if raw.startswith(prefix):
-            k = raw[len(prefix):]
-            if k.isdigit() and int(k) > 0:
-                return raw
-    raise argparse.ArgumentTypeError(
-        "Invalid --lora_loss_type. Supported: sft, origin, rkl, dual_rkl, kl, mse, kd, kd_top[_K], "
-        "eakld, eakld_kd, eakld_top[_K]/eakld_topk[_K], dual_kd_top[_K], dual_kl, dual_kd, "
-        "r_kl_top[_K], dual_r_kl_top[_K], kl_top[_K], dual_kl_top[_K], choice_kd, choice_kd_ce "
-        "(K must be a positive integer)."
-    )
-
-
-def _parse_distill_loss_type(value: str) -> str:
-    try:
-        return _parse_lora_loss_type(value)
-    except argparse.ArgumentTypeError as exc:
-        raise argparse.ArgumentTypeError(str(exc).replace("--lora_loss_type", "--distill_loss_type")) from exc
 
 
 def _parse_bool_like(value, *, arg_name: str) -> bool:

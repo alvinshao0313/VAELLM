@@ -13,11 +13,6 @@ from litebsq.bitpack import (
     unpack_uint8_tensor_to_bool,
     validate_bitpack_u8_spec,
 )
-from litebsq.low_rank_scope import (
-    LOW_RANK_SCOPE_COMPRESSED_SUBSPACE,
-    LOW_RANK_SCOPE_FULL,
-    normalize_low_rank_scope,
-)
 from litebsq.fused_multistage_decoder import (
     _TRITON_AVAILABLE,
     fused_decode_packed_symmetric_decoder,
@@ -131,7 +126,6 @@ class VAELinear(nn.Module):
         sparse_residual_zero_points: Optional[torch.Tensor] = None,
         low_rank_a: Optional[torch.Tensor] = None,
         low_rank_b: Optional[torch.Tensor] = None,
-        low_rank_scope: str = LOW_RANK_SCOPE_FULL,
         protected_residual_axis: Optional[str] = None,
         protected_residual_indices: Optional[torch.Tensor] = None,
         protected_residual_stage_vq_weights: Optional[Sequence[Any]] = None,
@@ -681,7 +675,6 @@ class VAELinear(nn.Module):
             self.register_buffer("sparse_residual_scales", None, persistent=True)
             self.register_buffer("sparse_residual_zero_points", None, persistent=True)
 
-        self.low_rank_scope = normalize_low_rank_scope(low_rank_scope)
         if low_rank_a is None and low_rank_b is None:
             self.register_parameter("low_rank_a", None)
             self.register_parameter("low_rank_b", None)
@@ -696,11 +689,7 @@ class VAELinear(nn.Module):
                 low_rank_b_param = low_rank_b
             else:
                 low_rank_b_param = nn.Parameter(low_rank_b.detach().contiguous(), requires_grad=False)
-            self._validate_low_rank_payload_tensors(
-                low_rank_a_param,
-                low_rank_b_param,
-                scope=self.low_rank_scope,
-            )
+            self._validate_low_rank_payload_tensors(low_rank_a_param, low_rank_b_param)
             low_rank_a_param.requires_grad = False
             low_rank_b_param.requires_grad = False
             self.register_parameter("low_rank_a", low_rank_a_param)
@@ -1755,6 +1744,28 @@ class VAELinear(nn.Module):
         for decoder in decoder_modules:
             decoder.requires_grad_(False)
 
+    def enable_trainable_sparse_bit_decode_graph(self, *, parallel_stage_decode: bool = False) -> None:
+        """Enable one decode graph for joint decoder + Sparse Bit training.
+
+        This is the canonical combined-mode contract: Sparse Bit keeps using the
+        packed-bit autograd path through ``_sparse_bit_binding`` while decoder
+        parameters remain trainable. Do not synthesize this state by calling the
+        decoder-only and Sparse-Bit-only helpers in a particular order.
+        """
+        self.enable_trainable_decode(parallel_stage_decode=bool(parallel_stage_decode))
+        decoder_modules = []
+        packed_decoder = getattr(self, "_parallel_stage_decoder", None)
+        if packed_decoder is not None:
+            decoder_modules.append(packed_decoder)
+        else:
+            for stage_idx in range(int(self.residual_stages)):
+                for part_idx in range(int(self.parallel_parts)):
+                    decoder_modules.append(
+                        self.get_stage_part_decoder(stage_idx=stage_idx, part_idx=part_idx)
+                    )
+        for decoder in decoder_modules:
+            decoder.requires_grad_(True)
+
     def disable_trainable_decode(self) -> None:
         self.trainable_decode = False
         self.cache_decoded_weight = True
@@ -2672,23 +2683,10 @@ class VAELinear(nn.Module):
         full_in.index_copy_(1, compressed_idx, full_weight)
         return full_in
 
-    def _expected_low_rank_shape_for_scope(
-        self,
-        scope: Optional[str] = None,
-    ) -> Tuple[int, int]:
-        resolved = normalize_low_rank_scope(
-            self.low_rank_scope if scope is None else scope
-        )
-        if resolved == LOW_RANK_SCOPE_FULL:
-            return int(self.out_features), int(self.in_features)
-        return int(self.compressed_out_features), int(self.compressed_in_features)
-
     def _validate_low_rank_payload_tensors(
         self,
         low_rank_a: torch.Tensor,
         low_rank_b: torch.Tensor,
-        *,
-        scope: Optional[str] = None,
     ) -> int:
         if low_rank_a.ndim != 2 or low_rank_b.ndim != 2:
             raise ValueError(
@@ -2697,7 +2695,7 @@ class VAELinear(nn.Module):
             )
         if not low_rank_a.is_floating_point() or not low_rank_b.is_floating_point():
             raise ValueError("low_rank_a and low_rank_b must be floating tensors.")
-        expected_rows, expected_cols = self._expected_low_rank_shape_for_scope(scope)
+        expected_rows, expected_cols = int(self.out_features), int(self.in_features)
         if int(low_rank_a.shape[0]) != expected_rows:
             raise ValueError(
                 f"low_rank_a rows {int(low_rank_a.shape[0])} != expected rows {expected_rows}."
@@ -2724,16 +2722,6 @@ class VAELinear(nn.Module):
         include_low_rank: bool = True,
         include_sparse_residual: bool = True,
     ) -> torch.Tensor:
-        scope = normalize_low_rank_scope(self.low_rank_scope)
-
-        if bool(include_low_rank) and scope == LOW_RANK_SCOPE_COMPRESSED_SUBSPACE:
-            compressed_weight = self._apply_low_rank_patch_to_weight(
-                compressed_weight,
-                dtype,
-                expected_rows=self.compressed_out_features,
-                expected_cols=self.compressed_in_features,
-            )
-
         full_weight = self._materialize_full_weight(
             compressed_weight,
             dtype=dtype,
@@ -2742,7 +2730,7 @@ class VAELinear(nn.Module):
         if bool(include_protected_residual):
             full_weight = self._apply_protected_residual_vae_patch(full_weight, dtype=dtype)
 
-        if bool(include_low_rank) and scope == LOW_RANK_SCOPE_FULL:
+        if bool(include_low_rank):
             full_weight = self._apply_low_rank_patch_to_weight(
                 full_weight,
                 dtype,
@@ -2815,6 +2803,33 @@ class VAELinear(nn.Module):
             expected_rows=self.out_features,
             expected_cols=self.in_features,
         )
+
+    def _apply_low_rank_activation_residual(
+        self,
+        x: torch.Tensor,
+        base_out: torch.Tensor,
+    ) -> torch.Tensor:
+        low_rank_a = getattr(self, "low_rank_a", None)
+        low_rank_b = getattr(self, "low_rank_b", None)
+        if low_rank_a is None and low_rank_b is None:
+            return base_out
+        if low_rank_a is None or low_rank_b is None:
+            raise RuntimeError("Low-rank payload is incomplete.")
+        self._validate_low_rank_payload_tensors(low_rank_a, low_rank_b)
+        low_rank_hidden = F.linear(
+            x.to(device=low_rank_b.device, dtype=low_rank_b.dtype),
+            low_rank_b,
+        )
+        low_rank_out = F.linear(
+            low_rank_hidden.to(device=low_rank_a.device, dtype=low_rank_a.dtype),
+            low_rank_a,
+        )
+        if low_rank_out.device != base_out.device:
+            raise RuntimeError(
+                "Low-rank residual/base output device mismatch: "
+                f"residual={low_rank_out.device} base={base_out.device}."
+            )
+        return base_out + low_rank_out.to(dtype=base_out.dtype)
 
     def _decode_sparse_residual_patch(
         self,
@@ -2985,7 +3000,10 @@ class VAELinear(nn.Module):
             param = next(self.parameters(), None)
             target_dtype = param.dtype if (param is not None and param.is_floating_point()) else torch.float32
 
-        w = self._decode_weight(dtype=target_dtype).detach()
+        w = self._decode_weight(
+            dtype=target_dtype,
+            include_low_rank=False,
+        ).detach()
         self._cached_weight = w
         self._clear_parallel_stage_decode_runtime_cache()
         return True
@@ -3031,9 +3049,9 @@ class VAELinear(nn.Module):
         else:
             if can_use_cache and torch.is_grad_enabled():
                 with torch.no_grad():
-                    w = self._decode_weight(dtype=x.dtype)
+                    w = self._decode_weight(dtype=x.dtype, include_low_rank=False)
             else:
-                w = self._decode_weight(dtype=x.dtype)
+                w = self._decode_weight(dtype=x.dtype, include_low_rank=False)
             if can_use_cache:
                 self._cached_weight = w.detach()
                 self._clear_parallel_stage_decode_runtime_cache()
@@ -3041,7 +3059,8 @@ class VAELinear(nn.Module):
         bias = self.bias
         if bias is not None and bias.dtype != x.dtype:
             bias = bias.to(dtype=x.dtype)
-        return F.linear(x, w, bias)
+        base_out = F.linear(x, w, bias)
+        return self._apply_low_rank_activation_residual(x, base_out)
 
 
 from litebsq.vae_linear_prewarm import (  # noqa: E402

@@ -89,7 +89,7 @@ def _compute_weighted_group_metric(
     for task_name, task_result in results.items():
         if not task_name.startswith(f"{group_name}_"):
             continue
-        one_metric_key, one_metric = _pick_task_metric(task_result)
+        one_metric_key, one_metric = pick_task_metric(task_result)
         if one_metric is None:
             continue
         weight = int(task_result.get("samples", 0) or 0)
@@ -110,9 +110,9 @@ def _resolve_task_metric(
     groups: Dict[str, Dict[str, Any]],
 ) -> Tuple[str, Optional[float]]:
     if task_name in groups:
-        return _pick_task_metric(groups[task_name])
+        return pick_task_metric(groups[task_name])
     if task_name in results:
-        return _pick_task_metric(results[task_name])
+        return pick_task_metric(results[task_name])
     if task_name == "mmlu":
         return _compute_weighted_group_metric(group_name="mmlu", results=results)
     return "n/a", None
@@ -481,7 +481,7 @@ def _parse_eval_batch_size(batch_size):
     return int(text)
 
 
-def _pick_task_metric(task_result):
+def pick_task_metric(task_result):
     keys = ("acc_norm,none", "acc,none", "acc_norm", "acc", "exact_match,none", "exact_match")
     for key in keys:
         value = task_result.get(key)

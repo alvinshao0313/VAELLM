@@ -11,10 +11,10 @@ from torch import nn
 from litebsq.llm_vae import Decoder
 from litebsq.vae_linear import VAELinear
 from mix_bit.checkpoint_pool import CheckpointSource, ModuleCandidate
-from train_utils.model_checkpoint_io import (
+from train_utils.checkpoint_v6 import (
     META_FILENAME,
     STATE_DICT_FILENAME,
-    save_model_checkpoint,
+    save_v6_full_checkpoint,
 )
 
 
@@ -78,7 +78,15 @@ def _checkpoint_fixture(tmp_path: Path) -> tuple[ModuleCandidate, dict[str, torc
     source_module = _make_vae_linear(with_bias=True, with_original=False)
     host = _make_nested_host(source_module)
     ckpt_dir = tmp_path / "tiny_ckpt"
-    save_model_checkpoint(host, str(ckpt_dir), save_config=False, unload_vae_original_weights=True)
+    save_v6_full_checkpoint(
+        host,
+        str(ckpt_dir),
+        checkpoint_kind="final_model",
+        compressed_targets=(MODULE_NAME,),
+        pending_dense_targets=("model.layers.0.k_proj",),
+        base_model_path="tiny-base",
+        save_config=False,
+    )
 
     meta = json.loads((ckpt_dir / META_FILENAME).read_text(encoding="utf-8"))
     full_state = torch.load(ckpt_dir / STATE_DICT_FILENAME, map_location="cpu", weights_only=True)
@@ -185,11 +193,11 @@ def test_candidate_construction_does_not_require_teacher_model(tmp_path: Path):
 def test_shape_only_placeholder_does_not_allocate_full_dense_weight(tmp_path: Path, monkeypatch):
     from mix_bit import module_swap
     from mix_bit.module_swap import build_candidate_module
-    from train_utils import model_checkpoint_io
+    from train_utils import checkpoint_v6
 
     candidate, compact_state, _ = _checkpoint_fixture(tmp_path)
     seen_weight_numels: list[int] = []
-    original_rebuild = model_checkpoint_io._rebuild_converted_modules
+    original_rebuild = checkpoint_v6._rebuild_converted_modules
 
     def _spy(holder, specs, **kwargs):
         target = holder.target

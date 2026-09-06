@@ -10,33 +10,21 @@ from torch import nn
 
 from e2e_common.selective_topk_head import (
     TeacherTopKTargets,
-    compute_selected_teacher_topk_kl,
     extract_teacher_topk_targets,
     is_selective_student_topk_loss,
     move_teacher_topk_targets_to_device,
     parse_selective_student_topk_k,
     selective_student_lm_head,
 )
-from train_utils.distill_losses import (
-    build_distill_token_regions,
-    compute_dual_kl_loss,
-    compute_dual_kl_topk_loss,
-    compute_dual_rkl_loss,
-    compute_dual_rkl_topk_loss,
-    compute_eakld,
-    compute_eakld_topk,
-    compute_entropy_aware_kl_loss,
-    compute_forward_kl_loss,
-    compute_kl_topk,
-    compute_masked_logit_mse_loss,
-    compute_reverse_kl_loss,
-    compute_rkl_topk,
-    is_eakld_top_loss,
-    parse_eakld_top_k,
+from train_utils.distill_loss_core import (
+    compute_model_level_loss,
+    compute_selected_kl_top_model_level_loss,
+    normalize_model_level_loss_type,
 )
 from train_utils.distill_token_stats import DistillTokenStatsAccumulator
 from train_utils.hif4_act import Hif4ActController
 from train_utils.distill_teacher import DistillTeacherRuntime, resolve_distill_teacher_required
+from train_utils.config.configs import DistillLossConfig
 
 
 logger = logging.getLogger(__name__)
@@ -728,43 +716,6 @@ def ensure_lora_training_stack_available() -> None:
         raise ImportError("未安装 trl。请先安装：pip install trl")
 
 
-def create_lora_adapters(
-    model: nn.Module,
-    *,
-    target_names: Sequence[str],
-    rank: int,
-    alpha: float,
-    dropout: float,
-    use_dora: bool,
-):
-    unique_target_names = sorted(set(str(name) for name in target_names if str(name).strip()))
-    if not unique_target_names:
-        return model, None, unique_target_names
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=int(rank),
-        lora_alpha=float(alpha),
-        lora_dropout=float(dropout),
-        target_modules=unique_target_names,
-        inference_mode=False,
-        bias="none",
-        use_dora=bool(use_dora),
-    )
-    return get_peft_model(model, lora_config), lora_config, unique_target_names
-
-
-def merge_all_lora(model: nn.Module) -> Tuple[nn.Module, int]:
-    if PeftModel is None or not isinstance(model, PeftModel):
-        return model, 0
-    trainable_count = 0
-    for name, _ in model.named_parameters():
-        if "lora_" in name:
-            trainable_count += 1
-    merged_model = model.merge_and_unload()
-    return merged_model, trainable_count
-
-
 class _DistillOptimizerGroupingMixin:
     def __init__(
         self,
@@ -778,100 +729,18 @@ class _DistillOptimizerGroupingMixin:
         super().__init__(*args, **kwargs)
 
     def create_optimizer(self):
+        selection = getattr(self, "model_level_trainable_selection", None)
         decoder_param_ids = frozenset(int(v) for v in getattr(self, "distill_decoder_param_ids", frozenset()))
-        if not decoder_param_ids:
+        if selection is None and not decoder_param_ids:
             return super().create_optimizer()
-
-        opt_model = getattr(self, "model_wrapped", None) or self.model
-        if self.optimizer is None:
-            decay_parameters = set(self.get_decay_parameter_names(opt_model))
-            nondecoder_decay = []
-            nondecoder_no_decay = []
-            decoder = []
-            trainable_ids = set()
-
-            for name, param in opt_model.named_parameters():
-                if not bool(param.requires_grad):
-                    continue
-                param_id = id(param)
-                trainable_ids.add(param_id)
-                if param_id in decoder_param_ids:
-                    decoder.append(param)
-                elif name in decay_parameters:
-                    nondecoder_decay.append(param)
-                else:
-                    nondecoder_no_decay.append(param)
-
-            grouped_ids = (
-                {id(param) for param in nondecoder_decay}
-                | {id(param) for param in nondecoder_no_decay}
-                | {id(param) for param in decoder}
+        if selection is None:
+            raise RuntimeError(
+                "CAT distill optimizer requires model_level_trainable_selection "
+                "(Task 6 inventories). decoder_param_ids alone is no longer sufficient."
             )
-            group_lengths = len(nondecoder_decay) + len(nondecoder_no_decay) + len(decoder)
-            if grouped_ids != trainable_ids or group_lengths != len(grouped_ids):
-                raise RuntimeError("Distill optimizer grouping produced duplicate or missing trainable parameters.")
-            missing_decoder = decoder_param_ids - trainable_ids
-            if missing_decoder:
-                raise RuntimeError(
-                    "Decoder optimizer group contains ids that are not trainable model parameters: "
-                    + ",".join(str(v) for v in sorted(missing_decoder))
-                )
+        from train_utils.model_level_optimizer import create_model_level_optimizer
 
-            optimizer_grouped_parameters = []
-            if nondecoder_decay:
-                optimizer_grouped_parameters.append(
-                    {
-                        "group_name": "nondecoder_decay",
-                        "params": nondecoder_decay,
-                        "weight_decay": self.args.weight_decay,
-                    }
-                )
-            if nondecoder_no_decay:
-                optimizer_grouped_parameters.append(
-                    {
-                        "group_name": "nondecoder_no_decay",
-                        "params": nondecoder_no_decay,
-                        "weight_decay": 0.0,
-                    }
-                )
-            if decoder:
-                optimizer_grouped_parameters.append(
-                    {
-                        "group_name": "decoder",
-                        "params": decoder,
-                        "lr": float(self.distill_decoder_lr),
-                        "weight_decay": 0.0,
-                    }
-                )
-
-            if self.optimizer_cls_and_kwargs is not None:
-                optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
-            else:
-                optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
-
-            if "params" in optimizer_kwargs:
-                optimizer_grouped_parameters = optimizer_kwargs.pop("params")
-            if "model" in optimizer_kwargs:
-                optimizer_grouped_parameters = optimizer_kwargs.pop("model")
-            if "optimizer_dict" in optimizer_kwargs:
-                optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
-
-            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-
-            if optimizer_cls.__name__ == "Adam8bit":
-                import bitsandbytes
-
-                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
-                skipped = 0
-                for module in opt_model.modules():
-                    if isinstance(module, nn.Embedding):
-                        skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
-                        logger.info("skipped %s: %sM params", module, skipped / 2**20)
-                        manager.register_module_override(module, "weight", {"optim_bits": 32})
-                        logger.debug("bitsandbytes: will optimize %s in fp32", module)
-                logger.info("skipped: %sM params", skipped / 2**20)
-        return self.optimizer
-
+        return create_model_level_optimizer(self)
 
 if SFTTrainer is None:
     class CustomSFTTrainer:
@@ -887,53 +756,59 @@ else:
         def __init__(
             self,
             *args,
-            loss_type: str = "r_kl_top_1000",
+            loss_type: str = "sft",
+            top_k: int = 100,
             temperature: float = 1.0,
             loss_alpha: float = 0.5,
             hidden_loss_weight: float = 0.0,
             pre_mlp_hidden_loss_weight: float = 0.0,
             prompt_kd_weight: float = 0.0,
             hidden_alignment_layer_weighting: str = "uniform",
-            eakld_confidence_k: int = 16,
             teacher_logits_cpu_staging: bool = False,
             selective_student_topk: bool = False,
             selective_student_topk_chunk_rows: int = 32,
             selective_teacher_topk_chunk_tokens: int = 8,
             distill_hif4_act_controller: Optional[Hif4ActController] = None,
             teacher_runtime: Optional[DistillTeacherRuntime] = None,
+            loss_config: Optional[DistillLossConfig] = None,
             **kwargs,
         ):
             super().__init__(*args, **kwargs)
-            self.loss_type = str(loss_type).strip().lower()
-            self.temperature = float(temperature)
-            self.loss_alpha = float(loss_alpha)
-            self.hidden_loss_weight = float(hidden_loss_weight)
-            if self.hidden_loss_weight < 0.0:
-                raise ValueError(f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}.")
-            self.pre_mlp_hidden_loss_weight = float(pre_mlp_hidden_loss_weight)
-            if self.pre_mlp_hidden_loss_weight < 0.0:
-                raise ValueError(
-                    f"pre_mlp_hidden_loss_weight must be >= 0, got {self.pre_mlp_hidden_loss_weight}."
+            if loss_config is not None:
+                loss_config.validate()
+                self.loss_config = loss_config
+            else:
+                self.loss_config = DistillLossConfig(
+                    loss_type=normalize_model_level_loss_type(loss_type),
+                    top_k=int(top_k),
+                    temperature=float(temperature),
+                    alpha=float(loss_alpha),
+                    prompt_loss_weight=float(prompt_kd_weight),
+                    hidden_loss_weight=float(hidden_loss_weight),
+                    pre_mlp_hidden_loss_weight=float(pre_mlp_hidden_loss_weight),
+                    hidden_layer_weighting=str(hidden_alignment_layer_weighting),
+                    selective_student_topk=bool(selective_student_topk),
+                    selective_student_topk_chunk_rows=int(selective_student_topk_chunk_rows),
                 )
-            self.prompt_kd_weight = float(prompt_kd_weight)
-            if self.prompt_kd_weight < 0.0:
-                raise ValueError(f"prompt_kd_weight must be >= 0, got {self.prompt_kd_weight}.")
+                self.loss_config.validate()
+            self.loss_type = str(self.loss_config.loss_type)
+            self.top_k = int(self.loss_config.top_k)
+            self.temperature = float(self.loss_config.temperature)
+            self.loss_alpha = float(self.loss_config.alpha)
+            self.hidden_loss_weight = float(self.loss_config.hidden_loss_weight)
+            self.pre_mlp_hidden_loss_weight = float(self.loss_config.pre_mlp_hidden_loss_weight)
+            self.prompt_kd_weight = float(self.loss_config.prompt_loss_weight)
             self.hidden_alignment_layer_weighting = parse_distill_hidden_alignment_layer_weighting(
-                hidden_alignment_layer_weighting
+                self.loss_config.hidden_layer_weighting
             )
-            self.eakld_confidence_k = int(eakld_confidence_k)
-            if self.eakld_confidence_k < 2:
-                raise ValueError(f"eakld_confidence_k must be >= 2, got {self.eakld_confidence_k}.")
             self.teacher_logits_cpu_staging = bool(teacher_logits_cpu_staging)
-            self.selective_student_topk = bool(selective_student_topk)
-            self.selective_student_topk_chunk_rows = int(selective_student_topk_chunk_rows)
+            self.selective_student_topk = bool(self.loss_config.selective_student_topk)
+            self.selective_student_topk_chunk_rows = int(self.loss_config.selective_student_topk_chunk_rows)
             self.selective_teacher_topk_chunk_tokens = int(selective_teacher_topk_chunk_tokens)
-            if self.selective_student_topk_chunk_rows < 1:
-                raise ValueError("selective_student_topk_chunk_rows must be >= 1.")
             if self.selective_teacher_topk_chunk_tokens < 1:
                 raise ValueError("selective_teacher_topk_chunk_tokens must be >= 1.")
             if self.selective_student_topk and not is_selective_student_topk_loss(self.loss_type):
-                raise ValueError("selective_student_topk only supports loss_type=kl_top[_K].")
+                raise ValueError("selective_student_topk only supports loss_type=kl_top.")
             self.distill_hif4_act_controller = distill_hif4_act_controller
             self.teacher_runtime = teacher_runtime
             self.teacher_required = resolve_distill_teacher_required(
@@ -946,6 +821,35 @@ else:
             self._runtime_view_cache_key = None
             self._runtime_view_cache = None
             self.distill_token_stats = DistillTokenStatsAccumulator()
+
+        def _resolved_loss_config(self) -> DistillLossConfig:
+            """Single-truth DistillLossConfig; rebuild from attrs if tests used ``__new__``."""
+            cfg = getattr(self, "loss_config", None)
+            if cfg is not None:
+                return cfg
+            canonical = normalize_model_level_loss_type(getattr(self, "loss_type", "sft"))
+            resolved_top_k = int(getattr(self, "top_k", 100))
+            cfg = DistillLossConfig(
+                loss_type=canonical,
+                top_k=resolved_top_k,
+                temperature=float(getattr(self, "temperature", 1.0)),
+                alpha=float(getattr(self, "loss_alpha", 0.5)),
+                prompt_loss_weight=float(getattr(self, "prompt_kd_weight", 0.0)),
+                hidden_loss_weight=float(getattr(self, "hidden_loss_weight", 0.0)),
+                pre_mlp_hidden_loss_weight=float(getattr(self, "pre_mlp_hidden_loss_weight", 0.0)),
+                hidden_layer_weighting=str(
+                    getattr(self, "hidden_alignment_layer_weighting", "uniform")
+                ),
+                selective_student_topk=bool(getattr(self, "selective_student_topk", False)),
+                selective_student_topk_chunk_rows=int(
+                    getattr(self, "selective_student_topk_chunk_rows", 32)
+                ),
+            )
+            cfg.validate()
+            self.loss_config = cfg
+            self.loss_type = str(cfg.loss_type)
+            self.top_k = int(cfg.top_k)
+            return cfg
 
         def _resolve_runtime_view_cache(self, model, pre_mlp_hidden_loss_enabled: bool):
             unwrapped_model = _unwrap_accelerator_model(
@@ -1061,7 +965,7 @@ else:
                 selective_topk = (
                     extract_teacher_topk_targets(
                         outputs.logits,
-                        k=parse_selective_student_topk_k(self.loss_type),
+                        k=parse_selective_student_topk_k(self.loss_type, top_k=self.top_k),
                         sequence_chunk_size=self.selective_teacher_topk_chunk_tokens,
                         pin_memory=True,
                     )
@@ -1112,16 +1016,15 @@ else:
             return targets
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
-            args = self.args
-            loss_type = self.loss_type
+            loss_cfg = self._resolved_loss_config()
             if bool(getattr(model, "training", False)):
                 original_labels = inputs.get("labels")
                 if isinstance(original_labels, torch.Tensor):
                     self.distill_token_stats.update(
                         original_labels, inputs.get("attention_mask")
                     )
-            hidden_loss_enabled = float(self.hidden_loss_weight) > 0.0
-            pre_mlp_hidden_loss_enabled = float(self.pre_mlp_hidden_loss_weight) > 0.0
+            hidden_loss_enabled = float(loss_cfg.hidden_loss_weight) > 0.0
+            pre_mlp_hidden_loss_enabled = float(loss_cfg.pre_mlp_hidden_loss_weight) > 0.0
             pre_mlp_reference_hidden_required = bool(
                 pre_mlp_hidden_loss_enabled
                 and is_adaptive_hidden_alignment_layer_weighting(
@@ -1136,15 +1039,7 @@ else:
             teacher_inputs = dict(inputs)
             teacher_inputs.pop("labels", None)
             student_inputs = dict(inputs)
-            uses_ce_loss = (
-                loss_type == "kd"
-                or loss_type == "dual_kd"
-                or loss_type == "eakld_kd"
-                or loss_type.startswith("kd_top")
-                or loss_type.startswith("dual_kd_top")
-            )
-            if not uses_ce_loss:
-                student_inputs.pop("labels", None)
+            student_inputs.pop("labels", None)
             full_inputs = dict(inputs)
 
             runtime_view = self._resolve_runtime_view_cache(
@@ -1162,25 +1057,6 @@ else:
 
             def prepare_student_path() -> None:
                 set_hif4_act_enabled(previous_hif4_enabled)
-
-            def parse_k(prefix: str, default_k: int = 1000) -> int:
-                if loss_type == prefix:
-                    return default_k
-                suffix = loss_type[len(prefix):]
-                if suffix.startswith("_"):
-                    suffix = suffix[1:]
-                if not suffix:
-                    return default_k
-                return max(1, int(suffix))
-
-            def get_teacher_targets():
-                return self._run_teacher_forward(
-                    teacher_inputs=teacher_inputs,
-                    need_logits=loss_type not in {"origin", "sft"},
-                    need_output_hidden_states=need_teacher_output_hidden_states,
-                    need_pre_mlp_hiddens=pre_mlp_hidden_loss_enabled,
-                    student_pre_mlp_modules=pre_mlp_capture_modules,
-                )
 
             def student_forward(model_inputs):
                 nonlocal student_pre_mlp_hiddens
@@ -1237,429 +1113,85 @@ else:
                     loss = loss + float(self.pre_mlp_hidden_loss_weight) * pre_mlp_hidden_loss
                 return loss
 
-            def build_token_regions(reference_logits):
-                return build_distill_token_regions(
-                    labels=full_inputs.get("labels"),
-                    attention_mask=full_inputs.get("attention_mask"),
-                    reference_logits=reference_logits,
-                )
-
-            def combine_region_loss(loss_for_mask, regions):
-                response_loss = loss_for_mask(regions.response_mask)
-                if self.prompt_kd_weight == 0.0:
-                    return response_loss
-                prompt_loss = loss_for_mask(regions.prompt_mask)
-                return response_loss + self.prompt_kd_weight * prompt_loss
-
             try:
-                if loss_type in {"origin", "sft"}:
-                    if hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
-                        teacher_targets = get_teacher_targets()
-                        prepare_student_path()
-                        outputs = student_forward(full_inputs)
-                        loss = add_hidden_alignment_loss(outputs["loss"], teacher_targets, outputs)
-                        return (loss, outputs) if return_outputs else loss
-                    try:
-                        return super().compute_loss(
-                            model,
-                            full_inputs,
-                            return_outputs=return_outputs,
-                            num_items_in_batch=num_items_in_batch,
-                        )
-                    except TypeError:
-                        return super().compute_loss(
-                            model,
-                            full_inputs,
-                            return_outputs=return_outputs,
-                        )
+                canonical_loss = normalize_model_level_loss_type(loss_cfg.loss_type)
+                resolved_top_k = int(loss_cfg.top_k)
+
+                input_ids = full_inputs.get("input_ids")
+                labels = full_inputs.get("labels")
+                attention_mask = full_inputs.get("attention_mask")
+                if not isinstance(input_ids, torch.Tensor):
+                    raise ValueError("model-level loss requires input_ids tensor.")
+                if not isinstance(labels, torch.Tensor):
+                    raise ValueError("model-level loss requires labels tensor.")
+                if not isinstance(attention_mask, torch.Tensor):
+                    raise ValueError("model-level loss requires attention_mask tensor.")
+
+                need_logits = canonical_loss != "sft"
+                teacher_targets = None
+                if need_logits or hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
+                    teacher_targets = self._run_teacher_forward(
+                        teacher_inputs=teacher_inputs,
+                        need_logits=need_logits,
+                        need_output_hidden_states=need_teacher_output_hidden_states,
+                        need_pre_mlp_hiddens=pre_mlp_hidden_loss_enabled,
+                        student_pre_mlp_modules=pre_mlp_capture_modules,
+                    )
 
                 prepare_student_path()
-
-                if loss_type == "rkl":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
+                if (
+                    canonical_loss == "kl_top"
+                    and self.selective_student_topk
+                ):
+                    if teacher_targets is None or teacher_targets.selective_topk is None:
+                        raise RuntimeError("selective student top-k requires compact teacher targets.")
+                    if int(teacher_targets.selective_topk.k) != int(resolved_top_k):
+                        raise RuntimeError("selective teacher top-k K does not match loss K.")
+                    input_tensor = next(
+                        value for value in student_inputs.values() if torch.is_tensor(value)
+                    )
+                    selected_indices, selected_teacher_logits = move_teacher_topk_targets_to_device(
+                        teacher_targets.selective_topk,
+                        device=input_tensor.device,
+                    )
+                    with selective_student_lm_head(
+                        model,
+                        teacher_topk_indices=selected_indices,
+                        chunk_rows=self.selective_student_topk_chunk_rows,
+                    ):
+                        outputs = student_forward(student_inputs)
+                    loss = compute_selected_kl_top_model_level_loss(
+                        student_selected_logits=outputs.logits,
+                        teacher_selected_logits=selected_teacher_logits,
+                        labels=labels,
+                        attention_mask=attention_mask,
+                        temperature=float(loss_cfg.temperature),
+                        prompt_loss_weight=float(loss_cfg.prompt_loss_weight),
+                    )
+                else:
                     outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_reverse_kl_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            temperature=float(self.temperature),
-                        ),
-                        regions,
+                    teacher_logits = None
+                    if need_logits:
+                        if teacher_targets is None or teacher_targets.logits is None:
+                            raise RuntimeError(f"loss_type={canonical_loss} requires teacher logits.")
+                        teacher_logits = self._teacher_logits_for_loss(teacher_targets.logits, outputs.logits)
+                    loss = compute_model_level_loss(
+                        loss_type=canonical_loss,
+                        student_logits=outputs.logits,
+                        input_ids=input_ids,
+                        labels=labels,
+                        attention_mask=attention_mask,
+                        teacher_logits=teacher_logits,
+                        temperature=float(loss_cfg.temperature),
+                        alpha=float(loss_cfg.alpha),
+                        top_k=resolved_top_k,
+                        prompt_loss_weight=float(loss_cfg.prompt_loss_weight),
                     )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
 
-                if loss_type == "dual_rkl":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_dual_rkl_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                        ),
-                        regions,
-                    )
+                if teacher_targets is not None:
                     loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type == "kl":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_forward_kl_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            temperature=float(self.temperature),
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type.startswith("r_kl_top"):
-                    k = parse_k("r_kl_top", default_k=1000)
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_rkl_topk(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            k=k,
-                            temperature=float(self.temperature),
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type.startswith("dual_r_kl_top"):
-                    k = parse_k("dual_r_kl_top", default_k=1000)
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_dual_rkl_topk_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            k=k,
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type.startswith("kl_top"):
-                    k = parse_k("kl_top", default_k=1000)
-                    teacher_targets = get_teacher_targets()
-                    if self.selective_student_topk:
-                        if teacher_targets.selective_topk is None:
-                            raise RuntimeError("selective student top-k requires compact teacher targets.")
-                        if int(teacher_targets.selective_topk.k) != int(k):
-                            raise RuntimeError("selective teacher top-k K does not match loss K.")
-                        input_tensor = next(
-                            value for value in student_inputs.values() if torch.is_tensor(value)
-                        )
-                        selected_indices, selected_teacher_logits = move_teacher_topk_targets_to_device(
-                            teacher_targets.selective_topk,
-                            device=input_tensor.device,
-                        )
-                        prepare_student_path()
-                        with selective_student_lm_head(
-                            model,
-                            teacher_topk_indices=selected_indices,
-                            chunk_rows=self.selective_student_topk_chunk_rows,
-                        ):
-                            outputs = student_forward(student_inputs)
-                        logits = outputs.logits
-                        regions = build_token_regions(logits)
-                        loss = combine_region_loss(
-                            lambda mask: compute_selected_teacher_topk_kl(
-                                student_selected_logits=logits,
-                                teacher_topk_logits=selected_teacher_logits,
-                                mask=mask,
-                                temperature=float(self.temperature),
-                            ),
-                            regions,
-                        )
-                        loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                        return (loss, outputs) if return_outputs else loss
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_kl_topk(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            k=k,
-                            temperature=float(self.temperature),
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type.startswith("kd_top"):
-                    k = parse_k("kd_top", default_k=1000)
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(full_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    T, alpha = self.temperature, self.loss_alpha
-                    ori_loss = outputs["loss"]
-                    regions = build_token_regions(logits)
-                    distill_loss = combine_region_loss(
-                        lambda mask: compute_kl_topk(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            k=k,
-                            temperature=float(T),
-                        ),
-                        regions,
-                    )
-                    # T² is already applied inside compute_kl_topk.
-                    loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type == "mse":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_masked_logit_mse_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type == "kd":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(full_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    T, alpha = self.temperature, self.loss_alpha
-                    ori_loss = outputs["loss"]
-                    regions = build_token_regions(logits)
-                    distill_loss = combine_region_loss(
-                        lambda mask: compute_forward_kl_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            temperature=float(T),
-                        ),
-                        regions,
-                    )
-                    # T² is already applied inside compute_forward_kl_loss.
-                    loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type == "dual_kl":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_dual_kl_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type.startswith("dual_kl_top"):
-                    k = parse_k("dual_kl_top", default_k=1000)
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_dual_kl_topk_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            k=k,
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type.startswith("dual_kd_top"):
-                    k = parse_k("dual_kd_top", default_k=1000)
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(full_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    ori_loss = outputs["loss"]
-                    regions = build_token_regions(logits)
-                    distill_loss = combine_region_loss(
-                        lambda mask: compute_dual_kl_topk_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            k=k,
-                        ),
-                        regions,
-                    )
-                    alpha = self.loss_alpha
-                    loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type == "dual_kd":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(full_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    ori_loss = outputs["loss"]
-                    regions = build_token_regions(logits)
-                    distill_loss = combine_region_loss(
-                        lambda mask: compute_dual_kl_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                        ),
-                        regions,
-                    )
-                    alpha = self.loss_alpha
-                    loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if is_eakld_top_loss(loss_type):
-                    k = parse_eakld_top_k(loss_type, default_k=1000)
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_eakld_topk(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            k=k,
-                            temperature=float(self.temperature),
-                            confidence_k=int(self.eakld_confidence_k),
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type == "eakld":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(student_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    regions = build_token_regions(logits)
-                    loss = combine_region_loss(
-                        lambda mask: compute_eakld(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            temperature=float(self.temperature),
-                            confidence_k=int(self.eakld_confidence_k),
-                        ),
-                        regions,
-                    )
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                if loss_type == "eakld_kd":
-                    teacher_targets = get_teacher_targets()
-                    ori_logits = teacher_targets.logits
-                    prepare_student_path()
-                    outputs = student_forward(full_inputs)
-                    logits = outputs.logits
-                    teacher_logits = self._teacher_logits_for_loss(ori_logits, logits)
-                    T, alpha = self.temperature, self.loss_alpha
-                    ori_loss = outputs["loss"]
-                    regions = build_token_regions(logits)
-                    distill_loss = combine_region_loss(
-                        lambda mask: compute_entropy_aware_kl_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_logits,
-                            mask=mask,
-                            temperature=float(T),
-                            confidence_k=int(self.eakld_confidence_k),
-                        ),
-                        regions,
-                    )
-                    # T² is already applied inside compute_eakld.
-                    loss = ori_loss * (1 - alpha) + distill_loss * alpha
-                    loss = add_hidden_alignment_loss(loss, teacher_targets, outputs)
-                    return (loss, outputs) if return_outputs else loss
-
-                raise ValueError(
-                    f"Unsupported lora loss type: {loss_type}. "
-                    f"Supported: sft/origin, rkl, dual_rkl, kl, r_kl_top[_K], dual_r_kl_top[_K], "
-                    f"kl_top[_K], kd_top[_K], eakld, eakld_kd, eakld_top[_K]/eakld_topk[_K], "
-                    f"dual_kl, dual_kd, dual_kl_top[_K], dual_kd_top[_K], mse, kd."
-                )
+                elif hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
+                    raise RuntimeError("hidden alignment requires teacher targets.")
+                return (loss, outputs) if return_outputs else loss
             finally:
                 set_hif4_act_enabled(previous_hif4_enabled)

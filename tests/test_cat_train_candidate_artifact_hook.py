@@ -7,14 +7,15 @@ import pytest
 
 
 def test_candidate_only_save_requires_spec_and_output_dir():
-    from train_utils.cat_train_args import process_cat_train_args
+    from train_utils.cat_runtime_adapter import parse_cat_runtime_args
 
-    with pytest.raises(ValueError, match="candidate_artifact_spec|candidate_artifact_output_dir"):
-        process_cat_train_args(
+    with pytest.raises(SystemExit):
+        parse_cat_runtime_args(
             [
                 "--convert",
                 "--save_candidate_artifact",
-                "--target_categories",
+                "true",
+                "--compression_categories",
                 "q_proj",
                 "--model_path",
                 "toy",
@@ -23,15 +24,15 @@ def test_candidate_only_save_requires_spec_and_output_dir():
 
 
 def test_candidate_artifact_args_rejected_when_disabled():
-    from train_utils.cat_train_args import process_cat_train_args
+    from train_utils.cat_runtime_adapter import parse_cat_runtime_args
 
-    with pytest.raises(ValueError, match="candidate_artifact"):
-        process_cat_train_args(
+    with pytest.raises(SystemExit):
+        parse_cat_runtime_args(
             [
                 "--convert",
                 "--candidate_artifact_spec",
                 "/tmp/spec.json",
-                "--target_categories",
+                "--compression_categories",
                 "q_proj",
                 "--model_path",
                 "toy",
@@ -40,18 +41,18 @@ def test_candidate_artifact_args_rejected_when_disabled():
 
 
 def test_save_model_path_unchanged_without_candidate_flag():
-    from train_utils.cat_train_args import process_cat_train_args
+    from train_utils.cat_runtime_adapter import parse_cat_runtime_args
 
-    cat_args, _hf, _train, _vae = process_cat_train_args(
+    cat_args, _hf, _train, _vae = parse_cat_runtime_args(
         [
             "--convert",
             "--save_model",
-            "--target_categories",
+            "--compression_categories",
             "q_proj",
             "--model_path",
             "toy",
-            "--eval_ppl",
-            "false",
+            "--skip_ppl_eval",
+            "true",
         ]
     )
     assert cat_args.save_model is True
@@ -80,19 +81,20 @@ def test_pipeline_candidate_branch_skips_full_model_checkpoint():
 
 
 def test_candidate_only_save_rejects_save_model_combination():
-    from train_utils.cat_train_args import process_cat_train_args
+    from train_utils.cat_runtime_adapter import parse_cat_runtime_args
 
-    with pytest.raises(ValueError, match="mutually exclusive|save_candidate_artifact|save_model"):
-        process_cat_train_args(
+    with pytest.raises(SystemExit):
+        parse_cat_runtime_args(
             [
                 "--convert",
                 "--save_candidate_artifact",
+                "true",
                 "--save_model",
                 "--candidate_artifact_spec",
                 "/tmp/spec.json",
                 "--candidate_artifact_output_dir",
                 "/tmp/artifact",
-                "--target_categories",
+                "--compression_categories",
                 "q_proj",
                 "--model_path",
                 "toy",

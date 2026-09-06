@@ -1,32 +1,27 @@
-import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
 from torch import nn
 
-from e2e_common.peft_proxy import PeftVAELinearProxy, iter_named_peft_vae_proxies
-from e2e_common.post_norm_head import fuse_post_norm_head_linear
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import (
     NamedVAELinearTarget,
-    clear_model_vae_linear_cache,
 )
 from train_utils.cat_after_category_distill import (
-    collect_compressed_category_targets,
     run_after_category_distill,
 )
-from train_utils.cat_arg_overrides import resolve_after_category_value
-from train_utils.cat_train_args import resolve_category_runtime_configs
+from train_utils.cat_category_runtime import resolve_category_runtime_configs
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.cat_train_runtime import (
-    normalize_cat_runtime_vae_original_state,
+    build_distributed_cat_run_output_dir as _build_distributed_run_output_dir,
     save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
 )
 from train_utils.base_reference import clone_frozen_linear_from_reference
 from train_utils.distill_teacher import DistillTeacherRuntime, resolve_distill_teacher_dtype
+from train_utils.distributed_guard import distributed_guarded_main
 from train_utils.lora_utils import (
     distill_distributed_barrier,
     ensure_distill_process_group_initialized,
@@ -34,12 +29,12 @@ from train_utils.lora_utils import (
     is_distill_main_process,
     resolve_distill_train_device,
 )
-from train_utils.model_checkpoint_io import (
-    META_FILENAME,
-    _build_distributed_run_output_dir,
-    load_model_checkpoint,
-    resolve_checkpoint_dir,
-    save_model_checkpoint,
+from train_utils.cat_checkpoint_distill_v6 import (
+    CheckpointDistillV6Source,
+    load_checkpoint_distill_progress,
+    load_checkpoint_distill_v6_source,
+    resolve_checkpoint_distill_mode,
+    save_checkpoint_distill_v6_model,
 )
 from train_utils.utils import (
     configure_deterministic_mode,
@@ -48,9 +43,6 @@ from train_utils.utils import (
     set_seed,
     split_csv as _split_csv,
 )
-
-
-_CHECKPOINT_DISTILL_MODES = {"compressed_lora", "decoder", "both"}
 
 
 @dataclass(frozen=True)
@@ -73,11 +65,9 @@ def _category_of_module_name(name: str) -> str:
 
 
 def _resolve_vae_base_layer(module: nn.Module) -> VAELinear:
-    if isinstance(module, PeftVAELinearProxy):
-        return module.base_layer
     if isinstance(module, VAELinear):
         return module
-    raise TypeError(f"Expected VAELinear or PeftVAELinearProxy, got {type(module)}")
+    raise TypeError(f"Expected VAELinear, got {type(module)}")
 
 
 def _iter_named_vae_targets(model: nn.Module) -> List[_NamedCategoryVAETarget]:
@@ -86,11 +76,7 @@ def _iter_named_vae_targets(model: nn.Module) -> List[_NamedCategoryVAETarget]:
     for name, module in model.named_modules():
         if any(name == prefix or name.startswith(f"{prefix}.") for prefix in skip_prefixes):
             continue
-        if isinstance(module, PeftVAELinearProxy):
-            skip_prefixes.append(f"{name}.base_layer")
-            skip_prefixes.append(f"{name}.per_decoded_linear")
-            base_layer = module.base_layer
-        elif isinstance(module, VAELinear):
+        if isinstance(module, VAELinear):
             base_layer = module
         else:
             continue
@@ -162,7 +148,7 @@ def _apply_vae_decoder_checkpoint_override(*, model: nn.Module, vae_args, logger
         return 0
 
     resolved_mode = str(mode).strip().lower()
-    if resolved_mode == "compressed_lora":
+    if resolved_mode in {"compressed_lora", "current_lora"}:
         logger.info(
             "Checkpoint distill: mode=compressed_lora，忽略 --vae_decoder_checkpoint（前向不跑 decoder）。"
         )
@@ -230,7 +216,7 @@ def _ensure_active_vae(
     device: torch.device,
 ) -> None:
     module = _get_module_by_name(model, name)
-    if isinstance(module, (VAELinear, PeftVAELinearProxy)):
+    if isinstance(module, VAELinear):
         base_layer = _resolve_vae_base_layer(module)
         base_layer.clear_decoded_weight_cache()
         module.to(device)
@@ -258,7 +244,7 @@ def _ensure_inactive_reference_linear(
     dtype: torch.dtype,
 ) -> None:
     module = _get_module_by_name(model, name)
-    if isinstance(module, (VAELinear, PeftVAELinearProxy)):
+    if isinstance(module, VAELinear):
         _stash_vae_module_to_cpu(name=name, module=module, residency=residency)
     elif isinstance(module, nn.Linear):
         reference = _get_or_create_reference_linear(
@@ -414,121 +400,6 @@ def _restore_final_vae_representation(
     )
 
 
-def _load_checkpoint_for_distill(*, cat_args, hf_args, vae_args, logger) -> nn.Module:
-    checkpoint_dir = resolve_checkpoint_dir(str(cat_args.resume_from_checkpoint))
-    meta_path = os.path.join(checkpoint_dir, META_FILENAME)
-    with open(meta_path, "r", encoding="utf-8") as handle:
-        meta = json.load(handle)
-
-    base_model_path = meta.get("base_model_path") or getattr(vae_args, "model_path", None)
-    if not base_model_path:
-        raise ValueError(
-            f"Cannot determine base model path for checkpoint: {checkpoint_dir}. "
-            "Please save checkpoints with base_model_path metadata or pass --model_path."
-        )
-
-    logger.info("Loading VAE checkpoint for distill: %s", checkpoint_dir)
-    logger.info("Checkpoint distill base model path: %s", str(base_model_path))
-    model, load_meta, load_result = load_model_checkpoint(
-        checkpoint_dir,
-        access_token=hf_args.access_token,
-        base_model_path=str(base_model_path),
-        map_location="cpu",
-        strict=True,
-        preserve_original_weights_from_base=False,
-    )
-    stripped = normalize_cat_runtime_vae_original_state(model)
-    vae_args.model_path = str(load_meta.get("base_model_path") or base_model_path)
-    logger.info(
-        "Checkpoint loaded for distill. missing_keys=%d unexpected_keys=%d converted_module_count=%s stripped_original_weight=%d",
-        len(getattr(load_result, "missing_keys", [])),
-        len(getattr(load_result, "unexpected_keys", [])),
-        str(load_meta.get("converted_module_count")),
-        int(stripped),
-    )
-    return model
-
-
-def _load_completed_categories_from_checkpoint(checkpoint_dir: str) -> List[str]:
-    meta_path = os.path.join(checkpoint_dir, META_FILENAME)
-    if not os.path.exists(meta_path):
-        return []
-    with open(meta_path, "r", encoding="utf-8") as handle:
-        meta = json.load(handle)
-    extra_meta = meta.get("extra_meta") if isinstance(meta, dict) else None
-    if not isinstance(extra_meta, dict):
-        return []
-    raw = extra_meta.get("completed_categories")
-    if not isinstance(raw, list):
-        return []
-    return [str(item).strip() for item in raw if str(item).strip()]
-
-
-def _save_distill_model(
-    *,
-    model: nn.Module,
-    model_out: str,
-    cat_args,
-    hf_args,
-    vae_args,
-    logger,
-    extra_meta: Optional[dict],
-    unload_vae_original_weights: bool,
-) -> None:
-    if not bool(getattr(cat_args, "convert", False)):
-        raise ValueError("--save_model requires --convert")
-
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(vae_args.model_path, use_fast=True, token=hf_args.access_token)
-    fused_post_norm_head = fuse_post_norm_head_linear(model)
-    if fused_post_norm_head:
-        logger.info("Save: fused post_norm_linear into lm_head.weight.")
-    leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
-    if leftover_proxies:
-        raise RuntimeError(
-            "Save found unexported PeftVAELinearProxy modules: "
-            + ", ".join(leftover_proxies)
-        )
-    cleared = clear_model_vae_linear_cache(model)
-    logger.info("Save: cleared decoded cache for %d VAELinear modules.", cleared)
-    save_paths = save_model_checkpoint(
-        model,
-        model_out,
-        base_model_path=vae_args.model_path,
-        tokenizer=tok,
-        save_config=True,
-        extra_meta=extra_meta,
-        unload_vae_original_weights=False,
-    )
-    logger.info("Saved model to %s", save_paths["output_dir"])
-
-
-def _save_final_model(
-    *,
-    model: nn.Module,
-    run_output_dir: str,
-    cat_args,
-    hf_args,
-    vae_args,
-    logger,
-    completed_categories: Optional[Sequence[str]] = None,
-) -> None:
-    _save_distill_model(
-        model=model,
-        model_out=os.path.join(run_output_dir, "final_model"),
-        cat_args=cat_args,
-        hf_args=hf_args,
-        vae_args=vae_args,
-        logger=logger,
-        extra_meta={
-            "stage": "final",
-            "completed_categories": [str(item) for item in (completed_categories or [])],
-        },
-        unload_vae_original_weights=False,
-    )
-
-
 def _save_after_category_checkpoint(
     *,
     model: nn.Module,
@@ -544,29 +415,38 @@ def _save_after_category_checkpoint(
     training_args,
     teacher_runtime,
     logger,
+    source: CheckpointDistillV6Source,
+    stage_history: Sequence[dict],
+    lora_round_idx: int,
 ) -> None:
-    # All ranks restore so DDP model graphs stay aligned; only rank0 writes.
+    # All ranks restore so DDP model graphs stay aligned; guarded main publishes.
     _restore_checkpoint_distill_residency(model=model, residency=residency, logger=logger)
     distill_distributed_barrier()
     try:
-        if is_distill_main_process():
-            _save_distill_model(
-                model=model,
-                model_out=os.path.join(run_output_dir, f"after_{category}"),
-                cat_args=cat_args,
-                hf_args=hf_args,
-                vae_args=vae_args,
-                logger=logger,
-                extra_meta={
-                    "stage": "after_category",
-                    "category": str(category),
-                    "completed_categories": [str(item) for item in completed_categories],
-                    "distill_after_category": str(mode),
-                },
-                unload_vae_original_weights=False,
+        def _publish():
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                vae_args.model_path, use_fast=True, token=hf_args.access_token
             )
+            return save_checkpoint_distill_v6_model(
+                model=model,
+                output_dir=os.path.join(run_output_dir, f"after_{category}"),
+                checkpoint_kind="category_boundary",
+                category=str(category),
+                mode=str(mode),
+                source=source,
+                checkpoint_distill_completed_categories=completed_categories,
+                checkpoint_distill_stage_history=stage_history,
+                cat_args=cat_args,
+                training_args=training_args,
+                vae_args=vae_args,
+                tokenizer=tokenizer,
+                round_idx=int(lora_round_idx),
+                logger=logger,
+            )
+        distributed_guarded_main(_publish, barrier=True)
     finally:
-        distill_distributed_barrier()
         residency_device = _resolve_residency_device(str(getattr(cat_args, "train_device", "cuda")))
         residency_dtype = _resolve_residency_dtype(
             bf16=bool(getattr(training_args, "bf16", False)),
@@ -589,17 +469,13 @@ def _save_after_category_checkpoint(
 
 
 def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) -> None:
-    mode = str(getattr(cat_args, "distill_after_category", "none")).strip().lower()
-    if mode not in _CHECKPOINT_DISTILL_MODES:
-        raise ValueError(
-            "cat checkpoint distill only supports --distill_after_category=compressed_lora, decoder, or both."
-        )
+    mode = resolve_checkpoint_distill_mode(cat_args)
     if not str(getattr(cat_args, "resume_from_checkpoint", "") or "").strip():
         raise ValueError("--resume_from_checkpoint is required for cat checkpoint distill.")
     if bool(getattr(training_args, "distill_hif4_act", False)) and mode == "none":
-        raise ValueError("--distill_hif4_act 仅在每类后蒸馏阶段生效，因此必须设置 --distill_after_category。")
+        raise ValueError("--distill_hif4_act 仅在每类后蒸馏阶段生效，因此必须设置 --after_category_mode。")
     if not bool(getattr(cat_args, "convert", False)):
-        raise ValueError("--distill_after_category requires --convert，因为每类后蒸馏必须作用在已替换的压缩模型上。")
+        raise ValueError("--after_category_mode requires --convert，因为每类后蒸馏必须作用在已替换的压缩模型上。")
 
     configure_deterministic_mode(bool(getattr(cat_args, "deterministic", False)))
     set_seed(cat_args.seed)
@@ -629,7 +505,12 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         _format_namespace(training_args),
     )
 
-    model = _load_checkpoint_for_distill(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args, logger=logger)
+    model, source = load_checkpoint_distill_v6_source(
+        str(cat_args.resume_from_checkpoint),
+        hf_args=hf_args,
+        vae_args=vae_args,
+        logger=logger,
+    )
     teacher_runtime = DistillTeacherRuntime(
         model_path=str(vae_args.model_path),
         access_token=hf_args.access_token,
@@ -640,7 +521,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     )
     _apply_vae_decoder_checkpoint_override(model=model, vae_args=vae_args, logger=logger, mode=mode)
     transpose_modules = _split_csv(cat_args.transpose_modules)
-    target_categories = _split_csv(cat_args.target_categories)
+    compression_categories = _split_csv(cat_args.compression_categories)
     only_decoder_projections = not bool(cat_args.include_all_linears)
     eval_tasks_text = str(getattr(cat_args, "eval_tasks", "")).strip()
     run_task_eval = bool(eval_tasks_text)
@@ -649,17 +530,18 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         logger.info("跳过类别后评估：--eval_ppl=false 且 --eval_tasks 为空。")
 
     targets_by_category = _collect_vae_targets_by_category(model)
-    missing_target_categories = [
-        category for category in target_categories if category not in targets_by_category
+    missing_compression_categories = [
+        category for category in compression_categories if category not in targets_by_category
     ]
-    if missing_target_categories:
+    if missing_compression_categories:
         raise ValueError(
-            "target_categories contains categories without VAELinear in checkpoint: "
-            + ",".join(missing_target_categories)
+            "compression_categories contains categories without VAELinear in checkpoint: "
+            + ",".join(missing_compression_categories)
         )
 
-    resume_checkpoint_dir = resolve_checkpoint_dir(str(cat_args.resume_from_checkpoint))
-    completed_categories = _load_completed_categories_from_checkpoint(resume_checkpoint_dir)
+    progress = load_checkpoint_distill_progress(source)
+    completed_categories = list(progress.completed_categories)
+    stage_history = [dict(item) for item in progress.stage_history]
     if bool(getattr(cat_args, "distill_reset_completed", False)):
         if completed_categories:
             logger.info(
@@ -673,13 +555,14 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                 "若类上已有 low_rank_a/b，将从其初始化 LoRA 续蒸。"
             )
         completed_categories = []
+        stage_history = []
     elif completed_categories:
         logger.info(
             "Checkpoint distill resume progress: completed_categories=%s",
             ",".join(completed_categories),
         )
 
-    resolved_category_cfgs = resolve_category_runtime_configs(cat_args, vae_args, target_categories)
+    resolved_category_cfgs = resolve_category_runtime_configs(cat_args, vae_args, compression_categories)
     snapshot_path = _save_normalized_cat_train_snapshot(
         run_output_dir=run_output_dir,
         cat_args=cat_args,
@@ -707,7 +590,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         bf16=bool(getattr(training_args, "bf16", False)),
         fp16=bool(getattr(training_args, "fp16", False)),
     )
-    lora_round_idx = int(len(completed_categories))
+    lora_round_idx = 0 if bool(getattr(cat_args, "distill_reset_completed", False)) else int(progress.lora_round_idx)
     active_categories: List[str] = []
     completed_categories = list(completed_categories)
     independent_categories = bool(getattr(cat_args, "distill_independent_categories", False))
@@ -716,7 +599,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             "Checkpoint distill: --distill_independent_categories=true，"
             "每轮只激活当前类；已完成类恢复为未压缩 Linear。"
         )
-    for category in target_categories:
+    for category in compression_categories:
         if independent_categories:
             round_active_categories = [str(category)]
         else:
@@ -746,7 +629,7 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             )
             continue
 
-        category_steps = int(resolve_after_category_value(cat_args.distill_steps, category))
+        category_steps = int(cat_args.resolve_after_category_config(category).opt.steps)
         run_this_category_eval = bool(run_category_eval) and category_steps > 0
         if run_category_eval and not run_this_category_eval:
             logger.info(
@@ -782,12 +665,21 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             lora_round_idx=lora_round_idx,
             transpose_modules=transpose_modules,
             only_decoder_projections=only_decoder_projections,
-            target_categories=target_categories,
+            compression_categories=compression_categories,
             teacher_runtime=teacher_runtime,
             newly_compressed_target_count=0,
+            online_cat=False,
         )
         model = distill_result.model
         lora_round_idx = int(distill_result.next_lora_round_idx)
+
+        stage_history.append(
+            {
+                "category": str(category),
+                "mode": str(mode),
+                "did_train": bool(distill_result.did_train),
+            }
+        )
 
         if bool(distill_result.did_train):
             if str(category) not in completed_categories:
@@ -816,6 +708,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
                     training_args=training_args,
                     teacher_runtime=teacher_runtime,
                     logger=logger,
+                    source=source,
+                    stage_history=stage_history,
+                    lora_round_idx=max(0, int(lora_round_idx) - 1),
                 )
 
         if run_this_category_eval:
@@ -867,16 +762,32 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
             run_output_dir=run_output_dir,
         )
 
-    if cat_args.save_model and is_distill_main_process():
-        _save_final_model(
-            model=model,
-            run_output_dir=run_output_dir,
-            cat_args=cat_args,
-            hf_args=hf_args,
-            vae_args=vae_args,
-            logger=logger,
-            completed_categories=completed_categories,
-        )
+    if cat_args.save_model:
+        def _publish_final():
+            from transformers import AutoTokenizer
 
-    distill_distributed_barrier()
+            tokenizer = AutoTokenizer.from_pretrained(
+                vae_args.model_path, use_fast=True, token=hf_args.access_token
+            )
+            return save_checkpoint_distill_v6_model(
+                model,
+                os.path.join(run_output_dir, "final_model"),
+                checkpoint_kind="final_model",
+                category=None,
+                mode=str(mode),
+                source=source,
+                checkpoint_distill_completed_categories=completed_categories,
+                checkpoint_distill_stage_history=stage_history,
+                cat_args=cat_args,
+                training_args=training_args,
+                vae_args=vae_args,
+                tokenizer=tokenizer,
+                round_idx=max(0, int(lora_round_idx) - 1),
+                logger=logger,
+            )
+
+        distributed_guarded_main(_publish_final, barrier=True)
+
+    if not cat_args.save_model:
+        distill_distributed_barrier()
     logger.info("Done.")

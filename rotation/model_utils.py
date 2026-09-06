@@ -3,6 +3,7 @@ import typing
 import transformers
 import os
 import logging
+from contextlib import contextmanager
 
 OPT_MODEL = transformers.models.opt.modeling_opt.OPTForCausalLM
 OPT_LAYER = transformers.models.opt.modeling_opt.OPTDecoderLayer
@@ -40,6 +41,23 @@ def skip(*args, **kwargs):
     pass
 
 
+@contextmanager
+def temporarily_disable_torch_weight_init():
+    """Disable expensive torch initializers only while loading pretrained weights."""
+    original_kaiming = torch.nn.init.kaiming_uniform_
+    original_uniform = torch.nn.init.uniform_
+    original_normal = torch.nn.init.normal_
+    try:
+        torch.nn.init.kaiming_uniform_ = skip
+        torch.nn.init.uniform_ = skip
+        torch.nn.init.normal_ = skip
+        yield
+    finally:
+        torch.nn.init.kaiming_uniform_ = original_kaiming
+        torch.nn.init.uniform_ = original_uniform
+        torch.nn.init.normal_ = original_normal
+
+
 def get_rope_function_name(model):
     if isinstance(model, LLAMA_MODEL):
         return "apply_rotary_pos_emb"
@@ -67,70 +85,57 @@ def get_layers(model):
 
 
 def get_llama(model_name, hf_token):
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    model = transformers.LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,
-                                                          use_auth_token=hf_token,
-                                                          attn_implementation="sdpa",
-                                                          low_cpu_mem_usage=True)
+    with temporarily_disable_torch_weight_init():
+        model = transformers.LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,
+                                                              use_auth_token=hf_token,
+                                                              attn_implementation="sdpa",
+                                                              low_cpu_mem_usage=True)
     model.seqlen = 2048
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model
 
 
 def get_mistral(model_name, hf_token):
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    model = transformers.MistralForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,
-                                                            use_auth_token=hf_token,
-                                                            low_cpu_mem_usage=True)
+    with temporarily_disable_torch_weight_init():
+        model = transformers.MistralForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16,
+                                                                use_auth_token=hf_token,
+                                                                low_cpu_mem_usage=True)
     model.seqlen = 2048
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model
 
 
 def get_qwen2(model_name, hf_token):
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    model = transformers.Qwen2ForCausalLM.from_pretrained(model_name, torch_dtype='auto',
-                                                          use_auth_token=hf_token,
-                                                          low_cpu_mem_usage=True)
+    with temporarily_disable_torch_weight_init():
+        model = transformers.Qwen2ForCausalLM.from_pretrained(model_name, torch_dtype='auto',
+                                                              use_auth_token=hf_token,
+                                                              low_cpu_mem_usage=True)
     model.seqlen = 2048
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model
 
 
 def get_qwen3(model_name, hf_token):
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    model = transformers.Qwen3ForCausalLM.from_pretrained(model_name, torch_dtype='auto',
-                                                          use_auth_token=hf_token,
-                                                          attn_implementation="flash_attention_2",
-                                                          low_cpu_mem_usage=True)
+    with temporarily_disable_torch_weight_init():
+        model = transformers.Qwen3ForCausalLM.from_pretrained(model_name, torch_dtype='auto',
+                                                              use_auth_token=hf_token,
+                                                              attn_implementation="flash_attention_2",
+                                                              low_cpu_mem_usage=True)
     model.seqlen = 2048
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model
 
 
 def get_opt(model_name):
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    model = transformers.OPTForCausalLM.from_pretrained(model_name, torch_dtype='auto',
-                                                        low_cpu_mem_usage=True)
+    with temporarily_disable_torch_weight_init():
+        model = transformers.OPTForCausalLM.from_pretrained(model_name, torch_dtype='auto',
+                                                            low_cpu_mem_usage=True)
     model.seqlen = model.config.max_position_embeddings
     logging.info('---> Loading {} Model with seq_len: {}'.format(model_name, model.seqlen))
     return model
 
 
 def get_auto_causal_lm(model_name, hf_token=None):
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
     kwargs = {
         "torch_dtype": "auto",
         "low_cpu_mem_usage": True,
@@ -138,16 +143,17 @@ def get_auto_causal_lm(model_name, hf_token=None):
     }
     if hf_token:
         kwargs["token"] = hf_token
-    try:
-        model = transformers.AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-    except ValueError as exc:
-        message = str(exc)
-        if "trust_remote_code" in message or "remote code" in message.lower():
-            raise ValueError(
-                f"Model {model_name!r} requires remote code and is unsupported "
-                f"by the additive AutoModel fallback: {exc}"
-            ) from exc
-        raise
+    with temporarily_disable_torch_weight_init():
+        try:
+            model = transformers.AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+        except ValueError as exc:
+            message = str(exc)
+            if "trust_remote_code" in message or "remote code" in message.lower():
+                raise ValueError(
+                    f"Model {model_name!r} requires remote code and is unsupported "
+                    f"by the additive AutoModel fallback: {exc}"
+                ) from exc
+            raise
     max_pos = getattr(model.config, "max_position_embeddings", None)
     if isinstance(max_pos, int) and max_pos > 0:
         model.seqlen = max_pos

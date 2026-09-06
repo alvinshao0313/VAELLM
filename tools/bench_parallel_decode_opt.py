@@ -23,11 +23,18 @@ from litebsq.fused_multistage_decoder import (  # noqa: E402
     fused_multistage_symmetric_decode,
 )
 from litebsq.vae_linear import VAELinear  # noqa: E402
-from train_utils.model_checkpoint_io import (  # noqa: E402
-    _get_module_by_name,
-    _rebuild_converted_modules,
-    _torch_load_state_dict,
-)
+from train_utils.checkpoint_v6 import _rebuild_converted_modules  # noqa: E402
+
+
+def _get_module_by_name(model: nn.Module, name: str) -> nn.Module:
+    module = model
+    for part in str(name).split("."):
+        module = getattr(module, part)
+    return module
+
+
+def _torch_load_state_dict(path: str, *, map_location: str):
+    return torch.load(path, map_location=map_location, weights_only=True)
 
 
 DEFAULT_CKPT = ".result/catlora/res0-bf16-protect-channel-vae/final_model"

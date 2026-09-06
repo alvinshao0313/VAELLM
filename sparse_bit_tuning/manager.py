@@ -299,12 +299,24 @@ class SparseBitTuningManager:
         return next(iter(devices))
 
     def configure_schedule(self, *, total_optimizer_steps: int) -> None:
-        self.bit_round_steps = resolve_round_steps(
+        resolved_round_steps = resolve_round_steps(
             self.config.round_steps,
             total_optimizer_steps=int(total_optimizer_steps),
             active_ratio=float(self.config.active_ratio),
         )
-        self.stable_steps = resolve_stable_steps(int(self.bit_round_steps))
+        resolved_stable_steps = resolve_stable_steps(int(resolved_round_steps))
+        if self.bit_round_steps is not None and int(self.bit_round_steps) != int(resolved_round_steps):
+            raise ValueError(
+                "Sparse Bit exact-resume round schedule mismatch: "
+                f"checkpoint={self.bit_round_steps} current={resolved_round_steps}."
+            )
+        if self.stable_steps is not None and int(self.stable_steps) != int(resolved_stable_steps):
+            raise ValueError(
+                "Sparse Bit exact-resume stable schedule mismatch: "
+                f"checkpoint={self.stable_steps} current={resolved_stable_steps}."
+            )
+        self.bit_round_steps = int(resolved_round_steps)
+        self.stable_steps = int(resolved_stable_steps)
 
     @torch.no_grad()
     def initialize_scores(self) -> None:
@@ -578,6 +590,214 @@ class SparseBitTuningManager:
         self.bit_optimizer.reset_round_state()
         self._initialized_scores = False
         self.score_module._initialized = False
+
+    def exact_state_dict(self) -> dict:
+        """Serialize the complete live Sparse-Bit state for optimizer-step exact resume.
+
+        This is deliberately distinct from ``coverage_metadata()``: coverage restore
+        resets live scores/round counters, while this payload preserves them exactly.
+        """
+        if not self._initialized_scores:
+            raise RuntimeError("Sparse Bit exact checkpoint requires initialized scores.")
+        if self.bit_round_steps is None or self.stable_steps is None:
+            raise RuntimeError("Sparse Bit exact checkpoint requires a configured schedule.")
+        return {
+            "format": "sparse_bit_tuning_exact_state",
+            "version": 1,
+            "training_seed": int(self.training_seed),
+            "streaming": bool(self.streaming),
+            "bit_active_ratio": float(self.config.active_ratio),
+            "target_modules": sorted(self._modules),
+            "banks": [
+                {
+                    "canonical_key": str(spec.canonical_key),
+                    "module_path": str(spec.module_path),
+                    "stage_idx": int(spec.stage_idx),
+                    "part_idx": int(spec.part_idx),
+                    "n_bits": int(spec.n_bits),
+                    "n_active": int(spec.n_active),
+                    "chunk_id": int(spec.chunk_id),
+                    "score_start": int(spec.score_start),
+                    "score_end": int(spec.score_end),
+                }
+                for spec in self._bank_specs
+            ],
+            "packed_banks": self.checkpoint_packed_snapshot(),
+            "score_chunks": [
+                score.detach().to(device="cpu", dtype=torch.float16).contiguous()
+                for score in self.score_module.score_chunks
+            ],
+            "sampler_states": {
+                key: state.to_metadata() for key, state in sorted(self.sampler_states.items())
+            },
+            "pending_next_states": {
+                key: state.to_metadata() for key, state in sorted(self.pending_next_states.items())
+            },
+            "bit_round_steps": int(self.bit_round_steps),
+            "stable_steps": int(self.stable_steps),
+            "global_bit_round": int(self.global_bit_round),
+            "bit_round_step": int(self.bit_round_step),
+            "stable_counter": int(self.stable_counter),
+            "cumulative_flip_count": int(self.cumulative_flip_count),
+            "had_flip": bool(self.had_flip),
+            "bit_optimizer": self.bit_optimizer.state_dict(),
+        }
+
+    @torch.no_grad()
+    def load_exact_state_dict(self, state_dict: dict) -> None:
+        """Restore an exact live state without invoking coverage-reset semantics."""
+        if not isinstance(state_dict, dict):
+            raise TypeError(f"Sparse Bit exact state must be dict, got {type(state_dict)}.")
+        if str(state_dict.get("format")) != "sparse_bit_tuning_exact_state" or int(
+            state_dict.get("version", -1)
+        ) != 1:
+            raise ValueError(
+                "unsupported Sparse Bit exact state format/version: "
+                f"{state_dict.get('format')!r}/{state_dict.get('version')!r}."
+            )
+        if int(state_dict.get("training_seed", -1)) != int(self.training_seed):
+            raise ValueError(
+                f"Sparse Bit exact training seed mismatch: checkpoint={state_dict.get('training_seed')} "
+                f"current={self.training_seed}."
+            )
+        if bool(state_dict.get("streaming")) != bool(self.streaming):
+            raise ValueError(
+                f"Sparse Bit exact streaming mismatch: checkpoint={state_dict.get('streaming')} "
+                f"current={self.streaming}."
+            )
+        if float(state_dict.get("bit_active_ratio", -1.0)) != float(self.config.active_ratio):
+            raise ValueError(
+                f"Sparse Bit exact active ratio mismatch: checkpoint={state_dict.get('bit_active_ratio')} "
+                f"current={self.config.active_ratio}."
+            )
+        expected_targets = sorted(self._modules)
+        provided_targets = sorted(str(v) for v in state_dict.get("target_modules", []))
+        if provided_targets != expected_targets:
+            raise ValueError(
+                f"Sparse Bit exact target mismatch: checkpoint={provided_targets} current={expected_targets}."
+            )
+
+        raw_banks = state_dict.get("banks")
+        if not isinstance(raw_banks, list):
+            raise TypeError("Sparse Bit exact state 'banks' must be a list.")
+        by_key = {}
+        for item in raw_banks:
+            if not isinstance(item, dict):
+                raise TypeError("Sparse Bit exact bank entries must be dicts.")
+            key = str(item.get("canonical_key"))
+            if key in by_key:
+                raise ValueError(f"duplicate Sparse Bit exact bank key: {key}")
+            by_key[key] = item
+        expected_keys = {spec.canonical_key for spec in self._bank_specs}
+        if set(by_key) != expected_keys:
+            raise ValueError(
+                "Sparse Bit exact bank set mismatch: "
+                f"missing={sorted(expected_keys - set(by_key))} extra={sorted(set(by_key) - expected_keys)}"
+            )
+        for spec in self._bank_specs:
+            item = by_key[spec.canonical_key]
+            expected_fields = {
+                "module_path": str(spec.module_path),
+                "stage_idx": int(spec.stage_idx),
+                "part_idx": int(spec.part_idx),
+                "n_bits": int(spec.n_bits),
+                "n_active": int(spec.n_active),
+                "chunk_id": int(spec.chunk_id),
+                "score_start": int(spec.score_start),
+                "score_end": int(spec.score_end),
+            }
+            for field_name, expected_value in expected_fields.items():
+                actual = item.get(field_name)
+                if actual != expected_value:
+                    raise ValueError(
+                        f"{spec.canonical_key}: exact bank {field_name} mismatch: "
+                        f"checkpoint={actual!r} current={expected_value!r}."
+                    )
+
+        packed_banks = state_dict.get("packed_banks")
+        if not isinstance(packed_banks, dict):
+            raise TypeError("Sparse Bit exact state 'packed_banks' must be a dict.")
+        self.restore_checkpoint_packed(packed_banks)
+
+        raw_sampler = state_dict.get("sampler_states")
+        raw_pending = state_dict.get("pending_next_states")
+        if not isinstance(raw_sampler, dict) or not isinstance(raw_pending, dict):
+            raise TypeError("Sparse Bit exact sampler/pending states must be dicts.")
+        if set(str(k) for k in raw_sampler) != expected_keys:
+            raise ValueError("Sparse Bit exact sampler state bank set mismatch.")
+        pending_keys = {str(k) for k in raw_pending}
+        if not pending_keys.issubset(expected_keys):
+            raise ValueError(
+                f"Sparse Bit exact pending state contains unknown banks: {sorted(pending_keys - expected_keys)}"
+            )
+        restored_sampler: Dict[str, AffineSamplerState] = {}
+        restored_pending: Dict[str, AffineSamplerState] = {}
+        for spec in self._bank_specs:
+            state = AffineSamplerState.from_metadata(raw_sampler[spec.canonical_key])
+            if int(state.n_bits) != int(spec.n_bits) or int(state.n_active) != int(spec.n_active):
+                raise ValueError(f"{spec.canonical_key}: exact sampler N_bits/N_active mismatch.")
+            restored_sampler[spec.canonical_key] = state
+            if spec.canonical_key in raw_pending:
+                pending = AffineSamplerState.from_metadata(raw_pending[spec.canonical_key])
+                if int(pending.n_bits) != int(spec.n_bits) or int(pending.n_active) != int(spec.n_active):
+                    raise ValueError(f"{spec.canonical_key}: exact pending sampler N_bits/N_active mismatch.")
+                restored_pending[spec.canonical_key] = pending
+        if restored_pending:
+            pending_modules = {
+                spec.module_path for spec in self._bank_specs if spec.canonical_key in restored_pending
+            }
+            for module_path in pending_modules:
+                module_keys = {spec.canonical_key for spec in self.module_bank_specs(module_path)}
+                if not module_keys.issubset(restored_pending):
+                    raise ValueError(f"{module_path}: partial pending exact Sparse Bit transition.")
+        self.sampler_states = restored_sampler
+        self.pending_next_states = restored_pending
+
+        raw_scores = state_dict.get("score_chunks")
+        if not isinstance(raw_scores, (list, tuple)) or len(raw_scores) != len(self.score_module.score_chunks):
+            raise ValueError(
+                "Sparse Bit exact score chunk count mismatch: "
+                f"checkpoint={len(raw_scores) if isinstance(raw_scores, (list, tuple)) else 'invalid'} "
+                f"current={len(self.score_module.score_chunks)}."
+            )
+        for chunk_id, (source, target) in enumerate(zip(raw_scores, self.score_module.score_chunks)):
+            if not torch.is_tensor(source) or source.dtype != torch.float16:
+                raise TypeError(
+                    f"Sparse Bit exact score chunk {chunk_id} must be FP16 Tensor, "
+                    f"got {type(source)}/{getattr(source, 'dtype', None)}."
+                )
+            if tuple(source.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Sparse Bit exact score chunk {chunk_id} shape mismatch: "
+                    f"checkpoint={tuple(source.shape)} current={tuple(target.shape)}."
+                )
+            target.copy_(source.to(device=target.device, dtype=torch.float16))
+            target.grad = None
+
+        bit_round_steps = int(state_dict.get("bit_round_steps", 0))
+        stable_steps = int(state_dict.get("stable_steps", 0))
+        if bit_round_steps < 1 or stable_steps < 1:
+            raise ValueError(
+                f"Sparse Bit exact schedule must be positive, got {bit_round_steps}/{stable_steps}."
+            )
+        self.bit_round_steps = bit_round_steps
+        self.stable_steps = stable_steps
+        self.global_bit_round = int(state_dict.get("global_bit_round", 0))
+        self.bit_round_step = int(state_dict.get("bit_round_step", 0))
+        self.stable_counter = int(state_dict.get("stable_counter", 0))
+        self.cumulative_flip_count = int(state_dict.get("cumulative_flip_count", 0))
+        self.had_flip = bool(state_dict.get("had_flip", False))
+        if self.global_bit_round < 0 or self.bit_round_step < 0 or self.bit_round_step >= bit_round_steps:
+            raise ValueError(
+                f"Sparse Bit exact round counters invalid: round={self.global_bit_round} "
+                f"step={self.bit_round_step}/{bit_round_steps}."
+            )
+        if self.stable_counter < 0 or self.cumulative_flip_count < 0:
+            raise ValueError("Sparse Bit exact counters must be non-negative.")
+
+        self.bit_optimizer.load_state_dict(state_dict.get("bit_optimizer"))
+        self.score_module.mark_initialized()
+        self._initialized_scores = True
 
     def detach_runtime(self) -> None:
         for path, module in self._modules.items():

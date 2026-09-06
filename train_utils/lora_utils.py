@@ -1,9 +1,11 @@
-import json
+"""Shared model-level trainer logging and distributed runtime helpers."""
+
+from __future__ import annotations
+
 import logging
 import os
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Sequence
 
 import torch
 from torch import nn
@@ -17,92 +19,8 @@ except ImportError:
     TrainerCallback = None
     TrainingArguments = None
 
-from e2e_common.chat_template_utils import (
-    infer_assistant_response_template,
-    infer_user_instruction_template,
-    render_messages,
-)
-from e2e_common.data import (
-    VAELLM_EDGERAZOR_SFT_ALIASES,
-    normalize_dataset_mix_spec,
-)
-from e2e_common.post_norm_head import ensure_post_norm_head_linear, resolve_post_norm_linear
-from rotation.model_utils import get_model_type, get_pre_head_layernorm
-from train_utils.cat_train_args import resolve_distill_runtime_config
-from train_utils.hif4_act import (
-    build_hif4_act_controller,
-    register_hif4_act_hooks,
-    remove_hif4_act_hooks,
-)
-from e2e_common.lazy_datasets import (
-    build_edgerazor_data_collator,
-    dataset_length_or_none,
-    default_dataloader_num_workers,
-    is_iterable_training_dataset,
-)
-from train_utils.lora_data import ensure_distill_dataset_stack_available, prepare_distill_datasets
-from litebsq.vae_linear import VAELinear
-from litebsq.vae_linear_prewarm import NamedVAELinearTarget, prime_named_vae_linear_cache
-from train_utils.distill_decoder import (
-    NamedMainDecoderTarget,
-    enable_main_decoder_targets,
-    finalize_main_decoder_targets,
-)
-from train_utils.lora_training import (
-    CustomSFTTrainer,
-    DataCollatorForCompletionOnlyLM,
-    GroupedSFTTrainer,
-    SFTTrainer,
-    create_lora_adapters,
-    ensure_lora_training_stack_available,
-    merge_all_lora,
-)
-
-
-@dataclass(frozen=True)
-class _ResolvedDistillStageConfig:
-    device: str
-    base_seed: int
-    round_idx: int
-    seed: int
-    rank: int
-    alpha: float
-    dropout: float
-    steps: int
-    batch_size: int
-    lr: float
-    decoder_lr: Optional[float]
-    weight_decay: float
-    log_every: int
-    temperature: float
-    loss_alpha: float
-    loss_type: str
-    hidden_loss_weight: float
-    pre_mlp_hidden_loss_weight: float
-    prompt_kd_weight: float
-    hidden_alignment_layer_weighting: str
-    eakld_confidence_k: int
-    dataset: str
-    use_dora: bool
-    use_distill_hif4_act: bool
-    distill_tune_final_norm: bool
-    distill_use_post_norm_head_linear: bool
-
-
-@dataclass(frozen=True)
-class RemainingLoraFinetuneResult:
-    model: nn.Module
-    did_train: bool
-    remaining_lora_target_count: int = 0
-    decoder_target_count: int = 0
-    resolved_distill_lr: Optional[float] = None
-    resolved_decoder_lr: Optional[float] = None
-
-
-@dataclass(frozen=True)
-class _ExtraTrainableModule:
-    name: str
-    module: nn.Module
+from train_utils.lora_data import ensure_distill_dataset_stack_available
+from train_utils.lora_training import ensure_lora_training_stack_available
 
 
 class _LoraTrainerLogCallback(TrainerCallback if TrainerCallback is not None else object):
@@ -110,64 +28,45 @@ class _LoraTrainerLogCallback(TrainerCallback if TrainerCallback is not None els
         self.logger = logger
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if not bool(getattr(state, "is_world_process_zero", True)):
-            return
-        if not logs:
+        if not bool(getattr(state, "is_world_process_zero", True)) or not logs:
             return
         values = dict(logs)
         optimizer = kwargs.get("optimizer")
         if optimizer is not None:
-            group_lrs = []
             decoder_lrs = []
-            nondecoder_lrs = []
+            main_lrs = []
             for group in getattr(optimizer, "param_groups", []):
-                params = list(group.get("params", []))
-                if not params:
+                if not list(group.get("params", [])):
                     continue
                 lr = float(group.get("lr", 0.0))
-                group_lrs.append(lr)
-                group_name = group.get("group_name")
+                group_name = str(group.get("group_name") or "")
                 if group_name == "decoder":
                     decoder_lrs.append(lr)
-                elif group_name in {"nondecoder_decay", "nondecoder_no_decay"}:
-                    nondecoder_lrs.append(lr)
+                elif group_name == "lora" or group_name.startswith("nondecoder"):
+                    main_lrs.append(lr)
+            if len(set(main_lrs)) > 1 or len(set(decoder_lrs)) > 1:
+                raise ValueError("model-level optimizer groups in one family must share the same lr.")
+            if main_lrs:
+                values["lr_lora"] = main_lrs[0]
             if decoder_lrs:
-                if len(set(nondecoder_lrs)) > 1:
-                    raise ValueError("nondecoder optimizer groups must share the same current lr.")
-                if len(set(decoder_lrs)) > 1:
-                    raise ValueError("decoder optimizer groups must share the same current lr.")
-                if nondecoder_lrs:
-                    values["lr_lora"] = nondecoder_lrs[0]
                 values["lr_decoder"] = decoder_lrs[0]
-            elif group_lrs:
-                if len(set(group_lrs)) > 1:
-                    raise ValueError("legacy LoRA optimizer groups must share the same current lr.")
-                values["lr_lora"] = group_lrs[0]
         values.pop("total_flos", None)
         ordered_keys = (
-            "loss",
-            "train_loss",
-            "eval_loss",
-            "learning_rate",
-            "lr_lora",
-            "lr_decoder",
-            "grad_norm",
-            "epoch",
+            "loss", "train_loss", "eval_loss", "learning_rate", "lr_lora",
+            "lr_decoder", "grad_norm", "epoch",
         )
         parts = []
         for key in ordered_keys:
             if key in values:
                 parts.append(f"{key}={values.pop(key)}")
-        for key in sorted(values):
-            parts.append(f"{key}={values[key]}")
-        if not parts:
-            return
-        _log_lora_trainer_message_to_file_handlers(
-            self.logger,
-            "LoRA train: step=%s %s",
-            str(getattr(state, "global_step", "unknown")),
-            " ".join(parts),
-        )
+        parts.extend(f"{key}={values[key]}" for key in sorted(values))
+        if parts:
+            _log_lora_trainer_message_to_file_handlers(
+                self.logger,
+                "LoRA train: step=%s %s",
+                str(getattr(state, "global_step", "unknown")),
+                " ".join(parts),
+            )
 
 
 class _QuietProgressCallback(ProgressCallback if ProgressCallback is not None else object):
@@ -184,27 +83,17 @@ class _LoraDistillTokenStatsCallback(TrainerCallback if TrainerCallback is not N
     def on_step_end(self, args, state, control, **kwargs):
         logging_steps = getattr(state, "logging_steps", None)
         if not isinstance(logging_steps, int) or logging_steps <= 0:
-            raise ValueError(
-                f"state.logging_steps must be a positive integer, got {logging_steps!r}."
-            )
-
+            raise ValueError(f"state.logging_steps must be a positive integer, got {logging_steps!r}.")
         global_step = int(getattr(state, "global_step", 0))
         if self.window_start_step is None:
             self.window_start_step = global_step
-
         if global_step <= 0 or global_step % logging_steps != 0:
             return
-
         stats = self._trainer.distill_token_stats.consume_global(self._trainer.accelerator)
         window_optimizer_steps = global_step - self.window_start_step + 1
         self.window_start_step = global_step + 1
-
-        if stats is None:
+        if stats is None or not bool(getattr(state, "is_world_process_zero", True)):
             return
-
-        if not bool(getattr(state, "is_world_process_zero", True)):
-            return
-
         _log_lora_trainer_message_to_file_handlers(
             self._logger,
             "LoRA token stats: step=%s window_optimizer_steps=%d avg_prompt_tokens=%.4f avg_response_tokens=%.4f global_samples=%d",
@@ -218,27 +107,17 @@ class _LoraDistillTokenStatsCallback(TrainerCallback if TrainerCallback is not N
 
 def _log_lora_trainer_message_to_file_handlers(logger, message: str, *args) -> None:
     record = logger.makeRecord(
-        logger.name,
-        logging.INFO,
-        fn="",
-        lno=0,
-        msg=message,
-        args=args,
-        exc_info=None,
+        logger.name, logging.INFO, fn="", lno=0, msg=message, args=args, exc_info=None
     )
     for handler in list(getattr(logger, "handlers", [])):
-        if not isinstance(handler, logging.FileHandler):
-            continue
-        if record.levelno < handler.level:
-            continue
-        handler.handle(record)
+        if isinstance(handler, logging.FileHandler) and record.levelno >= handler.level:
+            handler.handle(record)
 
 
 def _replace_progress_log_callback(trainer):
     if ProgressCallback is None:
         return trainer
-    callback_handler = getattr(trainer, "callback_handler", None)
-    callbacks = getattr(callback_handler, "callbacks", None)
+    callbacks = getattr(getattr(trainer, "callback_handler", None), "callbacks", None)
     if not isinstance(callbacks, list):
         return trainer
     for idx, callback in enumerate(callbacks):
@@ -252,12 +131,6 @@ def _ensure_lora_stack_available() -> None:
     ensure_distill_dataset_stack_available()
     if AutoTokenizer is None or TrainingArguments is None:
         raise ImportError("未安装 transformers。请先安装：pip install transformers")
-
-
-def _ensure_distill_trainer_data_stack_available() -> None:
-    ensure_distill_dataset_stack_available()
-    if AutoTokenizer is None or TrainingArguments is None or SFTTrainer is None:
-        raise ImportError("未安装 transformers/trl。请先安装 after-category distill 依赖。")
 
 
 def distill_world_size() -> int:
@@ -290,8 +163,6 @@ def distill_distributed_barrier() -> None:
 
 
 def _resolve_distill_process_group_timeout_sec() -> int:
-    # 分布式 lm_eval / barrier 时，mmlu 等长任务会让先完成的 rank 久等。
-    # 默认 3 小时；可用 DISTILL_NCCL_TIMEOUT_SEC 覆盖。
     raw = str(os.environ.get("DISTILL_NCCL_TIMEOUT_SEC", "10800")).strip()
     try:
         timeout_sec = int(raw)
@@ -301,17 +172,15 @@ def _resolve_distill_process_group_timeout_sec() -> int:
         ) from exc
     if timeout_sec <= 0:
         raise ValueError(f"DISTILL_NCCL_TIMEOUT_SEC must be > 0, got {timeout_sec}.")
-    return int(timeout_sec)
+    return timeout_sec
 
 
 def _apply_distill_process_group_timeout(timeout: timedelta) -> None:
-    """Force default PG collective timeout even if another library already initialized it."""
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return
     import torch.distributed.distributed_c10d as c10d
 
-    group = c10d._get_default_group()
-    c10d._set_pg_timeout(timeout, group)
+    c10d._set_pg_timeout(timeout, c10d._get_default_group())
 
 
 def ensure_distill_process_group_initialized() -> None:
@@ -319,10 +188,8 @@ def ensure_distill_process_group_initialized() -> None:
         return
     if not torch.distributed.is_available():
         raise RuntimeError("torch.distributed is unavailable but WORLD_SIZE > 1.")
-    timeout_sec = _resolve_distill_process_group_timeout_sec()
-    timeout = timedelta(seconds=timeout_sec)
+    timeout = timedelta(seconds=_resolve_distill_process_group_timeout_sec())
     if torch.distributed.is_initialized():
-        # HF TrainingArguments / Accelerate may have initialized with ddp_timeout=1800.
         _apply_distill_process_group_timeout(timeout)
         return
     backend = "nccl" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "gloo"
@@ -354,201 +221,15 @@ def unwrap_distill_model(model: nn.Module) -> nn.Module:
 
 
 def split_tasks_for_distill_rank(
-    task_names: Sequence[str],
-    *,
-    rank: int,
-    world_size: int,
+    task_names: Sequence[str], *, rank: int, world_size: int
 ) -> List[str]:
     world = int(world_size)
+    current_rank = int(rank)
     if world <= 0:
         raise ValueError(f"world_size must be > 0, got {world_size}.")
-    current_rank = int(rank)
     if current_rank < 0 or current_rank >= world:
         raise ValueError(f"rank must be in [0, {world}), got {rank}.")
     return [str(name) for idx, name in enumerate(task_names) if idx % world == current_rank]
-
-
-def _enum_to_value(value, default: str) -> str:
-    raw = value if value is not None else default
-    if hasattr(raw, "value"):
-        raw = raw.value
-    raw = str(raw).strip()
-    if "." in raw:
-        raw = raw.split(".")[-1]
-    return raw.lower()
-
-
-def _resolve_distill_stage_config(
-    *,
-    cat_args,
-    training_args,
-    after_category: Optional[str],
-    lora_round_idx: Optional[int],
-) -> _ResolvedDistillStageConfig:
-    round_idx = 0 if lora_round_idx is None else int(lora_round_idx)
-    if round_idx < 0:
-        raise ValueError(f"lora_round_idx must be >= 0, got {round_idx}")
-
-    runtime_cfg = resolve_distill_runtime_config(cat_args, after_category)
-    base_seed = int(getattr(cat_args, "seed", 0))
-    return _ResolvedDistillStageConfig(
-        device=resolve_distill_train_device(str(getattr(cat_args, "train_device", "cuda"))),
-        base_seed=base_seed,
-        round_idx=round_idx,
-        seed=int(base_seed + round_idx),
-        rank=int(runtime_cfg.rank),
-        alpha=float(runtime_cfg.alpha),
-        dropout=float(runtime_cfg.dropout),
-        steps=int(runtime_cfg.steps),
-        batch_size=int(runtime_cfg.batch_size),
-        lr=float(runtime_cfg.lr),
-        decoder_lr=runtime_cfg.decoder_lr,
-        weight_decay=float(runtime_cfg.weight_decay),
-        log_every=int(runtime_cfg.log_every),
-        temperature=float(runtime_cfg.temperature),
-        loss_alpha=float(runtime_cfg.loss_alpha),
-        loss_type=str(runtime_cfg.loss_type),
-        hidden_loss_weight=float(runtime_cfg.hidden_loss_weight),
-        pre_mlp_hidden_loss_weight=float(runtime_cfg.pre_mlp_hidden_loss_weight),
-        prompt_kd_weight=float(runtime_cfg.prompt_kd_weight),
-        hidden_alignment_layer_weighting=str(runtime_cfg.hidden_alignment_layer_weighting),
-        eakld_confidence_k=int(runtime_cfg.eakld_confidence_k),
-        dataset=str(getattr(cat_args, "distill_dataset", "")).strip().lower(),
-        use_dora=bool(runtime_cfg.use_dora),
-        use_distill_hif4_act=bool(getattr(training_args, "distill_hif4_act", False)),
-        distill_tune_final_norm=bool(getattr(cat_args, "distill_tune_final_norm", False)),
-        distill_use_post_norm_head_linear=bool(getattr(cat_args, "distill_use_post_norm_head_linear", False)),
-    )
-
-
-def _freeze_model_for_lora(model: nn.Module, *, device: str, logger) -> Optional[bool]:
-    previous_use_cache = None
-    for param in model.parameters():
-        param.requires_grad = False
-    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-        previous_use_cache = bool(model.config.use_cache)
-        model.config.use_cache = False
-        logger.info("LoRA: 已关闭 model.config.use_cache。")
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-        logger.info("LoRA: 已启用输入梯度。")
-    model.to(device)
-    model.train()
-    return previous_use_cache
-
-
-def _restore_model_use_cache(model: nn.Module, previous_use_cache: Optional[bool], *, logger) -> None:
-    if previous_use_cache is None:
-        return
-    if not hasattr(model, "config") or not hasattr(model.config, "use_cache"):
-        return
-    model.config.use_cache = bool(previous_use_cache)
-    logger.info("LoRA: 已恢复 model.config.use_cache=%s。", str(bool(previous_use_cache)).lower())
-
-
-def _find_module_name(model: nn.Module, target: nn.Module, fallback: str) -> str:
-    for name, module in model.named_modules():
-        if module is target:
-            return str(name)
-    return str(fallback)
-
-
-def _collect_extra_trainable_modules(
-    model: nn.Module,
-    *,
-    cfg: _ResolvedDistillStageConfig,
-    logger,
-) -> List[_ExtraTrainableModule]:
-    modules: List[_ExtraTrainableModule] = []
-
-    if bool(cfg.distill_tune_final_norm):
-        model_type = get_model_type(model)
-        final_norm = get_pre_head_layernorm(model, model_type)
-        final_norm_name = _find_module_name(model, final_norm, "model.norm")
-        modules.append(_ExtraTrainableModule(name=final_norm_name, module=final_norm))
-
-    if bool(cfg.distill_use_post_norm_head_linear):
-        attached = ensure_post_norm_head_linear(model)
-        if attached:
-            logger.info("LoRA: 已为 lm_head 挂载 identity 初始化的 post_norm_linear。")
-        post_norm_linear = resolve_post_norm_linear(model)
-        if post_norm_linear is None:
-            raise ValueError("--distill_use_post_norm_head_linear=true but model.lm_head is not LMHeadWithPostNormLinear.")
-        post_norm_name = _find_module_name(model, post_norm_linear, "lm_head.post_norm_linear")
-        modules.append(_ExtraTrainableModule(name=post_norm_name, module=post_norm_linear))
-
-    return modules
-
-
-def _enable_extra_trainable_params(modules: Sequence[_ExtraTrainableModule]) -> List[str]:
-    enabled: List[str] = []
-    seen = set()
-    for item in modules:
-        for param_name, param in item.module.named_parameters(recurse=True):
-            param_id = id(param)
-            if param_id in seen:
-                continue
-            seen.add(param_id)
-            param.requires_grad = True
-            enabled.append(str(item.name) if not param_name else f"{item.name}.{param_name}")
-    return sorted(enabled)
-
-
-def _log_lora_stage_start(
-    *,
-    logger,
-    cfg: _ResolvedDistillStageConfig,
-    after_category: Optional[str],
-    remaining_categories: Sequence[str],
-    target_count: int,
-    extra_trainable_names: Sequence[str],
-    use_custom_trainer: bool,
-) -> None:
-    if use_custom_trainer:
-        logger.info(
-            "LoRA: 使用 CustomSFTTrainer 微调，after_category=%s，loss_type=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d,dataset=%d)",
-            str(after_category),
-            str(cfg.loss_type).strip().lower(),
-            str(cfg.use_dora).lower(),
-            ",".join(remaining_categories),
-            int(target_count),
-            ",".join(extra_trainable_names) if extra_trainable_names else "none",
-            int(cfg.rank),
-            float(cfg.alpha),
-            int(cfg.steps),
-            int(cfg.batch_size),
-            int(cfg.base_seed),
-            int(cfg.round_idx),
-            int(cfg.seed),
-            int(cfg.base_seed),
-        )
-        logger.info(
-            "LoRA: 蒸馏参数 loss_alpha=%.4f temperature=%.4f hidden_loss_weight=%.6f pre_mlp_hidden_loss_weight=%.6f prompt_kd_weight=%.6f hidden_alignment_layer_weighting=%s",
-            float(cfg.loss_alpha),
-            float(cfg.temperature),
-            float(cfg.hidden_loss_weight),
-            float(cfg.pre_mlp_hidden_loss_weight),
-            float(cfg.prompt_kd_weight),
-            str(cfg.hidden_alignment_layer_weighting),
-        )
-        return
-
-    logger.info(
-        "LoRA: 使用 SFTTrainer 微调，after_category=%s，use_dora=%s，目标类别=%s，目标模块=%d，额外参数=%s，rank=%d，alpha=%.2f，steps=%d，batch_size=%d，seed(base=%d,round=%d,effective=%d,dataset=%d)",
-        str(after_category),
-        str(cfg.use_dora).lower(),
-        ",".join(remaining_categories),
-        int(target_count),
-        ",".join(extra_trainable_names) if extra_trainable_names else "none",
-        int(cfg.rank),
-        float(cfg.alpha),
-        int(cfg.steps),
-        int(cfg.batch_size),
-        int(cfg.base_seed),
-        int(cfg.round_idx),
-        int(cfg.seed),
-        int(cfg.base_seed),
-    )
 
 
 def _ensure_lora_tokenizer_ready(*, vae_args, model: nn.Module) -> None:
@@ -566,605 +247,21 @@ def _ensure_lora_tokenizer_ready(*, vae_args, model: nn.Module) -> None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
 
-def _resolve_distill_dataloader_num_workers(training_args) -> int:
-    raw = getattr(training_args, "distill_dataloader_num_workers", None)
-    if raw is None:
-        return int(default_dataloader_num_workers())
-    workers = int(raw)
-    if workers < 0:
-        raise ValueError(f"distill_dataloader_num_workers must be >= 0, got {workers}.")
-    return workers
-
-
-def _build_sft_args(*, cat_args, training_args, cfg: _ResolvedDistillStageConfig, train_is_iterable: bool = False, logger=None):
-    gradient_checkpointing_kwargs = None
-    raw_gc_kwargs = getattr(training_args, "distill_gradient_checkpointing_kwargs", None)
-    if raw_gc_kwargs is not None and str(raw_gc_kwargs).strip():
-        gradient_checkpointing_kwargs = json.loads(str(raw_gc_kwargs))
-        if not isinstance(gradient_checkpointing_kwargs, dict):
-            raise ValueError("--distill_gradient_checkpointing_kwargs must be a JSON object.")
-
-    requested_group_by_length = bool(getattr(training_args, "distill_group_by_length", True))
-    training_kwargs = dict(
-        output_dir=os.path.join(str(getattr(cat_args, "output_dir", ".result")), "lora_trainer_state"),
-        per_device_train_batch_size=int(cfg.batch_size),
-        gradient_accumulation_steps=int(getattr(training_args, "distill_gradient_accumulation_steps", 1)),
-        gradient_checkpointing=bool(getattr(training_args, "distill_gradient_checkpointing", False)),
-        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
-        optim=_enum_to_value(getattr(training_args, "distill_optim", "paged_adamw_8bit"), "paged_adamw_8bit"),
-        logging_strategy="steps",
-        logging_steps=max(1, int(cfg.log_every)),
-        logging_first_step=True,
-        learning_rate=float(cfg.lr),
-        weight_decay=float(cfg.weight_decay),
-        fp16=bool(getattr(training_args, "fp16", False)),
-        bf16=bool(getattr(training_args, "bf16", False)),
-        max_grad_norm=float(getattr(training_args, "distill_max_grad_norm", 0.3)),
-        max_steps=int(cfg.steps),
-        warmup_ratio=float(getattr(training_args, "distill_warmup_ratio", 0.3)),
-        group_by_length=requested_group_by_length,
-        lr_scheduler_type=_enum_to_value(getattr(training_args, "distill_lr_scheduler_type", "linear"), "linear"),
-        report_to=[],
-        disable_tqdm=not is_distill_main_process(),
-        log_level="info" if is_distill_main_process() else "error",
-        log_level_replica="error",
-        save_strategy="no",
-        seed=int(cfg.seed),
-        data_seed=int(cfg.base_seed),
-        full_determinism=bool(getattr(cat_args, "deterministic", False)),
-        dataloader_num_workers=_resolve_distill_dataloader_num_workers(training_args),
-        dataloader_pin_memory=True,
-    )
-    if train_is_iterable:
-        training_kwargs["group_by_length"] = False
-        training_kwargs["accelerator_config"] = {
-                        "dispatch_batches": False,
-                        "split_batches": False,
-                        }
-        if requested_group_by_length and logger is not None:
-            logger.info(
-                "LoRA: dataset is iterable，已忽略 --distill_group_by_length=true。"
-            )
-    if is_distill_distributed():
-        # Only current-category params are trainable; frozen params are unused in the graph.
-        training_kwargs["ddp_find_unused_parameters"] = True
-        if logger is not None:
-            logger.info("LoRA: DDP find_unused_parameters=True（仅当前类参数可训）。")
-            grad_acc = int(getattr(training_args, "distill_gradient_accumulation_steps", 1))
-            logger.info(
-                "LoRA: per_device_batch=%d world_size=%d grad_acc=%d effective_global_batch=%d",
-                int(cfg.batch_size),
-                int(distill_world_size()),
-                grad_acc,
-                int(cfg.batch_size) * int(distill_world_size()) * grad_acc,
-            )
-    return TrainingArguments(**training_kwargs)
-
-
-def _distill_dataset_uses_edgerazor_messages(dataset_mix_spec: str) -> bool:
-    if "=" not in str(dataset_mix_spec):
-        return False
-    sources, _, _ = normalize_dataset_mix_spec(str(dataset_mix_spec))
-    return any(str(alias) in VAELLM_EDGERAZOR_SFT_ALIASES for alias in sources)
-
-
-def _prepare_or_reuse_remaining_lora_distill_dataset(
-    *,
-    vae_args,
-    cfg: _ResolvedDistillStageConfig,
-    tokenizer,
-    training_args,
-    logger,
-):
-    max_seq_len = int(getattr(training_args, "distill_model_max_length", 2048))
-
-    dataset_cache = getattr(
-        vae_args,
-        "_cached_remaining_lora_distill_datasets",
-        None,
-    )
-    if not isinstance(dataset_cache, dict):
-        dataset_cache = {}
-        setattr(
-            vae_args,
-            "_cached_remaining_lora_distill_datasets",
-            dataset_cache,
-        )
-
-    raw_dataset_cache = getattr(
-        vae_args,
-        "_cached_remaining_lora_raw_datasets",
-        None,
-    )
-    if not isinstance(raw_dataset_cache, dict):
-        raw_dataset_cache = {}
-        setattr(
-            vae_args,
-            "_cached_remaining_lora_raw_datasets",
-            raw_dataset_cache,
-        )
-
-    dataset_cache_key = (
-        str(cfg.dataset),
-        int(max_seq_len),
-        int(cfg.base_seed),
-        id(tokenizer),
-    )
-
-    cached = dataset_cache.get(dataset_cache_key)
-    if cached is None:
-        cached = prepare_distill_datasets(
-            cfg.dataset,
-            seed=int(cfg.base_seed),
-            tokenizer=tokenizer,
-            max_seq_len=int(max_seq_len),
-            raw_dataset_cache=raw_dataset_cache,
-        )
-        dataset_cache[dataset_cache_key] = cached
-        logger.info(
-            "LoRA: prepared remaining_lora distill dataset cache "
-            "dataset_seed=%d max_seq_len=%d",
-            int(cfg.base_seed),
-            int(max_seq_len),
-        )
-    else:
-        logger.info(
-            "LoRA: reused remaining_lora distill dataset cache "
-            "dataset_seed=%d max_seq_len=%d",
-            int(cfg.base_seed),
-            int(max_seq_len),
-        )
-
-    return cached
-
-
-def _resolve_effective_decoder_lr(
-    cfg: _ResolvedDistillStageConfig,
-    decoder_params: Sequence[nn.Parameter],
-    *,
-    decoder_lr: Optional[float] = None,
-) -> Optional[float]:
-    if not decoder_params:
-        return None
-    value = cfg.decoder_lr if decoder_lr is None else decoder_lr
-    if value is None:
-        value = cfg.lr
-    if float(value) <= 0.0:
-        raise ValueError("effective decoder lr must be > 0 when decoder parameters are trainable.")
-    return float(value)
-
-
-def _build_lora_trainer(
-    *,
-    model: nn.Module,
-    train_ds,
-    eval_ds,
-    sft_args,
-    training_args,
-    logger,
-    cfg: _ResolvedDistillStageConfig,
-    hif4_act_controller,
-    teacher_runtime=None,
-    decoder_params: Sequence[nn.Parameter] = (),
-    decoder_lr: Optional[float] = None,
-    tokenizer=None,
-    train_is_iterable: bool = False,
-    use_lazy_tokenized_dataset: bool = False,
-):
-    max_seq_len = int(getattr(training_args, "distill_model_max_length", 2048))
-    trainer_kwargs = dict(
-        model=model,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        args=sft_args,
-        callbacks=[_LoraTrainerLogCallback(logger=logger)],
-    )
-    if use_lazy_tokenized_dataset:
-        if tokenizer is None:
-            raise ValueError("Lazy tokenized distill dataset requires tokenizer.")
-        trainer_kwargs["processing_class"] = tokenizer
-        dynamic_padding = bool(
-            getattr(training_args, "distill_dynamic_padding", False)
-        )
-        trainer_kwargs["data_collator"] = build_edgerazor_data_collator(
-            tokenizer,
-            max_seq_len=max_seq_len,
-            dynamic_padding=dynamic_padding,
-        )
-        logger.info(
-            "LoRA: distill padding mode=%s max_seq_len=%d pad_to_multiple_of=%s",
-            "dynamic" if dynamic_padding else "fixed",
-            int(max_seq_len),
-            "8" if dynamic_padding else "none",
-        )
-    elif tokenizer is not None and _distill_dataset_uses_edgerazor_messages(cfg.dataset):
-        if DataCollatorForCompletionOnlyLM is None:
-            raise ImportError("未安装 trl。EdgeRazor messages 蒸馏需要 DataCollatorForCompletionOnlyLM。")
-        response_template = infer_assistant_response_template(tokenizer)
-        instruction_template = infer_user_instruction_template(tokenizer)
-        trainer_kwargs["processing_class"] = tokenizer
-        trainer_kwargs["formatting_func"] = lambda example: render_messages(example["messages"], tokenizer)
-        trainer_kwargs["data_collator"] = DataCollatorForCompletionOnlyLM(
-            response_template,
-            instruction_template=instruction_template,
-            tokenizer=tokenizer,
-            mlm=False,
-        )
-        trainer_kwargs["max_seq_length"] = max_seq_len
-    else:
-        trainer_kwargs["dataset_text_field"] = "text"
-        trainer_kwargs["max_seq_length"] = max_seq_len
-    del train_is_iterable
-
-    decoder_param_ids = [id(param) for param in decoder_params]
-    resolved_decoder_lr = _resolve_effective_decoder_lr(cfg, decoder_params, decoder_lr=decoder_lr)
-    resolved_lora_loss = str(cfg.loss_type).strip().lower()
-    hidden_loss_enabled = float(cfg.hidden_loss_weight) > 0.0
-    pre_mlp_hidden_loss_enabled = float(cfg.pre_mlp_hidden_loss_weight) > 0.0
-    if resolved_lora_loss not in {"", "none", "sft"} or hidden_loss_enabled or pre_mlp_hidden_loss_enabled:
-        trainer_loss_type = "sft" if resolved_lora_loss in {"", "none"} else resolved_lora_loss
-        trainer = CustomSFTTrainer(
-            **trainer_kwargs,
-            loss_type=trainer_loss_type,
-            temperature=float(cfg.temperature),
-            loss_alpha=float(cfg.loss_alpha),
-            hidden_loss_weight=float(cfg.hidden_loss_weight),
-            pre_mlp_hidden_loss_weight=float(cfg.pre_mlp_hidden_loss_weight),
-            prompt_kd_weight=float(cfg.prompt_kd_weight),
-            hidden_alignment_layer_weighting=str(cfg.hidden_alignment_layer_weighting),
-            eakld_confidence_k=int(cfg.eakld_confidence_k),
-            teacher_logits_cpu_staging=bool(
-                getattr(training_args, "distill_teacher_logits_cpu_staging", False)
-            ),
-            selective_student_topk=bool(
-                getattr(training_args, "distill_selective_student_topk", False)
-            ),
-            selective_student_topk_chunk_rows=int(
-                getattr(training_args, "distill_selective_student_topk_chunk_rows", 32)
-            ),
-            selective_teacher_topk_chunk_tokens=8,
-            distill_hif4_act_controller=hif4_act_controller,
-            teacher_runtime=teacher_runtime,
-            decoder_param_ids=decoder_param_ids,
-            decoder_lr=resolved_decoder_lr,
-        )
-        trainer = _replace_progress_log_callback(trainer)
-        trainer.add_callback(
-            _LoraDistillTokenStatsCallback(trainer=trainer, logger=logger)
-        )
-        return trainer
-    if decoder_params:
-        trainer = GroupedSFTTrainer(
-            **trainer_kwargs,
-            decoder_param_ids=decoder_param_ids,
-            decoder_lr=resolved_decoder_lr,
-        )
-    else:
-        trainer = SFTTrainer(**trainer_kwargs)
-    return _replace_progress_log_callback(trainer)
-
-
-def _train_lora_trainer_without_merge(
-    *,
-    trainer,
-    hif4_act_controller,
-    logger,
-) -> nn.Module:
-    hif4_act_handles: List[torch.utils.hooks.RemovableHandle] = []
-    if hif4_act_controller is not None:
-        if hasattr(trainer, "distill_hif4_act_controller"):
-            trainer.distill_hif4_act_controller = hif4_act_controller
-        hif4_act_handles = register_hif4_act_hooks(trainer.model, hif4_act_controller)
-        if not hif4_act_handles:
-            raise RuntimeError("启用 HiFloat4 激活量化失败：未找到可注册 hook 的逻辑线性层。")
-        logger.info(
-            "LoRA: 已启用 HiFloat4 激活量化，student 前向量化类型=hifx4，hook 模块数=%d",
-            len(hif4_act_handles),
-        )
-
-    if hif4_act_controller is not None:
-        hif4_act_controller.enabled = True
-    try:
-        trainer.train()
-    finally:
-        if hif4_act_controller is not None:
-            hif4_act_controller.enabled = False
-        remove_hif4_act_hooks(hif4_act_handles)
-
-    distill_distributed_barrier()
-    return trainer.model
-
-
-def _train_and_merge_lora_model(
-    *,
-    trainer,
-    hif4_act_controller,
-    logger,
-) -> nn.Module:
-    model = _train_lora_trainer_without_merge(
-        trainer=trainer,
-        hif4_act_controller=hif4_act_controller,
-        logger=logger,
-    )
-    model, merged_count = merge_all_lora(model)
-    if is_distill_main_process():
-        logger.info("LoRA: 微调完成并融合，融合模块数量=%d", merged_count)
-    if is_distill_distributed():
-        distill_distributed_barrier()
-        return model
-    model.to("cpu")
-    torch.cuda.empty_cache()
-    return model
-
-
-def _vae_linear_reference_device_dtype(base_layer: VAELinear) -> Tuple[Optional[torch.device], Optional[torch.dtype]]:
-    device = None
-    dtype = None
-    for tensor in list(base_layer.parameters(recurse=True)) + list(base_layer.buffers(recurse=True)):
-        if device is None:
-            device = tensor.device
-        if dtype is None and tensor.is_floating_point():
-            dtype = tensor.dtype
-        if device is not None and dtype is not None:
-            break
-    return device, dtype
-
-
-def _has_valid_decoded_weight_cache(base_layer: VAELinear) -> bool:
-    cached = getattr(base_layer, "_cached_weight", None)
-    if cached is None:
-        return False
-    expected_device, expected_dtype = _vae_linear_reference_device_dtype(base_layer)
-    if expected_device is not None and cached.device != expected_device:
-        return False
-    if expected_dtype is not None and cached.dtype != expected_dtype:
-        return False
-    return True
-
-
-def _collect_remaining_decoder_frozen_vae_prewarm_targets(
-    model: nn.Module,
-    *,
-    decoder_targets: Sequence[NamedMainDecoderTarget],
-) -> Tuple[NamedVAELinearTarget, ...]:
-    excluded_ids = {id(target.base_layer) for target in decoder_targets}
-    seen_ids = set()
-    targets: List[NamedVAELinearTarget] = []
-    for name, module in model.named_modules():
-        if not isinstance(module, VAELinear):
-            continue
-        module_id = id(module)
-        if module_id in seen_ids:
-            continue
-        seen_ids.add(module_id)
-        if module_id in excluded_ids:
-            continue
-        if bool(getattr(module, "trainable_decode", False)):
-            continue
-        if not bool(getattr(module, "cache_decoded_weight", True)):
-            continue
-        if bool(getattr(module, "_skip_global_cache_prewarm", False)):
-            continue
-        if _has_valid_decoded_weight_cache(module):
-            continue
-        targets.append(NamedVAELinearTarget(name=str(name), base_layer=module))
-    return tuple(targets)
-
-
-def _prewarm_remaining_decoder_frozen_vae_linears(
-    model: nn.Module,
-    *,
-    decoder_targets: Sequence[NamedMainDecoderTarget],
-    compute_device: str,
-    logger,
-) -> Dict[str, int]:
-    if not decoder_targets:
-        return {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
-    targets = _collect_remaining_decoder_frozen_vae_prewarm_targets(
-        model,
-        decoder_targets=decoder_targets,
-    )
-    if targets:
-        stats = prime_named_vae_linear_cache(
-            targets,
-            dtype=None,
-            clear_existing=False,
-            group_size=8,
-            compute_device=compute_device,
-            logger=logger,
-        )
-    else:
-        stats = {"total": 0, "warmed": 0, "skipped": 0, "failed": 0}
-    if logger is not None:
-        logger.info(
-            "remaining decoder frozen VAE prewarm: selected_decoder_targets=%d frozen_candidates=%d warmed=%d skipped=%d failed=%d",
-            int(len(decoder_targets)),
-            int(len(targets)),
-            int(stats.get("warmed", 0)),
-            int(stats.get("skipped", 0)),
-            int(stats.get("failed", 0)),
-        )
-    return {
-        "total": int(stats.get("total", len(targets))),
-        "warmed": int(stats.get("warmed", 0)),
-        "skipped": int(stats.get("skipped", 0)),
-        "failed": int(stats.get("failed", 0)),
-    }
-
-
-def lora_finetune_remaining_categories(
-    model: nn.Module,
-    remaining_categories: Sequence[str],
-    *,
-    target_names: Sequence[str],
-    decoder_targets: Sequence[NamedMainDecoderTarget] = (),
-    cat_args,
-    vae_args,
-    training_args,
-    logger,
-    lora_round_idx: Optional[int] = None,
-    after_category: Optional[str] = None,
-    teacher_runtime=None,
-) -> RemainingLoraFinetuneResult:
-    cfg = _resolve_distill_stage_config(
-        cat_args=cat_args,
-        training_args=training_args,
-        after_category=after_category,
-        lora_round_idx=lora_round_idx,
-    )
-    has_extra_trainables = bool(cfg.distill_tune_final_norm) or bool(cfg.distill_use_post_norm_head_linear)
-    has_decoder_targets = bool(decoder_targets)
-    if cfg.steps <= 0:
-        return RemainingLoraFinetuneResult(model=model, did_train=False)
-    if not remaining_categories and not has_extra_trainables and not has_decoder_targets:
-        return RemainingLoraFinetuneResult(model=model, did_train=False)
-    _ensure_distill_trainer_data_stack_available()
-    if target_names:
-        ensure_lora_training_stack_available()
-
-    if not target_names and not has_extra_trainables and not has_decoder_targets:
-        logger.info("LoRA: 没有可微调的剩余 Linear，跳过。")
-        return RemainingLoraFinetuneResult(model=model, did_train=False)
-
-    previous_use_cache = _freeze_model_for_lora(model, device=cfg.device, logger=logger)
-    try:
-        extra_modules = _collect_extra_trainable_modules(model, cfg=cfg, logger=logger)
-        if target_names:
-            model, _lora_config, unique_target_names = create_lora_adapters(
-                model,
-                target_names=target_names,
-                rank=cfg.rank,
-                alpha=cfg.alpha,
-                dropout=cfg.dropout,
-                use_dora=cfg.use_dora,
-            )
-        else:
-            _lora_config = None
-            unique_target_names = []
-        extra_trainable_names = _enable_extra_trainable_params(extra_modules)
-        decoder_params = enable_main_decoder_targets(decoder_targets) if decoder_targets else ()
-        resolved_decoder_lr = _resolve_effective_decoder_lr(cfg, decoder_params)
-        _prewarm_remaining_decoder_frozen_vae_linears(
-            model,
-            decoder_targets=decoder_targets,
-            compute_device=cfg.device,
-            logger=logger,
-        )
-        if _lora_config is None:
-            logger.info("LoRA: 没有匹配到可插入 adapter 的 Linear，本轮仅训练额外解冻参数。")
-            if not extra_trainable_names and not decoder_params:
-                logger.info("LoRA: 没有额外可训练参数，跳过。")
-                return RemainingLoraFinetuneResult(model=model, did_train=False)
-
-        resolved_lora_loss = str(cfg.loss_type).strip().lower()
-        use_custom_trainer = (
-            resolved_lora_loss not in {"", "none", "sft"}
-            or float(cfg.hidden_loss_weight) > 0.0
-            or float(cfg.pre_mlp_hidden_loss_weight) > 0.0
-        )
-        _log_lora_stage_start(
-            logger=logger,
-            cfg=cfg,
-            after_category=after_category,
-            remaining_categories=remaining_categories,
-            target_count=len(unique_target_names),
-            extra_trainable_names=extra_trainable_names,
-            use_custom_trainer=use_custom_trainer,
-        )
-
-        _ensure_lora_tokenizer_ready(vae_args=vae_args, model=model)
-        tokenizer = getattr(vae_args, "_cached_lora_tokenizer", None)
-        (
-            dataset_mix_spec,
-            source_stats,
-            train_ds,
-            eval_ds,
-            _eval_split,
-        ) = _prepare_or_reuse_remaining_lora_distill_dataset(
-            vae_args=vae_args,
-            cfg=cfg,
-            tokenizer=tokenizer,
-            training_args=training_args,
-            logger=logger,
-        )
-        train_is_iterable = is_iterable_training_dataset(train_ds)
-        train_len = dataset_length_or_none(train_ds)
-        logger.info(
-            "LoRA: 补偿训练混合数据集=%s lazy_iterable=%s dataset_len=%s eval_dataset=none",
-            str(dataset_mix_spec),
-            str(train_is_iterable).lower(),
-            "unknown" if train_len is None else str(train_len),
-        )
-        for source_info in source_stats:
-            logger.info(
-                "LoRA: 混合数据源 alias=%s weight=%.6f raw_rows=%d hf=%s config=%s train_split=%s lazy_iterable=%s",
-                str(source_info["alias"]),
-                float(source_info["weight"]),
-                int(source_info["raw_rows"]),
-                str(source_info["path"]),
-                "none" if source_info["config"] is None else str(source_info["config"]),
-                str(source_info["train_split"]),
-                str(source_info.get("is_iterable", train_is_iterable)).lower(),
-            )
-        if train_len == 0:
-            logger.warning("LoRA: 数据集为空，跳过。")
-            if decoder_targets:
-                finalize_main_decoder_targets(decoder_targets)
-            model, _merged_count = merge_all_lora(model)
-            return RemainingLoraFinetuneResult(model=model, did_train=False)
-
-        sft_args = _build_sft_args(
-            cat_args=cat_args,
-            training_args=training_args,
-            cfg=cfg,
-            train_is_iterable=train_is_iterable,
-            logger=logger,
-        )
-        hif4_act_controller = build_hif4_act_controller(cfg.use_distill_hif4_act)
-        trainer = _build_lora_trainer(
-            model=model,
-            train_ds=train_ds,
-            eval_ds=eval_ds,
-            sft_args=sft_args,
-            training_args=training_args,
-            logger=logger,
-            cfg=cfg,
-            hif4_act_controller=hif4_act_controller,
-            teacher_runtime=teacher_runtime,
-            decoder_params=decoder_params,
-            decoder_lr=resolved_decoder_lr,
-            tokenizer=tokenizer,
-            train_is_iterable=train_is_iterable,
-            use_lazy_tokenized_dataset=True,
-        )
-        if decoder_targets:
-            model = _train_lora_trainer_without_merge(
-                trainer=trainer,
-                hif4_act_controller=hif4_act_controller,
-                logger=logger,
-            )
-            finalized = finalize_main_decoder_targets(decoder_targets)
-            logger.info("LoRA: finalized trainable main decoder targets=%d.", int(finalized))
-            model, merged_count = merge_all_lora(model)
-            if is_distill_main_process():
-                logger.info("LoRA: 微调完成并融合，融合模块数量=%d", merged_count)
-            distill_distributed_barrier()
-            if not is_distill_distributed():
-                model.to("cpu")
-                torch.cuda.empty_cache()
-        else:
-            model = _train_and_merge_lora_model(
-                trainer=trainer,
-                hif4_act_controller=hif4_act_controller,
-                logger=logger,
-            )
-        return RemainingLoraFinetuneResult(
-            model=model,
-            did_train=True,
-            remaining_lora_target_count=len(unique_target_names),
-            decoder_target_count=len(decoder_targets),
-            resolved_distill_lr=float(cfg.lr),
-            resolved_decoder_lr=resolved_decoder_lr,
-        )
-    finally:
-        _restore_model_use_cache(model, previous_use_cache, logger=logger)
+__all__ = [
+    "_LoraDistillTokenStatsCallback",
+    "_LoraTrainerLogCallback",
+    "_ensure_lora_stack_available",
+    "_ensure_lora_tokenizer_ready",
+    "_replace_progress_log_callback",
+    "_resolve_distill_process_group_timeout_sec",
+    "distill_distributed_barrier",
+    "distill_rank",
+    "distill_world_size",
+    "ensure_distill_process_group_initialized",
+    "get_distill_local_device",
+    "is_distill_distributed",
+    "is_distill_main_process",
+    "resolve_distill_train_device",
+    "split_tasks_for_distill_rank",
+    "unwrap_distill_model",
+]

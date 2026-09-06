@@ -81,41 +81,9 @@ def _build_logger(log_dir: str) -> Tuple[logging.Logger, str, str]:
 
 
 def _resolve_checkpoint_dir(path: str) -> str:
-    abs_path = os.path.abspath(path)
-    if os.path.isfile(abs_path):
-        if os.path.basename(abs_path) == META_FILENAME:
-            return os.path.dirname(abs_path)
-        raise FileNotFoundError(f"Expected {META_FILENAME} file, got: {abs_path}")
+    from train_utils.checkpoint_v6 import resolve_v6_checkpoint_dir
 
-    if not os.path.isdir(abs_path):
-        raise FileNotFoundError(f"Path does not exist: {abs_path}")
-
-    direct_meta = os.path.join(abs_path, META_FILENAME)
-    if os.path.exists(direct_meta):
-        return abs_path
-
-    final_model_meta = os.path.join(abs_path, "final_model", META_FILENAME)
-    if os.path.exists(final_model_meta):
-        return os.path.join(abs_path, "final_model")
-
-    candidates: List[str] = []
-    for child in os.listdir(abs_path):
-        child_dir = os.path.join(abs_path, child)
-        if not os.path.isdir(child_dir):
-            continue
-        if os.path.exists(os.path.join(child_dir, META_FILENAME)):
-            candidates.append(child_dir)
-
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return candidates[0]
-
-    raise FileNotFoundError(
-        f"Cannot find checkpoint metadata under: {abs_path}. "
-        f"Please pass a directory containing {META_FILENAME}."
-    )
+    return resolve_v6_checkpoint_dir(path)
 
 
 def _read_checkpoint_meta(checkpoint_dir: str) -> Dict[str, Any]:
@@ -208,17 +176,11 @@ def _validate_adapter_checkpoint_match(
 
 
 def _resolve_checkpoint_loader(meta: Dict[str, Any]) -> str:
-    adapter_modules = meta.get("adapter_modules")
-    adapter_module_count = int(meta.get("adapter_module_count", 0) or 0)
-    extra_meta = meta.get("extra_meta", {}) if isinstance(meta.get("extra_meta"), dict) else {}
-    stage = str(extra_meta.get("stage", "")).strip().lower()
-    if adapter_module_count > 0:
-        return "e2e"
-    if isinstance(adapter_modules, list) and len(adapter_modules) > 0:
-        return "e2e"
-    if stage in {"e2e_fintuning", "dense_e2e_fintuning"}:
-        return "e2e"
-    return "cat"
+    if str(meta.get("format")) != "vaellm_model_checkpoint_v6":
+        raise ValueError("Legacy checkpoint input is unsupported; run tools/migrate_checkpoint_v6.py first.")
+    if str(meta.get("checkpoint_kind")) not in {"round_base", "category_boundary", "final_model"}:
+        raise ValueError("cat_eval requires an independently loadable v6 checkpoint.")
+    return "v6"
 
 
 def _resolve_eval_device(requested_device: str, logger: logging.Logger) -> str:
@@ -252,30 +214,20 @@ def _prepare_model_for_eval(
     logger.info("[warmup] Moving model to %s ...", device)
     model.to(device)
 
-    from e2e_common.peft_proxy import iter_named_peft_vae_proxies, materialize_peft_proxy_decoded_linears
     from e2e_common.proxy_trainables import iter_named_vae_module_refs
     from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
 
     start_time = time.time()
-    if any(True for _ in iter_named_peft_vae_proxies(model)):
-        stats = materialize_peft_proxy_decoded_linears(
-            model,
-            group_size=int(prewarm_group_size),
-            compute_device=device,
-            logger=logger,
-            log_prefix="[warmup] ",
-        )
-    else:
-        named_targets = [
-            NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer)
-            for ref in iter_named_vae_module_refs(model)
-        ]
-        stats = prime_named_vae_linear_cache(
-            named_targets,
-            group_size=int(prewarm_group_size),
-            compute_device=device,
-            logger=logger,
-        )
+    named_targets = [
+        NamedVAELinearTarget(name=ref.name, base_layer=ref.base_layer)
+        for ref in iter_named_vae_module_refs(model)
+    ]
+    stats = prime_named_vae_linear_cache(
+        named_targets,
+        group_size=int(prewarm_group_size),
+        compute_device=device,
+        logger=logger,
+    )
     duration_sec = float(time.time() - start_time)
     result = {
         **stats,
@@ -457,7 +409,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     logger.info("Loading evaluated model from checkpoint...")
     if adapter_dir is not None:
-        if checkpoint_loader != "cat":
+        if checkpoint_loader != "v6":
             raise ValueError(
                 "--adapter_dir requires a compressed cat checkpoint as --checkpoint_dir. "
                 f"Current checkpoint loader detected: {checkpoint_loader}."
@@ -527,27 +479,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         load_result = None
         checkpoint_loader = "cat+adapter"
         logger.info("Loaded and merged adapter into dense rebuilt model for evaluation.")
-    elif checkpoint_loader == "e2e":
-        from e2e_common.checkpoint_io import load_e2e_model_checkpoint
-        from e2e_common.temporary_mode import set_model_temporary
-        from litebsq.vae_linear import clear_model_vae_linear_cache
-
-        model, meta, load_result = load_e2e_model_checkpoint(
-            ckpt_dir,
-            access_token=args.access_token,
-            base_model_path=args.base_model_path,
-            map_location=args.map_location,
-            strict=args.strict,
-            materialize_proxy_decoded_linears=False,
-            proxy_group_size=int(args.prewarm_group_size),
-        )
-        set_model_temporary(model, True)
-        clear_model_vae_linear_cache(model)
-        logger.info("Applied e2e student mode and cleared VAELinear cache after checkpoint load.")
     else:
-        from train_utils.model_checkpoint_io import load_model_checkpoint
+        from train_utils.v6_model_loader import load_v6_model_checkpoint
 
-        model, meta, load_result = load_model_checkpoint(
+        model, meta, load_result = load_v6_model_checkpoint(
             ckpt_dir,
             access_token=args.access_token,
             base_model_path=args.base_model_path,

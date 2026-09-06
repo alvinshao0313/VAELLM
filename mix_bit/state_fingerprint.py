@@ -20,7 +20,7 @@ from torch import nn
 
 from mix_bit.model_adapter import get_model_adapter
 from mix_bit.schema import ResolvedRunConfig
-from train_utils.model_checkpoint_io import load_checkpoint_into_model
+from train_utils.checkpoint_v6 import load_v6_full_checkpoint_into_model
 
 
 STATE_FINGERPRINT_KIND = "mix_bit_state_fingerprint_v1"
@@ -225,9 +225,9 @@ def verify_saved_checkpoint_state(
     adapter = get_model_adapter(profile.adapter)
     reloaded = adapter.load_model(profile)
     try:
-        load_checkpoint_into_model(
-            model=reloaded,
-            model_dir=str(output_dir),
+        load_v6_full_checkpoint_into_model(
+            reloaded,
+            str(output_dir),
             map_location="cpu",
             strict=True,
         )

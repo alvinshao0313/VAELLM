@@ -123,8 +123,8 @@ def _make_resolved(
         values={
             "seed": 31,
             "deterministic": True,
-            "steps_per_category": 10,
-            "batch_size": 8,
+            "vae_steps": 10,
+            "vae_batch_size": 8,
             "base_ch": 8,
             "num_res_blocks": 0,
             "decoder_base_ch": 8,
@@ -138,13 +138,13 @@ def _make_resolved(
             "gamma": 1.0,
             "zeta": 1.0,
             "inv_temperature": 100.0,
-            "lr": 0.001,
+            "vae_learning_rate": 0.001,
             "beta1": 0.9,
             "beta2": 0.95,
-            "weight_decay": 0.0,
-            "optimizer": "adamw",
-            "lr_scheduler": "linear",
-            "lr_warmup_steps": 0,
+            "vae_weight_decay": 0.0,
+            "vae_optim": "adamw",
+            "vae_lr_scheduler_type": "linear",
+            "vae_warmup_ratio": 0,
             "l1_weight": 1.0,
             "lfq_weight": 1.0,
             "commitment_loss_weight": 0.25,
@@ -155,11 +155,11 @@ def _make_resolved(
             "log_every": 1,
             "eval_every": 0,
             "eval_blocks": 8,
-            "outlier_protect_mode": "channel",
-            "outlier_protect_count": 0,
-            "outlier_protect_min_per_layer": 0,
-            "distill_after_category": "none",
-            "eval_ppl": False,
+            "channel_protect_mode": "channel",
+            "channel_protect_count": 0,
+            "channel_min_per_layer": 0,
+            "after_category_mode": "none",
+            "skip_ppl_eval": True,
             "eval_tasks": "",
             "rot_llm": False,
             "fp16": False,
@@ -422,12 +422,12 @@ def test_loader_preflight_rejects_missing_category_before_jobs(tmp_path: Path):
     # Drop one category from discovered linears
     from train_utils.utils import collect_linears as real_collect
 
-    def _partial_collect(model, transpose_modules, *, only_decoder_projections, target_categories):
+    def _partial_collect(model, transpose_modules, *, only_decoder_projections, categories):
         refs = real_collect(
             model,
             transpose_modules,
             only_decoder_projections=only_decoder_projections,
-            target_categories=target_categories,
+            categories=categories,
         )
         return [r for r in refs if r.category != "v_proj"]
 
@@ -470,8 +470,8 @@ def test_command_disables_category_distillation(tmp_path: Path):
     inventory = _inventory_for(resolved.config.model_profile, _ToyModel())
     trial = generate_candidate_trials(resolved, inventory)[0]
     cmd = build_trial_command(trial, resolved, gpu_id="4")
-    assert "--distill_after_category" in cmd
-    assert cmd[cmd.index("--distill_after_category") + 1] == "none"
+    assert "--after_category_mode" in cmd
+    assert cmd[cmd.index("--after_category_mode") + 1] == "none"
 
 
 def test_command_disables_inline_ppl_and_task_evaluation(tmp_path: Path):
@@ -479,7 +479,7 @@ def test_command_disables_inline_ppl_and_task_evaluation(tmp_path: Path):
     inventory = _inventory_for(resolved.config.model_profile, _ToyModel())
     trial = generate_candidate_trials(resolved, inventory)[0]
     cmd = build_trial_command(trial, resolved, gpu_id="4")
-    assert cmd[cmd.index("--eval_ppl") + 1] == "false"
+    assert cmd[cmd.index("--skip_ppl_eval") + 1] == "true"
     assert cmd[cmd.index("--eval_tasks") + 1] == ""
 
 
@@ -504,19 +504,20 @@ def test_command_uses_candidate_only_save_and_omits_save_model(tmp_path: Path):
 
 
 def test_candidate_only_save_rejects_save_model_combination():
-    from train_utils.cat_train_args import process_cat_train_args
+    from train_utils.cat_runtime_adapter import parse_cat_runtime_args
 
-    with pytest.raises(ValueError, match="mutually exclusive|save_candidate_artifact|save_model"):
-        process_cat_train_args(
+    with pytest.raises(SystemExit):
+        parse_cat_runtime_args(
             [
                 "--convert",
                 "--save_candidate_artifact",
+                "true",
                 "--save_model",
                 "--candidate_artifact_spec",
                 "/tmp/spec.json",
                 "--candidate_artifact_output_dir",
                 "/tmp/artifact",
-                "--target_categories",
+                "--compression_categories",
                 "q_proj",
                 "--model_path",
                 "toy",

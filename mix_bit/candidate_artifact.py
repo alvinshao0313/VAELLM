@@ -18,10 +18,7 @@ from mix_bit.candidate_contract import (
 )
 from mix_bit.candidate_pool import load_trial_spec
 from mix_bit.module_swap import build_candidate_module
-from train_utils.model_checkpoint_io import (
-    _collect_vae_linear_specs,
-    temporarily_pack_parallel_stage_decoders_for_checkpoint,
-)
+from train_utils.checkpoint_v6 import _collect_vae_linear_specs
 
 CANDIDATE_FORMAT = "vaellm_candidate_modules_v1"
 MODULE_STATE_FILENAME = "module_state.pt"
@@ -192,121 +189,120 @@ def save_candidate_artifact_from_model(
     if completed_path.is_file():
         completed_path.unlink()
 
-    with temporarily_pack_parallel_stage_decoders_for_checkpoint(model):
-        all_specs = _collect_vae_linear_specs(model)
-        selected_specs = [spec for spec in all_specs if str(spec["name"]) in expected_set]
-        if len(selected_specs) != len(expected_set):
-            found = {str(s["name"]) for s in selected_specs}
+    all_specs = _collect_vae_linear_specs(model)
+    selected_specs = [spec for spec in all_specs if str(spec["name"]) in expected_set]
+    if len(selected_specs) != len(expected_set):
+        found = {str(s["name"]) for s in selected_specs}
+        raise ValueError(
+            f"Converted-module specs mismatch: expected={sorted(expected_set)} found={sorted(found)}"
+        )
+    for spec in selected_specs:
+        if bool(spec.get("has_original_weight", False)):
             raise ValueError(
-                f"Converted-module specs mismatch: expected={sorted(expected_set)} found={sorted(found)}"
+                f"{spec['name']}: candidate export rejects has_original_weight=true"
             )
-        for spec in selected_specs:
-            if bool(spec.get("has_original_weight", False)):
-                raise ValueError(
-                    f"{spec['name']}: candidate export rejects has_original_weight=true"
-                )
-            validate_module_spec_mode_contract(
-                spec,
-                mode,
-                label=f"export/{trial_spec.get('category_name', '?')}/{mode.name}/{spec['name']}",
+        validate_module_spec_mode_contract(
+            spec,
+            mode,
+            label=f"export/{trial_spec.get('category_name', '?')}/{mode.name}/{spec['name']}",
+        )
+
+    artifact_state: dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        module = named[name]
+        local = module.state_dict()
+        if any("cached" in key for key in local):
+            raise ValueError(f"{name}: decoded caches must not appear in state_dict")
+        if "original_weight" in local:
+            raise ValueError(f"{name}: original_weight leaked into module state_dict")
+        _validate_vq_buffers(module, local)
+        for key, value in local.items():
+            artifact_state[f"{name}.{key}"] = value.detach().cpu()
+
+    # Full-model state_dict must never be used; also reject foreign prefixes.
+    for key in artifact_state:
+        if not any(key.startswith(f"{name}.") for name in expected_names):
+            raise ValueError(f"Artifact key escapes target prefixes: {key}")
+    banned_prefixes = ("embed_tokens", "lm_head", "norm", "dense_backbone")
+    for key in artifact_state:
+        top = key.split(".")[0]
+        if top in banned_prefixes:
+            raise ValueError(f"Artifact contains banned backbone key: {key}")
+    _reject_forbidden_keys(artifact_state)
+
+    state_path = out_dir / MODULE_STATE_FILENAME
+    tmp_state = out_dir / (MODULE_STATE_FILENAME + ".tmp")
+    torch.save(artifact_state, tmp_state)
+    os.replace(tmp_state, state_path)
+
+    payload_summaries = {key: _tensor_summary(tensor) for key, tensor in artifact_state.items()}
+    state_sha = _sha256_file(state_path)
+    canonical_mode = {
+        "name": mode.name,
+        "nominal_bit": mode.nominal_bit,
+        "codebook_bits": mode.codebook_bits,
+        "codebook_dim": mode.codebook_dim,
+        "residual_stages": mode.residual_stages,
+    }
+    meta = {
+        "format": CANDIDATE_FORMAT,
+        "module_specs": selected_specs,
+        "expected_module_names": expected_names,
+        "payload_summaries": payload_summaries,
+        "run_config_sha256": trial_spec.get("run_config_sha256"),
+        "candidate_space_sha256": trial_spec.get("candidate_space_sha256"),
+        "training_recipe_sha256": trial_spec.get("training_recipe_sha256"),
+        "model_profile_sha256": trial_spec.get("model_profile_sha256"),
+        "model_inventory_fingerprint": trial_spec.get("model_inventory_fingerprint"),
+        "mode": canonical_mode,
+        "category_name": trial_spec.get("category_name"),
+        "source_run_dir": str(source_run_dir),
+        "trial_spec_path": str(Path(trial_spec_path).resolve()),
+        "module_state_file": MODULE_STATE_FILENAME,
+        "module_state_sha256": state_sha,
+    }
+    meta_path = out_dir / CANDIDATE_META_FILENAME
+    _write_json_atomic(meta_path, meta)
+    meta_sha = _sha256_file(meta_path)
+
+    # Round-trip verify every module before completed.json.
+    for spec in selected_specs:
+        name = str(spec["name"])
+        source_module = named[name]
+        prefix = f"{name}."
+        local_prefixed = {k: v for k, v in artifact_state.items() if k.startswith(prefix)}
+        rebuilt = build_candidate_module(
+            SimpleNamespace(
+                module_name=name,
+                module_spec=spec,
+                in_features=int(spec["in_features"]),
+                out_features=int(spec["out_features"]),
+                has_bias=bool(spec.get("has_bias", False)),
+            ),
+            local_prefixed,
+            device="cpu",
+        )
+        if not isinstance(rebuilt, VAELinear):
+            raise TypeError(f"Expected VAELinear after rebuild, got {type(rebuilt)}")
+        rebuilt_state = rebuilt.state_dict()
+        source_local = {k[len(prefix) :]: v for k, v in local_prefixed.items()}
+        if set(rebuilt_state) != set(source_local):
+            raise ValueError(
+                f"{name}: rebuilt state keys mismatch "
+                f"missing={sorted(set(source_local) - set(rebuilt_state))} "
+                f"extra={sorted(set(rebuilt_state) - set(source_local))}"
             )
+        for key, value in source_local.items():
+            torch.testing.assert_close(rebuilt_state[key].cpu(), value.cpu())
+        _forward_equivalence_check(source_module, rebuilt)
 
-        artifact_state: dict[str, torch.Tensor] = {}
-        for name in expected_names:
-            module = named[name]
-            local = module.state_dict()
-            if any("cached" in key for key in local):
-                raise ValueError(f"{name}: decoded caches must not appear in state_dict")
-            if "original_weight" in local:
-                raise ValueError(f"{name}: original_weight leaked into module state_dict")
-            _validate_vq_buffers(module, local)
-            for key, value in local.items():
-                artifact_state[f"{name}.{key}"] = value.detach().cpu()
-
-        # Full-model state_dict must never be used; also reject foreign prefixes.
-        for key in artifact_state:
-            if not any(key.startswith(f"{name}.") for name in expected_names):
-                raise ValueError(f"Artifact key escapes target prefixes: {key}")
-        banned_prefixes = ("embed_tokens", "lm_head", "norm", "dense_backbone")
-        for key in artifact_state:
-            top = key.split(".")[0]
-            if top in banned_prefixes:
-                raise ValueError(f"Artifact contains banned backbone key: {key}")
-        _reject_forbidden_keys(artifact_state)
-
-        state_path = out_dir / MODULE_STATE_FILENAME
-        tmp_state = out_dir / (MODULE_STATE_FILENAME + ".tmp")
-        torch.save(artifact_state, tmp_state)
-        os.replace(tmp_state, state_path)
-
-        payload_summaries = {key: _tensor_summary(tensor) for key, tensor in artifact_state.items()}
-        state_sha = _sha256_file(state_path)
-        canonical_mode = {
-            "name": mode.name,
-            "nominal_bit": mode.nominal_bit,
-            "codebook_bits": mode.codebook_bits,
-            "codebook_dim": mode.codebook_dim,
-            "residual_stages": mode.residual_stages,
-        }
-        meta = {
-            "format": CANDIDATE_FORMAT,
-            "module_specs": selected_specs,
-            "expected_module_names": expected_names,
-            "payload_summaries": payload_summaries,
-            "run_config_sha256": trial_spec.get("run_config_sha256"),
-            "candidate_space_sha256": trial_spec.get("candidate_space_sha256"),
-            "training_recipe_sha256": trial_spec.get("training_recipe_sha256"),
-            "model_profile_sha256": trial_spec.get("model_profile_sha256"),
-            "model_inventory_fingerprint": trial_spec.get("model_inventory_fingerprint"),
-            "mode": canonical_mode,
-            "category_name": trial_spec.get("category_name"),
-            "source_run_dir": str(source_run_dir),
-            "trial_spec_path": str(Path(trial_spec_path).resolve()),
-            "module_state_file": MODULE_STATE_FILENAME,
-            "module_state_sha256": state_sha,
-        }
-        meta_path = out_dir / CANDIDATE_META_FILENAME
-        _write_json_atomic(meta_path, meta)
-        meta_sha = _sha256_file(meta_path)
-
-        # Round-trip verify every module before completed.json.
-        for spec in selected_specs:
-            name = str(spec["name"])
-            source_module = named[name]
-            prefix = f"{name}."
-            local_prefixed = {k: v for k, v in artifact_state.items() if k.startswith(prefix)}
-            rebuilt = build_candidate_module(
-                SimpleNamespace(
-                    module_name=name,
-                    module_spec=spec,
-                    in_features=int(spec["in_features"]),
-                    out_features=int(spec["out_features"]),
-                    has_bias=bool(spec.get("has_bias", False)),
-                ),
-                local_prefixed,
-                device="cpu",
-            )
-            if not isinstance(rebuilt, VAELinear):
-                raise TypeError(f"Expected VAELinear after rebuild, got {type(rebuilt)}")
-            rebuilt_state = rebuilt.state_dict()
-            source_local = {k[len(prefix) :]: v for k, v in local_prefixed.items()}
-            if set(rebuilt_state) != set(source_local):
-                raise ValueError(
-                    f"{name}: rebuilt state keys mismatch "
-                    f"missing={sorted(set(source_local) - set(rebuilt_state))} "
-                    f"extra={sorted(set(rebuilt_state) - set(source_local))}"
-                )
-            for key, value in source_local.items():
-                torch.testing.assert_close(rebuilt_state[key].cpu(), value.cpu())
-            _forward_equivalence_check(source_module, rebuilt)
-
-        completed = {
-            "format": CANDIDATE_FORMAT,
-            "module_state_sha256": state_sha,
-            "candidate_meta_sha256": meta_sha,
-            "module_count": len(expected_names),
-        }
-        _write_json_atomic(out_dir / COMPLETED_FILENAME, completed)
+    completed = {
+        "format": CANDIDATE_FORMAT,
+        "module_state_sha256": state_sha,
+        "candidate_meta_sha256": meta_sha,
+        "module_count": len(expected_names),
+    }
+    _write_json_atomic(out_dir / COMPLETED_FILENAME, completed)
 
     return {
         "output_dir": str(out_dir),

@@ -7,6 +7,12 @@ from torch import nn
 from litebsq.autoencoder import Decoder
 from litebsq.vae_linear import VAELinear
 from sparse_bit_tuning.checkpoint import load_sidecar, save_sidecar, sidecar_complete
+from sparse_bit_tuning.exact_checkpoint import (
+    exact_sidecar_complete,
+    load_exact_sidecar,
+    restore_exact_sidecar,
+    save_exact_sidecar,
+)
 from sparse_bit_tuning.config import SparseBitTuningConfig
 from sparse_bit_tuning.manager import SparseBitTuningManager
 
@@ -48,7 +54,7 @@ def _layer():
     )
 
 
-def _manager(*, streaming=False, round_steps=5, seed=17):
+def _manager(*, streaming=False, round_steps=5, seed=17, optimizer="rms_sgd"):
     device = torch.device("cuda:0")
     layer = _layer().to(device=device, dtype=torch.bfloat16)
     layer.enable_sparse_bit_decode_graph(parallel_stage_decode=False)
@@ -62,7 +68,7 @@ def _manager(*, streaming=False, round_steps=5, seed=17):
         config=SparseBitTuningConfig(
             enabled=True,
             active_ratio=0.5,
-            optimizer="rms_sgd",
+            optimizer=str(optimizer),
             bit_lr=2.0,
             round_steps=round_steps,
         ),
@@ -165,3 +171,80 @@ def test_resume_rejects_sampling_config_mismatch():
     _root1, _layer1, manager1 = _manager(seed=32)
     with pytest.raises(ValueError, match="training seed mismatch"):
         manager1.restore_coverage_metadata(coverage)
+
+
+def _assert_tensor_tree_equal(lhs, rhs):
+    if torch.is_tensor(lhs) or torch.is_tensor(rhs):
+        assert torch.is_tensor(lhs) and torch.is_tensor(rhs)
+        assert torch.equal(lhs, rhs)
+        return
+    if isinstance(lhs, dict) or isinstance(rhs, dict):
+        assert isinstance(lhs, dict) and isinstance(rhs, dict)
+        assert set(lhs) == set(rhs)
+        for key in lhs:
+            _assert_tensor_tree_equal(lhs[key], rhs[key])
+        return
+    if isinstance(lhs, (list, tuple)) or isinstance(rhs, (list, tuple)):
+        assert isinstance(lhs, (list, tuple)) and isinstance(rhs, (list, tuple))
+        assert len(lhs) == len(rhs)
+        for a, b in zip(lhs, rhs):
+            _assert_tensor_tree_equal(a, b)
+        return
+    assert lhs == rhs
+
+
+def test_exact_state_round_trip_preserves_live_scores_counters_and_adam_state():
+    _root0, _layer0, manager0 = _manager(streaming=False, round_steps=5, seed=41, optimizer="adam")
+    for score in manager0.score_module.score_chunks:
+        score.grad = torch.where(score.detach() >= 0, torch.ones_like(score), -torch.ones_like(score))
+    manager0.optimizer_step()
+    assert manager0.bit_round_step == 1
+    exact0 = manager0.exact_state_dict()
+    assert any(
+        payload["exp_avg"] is not None
+        for payload in exact0["bit_optimizer"]["chunks"].values()
+    )
+
+    _root1, _layer1, manager1 = _manager(streaming=False, round_steps=5, seed=41, optimizer="adam")
+    manager1.load_exact_state_dict(exact0)
+    exact1 = manager1.exact_state_dict()
+    _assert_tensor_tree_equal(exact0, exact1)
+    # configure_schedule is called again by Trainer.create_scheduler on resume;
+    # it must validate, not reset, the restored schedule.
+    manager1.configure_schedule(total_optimizer_steps=20)
+    assert manager1.bit_round_step == 1
+
+
+def test_exact_state_round_trip_preserves_streaming_pending_transition():
+    _root0, _layer0, manager0 = _manager(streaming=True, round_steps=1, seed=43)
+    for score in manager0.score_module.score_chunks:
+        score.grad = torch.where(score.detach() >= 0, torch.ones_like(score), -torch.ones_like(score))
+    telemetry = manager0.optimizer_step()
+    assert telemetry.round_ended
+    assert manager0.pending_next_states
+    exact0 = manager0.exact_state_dict()
+
+    _root1, _layer1, manager1 = _manager(streaming=True, round_steps=1, seed=43)
+    manager1.load_exact_state_dict(exact0)
+    assert manager1.pending_next_states == manager0.pending_next_states
+    assert manager1.sampler_states == manager0.sampler_states
+    assert manager1.global_bit_round == manager0.global_bit_round == 1
+    assert manager1.bit_round_step == manager0.bit_round_step == 0
+    _assert_tensor_tree_equal(exact0, manager1.exact_state_dict())
+
+
+def test_exact_sidecar_file_round_trip_uses_exact_restore_api():
+    _root0, _layer0, manager0 = _manager(streaming=False, round_steps=5, seed=47, optimizer="adam")
+    for score in manager0.score_module.score_chunks:
+        score.grad = torch.where(score.detach() >= 0, torch.ones_like(score), -torch.ones_like(score))
+    manager0.optimizer_step()
+    expected = manager0.exact_state_dict()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        save_exact_sidecar(tmp, manager0)
+        assert exact_sidecar_complete(tmp)
+        _assert_tensor_tree_equal(expected, load_exact_sidecar(tmp))
+
+        _root1, _layer1, manager1 = _manager(streaming=False, round_steps=5, seed=47, optimizer="adam")
+        restore_exact_sidecar(tmp, manager1)
+        _assert_tensor_tree_equal(expected, manager1.exact_state_dict())

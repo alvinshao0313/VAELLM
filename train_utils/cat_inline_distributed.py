@@ -88,33 +88,39 @@ def _unpack_bool_tensors_from_transport(obj: Any) -> Any:
     return obj
 
 
-def broadcast_group_vae_payload(payload: Optional[Dict[str, Any]], *, src: int = 0) -> Dict[str, Any]:
-    """Broadcast a group VAE payload with bool tensors bit-packed for transport only."""
+def _broadcast_cpu_dict(
+    payload: Optional[Dict[str, Any]],
+    *,
+    src: int,
+    expected_format: str,
+    expected_version: int,
+    label: str,
+) -> Dict[str, Any]:
     world_size = distill_world_size()
     if world_size <= 1:
         if not isinstance(payload, dict):
-            raise TypeError("Single-rank CAT VAE payload must be a dict.")
+            raise TypeError(f"Single-rank {label} payload must be a dict.")
         return payload
 
     group = initialize_cat_payload_group()
     rank = distill_rank()
     if rank == int(src):
         if not isinstance(payload, dict):
-            raise TypeError("Source CAT VAE payload must be a dict.")
+            raise TypeError(f"Source {label} payload must be a dict.")
         buffer = io.BytesIO()
         torch.save(_pack_bool_tensors_for_transport(payload), buffer)
         raw = buffer.getvalue()
         length = torch.tensor([len(raw)], dtype=torch.int64, device="cpu")
     else:
         if payload is not None:
-            raise TypeError("Non-source CAT VAE payload must be None.")
+            raise TypeError(f"Non-source {label} payload must be None.")
         raw = b""
         length = torch.empty(1, dtype=torch.int64, device="cpu")
 
     torch.distributed.broadcast(length, src=int(src), group=group)
     byte_count = int(length.item())
     if byte_count < 1:
-        raise RuntimeError(f"Invalid CAT inline payload byte length: {byte_count}.")
+        raise RuntimeError(f"Invalid {label} payload byte length: {byte_count}.")
     if rank == int(src):
         byte_tensor = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
     else:
@@ -125,14 +131,35 @@ def broadcast_group_vae_payload(payload: Optional[Dict[str, Any]], *, src: int =
     )
     result = _unpack_bool_tensors_from_transport(received)
     if not isinstance(result, dict):
-        raise TypeError(f"Received CAT VAE payload must be a dict, got {type(result)}.")
-    if result.get("format") != "vaellm_group_vae_payload" or int(result.get("version", 0)) != 1:
-        raise ValueError("Received invalid CAT VAE payload format/version.")
+        raise TypeError(f"Received {label} payload must be a dict, got {type(result)}.")
+    if result.get("format") != expected_format or int(result.get("version", 0)) != expected_version:
+        raise ValueError(f"Received invalid {label} payload format/version.")
     if rank == int(src):
         serialized_mb = byte_count / (1024.0 * 1024.0)
         print(
-            "Cat inline VAE payload broadcast: "
-            f"world_size={world_size} serialized_mb={serialized_mb:.2f}",
+            f"{label} broadcast: world_size={world_size} serialized_mb={serialized_mb:.2f}",
             flush=True,
         )
     return result
+
+
+def broadcast_group_vae_payload(payload: Optional[Dict[str, Any]], *, src: int = 0) -> Dict[str, Any]:
+    """Broadcast a group VAE payload with bool tensors bit-packed for transport only."""
+    return _broadcast_cpu_dict(
+        payload,
+        src=int(src),
+        expected_format="vaellm_group_vae_payload",
+        expected_version=1,
+        label="CAT VAE payload",
+    )
+
+
+def broadcast_adaptive_channel_plan(payload: Optional[Dict[str, Any]], *, src: int = 0) -> Dict[str, Any]:
+    """Broadcast a CPU-serializable adaptive channel plan. Single-rank returns locally."""
+    return _broadcast_cpu_dict(
+        payload,
+        src=int(src),
+        expected_format="vaellm_adaptive_channel_plan",
+        expected_version=1,
+        label="CAT adaptive channel plan",
+    )

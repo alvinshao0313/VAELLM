@@ -11,7 +11,11 @@ from train_utils.base_reference import (
 
 def distill_loss_requires_teacher(loss_type: str) -> bool:
     normalized = str(loss_type or "").strip().lower()
-    return normalized not in {"", "none", "sft", "origin"}
+    if normalized in {"", "none", "sft"}:
+        return False
+    from train_utils.distill_loss_core import normalize_model_level_loss_type
+
+    return normalize_model_level_loss_type(normalized) != "sft"
 
 
 def resolve_distill_teacher_required(

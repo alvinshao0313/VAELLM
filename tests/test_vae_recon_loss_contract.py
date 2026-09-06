@@ -5,8 +5,7 @@ import torch
 
 from litebsq.autoencoder import AutoEncoder
 from litebsq.bsq import BSQ
-from train_utils.block_vae_lora_args import _RECON_LOSS_TYPE_CHOICES
-from train_utils.cat_train_args import _CAT_RECON_LOSS_CHOICES
+from train_utils.config.configs import RECON_LOSS_TYPES
 from train_utils.cat_train_pipeline import (
     _compute_recon_loss as compute_category_recon_loss,
     _compute_reconstruction_eval_metrics,
@@ -52,15 +51,12 @@ _CATEGORY_ONLY_RECON_LOSSES = frozenset({"wa_mse", "amse"})
 
 
 def test_recon_loss_choice_sets_match_dispatchers_and_execute() -> None:
-    block_only_in_cat = set(_CAT_RECON_LOSS_CHOICES) - set(_RECON_LOSS_TYPE_CHOICES)
-    assert block_only_in_cat == set(_CATEGORY_ONLY_RECON_LOSSES)
-
     torch.manual_seed(41)
     x = torch.randn(2, 3, 8)
     weights = torch.rand(2, 3, 8).add_(0.1)
     autoencoder = object.__new__(AutoEncoder)
 
-    for loss_type in _RECON_LOSS_TYPE_CHOICES:
+    for loss_type in ("mse", "l1", "huber", "relative_l1", "w_mse", "w2_mse"):
         x_recon = torch.randn(2, 3, 8, requires_grad=True)
         autoencoder.recon_loss_type = loss_type
         loss = AutoEncoder._compute_recon_loss(autoencoder, x_recon, x)
@@ -68,7 +64,7 @@ def test_recon_loss_choice_sets_match_dispatchers_and_execute() -> None:
         assert torch.isfinite(loss)
         loss.backward()
 
-    for loss_type in _CAT_RECON_LOSS_CHOICES:
+    for loss_type in RECON_LOSS_TYPES:
         x_recon = torch.randn(2, 3, 8, requires_grad=True)
         act_max = weights if loss_type in _CATEGORY_ONLY_RECON_LOSSES else None
         loss = compute_category_recon_loss(
@@ -83,7 +79,7 @@ def test_recon_loss_choice_sets_match_dispatchers_and_execute() -> None:
 
 
 def test_recon_loss_choice_contracts_are_exact() -> None:
-    assert _CAT_RECON_LOSS_CHOICES == (
+    assert RECON_LOSS_TYPES == (
         "mse",
         "l1",
         "huber",
@@ -92,14 +88,6 @@ def test_recon_loss_choice_contracts_are_exact() -> None:
         "w2_mse",
         "wa_mse",
         "amse",
-    )
-    assert _RECON_LOSS_TYPE_CHOICES == (
-        "mse",
-        "l1",
-        "huber",
-        "relative_l1",
-        "w_mse",
-        "w2_mse",
     )
 
 

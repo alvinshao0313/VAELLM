@@ -44,7 +44,7 @@ from mix_bit.schema import (
 )
 from mix_bit.solver import bit_to_units
 from mix_bit.teacher_cache import build_teacher_topk_chunk, write_teacher_cache_chunk
-from train_utils.model_checkpoint_io import META_FILENAME, STATE_DICT_FILENAME
+from train_utils.checkpoint_v6 import META_FILENAME, STATE_DICT_FILENAME
 
 
 HIDDEN = 8
@@ -255,8 +255,8 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
         values={
             "seed": 31,
             "deterministic": True,
-            "steps_per_category": 10,
-            "batch_size": 8,
+            "vae_steps": 10,
+            "vae_batch_size": 8,
             "base_ch": 8,
             "num_res_blocks": 0,
             "decoder_base_ch": 8,
@@ -270,13 +270,13 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
             "gamma": 1.0,
             "zeta": 1.0,
             "inv_temperature": 100.0,
-            "lr": 0.001,
+            "vae_learning_rate": 0.001,
             "beta1": 0.9,
             "beta2": 0.95,
-            "weight_decay": 0.0,
-            "optimizer": "adamw",
-            "lr_scheduler": "linear",
-            "lr_warmup_steps": 0,
+            "vae_weight_decay": 0.0,
+            "vae_optim": "adamw",
+            "vae_lr_scheduler_type": "linear",
+            "vae_warmup_ratio": 0,
             "l1_weight": 1.0,
             "lfq_weight": 1.0,
             "commitment_loss_weight": 0.25,
@@ -287,11 +287,11 @@ def _make_resolved(tmp_path: Path, profile: ModelProfile, modes: tuple[Candidate
             "log_every": 1,
             "eval_every": 0,
             "eval_blocks": 8,
-            "outlier_protect_mode": "channel",
-            "outlier_protect_count": 0,
-            "outlier_protect_min_per_layer": 0,
-            "distill_after_category": "none",
-            "eval_ppl": False,
+            "channel_protect_mode": "channel",
+            "channel_protect_count": 0,
+            "channel_min_per_layer": 0,
+            "after_category_mode": "none",
+            "skip_ppl_eval": True,
             "eval_tasks": "",
             "rot_llm": False,
             "fp16": False,
@@ -669,7 +669,7 @@ def _patch_reload_model(monkeypatch: pytest.MonkeyPatch, template: nn.Module) ->
     def _get_model(_path, _token=None):
         return copy.deepcopy(template)
 
-    monkeypatch.setattr("train_utils.model_checkpoint_io.get_model", _get_model)
+    monkeypatch.setattr("train_utils.v6_model_loader.get_model", _get_model)
     monkeypatch.setattr("rotation.model_utils.get_model", _get_model)
 
 
@@ -854,7 +854,7 @@ def test_validate_mixed_model_moves_reloaded_model_to_device_before_save_reload(
     from mix_bit import validation as validation_mod
 
     seen = {"to_before_save_reload": False, "save_reload": False}
-    real_load = validation_mod.load_model_checkpoint
+    real_load = validation_mod.load_v6_model_checkpoint
 
     def _load(*args, **kwargs):
         model, meta, result = real_load(*args, **kwargs)
@@ -868,7 +868,7 @@ def test_validate_mixed_model_moves_reloaded_model_to_device_before_save_reload(
         model.to = _to
         return model, meta, result
 
-    monkeypatch.setattr(validation_mod, "load_model_checkpoint", _load)
+    monkeypatch.setattr(validation_mod, "load_v6_model_checkpoint", _load)
 
     real_srl = validation_mod.validate_save_reload_logits
 
@@ -1165,7 +1165,7 @@ def test_validate_offloads_mixed_model_after_kl_before_building_baseline(
     kl_finished = {"value": False}
     mixed_holder: dict[str, Any] = {}
 
-    real_load = validation_mod.load_model_checkpoint
+    real_load = validation_mod.load_v6_model_checkpoint
 
     def _load(*args, **kwargs):
         model, meta, result = real_load(*args, **kwargs)
@@ -1181,7 +1181,7 @@ def test_validate_offloads_mixed_model_after_kl_before_building_baseline(
         mixed_holder["model"] = model
         return model, meta, result
 
-    monkeypatch.setattr(validation_mod, "load_model_checkpoint", _load)
+    monkeypatch.setattr(validation_mod, "load_v6_model_checkpoint", _load)
 
     real_kl = validation_mod._measure_actual_kl
 

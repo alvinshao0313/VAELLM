@@ -14,6 +14,7 @@ from transformers import TrainerCallback
 
 from litebsq.vae_linear import VAELinear
 from litebsq.vae_linear_prewarm import clear_model_vae_linear_cache
+from train_utils.decoder_execution import enable_vae_linear_by_execution_plan
 from train_utils.eval_utils import merge_lm_eval_results, run_lm_eval
 from train_utils.hif4_act import applied_hif4_act
 from train_utils.lm_eval_partial_io import (
@@ -49,10 +50,9 @@ def _iter_trainable_decode_modules(model: nn.Module) -> Iterator[VAELinear]:
 def temporary_inference_decode_mode(
     model: nn.Module,
     *,
-    parallel_stage_decode: bool,
     cache_decoded_weight: bool = False,
 ):
-    """Disable trainable_decode for eval, then restore for modules that had it enabled.
+    """Disable trainable_decode for eval, then restore via the shared execution resolver.
 
     Mid-training eval keeps cache_decoded_weight=False so full dense weights are not
     retained on GPU alongside optimizer/teacher memory.
@@ -87,9 +87,9 @@ def temporary_inference_decode_mode(
     finally:
         for module, has_sparse_binding, decoder_trainable in restore_modes:
             if has_sparse_binding and not decoder_trainable:
-                module.enable_sparse_bit_decode_graph(parallel_stage_decode=bool(parallel_stage_decode))
+                enable_vae_linear_by_execution_plan(module, mode="sparse_bit")
             else:
-                module.enable_trainable_decode(parallel_stage_decode=bool(parallel_stage_decode))
+                enable_vae_linear_by_execution_plan(module, mode="trainable_decoder")
         if was_training:
             model.train()
         else:
@@ -232,7 +232,6 @@ def run_e2e_lm_eval(
     log,
     eval_tag: str,
     move_to_device: bool,
-    parallel_stage_decode: bool,
     cache_decoded_weight: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Run lm-eval; under WORLD_SIZE>1, shard tasks across ranks and merge on rank0."""
@@ -244,7 +243,6 @@ def run_e2e_lm_eval(
     distributed = is_distill_distributed()
     with temporary_inference_decode_mode(
         model,
-        parallel_stage_decode=bool(parallel_stage_decode),
         cache_decoded_weight=bool(cache_decoded_weight),
     ):
         if distributed:
@@ -346,7 +344,6 @@ class EvalAfterSaveCallback(TrainerCallback):
         base_model_path: str,
         run_output_dir: str,
         log,
-        parallel_stage_decode: bool,
         parallel_mode: str,
     ):
         self.e2e_args = e2e_args
@@ -354,7 +351,6 @@ class EvalAfterSaveCallback(TrainerCallback):
         self.base_model_path = str(base_model_path)
         self.run_output_dir = str(run_output_dir)
         self.log = log
-        self.parallel_stage_decode = bool(parallel_stage_decode)
         self.parallel_mode = str(parallel_mode).strip().lower()
         self._last_eval_step: Optional[int] = None
         self._trainer = None
@@ -442,7 +438,6 @@ class EvalAfterSaveCallback(TrainerCallback):
                 log=self.log,
                 eval_tag=eval_tag,
                 move_to_device=bool(move_to_device),
-                parallel_stage_decode=self.parallel_stage_decode,
                 cache_decoded_weight=False,
             )
         finally:

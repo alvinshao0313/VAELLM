@@ -83,12 +83,18 @@ def _write_source_checkpoint(tmp_path: Path, source_state: dict[str, torch.Tenso
     ckpt_dir.mkdir(parents=True)
     torch.save(source_state, ckpt_dir / "pytorch_model.bin")
     meta = {
-        "format": "vaellm_state_dict_with_meta",
-        "version": 5,
+        "format": "vaellm_model_checkpoint_v6",
+        "schema_version": 6,
+        "checkpoint_kind": "final_model",
+        "checkpoint_id": "00000000-0000-4000-8000-000000000001",
         "base_model_path": "Qwen/Qwen3-8B",
         "state_dict_file": "pytorch_model.bin",
         "converted_module_count": len(converted_modules),
         "converted_modules": converted_modules,
+        "compressed_targets": [str(item["name"]) for item in converted_modules],
+        "pending_dense_targets": [],
+        "skip_targets": [],
+        "legacy_original_only_sources": [],
     }
     (ckpt_dir / "checkpoint_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return run_dir
@@ -114,7 +120,6 @@ def _build_mixed_source_state() -> tuple[dict[str, torch.Tensor], list[dict]]:
     converted_modules = [
         _make_down_spec(0),
         _make_down_spec(1),
-        {"name": "model.layers.0.self_attn.q_proj", "residual_stages": 1},
     ]
     return source_state, converted_modules
 

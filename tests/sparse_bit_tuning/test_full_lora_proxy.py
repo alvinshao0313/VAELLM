@@ -2,7 +2,6 @@ import torch
 from torch import nn
 
 from litebsq.autoencoder import Decoder
-from litebsq.low_rank_scope import LOW_RANK_SCOPE_FULL
 from litebsq.vae_linear import VAELinear
 from sparse_bit_tuning.full_lora_proxy import (
     FullCompressedPeftProxy,
@@ -88,7 +87,6 @@ def test_full_proxy_existing_payload_round_trip():
     rank = 2
     low_rank_a = torch.randn(4, rank)
     low_rank_b = torch.randn(rank, 4)
-    layer.low_rank_scope = LOW_RANK_SCOPE_FULL
     layer.register_parameter("low_rank_a", nn.Parameter(low_rank_a.clone(), requires_grad=False))
     layer.register_parameter("low_rank_b", nn.Parameter(low_rank_b.clone(), requires_grad=False))
     root = _root(layer)

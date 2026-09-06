@@ -134,7 +134,7 @@ def build_train_command(gpu_id: str, trial: TrialSpec, run_dir: str) -> List[str
         "bash",
         BASE_SCRIPT,
         str(gpu_id),
-        "--target_categories",
+        "--compression_categories",
         trial.category,
         "--output_dir",
         run_dir,

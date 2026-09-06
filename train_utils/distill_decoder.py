@@ -4,6 +4,7 @@ from typing import Sequence, Tuple
 from torch import nn
 
 from litebsq.vae_linear import VAELinear
+from train_utils.decoder_execution import enable_vae_linear_by_execution_plan
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ def enable_main_decoder_targets(
     empty_targets = []
 
     for target in targets:
-        target.base_layer.enable_trainable_decode(parallel_stage_decode=True)
+        enable_vae_linear_by_execution_plan(target.base_layer, mode="trainable_decoder")
         target_params = []
         for decoder in iter_main_decoder_modules(target.base_layer):
             decoder.requires_grad_(True)

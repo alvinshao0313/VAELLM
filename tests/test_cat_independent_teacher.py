@@ -125,14 +125,11 @@ def test_resolve_distill_teacher_dtype_defaults_to_float32_without_floating_para
     "loss_type,hidden,pre_mlp,expected",
     [
         ("sft", 0.0, 0.0, False),
-        ("origin", 0.0, 0.0, False),
         ("none", 0.0, 0.0, False),
         ("sft", 0.1, 0.0, True),
-        ("origin", 0.0, 0.01, True),
         ("kl", 0.0, 0.0, True),
-        ("kl_top_100", 0.0, 0.0, True),
+        ("kl_top", 0.0, 0.0, True),
         ("kd", 0.0, 0.0, True),
-        ("eakld", 0.0, 0.0, True),
     ],
 )
 def test_resolve_distill_teacher_required_matrix(loss_type, hidden, pre_mlp, expected):
@@ -152,7 +149,6 @@ def _build_trainer_for_teacher_required(monkeypatch, *, loss_type, hidden, pre_m
         loss_type=loss_type,
         hidden_loss_weight=hidden,
         pre_mlp_hidden_loss_weight=pre_mlp,
-        eakld_confidence_k=16,
         teacher_runtime=teacher_runtime,
     )
 
@@ -161,9 +157,9 @@ def _build_trainer_for_teacher_required(monkeypatch, *, loss_type, hidden, pre_m
     "loss_type,hidden,pre_mlp",
     [
         ("sft", 0.0, 0.0),
-        ("origin", 0.0, 0.0),
         ("kl", 0.0, 0.0),
         ("sft", 0.1, 0.0),
+        ("kl_top", 0.0, 0.0),
     ],
 )
 def test_distill_stage_meta_teacher_required_matches_trainer(monkeypatch, loss_type, hidden, pre_mlp):
@@ -211,10 +207,6 @@ def test_custom_sft_trainer_rejects_missing_runtime_when_teacher_required(monkey
 
 def test_pure_sft_compute_loss_does_not_load_lazy_teacher(monkeypatch):
     monkeypatch.setattr("train_utils.lora_training.SFTTrainer.__init__", lambda self, *args, **kwargs: None)
-    monkeypatch.setattr(
-        "train_utils.lora_training.SFTTrainer.compute_loss",
-        lambda self, model, inputs, return_outputs=False, **_kwargs: torch.tensor(0.0),
-    )
 
     def fail_loader(*_args, **_kwargs):
         raise AssertionError("pure SFT must not materialize teacher")
@@ -235,17 +227,33 @@ def test_pure_sft_compute_loss_does_not_load_lazy_teacher(monkeypatch):
         teacher_runtime=runtime,
     )
     trainer.args = SimpleNamespace(bf16=False, fp16=False)
-    model = nn.Linear(2, 2)
-    model.eval()
+    trainer.distill_hif4_act_controller = None
 
+    class _FakeLM(nn.Module):
+        def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **_kwargs):
+            batch, seq = input_ids.shape
+            logits = torch.zeros(batch, seq, 4, dtype=torch.float32)
+            return SimpleNamespace(logits=logits, hidden_states=None)
+
+    model = _FakeLM()
+    model.eval()
+    monkeypatch.setattr(
+        trainer,
+        "_resolve_runtime_view_cache",
+        lambda _model, pre_mlp_hidden_loss_enabled=False: {
+            "pre_mlp_capture_modules": (),
+            "base_model_for_capture": model,
+        },
+    )
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
     loss = trainer.compute_loss(
         model,
         {
-            "input_ids": torch.ones(1, 1, dtype=torch.long),
-            "attention_mask": torch.ones(1, 1, dtype=torch.long),
-            "labels": torch.ones(1, 1, dtype=torch.long),
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "labels": input_ids.clone(),
         },
     )
 
-    assert torch.equal(loss, torch.tensor(0.0))
+    assert torch.isfinite(loss)
     assert runtime.is_loaded is False

@@ -7,13 +7,9 @@ from torch import nn
 from torch.utils.data import Dataset
 from transformers import TrainingArguments
 
-from compressed_e2e_fintuning.aux_trainables import (
-    AUX_CHECKPOINT_FILE,
-    enable_compressed_lora_auxiliary_trainables,
-)
+from compressed_e2e_fintuning.aux_trainables import enable_compressed_lora_auxiliary_trainables
 from compressed_e2e_fintuning.trainer import VAEDecoderE2ETrainer
 from litebsq.autoencoder import Decoder
-from litebsq.low_rank_scope import LOW_RANK_SCOPE_FULL
 from litebsq.vae_linear import VAELinear
 from sparse_bit_tuning.checkpoint import sidecar_complete
 from sparse_bit_tuning.config import SparseBitTuningConfig
@@ -91,9 +87,7 @@ def _build():
     aux = enable_compressed_lora_auxiliary_trainables(
         peft_model,
         selected_vae_modules=[("layer", layer)],
-        low_rank_scope=LOW_RANK_SCOPE_FULL,
         sparse_bit_tuning=True,
-        vae_tune_bias=True,
         tune_final_norm=False,
         use_post_norm_head_linear=False,
     )
@@ -145,7 +139,7 @@ def _trainer(model, manager, aux, output_dir, max_steps, save_steps):
     )
 
 
-def test_full_lora_bit_bias_real_trainer_adapter_sidecars_and_resume():
+def test_full_lora_bit_real_trainer_adapter_sidecars_and_resume():
     with tempfile.TemporaryDirectory() as tmp:
         model0, layer0, aux0, manager0 = _build()
         initial_bias = layer0.bias.detach().cpu().clone()
@@ -157,13 +151,13 @@ def test_full_lora_bit_bias_real_trainer_adapter_sidecars_and_resume():
         assert os.path.isfile(os.path.join(ckpt, "adapter_config.json"))
         assert not os.path.isfile(os.path.join(ckpt, "pytorch_model.bin"))
         assert sidecar_complete(ckpt)
-        assert os.path.isfile(os.path.join(ckpt, AUX_CHECKPOINT_FILE))
-        assert not torch.equal(layer0.bias.detach().cpu(), initial_bias)
+        assert torch.equal(layer0.bias.detach().cpu(), initial_bias)
+        assert not layer0.bias.requires_grad
 
         model1, layer1, aux1, manager1 = _build()
         trainer1 = _trainer(model1, manager1, aux1, tmp, max_steps=2, save_steps=99)
         out1 = trainer1.train(resume_from_checkpoint=ckpt)
         assert int(out1.global_step) == 2
         assert manager1.bit_round_step >= 1
-        assert layer1.bias.requires_grad
+        assert not layer1.bias.requires_grad
         assert any("lora_" in name and p.requires_grad for name, p in model1.named_parameters())

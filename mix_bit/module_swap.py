@@ -10,10 +10,7 @@ from torch import nn
 from litebsq.bitpack import BITPACK_U8_STORAGE_FORMAT, validate_bitpack_u8_spec
 from litebsq.misc import set_module_by_name
 from litebsq.vae_linear import VAELinear
-from train_utils.model_checkpoint_io import (
-    _rebuild_converted_modules,
-    _refresh_vae_linear_runtime_after_state_load,
-)
+from train_utils.checkpoint_v6 import _rebuild_converted_modules
 
 
 class ModuleCandidateLike(Protocol):
@@ -48,7 +45,14 @@ class _ShapeOnlyPlaceholder(nn.Module):
 
 def refresh_vae_runtime(model: nn.Module) -> None:
     """Refresh VAELinear runtime plans and clear decoded caches after state load."""
-    _refresh_vae_linear_runtime_after_state_load(model)
+    for module in model.modules():
+        if not isinstance(module, VAELinear):
+            continue
+        if getattr(module, "_parallel_stage_decoder", None) is not None:
+            module._build_parallel_stage_decode_plan()
+        if getattr(module, "_protected_residual_parallel_decoder", None) is not None:
+            module._build_protected_residual_parallel_decode_plan()
+        module.clear_decoded_weight_cache()
 
 
 def _strip_module_prefix(

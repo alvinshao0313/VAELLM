@@ -13,7 +13,8 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from litebsq.bitpack import build_bitpack_u8_spec, pack_bool_tensor_to_uint8, validate_bitpack_u8_spec
-from train_utils.model_checkpoint_io import META_FILENAME, resolve_checkpoint_dir
+from train_utils.checkpoint_v6 import META_FILENAME
+from train_utils.legacy_checkpoint_io import inspect_legacy_checkpoint
 
 
 def _normalize_shape(shape: Sequence[int], *, arg_name: str) -> Tuple[int, ...]:
@@ -143,7 +144,7 @@ def _copy_non_checkpoint_files(src_dir: str, dst_dir: str, *, state_dict_file: s
 
 
 def convert_checkpoint(src_dir: str, dst_dir: str) -> Tuple[str, str]:
-    checkpoint_dir = resolve_checkpoint_dir(src_dir)
+    checkpoint_dir = inspect_legacy_checkpoint(src_dir).checkpoint_dir
     if os.path.exists(dst_dir):
         raise FileExistsError(f"Output directory already exists: {dst_dir}")
 

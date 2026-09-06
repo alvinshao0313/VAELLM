@@ -13,31 +13,48 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from train_utils.train_args import create_optimizer
-from train_utils.cat_train_args import (
-    _DISTILL_AFTER_CATEGORY_REMAINING_MODES,
+from train_utils.cat_category_runtime import (
     ResolvedCategoryRuntimeConfig,
-    process_cat_train_args,
     resolve_category_runtime_configs,
-    resolve_skip_layer_matches,
 )
 from train_utils.cat_after_category_distill import run_after_category_distill
 from train_utils.distill_teacher import DistillTeacherRuntime, resolve_distill_teacher_dtype
+from train_utils.distributed_guard import distributed_guarded_main
 from train_utils.cat_train_runtime import (
+    build_cat_run_output_dir as _build_run_output_dir,
+    build_distributed_cat_run_output_dir as _build_distributed_run_output_dir,
     load_cat_resume_distill_progress,
     load_model_for_cat_train as _load_model_for_cat_train,
     save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
 )
-from train_utils.lora_utils import resolve_distill_train_device
-from train_utils.cat_train_residual_protection import (
-    RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX as _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX,
-    RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN as _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN,
-    build_sparse_residual_payload as _build_sparse_residual_payload,
+from train_utils.cat_runtime_state_v6 import (
+    build_cat_cross_category_runtime_identity,
+    build_cat_runtime_state,
+    restore_cat_runtime_state,
+    validate_cat_runtime_identity,
 )
+from train_utils.channel_protection import (
+    AdaptiveChannelPlan,
+    ChannelLinearSpec,
+    category_raw_budget,
+    global_raw_budget,
+    group_layer_scope_inventory,
+    layer_scope_group_seed_offsets,
+    resolve_adaptive_channel_plan,
+    validate_adaptive_channel_tail_policy,
+    validate_global_channel_runtime,
+    vae_group_shuffle_seed,
+)
+from train_utils.config.targets import (
+    discover_cat_projection_inventory,
+    parse_compression_categories,
+    parse_skip_layers,
+    parse_target_layers,
+    validate_skip_layers_against_inventory,
+)
+from train_utils.lora_utils import resolve_distill_train_device
 from litebsq.vae_args import apply_autoencoder_arch_defaults
 from litebsq.misc import set_module_by_name
-from litebsq.sparse_residual import (
-    SPARSE_RESIDUAL_FORMAT_COO_FP16,
-)
 from train_utils.cat_data_prep import (
     LinearPrepRef,
     build_outlier_channel_index_plan,
@@ -75,14 +92,11 @@ from train_utils.cat_train_data import (
 #     finetune_stage_decoders_in_subgroups as _finetune_stage_decoders_in_subgroups,
 # )
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
-from train_utils.model_checkpoint_io import (
-    _build_distributed_run_output_dir,
-    _build_run_output_dir,
-    register_shared_protected_residual_decoder,
-    save_model_checkpoint,
-)
+from train_utils.cat_checkpoint_v6 import save_cat_v6_full_checkpoint
+from train_utils.cat_step_resume_v6 import prune_completed_cat_round_roots
 from train_utils.cat_inline_distributed import (
     _resolve_cat_inline_vae_wait_timeout_sec,
+    broadcast_adaptive_channel_plan,
     broadcast_group_vae_payload,
     initialize_cat_payload_group,
 )
@@ -109,22 +123,29 @@ from train_utils.utils import (
 log = get_logger("linear_by_category")
 
 
-def _validate_inline_distill_after_category(mode: str) -> None:
+def _load_checkpoint_tokenizer(model_path: str, access_token):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        model_path,
+        use_fast=True,
+        token=access_token,
+    )
+
+
+def _validate_inline_after_category_mode(mode: str) -> None:
     resolved = str(mode).strip().lower()
-    if resolved not in _DISTILL_AFTER_CATEGORY_REMAINING_MODES:
+    allowed = {
+        "remaining_lora",
+        "remaining_lora_current_decoder",
+        "remaining_lora_prefix_decoder",
+    }
+    if resolved not in allowed:
         raise ValueError(
-            "WORLD_SIZE > 1 inline cat_train requires --distill_after_category to be one of: "
-            + ",".join(sorted(_DISTILL_AFTER_CATEGORY_REMAINING_MODES))
+            "WORLD_SIZE > 1 inline cat_train requires --after_category_mode to be one of: "
+            + ",".join(sorted(allowed))
         )
 
-
-def _safe_shared_decoder_ref(value: str) -> str:
-    text = str(value).strip()
-    chars = [ch if (ch.isalnum() or ch == "_") else "_" for ch in text]
-    out = "".join(chars).strip("_")
-    while "__" in out:
-        out = out.replace("__", "_")
-    return out or "shared_protected_residual_decoder"
 
 
 def _fuse_q_scale_linear(linear: nn.Linear, q_scale: float) -> None:
@@ -500,232 +521,6 @@ def _extract_linear_weight_from_group_stacked(
     return w_split.t().contiguous() if bool(split_meta.transpose) else w_split.contiguous()
 
 
-def _build_protected_residual_entries_from_final_residual(
-    *,
-    group_tag: str,
-    group_refs: Sequence[LinearRef],
-    target_common_split_metas: Sequence[object],
-    final_common_stacked: torch.Tensor,
-    parts_per_linear: int,
-    outlier_protect_axis: str,
-    final_stage_idx: int,
-    codebook_dim: Optional[int] = None,
-) -> List[Tuple[LinearRef, str, torch.Tensor, torch.Tensor]]:
-    if len(group_refs) != len(target_common_split_metas):
-        raise ValueError(
-            f"[{group_tag}] group_data/final residual metadata mismatch after base stage_idx={final_stage_idx}: "
-            f"group_refs={len(group_refs)} split_metas={len(target_common_split_metas)}."
-        )
-    if final_common_stacked.ndim != 3:
-        raise ValueError(
-            f"[{group_tag}] final residual must be 3D [N_blocks, models, codebook_dim] after "
-            f"base stage_idx={final_stage_idx}, got shape={tuple(final_common_stacked.shape)}."
-        )
-    expected_models = int(len(group_refs)) * int(parts_per_linear)
-    if int(final_common_stacked.shape[1]) != expected_models:
-        raise ValueError(
-            f"[{group_tag}] final residual model/part count mismatch after base stage_idx={final_stage_idx}: "
-            f"stacked_models={int(final_common_stacked.shape[1])} expected={expected_models} "
-            f"group_refs={len(group_refs)} parts_per_linear={parts_per_linear} "
-            f"stacked_shape={tuple(final_common_stacked.shape)}."
-        )
-
-    axis_name = str(outlier_protect_axis).strip().lower()
-    if axis_name not in {"input", "output"}:
-        raise ValueError(f"[{group_tag}] unsupported outlier_protect_axis={outlier_protect_axis!r}.")
-
-    protected_residual_entries: List[Tuple[LinearRef, str, torch.Tensor, torch.Tensor]] = []
-    for linear_idx, (r, split_meta) in enumerate(zip(group_refs, target_common_split_metas)):
-        if str(split_meta.linear_name) != str(r.name):
-            raise ValueError(
-                f"[{group_tag}] split metadata order mismatch after base stage_idx={final_stage_idx}: "
-                f"idx={linear_idx} meta={split_meta.linear_name} ref={r.name}."
-            )
-        residual_weight = _extract_linear_weight_from_group_stacked(
-            group_tag=group_tag,
-            linear_name=r.name,
-            linear_idx=int(linear_idx),
-            stacked_data=final_common_stacked,
-            split_meta=split_meta,
-            parts_per_linear=int(parts_per_linear),
-            stage_idx=int(final_stage_idx),
-        ).to(device="cpu", dtype=torch.float32).contiguous()
-        expected_shape = (int(r.module.out_features), int(r.module.in_features))
-        if tuple(residual_weight.shape) != expected_shape:
-            raise ValueError(
-                f"[{group_tag}] final residual shape mismatch for linear={r.name} "
-                f"after base stage_idx={final_stage_idx}: got={tuple(residual_weight.shape)} "
-                f"expected={expected_shape}."
-            )
-
-        if axis_name == "output":
-            protected_idx = split_meta.protected_output_indices
-            axis = "output"
-            axis_dim = 0
-        else:
-            protected_idx = split_meta.protected_input_indices
-            axis = "input"
-            axis_dim = 1
-        if not isinstance(protected_idx, torch.Tensor) or int(protected_idx.numel()) == 0:
-            continue
-        idx_cpu = protected_idx.detach().to(device="cpu", dtype=torch.long).contiguous()
-        min_idx = int(idx_cpu.min().item())
-        max_idx = int(idx_cpu.max().item())
-        axis_size = int(residual_weight.shape[axis_dim])
-        if min_idx < 0 or max_idx >= axis_size:
-            raise ValueError(
-                f"[{group_tag}] protected residual index out of bounds for linear={r.name} "
-                f"after base stage_idx={final_stage_idx}: axis={axis} axis_size={axis_size} "
-                f"idx_size={int(idx_cpu.numel())} min_idx={min_idx} max_idx={max_idx} "
-                f"tensor_shape={tuple(residual_weight.shape)}."
-            )
-        residual_slice = residual_weight.index_select(axis_dim, idx_cpu).contiguous()
-        if residual_slice.ndim != 2:
-            raise ValueError(
-                f"[{group_tag}] protected residual slice must be 2D for linear={r.name} "
-                f"after base stage_idx={final_stage_idx}: axis={axis} idx_size={int(idx_cpu.numel())} "
-                f"slice_shape={tuple(residual_slice.shape)} tensor_shape={tuple(residual_weight.shape)}."
-            )
-        if codebook_dim is not None and int(residual_slice.numel()) % int(codebook_dim) != 0:
-            raise ValueError(
-                f"[{group_tag}] protected residual slice numel is not divisible by codebook_dim for "
-                f"linear={r.name} after base stage_idx={final_stage_idx}: axis={axis} "
-                f"idx_size={int(idx_cpu.numel())} slice_shape={tuple(residual_slice.shape)} "
-                f"codebook_dim={int(codebook_dim)} tensor_shape={tuple(residual_weight.shape)}."
-            )
-        protected_residual_entries.append((r, axis, idx_cpu, residual_slice))
-    return protected_residual_entries
-
-
-def _select_channel_residual_vae_plan_from_final_residual(
-    *,
-    group_tag: str,
-    group_refs: Sequence[LinearRef],
-    target_common_split_metas: Sequence[object],
-    final_common_stacked: torch.Tensor,
-    parts_per_linear: int,
-    outlier_protect_count: int,
-    outlier_protect_axis: str,
-    outlier_channel_scope: str,
-    outlier_rank_metric: str,
-    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
-    activation_abs_mean_by_linear: Optional[Dict[str, torch.Tensor]],
-    activation_sq_mean_by_linear: Optional[Dict[str, torch.Tensor]],
-    final_stage_idx: int,
-    outlier_protect_min_per_layer: int = 0,
-) -> Tuple[List[object], Dict[str, float]]:
-    protect_count = int(outlier_protect_count)
-    if protect_count < 0:
-        raise ValueError(f"[{group_tag}] outlier_protect_count must be >= 0, got {protect_count}.")
-    axis = str(outlier_protect_axis).strip().lower()
-    if axis not in {"input", "output"}:
-        raise ValueError(f"[{group_tag}] unsupported outlier_protect_axis={outlier_protect_axis!r}.")
-    scope = str(outlier_channel_scope).strip().lower()
-    if scope not in {"layer", "category"}:
-        raise ValueError(f"[{group_tag}] unsupported outlier_channel_scope={outlier_channel_scope!r}.")
-    if len(group_refs) != len(target_common_split_metas):
-        raise ValueError(
-            f"[{group_tag}] cannot select channel residual VAE plan: "
-            f"group_refs={len(group_refs)} split_metas={len(target_common_split_metas)}."
-        )
-
-    empty_plan = {
-        r.name: torch.empty(0, dtype=torch.long)
-        for r in group_refs
-    }
-    per_linear_scores: Dict[str, torch.Tensor] = {}
-    for linear_idx, (r, split_meta) in enumerate(zip(group_refs, target_common_split_metas)):
-        residual_weight = _extract_linear_weight_from_group_stacked(
-            group_tag=group_tag,
-            linear_name=r.name,
-            linear_idx=int(linear_idx),
-            stacked_data=final_common_stacked,
-            split_meta=split_meta,
-            parts_per_linear=int(parts_per_linear),
-            stage_idx=int(final_stage_idx),
-        ).to(device="cpu", dtype=torch.float32).contiguous()
-        expected_shape = (int(r.module.out_features), int(r.module.in_features))
-        if tuple(residual_weight.shape) != expected_shape:
-            raise ValueError(
-                f"[{group_tag}] final residual shape mismatch before channel ranking for linear={r.name}: "
-                f"got={tuple(residual_weight.shape)} expected={expected_shape} "
-                f"stage_idx={final_stage_idx} axis={axis}."
-            )
-        act_max = None if activation_weight_by_linear is None else activation_weight_by_linear.get(r.name)
-        act_mean = None if activation_abs_mean_by_linear is None else activation_abs_mean_by_linear.get(r.name)
-        act_sq_mean = None if activation_sq_mean_by_linear is None else activation_sq_mean_by_linear.get(r.name)
-        per_linear_scores[r.name] = compute_channel_rank_score(
-            metric=outlier_rank_metric,
-            weight=r.module.weight.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-            residual=residual_weight,
-            act_max=act_max,
-            act_mean=act_mean,
-            act_sq_mean=act_sq_mean,
-            axis=axis,
-            transpose=bool(r.transpose),
-            linear_name=r.name,
-            expected_in_features=int(r.module.in_features),
-            expected_out_features=int(r.module.out_features),
-        )
-
-    selected_plan, selection_stats = select_outlier_channel_indices_from_scores(
-        scores_by_name=per_linear_scores,
-        linear_names=[r.name for r in group_refs],
-        outlier_protect_count=int(protect_count),
-        outlier_protect_min_per_layer=int(outlier_protect_min_per_layer),
-        outlier_channel_scope=scope,
-    )
-    if protect_count == 0 or not per_linear_scores:
-        selected_plan = empty_plan
-
-    updated_split_metas: List[object] = []
-    for r, split_meta in zip(group_refs, target_common_split_metas):
-        idx = selected_plan.get(r.name, torch.empty(0, dtype=torch.long)).detach().to(
-            device="cpu",
-            dtype=torch.long,
-        ).contiguous()
-        if axis == "input":
-            updated_split_metas.append(
-                replace(
-                    split_meta,
-                    protected_input_indices=idx,
-                    protected_input_weight=None,
-                    protected_input_qvalues=None,
-                    protected_input_scales=None,
-                    protected_output_indices=None,
-                    protected_output_weight=None,
-                    protected_output_qvalues=None,
-                    protected_output_scales=None,
-                )
-            )
-        else:
-            updated_split_metas.append(
-                replace(
-                    split_meta,
-                    protected_input_indices=None,
-                    protected_input_weight=None,
-                    protected_input_qvalues=None,
-                    protected_input_scales=None,
-                    protected_output_indices=idx,
-                    protected_output_weight=None,
-                    protected_output_qvalues=None,
-                    protected_output_scales=None,
-                )
-            )
-
-    score_values = torch.cat([score.detach().to(device="cpu", dtype=torch.float32).reshape(-1) for score in per_linear_scores.values()])
-    selected_count = sum(int(idx.numel()) for idx in selected_plan.values())
-    return updated_split_metas, {
-        "num_channels": float(int(score_values.numel())),
-        "topk": float(int(selected_count)),
-        "score_max": float(score_values.max().item()) if int(score_values.numel()) else 0.0,
-        "score_mean": float(score_values.mean().item()) if int(score_values.numel()) else 0.0,
-        "min_per_layer": float(selection_stats["min_per_layer"]),
-        "floor_selected_count": float(selection_stats["floor_selected_count"]),
-        "global_selected_count": float(selection_stats["global_selected_count"]),
-        "num_zero_protected_linears": float(selection_stats["num_zero_protected_linears"]),
-    }
-
 
 def _convert_stage_stacked_to_common_stacked(
     *,
@@ -782,13 +577,13 @@ def _collect_current_trainable_linears(
     *,
     transpose_modules: Sequence[str],
     only_decoder_projections: bool,
-    target_categories: Sequence[str],
+    compression_categories: Sequence[str],
 ) -> List[LinearRef]:
     return _collect_linears(
         model,
         transpose_modules,
         only_decoder_projections=only_decoder_projections,
-        target_categories=target_categories,
+        categories=compression_categories,
     )
 
 
@@ -798,7 +593,7 @@ def _collect_sorted_category_refs(
     category: str,
     transpose_modules: Sequence[str],
     only_decoder_projections: bool,
-    target_categories: Sequence[str],
+    compression_categories: Sequence[str],
 ) -> Tuple[List[Tuple[int, LinearRef]], int]:
     refs_sorted: List[Tuple[int, LinearRef]] = []
     missing = 0
@@ -806,7 +601,7 @@ def _collect_sorted_category_refs(
         model,
         transpose_modules=transpose_modules,
         only_decoder_projections=only_decoder_projections,
-        target_categories=target_categories,
+        compression_categories=compression_categories,
     ):
         if ref.category != category:
             continue
@@ -835,6 +630,107 @@ def _filter_eligible_vae_refs(
     return eligible
 
 
+def _channel_spec_from_ref(
+    ref: LinearRef,
+    *,
+    codebook_dim: int,
+    intra_parallel: Tuple[int, int],
+    ref_position: int,
+    axis: str,
+    category: str,
+    scores: Optional[torch.Tensor] = None,
+) -> ChannelLinearSpec:
+    return ChannelLinearSpec(
+        name=ref.name,
+        in_features=int(ref.module.in_features),
+        out_features=int(ref.module.out_features),
+        codebook_dim=int(codebook_dim),
+        transpose=bool(ref.transpose),
+        intra_parallel=tuple(int(v) for v in intra_parallel),
+        ref_position=int(ref_position),
+        scores=scores,
+        axis=str(axis),
+        category=str(category),
+    )
+
+
+def _score_channel_specs(
+    specs: Sequence[ChannelLinearSpec],
+    refs_by_name: Dict[str, LinearRef],
+    *,
+    metric: str,
+    axis: str,
+    activation_weight_by_linear: Optional[Dict[str, torch.Tensor]],
+    activation_abs_mean_by_linear: Optional[Dict[str, torch.Tensor]],
+) -> List[ChannelLinearSpec]:
+    scored: List[ChannelLinearSpec] = []
+    for spec in specs:
+        ref = refs_by_name[spec.name]
+        act = None if activation_weight_by_linear is None else activation_weight_by_linear.get(ref.name)
+        act_mean = None if activation_abs_mean_by_linear is None else activation_abs_mean_by_linear.get(ref.name)
+        score = compute_channel_rank_score(
+            metric=metric,
+            weight=ref.module.weight,
+            residual=None,
+            linear_name=ref.name,
+            act_max=act,
+            act_mean=act_mean,
+            act_sq_mean=None,
+            axis=axis,
+            transpose=bool(ref.transpose),
+            expected_in_features=int(ref.module.in_features),
+            expected_out_features=int(ref.module.out_features),
+        )
+        scored.append(replace(spec, scores=score))
+    return scored
+
+
+def _activation_views_for_refs(
+    refs: Sequence[LinearRef],
+    activation_runtime: Optional[Dict[str, Any]],
+    *,
+    category: str,
+    rank_metric: str,
+) -> Tuple[Optional[Dict[str, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
+    if rank_metric not in {"channel_weight_actmax_abs", "channel_weight_actmean_abs"}:
+        return None, None
+    if activation_runtime is None:
+        raise ValueError(
+            f"[{category}] dynamic activation runtime is required for activation-weighted channel scoring."
+        )
+    stats_by_linear = activation_runtime.get("stats_by_linear")
+    if not isinstance(stats_by_linear, dict):
+        raise ValueError(
+            f"[{category}] precomputed activation stats are required but missing from activation_runtime."
+        )
+    subset_stats = subset_activation_stats(stats_by_linear, [ref.name for ref in refs])
+    weight_view, abs_mean_view, _ = activation_stats_to_views(subset_stats)
+    return weight_view, abs_mean_view
+
+
+def _pairs_from_name_groups(
+    name_groups: Sequence[Sequence[str]],
+    pair_by_name: Dict[str, Tuple[int, LinearRef]],
+) -> List[List[Tuple[int, LinearRef]]]:
+    grouped: List[List[Tuple[int, LinearRef]]] = []
+    for names in name_groups:
+        grouped.append([pair_by_name[name] for name in names])
+    return grouped
+
+
+def _outlier_plan_from_adaptive(
+    plan: AdaptiveChannelPlan,
+    names: Optional[Set[str]] = None,
+) -> Dict[str, torch.Tensor]:
+    selected = plan.selected_indices
+    if names is not None:
+        selected = {name: indices for name, indices in selected.items() if name in names}
+    return {
+        name: torch.tensor(indices, dtype=torch.long)
+        for name, indices in selected.items()
+    }
+
+
 def _is_skipped_linear_ref(ref: LinearRef, skip_layer_keys: Set[Tuple[int, str]]) -> bool:
     layer_idx = _extract_layer_idx(ref.name)
     return (
@@ -859,8 +755,6 @@ def _build_vae_linear_from_stage_payload(
     parallel_cols: int,
     parallel_parts: int,
     bias,
-    sparse_residual_kwargs: Optional[Dict[str, object]] = None,
-    protected_residual_kwargs: Optional[Dict[str, object]] = None,
     protected_channel_quant_format: str = "none",
 ):
     from litebsq.vae_linear import VAELinear
@@ -913,10 +807,6 @@ def _build_vae_linear_from_stage_payload(
         always_use_original=False,
         protect_original_weight=False,
     )
-    if sparse_residual_kwargs:
-        common_kwargs.update(dict(sparse_residual_kwargs))
-    if protected_residual_kwargs:
-        common_kwargs.update(dict(protected_residual_kwargs))
     if residual_stages == 1:
         return VAELinear(
             vq_weight=stage_part_bits_payload[0],
@@ -931,314 +821,6 @@ def _build_vae_linear_from_stage_payload(
         **common_kwargs,
     )
 
-
-def _decode_reconstructed_linear_weight(
-    *,
-    old_module: nn.Module,
-    transpose: bool,
-    split_meta,
-    stage_split_metas: Sequence[object],
-    stage_part_bits_payload: Sequence[object],
-    stage_part_decoders_payload: Sequence[object],
-    stage_codebook_dims: Sequence[int],
-    parallel_rows: int,
-    parallel_cols: int,
-    parallel_parts: int,
-) -> torch.Tensor:
-    temp_linear = _build_vae_linear_from_stage_payload(
-        old_module=old_module,
-        transpose=transpose,
-        split_meta=split_meta,
-        stage_split_metas=stage_split_metas,
-        stage_part_bits_payload=stage_part_bits_payload,
-        stage_part_decoders_payload=stage_part_decoders_payload,
-        stage_codebook_dims=stage_codebook_dims,
-        parallel_rows=parallel_rows,
-        parallel_cols=parallel_cols,
-        parallel_parts=parallel_parts,
-        bias=None,
-    )
-    return temp_linear._decode_weight(dtype=torch.float32).detach().to(device="cpu", dtype=torch.float32)
-
-
-def _train_protected_residual_vae_payload(
-    *,
-    linear_name: str,
-    residual_slice: torch.Tensor,
-    runtime_cfg: ResolvedCategoryRuntimeConfig,
-    vae_args,
-    training_args,
-    train_device: str,
-    train_dtype: torch.dtype,
-    batch_size: int,
-    steps: int,
-    lr: float,
-    log_every: int,
-    deterministic: bool,
-    shuffle_seed: int,
-) -> Optional[Dict[str, object]]:
-    from litebsq.llm_vae import MultiLayerVAE
-
-    protected_steps = int(steps)
-    if protected_steps <= 0:
-        return None
-    protected_lr = float(lr)
-    if protected_lr <= 0.0:
-        raise ValueError(f"{linear_name}: protected residual VAE lr must be > 0, got {protected_lr}.")
-    recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
-    codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
-    stages = int(runtime_cfg.outlier_residual_vae_stages)
-    residual = residual_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    if residual.ndim != 2:
-        raise ValueError(f"{linear_name}: protected residual slice must be 2D, got shape={tuple(residual.shape)}.")
-    if int(residual.numel()) == 0:
-        return None
-    if int(residual.numel()) % codebook_dim != 0:
-        raise ValueError(
-            f"{linear_name}: protected residual numel={int(residual.numel())} is not divisible by "
-            f"codebook_dim={codebook_dim}."
-        )
-
-    current = residual.view(-1, 1, codebook_dim).contiguous()
-    initial_rms = float(current.float().pow(2).mean().sqrt().item())
-    stage_bits: List[torch.Tensor] = []
-    stage_decoders: List[nn.Module] = []
-    stage_codebook_dims: List[int] = []
-    last_loss = None
-    last_recon = None
-    last_commit = None
-    shared_stage_args = _clone_namespace(
-        vae_args,
-        parallel_layers=1,
-        residual_stages=int(stages),
-        codebook_bits=int(runtime_cfg.outlier_residual_vae_codebook_bits),
-        codebook_dim=int(codebook_dim),
-        base_ch=int(runtime_cfg.base_ch),
-        num_res_blocks=int(runtime_cfg.num_res_blocks),
-        norm_type=str(runtime_cfg.norm_type),
-        activation_type=str(runtime_cfg.activation_type),
-        decoder_type=str(runtime_cfg.decoder_type),
-        decoder_base_ch=(
-            None if runtime_cfg.decoder_base_ch is None else int(runtime_cfg.decoder_base_ch)
-        ),
-        decoder_num_res_blocks=(
-            None if runtime_cfg.decoder_num_res_blocks is None else int(runtime_cfg.decoder_num_res_blocks)
-        ),
-        recon_loss_type=recon_loss,
-    )
-    apply_autoencoder_arch_defaults(shared_stage_args)
-    use_stage_norm = bool(getattr(shared_stage_args, "normalize_weight", False))
-
-    for stage_idx in range(stages):
-        stage_tag = f"{linear_name}/protected_residual_stage{stage_idx + 1}"
-        residual_data = current.detach().clone().contiguous()
-        if use_stage_norm:
-            stage_norm_mean, stage_norm_scale = _compute_stage_norm_stats(residual_data)
-            stage_train_data = _apply_stage_norm(residual_data, mean=stage_norm_mean, scale=stage_norm_scale)
-        else:
-            stage_norm_mean = None
-            stage_norm_scale = None
-            stage_train_data = residual_data
-
-        effective_batch_size = min(max(1, int(batch_size)), int(stage_train_data.shape[0]))
-        train_loader, eval_loader = _build_block_data_loaders(
-            stage_train_data,
-            batch_size=int(effective_batch_size),
-            shuffle_seed=int(shuffle_seed) + int(stage_idx) if bool(deterministic) else None,
-        )
-        vae = MultiLayerVAE(shared_stage_args).to(train_device)
-        optimizer = create_optimizer(vae.parameters(), shared_stage_args, protected_lr)
-        lr_scheduler = None
-        lr_scheduler_name = str(getattr(shared_stage_args, "lr_scheduler", "constant")).strip().lower()
-        if lr_scheduler_name != "constant":
-            import transformers
-
-            lr_scheduler = transformers.get_scheduler(
-                lr_scheduler_name,
-                optimizer,
-                num_warmup_steps=int(getattr(shared_stage_args, "lr_warmup_steps", 0)),
-                num_training_steps=int(protected_steps),
-            )
-        start = time.time()
-        train_iter = iter(train_loader)
-        vae.train()
-        for step in range(int(protected_steps)):
-            try:
-                x_cpu, _idx = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                x_cpu, _idx = next(train_iter)
-            x = x_cpu.to(device=train_device, dtype=train_dtype, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            _x_recon, loss_dict = vae(x, is_train=True)
-            loss = loss_dict["loss"]
-            loss.backward()
-            optimizer.step()
-            if lr_scheduler is not None:
-                lr_scheduler.step()
-            last_loss = float(loss.detach().float().item())
-            recon_value = loss_dict.get("train/recon_loss")
-            if isinstance(recon_value, torch.Tensor):
-                last_recon = float(recon_value.detach().float().item())
-            commit_value = loss_dict.get("train/commitment_loss")
-            if isinstance(commit_value, torch.Tensor):
-                last_commit = float(commit_value.detach().float().item())
-            if log_every > 0 and (step + 1) % int(log_every) == 0:
-                speed = (time.time() - start) / int(log_every)
-                log.info(
-                    "[%s] step=%d/%d loss=%.4e speed=%.4fs/it",
-                    stage_tag,
-                    step + 1,
-                    int(protected_steps),
-                    float(loss.detach().float().item()),
-                    speed,
-                )
-                start = time.time()
-
-        # 训完立刻释放 Adam 状态，降低随后全量重构的显存尖峰。
-        del optimizer
-        optimizer = None
-        if lr_scheduler is not None:
-            del lr_scheduler
-            lr_scheduler = None
-        torch.cuda.empty_cache()
-
-        vae.eval()
-        recon_chunks: List[torch.Tensor] = []
-        bit_chunks: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x_cpu, _idx in eval_loader:
-                x = x_cpu.to(device=train_device, dtype=train_dtype, non_blocking=True)
-                x_recon, bit_idx = vae(x, is_train=False)
-                recon_chunks.append(x_recon.detach().to(device="cpu", dtype=stage_train_data.dtype))
-                bit_chunks.append(bit_idx.detach().to(device="cpu"))
-        stage_recon_norm = torch.cat(recon_chunks, dim=0)
-        stage_recon = (
-            _restore_stage_norm(stage_recon_norm, mean=stage_norm_mean, scale=stage_norm_scale)
-            if stage_norm_mean is not None and stage_norm_scale is not None
-            else stage_recon_norm
-        )
-        current = (current - stage_recon.to(dtype=current.dtype)).contiguous()
-        stage_bits.append(torch.cat(bit_chunks, dim=0).contiguous())
-        stage_codebook_dims.append(int(codebook_dim))
-
-        decoder_in_dim = int(getattr(vae.model.decoder, "in_dim"))
-        use_new_quant = bool(getattr(shared_stage_args, "new_quant", False))
-        quant_q_scale = (1.0 / math.sqrt(decoder_in_dim)) if use_new_quant else 1.0
-        dec = vae.model.decoder.get_sub_decoder(0)
-        _fuse_q_scale_into_decoder(dec, q_scale=float(quant_q_scale))
-        if use_stage_norm:
-            if stage_norm_mean is None or stage_norm_scale is None:
-                raise RuntimeError(f"{stage_tag}: stage norm stats missing while normalize_weight=True")
-            _fuse_norm_into_decoder(
-                dec,
-                mean=float(stage_norm_mean[0].item()),
-                std=float(stage_norm_scale[0].item()),
-            )
-        dec.to("cpu")
-        stage_decoders.append(dec)
-        del vae, train_loader, eval_loader
-        torch.cuda.empty_cache()
-
-    return {
-        "stage_vq_weights": stage_bits,
-        "stage_decoders": stage_decoders,
-        "stage_codebook_dims": stage_codebook_dims,
-        "metrics": {
-            "protected_residual_rms_before": float(initial_rms),
-            "protected_residual_rms_after": float(current.float().pow(2).mean().sqrt().item()),
-            "residual_vae_final_loss": last_loss,
-            "residual_vae_final_recon": last_recon,
-            "residual_vae_final_commit": last_commit,
-        },
-    }
-
-
-def _train_shared_protected_residual_vae_payloads(
-    *,
-    group_tag: str,
-    residual_slices_by_name: Dict[str, torch.Tensor],
-    runtime_cfg: ResolvedCategoryRuntimeConfig,
-    vae_args,
-    training_args,
-    train_device: str,
-    train_dtype: torch.dtype,
-    batch_size: int,
-    steps: int,
-    lr: float,
-    log_every: int,
-    deterministic: bool,
-    shuffle_seed: int,
-) -> Dict[str, Dict[str, object]]:
-    if not residual_slices_by_name:
-        return {}
-    codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
-    ordered_items = list(residual_slices_by_name.items())
-    block_counts: Dict[str, int] = {}
-    flat_chunks: List[torch.Tensor] = []
-    for linear_name, residual_slice in ordered_items:
-        residual = residual_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
-        if residual.ndim != 2:
-            raise ValueError(f"{linear_name}: protected residual slice must be 2D, got shape={tuple(residual.shape)}.")
-        if int(residual.numel()) == 0:
-            continue
-        if int(residual.numel()) % codebook_dim != 0:
-            raise ValueError(
-                f"{linear_name}: protected residual numel={int(residual.numel())} is not divisible by "
-                f"codebook_dim={codebook_dim}."
-            )
-        blocks = int(residual.numel()) // int(codebook_dim)
-        block_counts[linear_name] = blocks
-        flat_chunks.append(residual.view(blocks, codebook_dim))
-    if not flat_chunks:
-        return {}
-
-    combined = torch.cat(flat_chunks, dim=0).contiguous()
-    shared_payload = _train_protected_residual_vae_payload(
-        linear_name=f"{group_tag}/shared_protected_residual",
-        residual_slice=combined,
-        runtime_cfg=runtime_cfg,
-        vae_args=vae_args,
-        training_args=training_args,
-        train_device=train_device,
-        train_dtype=train_dtype,
-        batch_size=batch_size,
-        steps=int(steps),
-        lr=float(lr),
-        log_every=log_every,
-        deterministic=deterministic,
-        shuffle_seed=shuffle_seed,
-    )
-    if shared_payload is None:
-        return {}
-
-    stage_bits_all = shared_payload["stage_vq_weights"]
-    shared_stage_decoders = shared_payload["stage_decoders"]
-    stage_codebook_dims = shared_payload["stage_codebook_dims"]
-    refs = [
-        _safe_shared_decoder_ref(f"{group_tag}.protected_residual.stage{stage_idx}")
-        for stage_idx in range(len(shared_stage_decoders))
-    ]
-
-    out: Dict[str, Dict[str, object]] = {}
-    offset = 0
-    for linear_name, _residual_slice in ordered_items:
-        blocks = int(block_counts.get(linear_name, 0))
-        if blocks <= 0:
-            continue
-        per_linear_stage_bits = [
-            stage_bits[offset: offset + blocks].contiguous()
-            for stage_bits in stage_bits_all
-        ]
-        offset += blocks
-        out[linear_name] = {
-            "stage_vq_weights": per_linear_stage_bits,
-            "shared_decoder_refs": list(refs),
-            "shared_stage_decoders": shared_stage_decoders,
-            "stage_codebook_dims": stage_codebook_dims,
-            "metrics": shared_payload.get("metrics"),
-        }
-    return out
 
 
 def train_group_vae_payload(
@@ -1258,22 +840,13 @@ def train_group_vae_payload(
     eval_blocks: int,
     gpu_resident_data: bool = False,
     activation_runtime: Optional[Dict[str, object]] = None,
-    outlier_protect_mode: str = "channel",
-    outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
-    outlier_channel_scope: str = "layer",
-    outlier_rank_metric: str = "sparse_residual_abs",
-    outlier_residual_min_abs: float = 1e-6,
-    outlier_protect_axis: str = "input",
-    outlier_protect_channel_quant: str = "none",
-    outlier_protect_min_per_layer: int = 0,
-    outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
-    outlier_residual_index_bits: int = 8,
-    outlier_residual_value_bits: int = 8,
-    outlier_residual_block_shape: Tuple[int, int] = (256, 256),
-    outlier_residual_vae_decoder_share_scope: str = "none",
-    outlier_residual_vae_batch_multiplier: int = 1,
-    outlier_residual_vae_steps: int = 0,
-    outlier_residual_vae_lr: float = 0.0,
+    channel_protect_mode: str = "channel",
+    channel_plan: Optional[Dict[str, torch.Tensor]] = None,
+    channel_scope: str = "layer",
+    channel_rank_metric: str = "channel_weight_abs",
+    channel_axis: str = "input",
+    channel_quant: str = "none",
+    channel_min_per_layer: int = 0,
     # 排序代码，已关闭。旧参数保留如下：
     # sort_executor=None,
     # sort_prep_workers_resolved: int = 1,
@@ -1290,24 +863,6 @@ def train_group_vae_payload(
         materialize_batch_size = int(batch_size)
         if int(materialize_batch_size) < 1:
             raise ValueError(f"[{group_tag}] batch_size must be >= 1 or 'all', got {batch_size!r}.")
-    residual_vae_batch_multiplier = int(outlier_residual_vae_batch_multiplier)
-    if residual_vae_batch_multiplier < 1:
-        raise ValueError(
-            f"[{group_tag}] outlier_residual_vae_batch_multiplier must be >= 1, "
-            f"got {residual_vae_batch_multiplier}."
-        )
-    protected_residual_vae_batch_size = int(materialize_batch_size) * int(residual_vae_batch_multiplier)
-    requested_residual_vae_steps = int(outlier_residual_vae_steps)
-    requested_residual_vae_lr = float(outlier_residual_vae_lr)
-    if requested_residual_vae_steps < 0:
-        raise ValueError(
-            f"[{group_tag}] outlier_residual_vae_steps must be >= 0, got {requested_residual_vae_steps}."
-        )
-    if requested_residual_vae_lr < 0.0:
-        raise ValueError(
-            f"[{group_tag}] outlier_residual_vae_lr must be >= 0, got {requested_residual_vae_lr}."
-        )
-
     train_dtype = _resolve_train_dtype(training_args)
 
     residual_stages = int(runtime_cfg.residual_stages)
@@ -1326,100 +881,35 @@ def train_group_vae_payload(
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
     stage_activation_type = str(runtime_cfg.activation_type).strip().lower()
     stage_decoder_type = str(runtime_cfg.decoder_type).strip().lower()
-    protected_residual_vae_steps = (
-        int(requested_residual_vae_steps)
-        if int(requested_residual_vae_steps) > 0
-        else int(stage_steps)
-    )
-    protected_residual_vae_lr = (
-        float(requested_residual_vae_lr)
-        if float(requested_residual_vae_lr) > 0.0
-        else float(getattr(vae_args, "lr"))
-    )
-    protected_residual_vae_codebook_bits = int(runtime_cfg.outlier_residual_vae_codebook_bits)
-    protected_residual_vae_codebook_dim = int(runtime_cfg.outlier_residual_vae_codebook_dim)
-    outlier_protect_count = int(runtime_cfg.outlier_protect_count)
-    outlier_residual_top_p = float(runtime_cfg.outlier_residual_top_p)
-    resolved_outlier_mode = str(outlier_protect_mode).strip().lower()
-    resolved_protected_residual_decoder_share_scope = str(outlier_residual_vae_decoder_share_scope).strip().lower()
-    resolved_outlier_rank_metric = str(outlier_rank_metric).strip().lower()
-    resolved_residual_min_abs = float(outlier_residual_min_abs)
-    residual_sparse_enabled = resolved_outlier_mode == "residual_sparse"
-    channel_protection_enabled = resolved_outlier_mode in {
-        "channel", "channel_residual_vae"} and int(outlier_protect_count) > 0
-    residual_sparse_needs_activation = (
-        residual_sparse_enabled
-        and (
-            resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX
-            or resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN
-        )
-    )
+    channel_protect_count = int(runtime_cfg.channel_protect_count)
+    resolved_channel_mode = str(channel_protect_mode).strip().lower()
+    resolved_channel_rank_metric = str(channel_rank_metric).strip().lower()
+    channel_protection_enabled = resolved_channel_mode == "channel" and int(channel_protect_count) > 0
     channel_rank_needs_actmax = (
         channel_protection_enabled
-        and resolved_outlier_rank_metric in {"channel_weight_actmax_abs", "channel_residual_actmax_abs"}
+        and resolved_channel_rank_metric == "channel_weight_actmax_abs"
     )
     channel_rank_needs_actmean = (
         channel_protection_enabled
-        and resolved_outlier_rank_metric in {"channel_weight_actmean_abs", "channel_residual_actmean_abs"}
+        and resolved_channel_rank_metric == "channel_weight_actmean_abs"
     )
-    channel_rank_needs_sq_mean = (
-        channel_protection_enabled
-        and resolved_outlier_rank_metric == "channel_residual_actrms_abs"
-    )
-    if resolved_outlier_mode not in {"none", "channel", "channel_residual_vae", "residual_sparse"}:
+    if resolved_channel_mode not in {"none", "channel"}:
         raise ValueError(
-            f"[{group_tag}] unsupported outlier_protect_mode={outlier_protect_mode!r}. "
-            "Expected none, channel, channel_residual_vae, or residual_sparse."
+            f"[{group_tag}] unsupported channel_protect_mode={channel_protect_mode!r}. "
+            "Expected none or channel."
         )
-    if resolved_protected_residual_decoder_share_scope not in {"none", "category"}:
-        raise ValueError(
-            f"[{group_tag}] unsupported outlier_residual_vae_decoder_share_scope="
-            f"{outlier_residual_vae_decoder_share_scope!r}. Expected one of: none, category."
-        )
-    if resolved_outlier_mode == "channel_residual_vae" and int(outlier_protect_count) > 0:
-        log.info(
-            "[%s] protected residual VAE schedule: steps=%d lr=%.6g batch=%d share_scope=%s codebook_bits=%d codebook_dim=%d",
-            group_tag,
-            int(protected_residual_vae_steps),
-            float(protected_residual_vae_lr),
-            int(protected_residual_vae_batch_size),
-            resolved_protected_residual_decoder_share_scope,
-            int(protected_residual_vae_codebook_bits),
-            int(protected_residual_vae_codebook_dim),
-        )
-    if residual_sparse_enabled and int(outlier_protect_count) != 0:
-        raise ValueError(
-            f"[{group_tag}] residual_sparse mode requires outlier_protect_count=0, got {outlier_protect_count}."
-        )
-    if residual_sparse_enabled and not (0.0 < outlier_residual_top_p <= 1.0):
-        raise ValueError(
-            f"[{group_tag}] residual_sparse mode requires 0 < outlier_residual_top_p <= 1, "
-            f"got {outlier_residual_top_p}."
-        )
-    if resolved_residual_min_abs < 0.0:
-        raise ValueError(
-            f"[{group_tag}] residual_sparse mode requires outlier_residual_min_abs >= 0, "
-            f"got {resolved_residual_min_abs}."
-        )
-    resolved_residual_codec = str(outlier_residual_codec).strip().lower()
     use_wa_mse_loss = stage_recon_loss == "wa_mse"
     use_channel_weight_loss = stage_recon_loss in {"wa_mse", "amse"}
-    row_parts, col_parts = 1, 1
-    parts_per_linear = 1
+    intra_parallel = tuple(getattr(runtime_cfg, "intra_parallel", (1, 1)))
+    if len(intra_parallel) != 2:
+        raise ValueError(f"[{group_tag}] intra_parallel must be a (row_parts, col_parts) pair, got {intra_parallel!r}.")
+    row_parts, col_parts = int(intra_parallel[0]), int(intra_parallel[1])
+    parts_per_linear = int(row_parts) * int(col_parts)
     sort_mode = str(runtime_cfg.intra_part_sort_mode).strip().lower()
-    # 排序代码，已关闭。原 act_spectral_cosine 动态 activation 触发条件保留如下：
-    # needs_dynamic_activation = (
-    #     use_wa_mse_loss
-    #     or sort_mode == "act_spectral_cosine"
-    #     or (resolved_outlier_mode == "channel" and int(outlier_protect_count) > 0)
-    #     or residual_sparse_needs_activation
-    # )
     needs_dynamic_activation = (
         use_channel_weight_loss
-        or residual_sparse_needs_activation
         or channel_rank_needs_actmax
         or channel_rank_needs_actmean
-        or channel_rank_needs_sq_mean
     )
     effective_activation_weight: Optional[Dict[str, torch.Tensor]] = None
     effective_activation_abs_mean: Optional[Dict[str, torch.Tensor]] = None
@@ -1427,7 +917,7 @@ def train_group_vae_payload(
     if needs_dynamic_activation:
         if activation_runtime is None:
             raise ValueError(
-                f"[{group_tag}] dynamic activation runtime is required for wa_mse/amse or outlier protection."
+                f"[{group_tag}] dynamic activation runtime is required for wa_mse/amse or channel protection."
             )
         stats_by_linear = activation_runtime.get("stats_by_linear")
         if not isinstance(stats_by_linear, dict):
@@ -1467,17 +957,17 @@ def train_group_vae_payload(
         group_refs=prep_refs,
         activation_weight_by_linear=prep_channel_weight_by_linear,
         activation_abs_mean_by_linear=effective_activation_abs_mean,
-        outlier_protect_count=(
-            int(outlier_protect_count)
-            if resolved_outlier_mode == "channel" and channel_protection_enabled
+        channel_protect_count=(
+            int(channel_protect_count)
+            if resolved_channel_mode == "channel" and channel_protection_enabled
             else 0
         ),
-        outlier_protect_axis=str(outlier_protect_axis),
-        outlier_protect_channel_quant=str(outlier_protect_channel_quant),
+        channel_axis=str(channel_axis),
+        channel_quant=str(channel_quant),
         recon_loss_type="wa_mse" if use_wa_mse_loss else stage_recon_loss,
         intra_part_sort_mode=stage_sort_mode,
-        outlier_channel_plan=outlier_channel_plan if resolved_outlier_mode == "channel" and channel_protection_enabled else None,
-        apply_outlier_channel_removal=resolved_outlier_mode == "channel",
+        channel_plan=channel_plan if resolved_channel_mode == "channel" and channel_protection_enabled else None,
+        apply_outlier_channel_removal=resolved_channel_mode == "channel",
     )
     initial_split_weights_by_linear: Optional[List[torch.Tensor]] = None
     target_common_result = materialize_prepared_group_data(
@@ -1510,10 +1000,10 @@ def train_group_vae_payload(
             f"[{group_tag}] split metadata mismatch: len(split_metas)={len(target_common_split_metas)} "
             f"vs len(group_refs)={len(group_refs)}"
         )
-    if resolved_outlier_mode == "channel" and channel_protection_enabled:
+    if resolved_channel_mode == "channel" and channel_protection_enabled:
         per_linear_protected = []
         for ref, meta in zip(group_refs, target_common_split_metas):
-            if str(outlier_protect_axis) == "output":
+            if str(channel_axis) == "output":
                 protected_idx = meta.protected_output_indices
                 total_channels = int(ref.module.out_features)
             else:
@@ -1524,25 +1014,12 @@ def train_group_vae_payload(
                 f"{ref.name}:{protected_count}/{total_channels}"
             )
         log.info(
-            "[%s] outlier protection mode=%s axis=%s count=%d protected_channels=%s",
+            "[%s] channel protection mode=%s axis=%s count=%d protected_channels=%s",
             group_tag,
-            resolved_outlier_mode,
-            str(outlier_protect_axis),
-            int(outlier_protect_count),
+            resolved_channel_mode,
+            str(channel_axis),
+            int(channel_protect_count),
             ",".join(per_linear_protected),
-        )
-    if residual_sparse_enabled:
-        log.info(
-            "[%s] residual sparse protection enabled: top_p=%.6f rank_metric=%s min_abs=%.6e codec=%s index_bits=%d value_bits=%d block=%dx%d",
-            group_tag,
-            outlier_residual_top_p,
-            resolved_outlier_rank_metric,
-            resolved_residual_min_abs,
-            resolved_residual_codec,
-            int(outlier_residual_index_bits),
-            int(outlier_residual_value_bits),
-            int(outlier_residual_block_shape[0]),
-            int(outlier_residual_block_shape[1]),
         )
     if use_wa_mse:
         log.info("[%s] %s enabled with online channel weight gather.", group_tag, stage_recon_loss)
@@ -2043,147 +1520,6 @@ def train_group_vae_payload(
             f"residual_stages={residual_stages}"
         )
 
-    protected_residual_payload_by_name: Dict[str, Dict[str, object]] = {}
-    if resolved_outlier_mode == "channel_residual_vae" and int(outlier_protect_count) > 0:
-        if final_base_residual_stage_idx != int(residual_stages) - 1:
-            raise RuntimeError(
-                f"[{group_tag}/channel_residual_vae] final residual is not from the last base VAE stage: "
-                f"final_stage_idx={final_base_residual_stage_idx} expected={int(residual_stages) - 1}."
-            )
-        log.info(
-            "[%s/channel_residual_vae] using final residual from base VAE stage output; skip base re-decode",
-            group_tag,
-        )
-        log.info(
-            "[%s/channel_residual_vae] selecting protected channels after base VAE stages using final residual",
-            group_tag,
-        )
-        target_common_split_metas, channel_rank_summary = _select_channel_residual_vae_plan_from_final_residual(
-            group_tag=group_tag,
-            group_refs=group_refs,
-            target_common_split_metas=target_common_split_metas,
-            final_common_stacked=current_common_stacked,
-            parts_per_linear=int(parts_per_linear),
-            outlier_protect_count=int(outlier_protect_count),
-            outlier_protect_axis=str(outlier_protect_axis),
-            outlier_channel_scope=str(outlier_channel_scope),
-            outlier_rank_metric=resolved_outlier_rank_metric,
-            activation_weight_by_linear=effective_activation_weight,
-            activation_abs_mean_by_linear=effective_activation_abs_mean,
-            activation_sq_mean_by_linear=effective_activation_sq_mean,
-            final_stage_idx=int(final_base_residual_stage_idx),
-            outlier_protect_min_per_layer=int(outlier_protect_min_per_layer),
-        )
-        protected_residual_entries = _build_protected_residual_entries_from_final_residual(
-            group_tag=group_tag,
-            group_refs=group_refs,
-            target_common_split_metas=target_common_split_metas,
-            final_common_stacked=current_common_stacked,
-            parts_per_linear=int(parts_per_linear),
-            outlier_protect_axis=str(outlier_protect_axis),
-            final_stage_idx=int(final_base_residual_stage_idx),
-            codebook_dim=int(protected_residual_vae_codebook_dim),
-        )
-        protected_numel = sum(int(residual_slice.numel()) for _r, _axis, _idx_cpu, residual_slice in protected_residual_entries)
-        if protected_numel > 0:
-            protected_sq_sum = sum(
-                float(residual_slice.float().pow(2).sum().item())
-                for _r, _axis, _idx_cpu, residual_slice in protected_residual_entries
-            )
-            protected_rms = math.sqrt(protected_sq_sum / float(protected_numel))
-        else:
-            protected_rms = 0.0
-        log.info(
-            "[%s/channel_residual_vae] metric=%s axis=%s num_channels=%d topk=%d score_max=%.6e score_mean=%.6e protected_residual_rms=%.6e",
-            group_tag,
-            resolved_outlier_rank_metric,
-            str(outlier_protect_axis),
-            int(channel_rank_summary["num_channels"]),
-            int(channel_rank_summary["topk"]),
-            float(channel_rank_summary["score_max"]),
-            float(channel_rank_summary["score_mean"]),
-            float(protected_rms),
-        )
-        for r, axis, idx_cpu, residual_slice in protected_residual_entries:
-            residual_rms = float(residual_slice.float().pow(2).mean().sqrt().item())
-            log.info(
-                "[%s/channel_residual_vae] axis=%s channels=%d residual_rms=%.6e",
-                r.name,
-                axis,
-                int(idx_cpu.numel()),
-                residual_rms,
-            )
-
-        shared_payload_by_name: Dict[str, Dict[str, object]] = {}
-        if resolved_protected_residual_decoder_share_scope == "category":
-            shared_payload_by_name = _train_shared_protected_residual_vae_payloads(
-                group_tag=group_tag,
-                residual_slices_by_name={
-                    r.name: residual_slice
-                    for r, _axis, _idx_cpu, residual_slice in protected_residual_entries
-                },
-                runtime_cfg=runtime_cfg,
-                vae_args=vae_args,
-                training_args=training_args,
-                train_device=train_device,
-                train_dtype=train_dtype,
-                batch_size=int(protected_residual_vae_batch_size),
-                steps=int(protected_residual_vae_steps),
-                lr=float(protected_residual_vae_lr),
-                log_every=log_every,
-                deterministic=deterministic,
-                shuffle_seed=int(shuffle_seed),
-            )
-
-        for r, axis, idx_cpu, residual_slice in protected_residual_entries:
-            if resolved_protected_residual_decoder_share_scope == "category":
-                residual_payload = shared_payload_by_name.get(r.name)
-            else:
-                residual_payload = _train_protected_residual_vae_payload(
-                    linear_name=r.name,
-                    residual_slice=residual_slice,
-                    runtime_cfg=runtime_cfg,
-                    vae_args=vae_args,
-                    training_args=training_args,
-                    train_device=train_device,
-                    train_dtype=train_dtype,
-                    batch_size=int(protected_residual_vae_batch_size),
-                    steps=int(protected_residual_vae_steps),
-                    lr=float(protected_residual_vae_lr),
-                    log_every=log_every,
-                    deterministic=deterministic,
-                    shuffle_seed=int(shuffle_seed),
-                )
-            if residual_payload is None:
-                continue
-            protected_residual_payload_by_name[r.name] = {
-                "protected_residual_axis": axis,
-                "protected_residual_indices": idx_cpu,
-                "protected_residual_stage_vq_weights": residual_payload["stage_vq_weights"],
-                "protected_residual_stage_codebook_dims": residual_payload["stage_codebook_dims"],
-            }
-            if resolved_protected_residual_decoder_share_scope == "category":
-                protected_residual_payload_by_name[r.name].update(
-                    {
-                        "protected_residual_shared_decoder_refs": residual_payload["shared_decoder_refs"],
-                        "protected_residual_shared_stage_decoders": residual_payload["shared_stage_decoders"],
-                    }
-                )
-            else:
-                protected_residual_payload_by_name[r.name]["protected_residual_stage_decoders"] = residual_payload["stage_decoders"]
-            log.info(
-                "[%s] protected residual VAE patch for %s: axis=%s channels=%d stages=%d steps=%d decoder_share_scope=%s codebook_bits=%d codebook_dim=%d",
-                group_tag,
-                r.name,
-                axis,
-                int(idx_cpu.numel()),
-                int(runtime_cfg.outlier_residual_vae_stages),
-                int(protected_residual_vae_steps),
-                resolved_protected_residual_decoder_share_scope,
-                int(protected_residual_vae_codebook_bits),
-                int(protected_residual_vae_codebook_dim),
-            )
-
     for stage_decoders in all_stage_decoders:
         for decoder in stage_decoders:
             decoder.to("cpu")
@@ -2199,21 +1535,7 @@ def train_group_vae_payload(
         "all_stage_decoders": all_stage_decoders,
         "all_stage_codebook_dims": all_stage_codebook_dims,
         "all_stage_split_metas": all_stage_split_metas,
-        "resolved_outlier_mode": resolved_outlier_mode,
-        "residual_sparse_enabled": bool(residual_sparse_enabled),
-        "effective_activation_weight": effective_activation_weight,
-        "effective_activation_abs_mean": effective_activation_abs_mean,
-        "outlier_residual_top_p": float(outlier_residual_top_p),
-        "resolved_outlier_rank_metric": resolved_outlier_rank_metric,
-        "resolved_residual_min_abs": float(resolved_residual_min_abs),
-        "resolved_residual_codec": resolved_residual_codec,
-        "outlier_residual_index_bits": int(outlier_residual_index_bits),
-        "outlier_residual_value_bits": int(outlier_residual_value_bits),
-        "outlier_residual_block_shape": tuple(int(v) for v in outlier_residual_block_shape),
-        "resolved_protected_residual_vae_codebook_bits": int(protected_residual_vae_codebook_bits),
-        "resolved_protected_residual_vae_codebook_dim": int(protected_residual_vae_codebook_dim),
-        "protected_residual_payload_by_name": protected_residual_payload_by_name,
-        "protected_channel_quant_format": str(outlier_protect_channel_quant),
+        "protected_channel_quant_format": str(channel_quant),
     }
     del current_residual_weights, target_common_result
     torch.cuda.empty_cache()
@@ -2241,18 +1563,6 @@ def apply_group_vae_payload(
     all_stage_decoders = payload["all_stage_decoders"]
     all_stage_codebook_dims = payload["all_stage_codebook_dims"]
     all_stage_split_metas = payload["all_stage_split_metas"]
-    resolved_outlier_mode = str(payload["resolved_outlier_mode"])
-    residual_sparse_enabled = bool(payload["residual_sparse_enabled"])
-    effective_activation_weight = payload.get("effective_activation_weight")
-    effective_activation_abs_mean = payload.get("effective_activation_abs_mean")
-    outlier_residual_top_p = float(payload["outlier_residual_top_p"])
-    resolved_outlier_rank_metric = str(payload["resolved_outlier_rank_metric"])
-    resolved_residual_min_abs = float(payload["resolved_residual_min_abs"])
-    resolved_residual_codec = str(payload["resolved_residual_codec"])
-    outlier_residual_index_bits = int(payload["outlier_residual_index_bits"])
-    outlier_residual_value_bits = int(payload["outlier_residual_value_bits"])
-    outlier_residual_block_shape = tuple(int(v) for v in payload["outlier_residual_block_shape"])
-    protected_residual_payload_by_name = payload.get("protected_residual_payload_by_name") or {}
     protected_channel_quant_format = str(payload.get("protected_channel_quant_format", "none"))
 
     if (
@@ -2301,78 +1611,6 @@ def apply_group_vae_payload(
                 stage_part_bits_payload.append(part_bits[0])
                 stage_part_decoders_payload.append(part_decoders[0])
 
-        sparse_residual_kwargs = None
-        reconstructed_weight = None
-        if residual_sparse_enabled:
-            reconstructed_weight = _decode_reconstructed_linear_weight(
-                old_module=old,
-                transpose=r.transpose,
-                split_meta=split_meta,
-                stage_split_metas=stage_split_metas,
-                stage_part_bits_payload=stage_part_bits_payload,
-                stage_part_decoders_payload=stage_part_decoders_payload,
-                stage_codebook_dims=all_stage_codebook_dims,
-                parallel_rows=row_parts,
-                parallel_cols=col_parts,
-                parallel_parts=parts_per_linear,
-            )
-        if residual_sparse_enabled:
-            activation_weight = None
-            activation_mean = None
-            if resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX:
-                if effective_activation_weight is None or r.name not in effective_activation_weight:
-                    raise ValueError(
-                        f"[{group_tag}] missing activation vector for residual_sparse scoring at linear '{r.name}'."
-                    )
-                activation_weight = effective_activation_weight[r.name]
-            if resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN:
-                if effective_activation_abs_mean is None or r.name not in effective_activation_abs_mean:
-                    raise ValueError(
-                        f"[{group_tag}] missing activation mean vector for residual_sparse scoring at linear '{r.name}'."
-                    )
-                activation_mean = effective_activation_abs_mean[r.name]
-            if reconstructed_weight is None:
-                raise RuntimeError(f"[{group_tag}] missing reconstructed weight for residual_sparse payload.")
-            sparse_residual_kwargs, sparse_nnz, sparse_storage = _build_sparse_residual_payload(
-                linear_name=r.name,
-                target_weight=old.weight,
-                reconstructed_weight=reconstructed_weight,
-                activation_weight=activation_weight,
-                activation_mean=activation_mean,
-                rank_metric=resolved_outlier_rank_metric,
-                top_p=outlier_residual_top_p,
-                min_abs=resolved_residual_min_abs,
-                codec=resolved_residual_codec,
-                index_bits=outlier_residual_index_bits,
-                value_bits=outlier_residual_value_bits,
-                block_shape=outlier_residual_block_shape,
-            )
-            log.info(
-                "[%s] residual sparse patch for %s: nnz=%d top_p=%.6f rank_metric=%s min_abs=%.6e codec=%s bytes(codec=%d coo=%d)",
-                group_tag,
-                r.name,
-                sparse_nnz,
-                outlier_residual_top_p,
-                resolved_outlier_rank_metric,
-                resolved_residual_min_abs,
-                resolved_residual_codec,
-                int(sparse_storage["codec_bytes"]),
-                int(sparse_storage["coo_bytes"]),
-            )
-        protected_residual_kwargs = protected_residual_payload_by_name.get(r.name)
-        if protected_residual_kwargs:
-            shared_refs = protected_residual_kwargs.get("protected_residual_shared_decoder_refs")
-            shared_decoders = protected_residual_kwargs.get("protected_residual_shared_stage_decoders")
-            if shared_refs is not None or shared_decoders is not None:
-                if not isinstance(shared_refs, (list, tuple)) or not isinstance(shared_decoders, (list, tuple)):
-                    raise TypeError(f"[{group_tag}] invalid shared protected residual decoder payload for {r.name}.")
-                if len(shared_refs) != len(shared_decoders):
-                    raise ValueError(
-                        f"[{group_tag}] shared protected residual decoder ref/object length mismatch for {r.name}: "
-                        f"{len(shared_refs)} vs {len(shared_decoders)}"
-                    )
-                for ref, decoder in zip(shared_refs, shared_decoders):
-                    register_shared_protected_residual_decoder(model, str(ref), decoder)
         new_linear = _build_vae_linear_from_stage_payload(
             old_module=old,
             transpose=r.transpose,
@@ -2385,8 +1623,6 @@ def apply_group_vae_payload(
             parallel_cols=col_parts,
             parallel_parts=parts_per_linear,
             bias=old.bias,
-            sparse_residual_kwargs=sparse_residual_kwargs,
-            protected_residual_kwargs=protected_residual_kwargs,
             protected_channel_quant_format=protected_channel_quant_format,
         ).to(convert_device)
         new_linear.to("cpu")
@@ -2412,22 +1648,13 @@ def _train_group_vae_and_replace(
     eval_blocks: int,
     gpu_resident_data: bool = False,
     activation_runtime: Optional[Dict[str, object]] = None,
-    outlier_protect_mode: str = "channel",
-    outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None,
-    outlier_channel_scope: str = "layer",
-    outlier_rank_metric: str = "sparse_residual_abs",
-    outlier_residual_min_abs: float = 1e-6,
-    outlier_protect_axis: str = "input",
-    outlier_protect_channel_quant: str = "none",
-    outlier_protect_min_per_layer: int = 0,
-    outlier_residual_codec: str = SPARSE_RESIDUAL_FORMAT_COO_FP16,
-    outlier_residual_index_bits: int = 8,
-    outlier_residual_value_bits: int = 8,
-    outlier_residual_block_shape: Tuple[int, int] = (256, 256),
-    outlier_residual_vae_decoder_share_scope: str = "none",
-    outlier_residual_vae_batch_multiplier: int = 1,
-    outlier_residual_vae_steps: int = 0,
-    outlier_residual_vae_lr: float = 0.0,
+    channel_protect_mode: str = "channel",
+    channel_plan: Optional[Dict[str, torch.Tensor]] = None,
+    channel_scope: str = "layer",
+    channel_rank_metric: str = "channel_weight_abs",
+    channel_axis: str = "input",
+    channel_quant: str = "none",
+    channel_min_per_layer: int = 0,
     # 排序代码，已关闭。旧参数保留如下：
     # sort_executor=None,
     # sort_prep_workers_resolved: int = 1,
@@ -2450,22 +1677,13 @@ def _train_group_vae_and_replace(
         eval_every=eval_every,
         eval_blocks=eval_blocks,
         activation_runtime=activation_runtime,
-        outlier_protect_mode=outlier_protect_mode,
-        outlier_channel_plan=outlier_channel_plan,
-        outlier_channel_scope=outlier_channel_scope,
-        outlier_rank_metric=outlier_rank_metric,
-        outlier_residual_min_abs=outlier_residual_min_abs,
-        outlier_protect_axis=outlier_protect_axis,
-        outlier_protect_channel_quant=outlier_protect_channel_quant,
-        outlier_protect_min_per_layer=outlier_protect_min_per_layer,
-        outlier_residual_codec=outlier_residual_codec,
-        outlier_residual_index_bits=outlier_residual_index_bits,
-        outlier_residual_value_bits=outlier_residual_value_bits,
-        outlier_residual_block_shape=outlier_residual_block_shape,
-        outlier_residual_vae_decoder_share_scope=outlier_residual_vae_decoder_share_scope,
-        outlier_residual_vae_batch_multiplier=outlier_residual_vae_batch_multiplier,
-        outlier_residual_vae_steps=outlier_residual_vae_steps,
-        outlier_residual_vae_lr=outlier_residual_vae_lr,
+        channel_protect_mode=channel_protect_mode,
+        channel_plan=channel_plan,
+        channel_scope=channel_scope,
+        channel_rank_metric=channel_rank_metric,
+        channel_axis=channel_axis,
+        channel_quant=channel_quant,
+        channel_min_per_layer=channel_min_per_layer,
         deterministic=deterministic,
         shuffle_seed=shuffle_seed,
     )
@@ -2556,17 +1774,17 @@ def _train_group_vae_and_replace_inline_distributed(
 
 def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     global log
-    distill_after_category = str(getattr(cat_args, "distill_after_category", "none")).strip().lower()
+    after_category_mode = str(getattr(cat_args, "after_category_mode", "none")).strip().lower()
     world_size = distill_world_size()
     inline_distributed = world_size > 1
     if inline_distributed:
-        _validate_inline_distill_after_category(distill_after_category)
+        _validate_inline_after_category_mode(after_category_mode)
         ensure_distill_process_group_initialized()
         initialize_cat_payload_group()
-    if bool(getattr(training_args, "distill_hif4_act", False)) and distill_after_category == "none":
-        raise ValueError("--distill_hif4_act 仅在每类后蒸馏阶段生效，因此必须设置 --distill_after_category。")
-    if distill_after_category != "none" and not bool(cat_args.convert):
-        raise ValueError("--distill_after_category requires --convert，因为每类后蒸馏必须作用在已替换的压缩模型上。")
+    if bool(getattr(training_args, "distill_hif4_act", False)) and after_category_mode == "none":
+        raise ValueError("--distill_hif4_act 仅在每类后蒸馏阶段生效，因此必须设置 --after_category_mode。")
+    if after_category_mode != "none" and not bool(cat_args.convert):
+        raise ValueError("--after_category_mode requires --convert，因为每类后蒸馏必须作用在已替换的压缩模型上。")
     configure_deterministic_mode(bool(getattr(cat_args, "deterministic", False)))
     set_seed(cat_args.seed)
 
@@ -2585,7 +1803,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         log.info(
             "Cat inline distributed mode: world_size=%d, VAE rank=0, distill=%s",
             world_size,
-            distill_after_category,
+            after_category_mode,
         )
     if bool(getattr(cat_args, "distill_independent_categories", False)):
         log.warning(
@@ -2603,7 +1821,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
 
     model = _load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)
     teacher_runtime = None
-    if distill_after_category != "none":
+    if after_category_mode != "none":
         teacher_runtime = DistillTeacherRuntime(
             model_path=str(vae_args.model_path),
             access_token=hf_args.access_token,
@@ -2613,10 +1831,10 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             logger=log,
         )
     activation_runtime: Optional[Dict[str, object]] = None
-    outlier_protect_axis = str(getattr(cat_args, "outlier_protect_axis", "input")).strip().lower()
-    outlier_protect_channel_quant = str(getattr(cat_args, "outlier_protect_channel_quant", "none")).strip().lower()
+    channel_axis = str(getattr(cat_args, "channel_axis", "input")).strip().lower()
+    channel_quant = str(getattr(cat_args, "channel_quant", "none")).strip().lower()
     transpose_modules = _split_csv(cat_args.transpose_modules)
-    target_categories = _split_csv(cat_args.target_categories)
+    compression_categories = _split_csv(cat_args.compression_categories)
     only_decoder_projections = not bool(cat_args.include_all_linears)
     eval_tasks_text = str(getattr(cat_args, "eval_tasks", "")).strip()
     run_task_eval = bool(eval_tasks_text)
@@ -2629,38 +1847,38 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         model,
         transpose_modules=transpose_modules,
         only_decoder_projections=only_decoder_projections,
-        target_categories=target_categories,
+        compression_categories=compression_categories,
     )
-    discovered_categories = [r.category for r in all_linears]
-    discovered_category_set = set(discovered_categories)
-    missing_target_categories = [
-        category for category in target_categories if category not in discovered_category_set
+    compression_category_values = parse_compression_categories(
+        getattr(cat_args, "compression_categories", cat_args.compression_categories)
+    )
+    target_layers = parse_target_layers(getattr(cat_args, "target_layers", "all"))
+    skip_layers = parse_skip_layers(getattr(cat_args, "skip_layers", ""))
+    inventory = discover_cat_projection_inventory(
+        model,
+        compression_categories=compression_category_values,
+    )
+    discovered_category_set = {str(category) for _layer_idx, category in inventory}
+    missing_compression_categories = [
+        category for category in compression_categories if category not in discovered_category_set
     ]
-    if missing_target_categories:
+    if missing_compression_categories:
         raise ValueError(
-            "target_categories contains categories not found in model: "
-            + ",".join(missing_target_categories)
+            "compression_categories contains categories not found in canonical CAT projection inventory: "
+            + ",".join(missing_compression_categories)
         )
-    discovered_skip_keys = []
-    for r in all_linears:
-        li = _extract_layer_idx(r.name)
-        if li is not None:
-            discovered_skip_keys.append((li, r.category))
-    skip_layer_keys, matched, missing = resolve_skip_layer_matches(
-        getattr(cat_args, "skip_layers", ""),
-        discovered_skip_keys,
+    validate_skip_layers_against_inventory(
+        skip_layers,
+        target_layers=target_layers,
+        compression_categories=compression_category_values,
+        inventory=inventory,
     )
+    skip_layer_keys = set(skip_layers)
     if skip_layer_keys:
-        if matched:
-            log.info(
-                "skip_layers 生效: %s",
-                ",".join(f"{li}.{cat}" for li, cat in matched),
-            )
-        if missing:
-            raise ValueError(
-                "skip_layers contains unknown layer/category pairs: "
-                + ",".join(f"{li}.{cat}" for li, cat in missing)
-            )
+        log.info(
+            "skip_layers 生效: %s",
+            ",".join(f"{li}.{cat}" for li, cat in sorted(skip_layer_keys)),
+        )
     eligible_all_linears = [
         ref for ref in all_linears
         if not _is_skipped_linear_ref(ref, skip_layer_keys)
@@ -2670,61 +1888,50 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     if linear_group_size < 1:
         raise ValueError(f"linear_group_size must be >= 1, got {linear_group_size}")
 
-    active_categories = list(target_categories)
+    active_categories = list(compression_categories)
     if not active_categories:
         raise ValueError("No active categories discovered for training.")
 
     resolved_category_cfgs = resolve_category_runtime_configs(cat_args, vae_args, active_categories)
-    resolved_outlier_mode = str(getattr(cat_args, "outlier_protect_mode", "channel")).strip().lower()
-    resolved_outlier_rank_metric = str(getattr(cat_args, "outlier_rank_metric", "sparse_residual_abs")).strip().lower()
-    resolved_outlier_mlp_rank_metric = str(getattr(cat_args, "outlier_mlp_rank_metric", "none")).strip().lower()
+    cat_runtime_identity = build_cat_cross_category_runtime_identity(
+        cat_args=cat_args,
+        vae_args=vae_args,
+        resolved_category_cfgs=resolved_category_cfgs,
+        compression_categories=compression_category_values,
+        target_layers=target_layers,
+        skip_layers=skip_layers,
+        transpose_modules=transpose_modules,
+    )
+    restored_global_adaptive_plan: Optional[AdaptiveChannelPlan] = None
+    resume_runtime_payload = getattr(cat_args, "_v6_cat_runtime_state_payload", None)
+    if getattr(cat_args, "resume_from_checkpoint", None):
+        if resume_runtime_payload is None:
+            raise FileNotFoundError(
+                "Exact CAT v6 resume requires cat_runtime_state.pt on the referenced category boundary/round base."
+            )
+        activation_runtime, restored_global_adaptive_plan, saved_runtime_identity = restore_cat_runtime_state(
+            resume_runtime_payload,
+            access_token=getattr(hf_args, "access_token", None),
+        )
+        validate_cat_runtime_identity(saved_runtime_identity, cat_runtime_identity)
+        log.info(
+            "Restored exact cross-category CAT runtime state: activation=%s global_plan=%s",
+            bool(activation_runtime is not None),
+            bool(restored_global_adaptive_plan is not None),
+        )
+    resolved_channel_mode = str(getattr(cat_args, "channel_protect_mode", "channel")).strip().lower()
+    if resolved_channel_mode not in {"none", "channel"}:
+        raise ValueError(
+            f"unsupported channel_protect_mode={resolved_channel_mode!r}. Expected none or channel."
+        )
+    resolved_channel_rank_metric = str(getattr(cat_args, "channel_rank_metric", "channel_weight_abs")).strip().lower()
+    resolved_channel_mlp_rank_metric = str(getattr(cat_args, "channel_mlp_rank_metric", "none")).strip().lower()
     log.info(
-        "outlier_mode=%s outlier_rank_metric=%s outlier_mlp_rank_metric=%s",
-        resolved_outlier_mode,
-        resolved_outlier_rank_metric,
-        resolved_outlier_mlp_rank_metric,
+        "channel_mode=%s channel_rank_metric=%s channel_mlp_rank_metric=%s",
+        resolved_channel_mode,
+        resolved_channel_rank_metric,
+        resolved_channel_mlp_rank_metric,
     )
-    if resolved_outlier_mode == "residual_sparse":
-        nonzero_counts = {
-            cat: int(cfg.outlier_protect_count)
-            for cat, cfg in resolved_category_cfgs.items()
-            if int(cfg.outlier_protect_count) != 0
-        }
-        if nonzero_counts:
-            raise ValueError(
-                "residual_sparse mode requires outlier_protect_count=0 for all active categories, got "
-                + ",".join(f"{cat}:{count}" for cat, count in nonzero_counts.items())
-            )
-        invalid_top_p = {
-            cat: float(cfg.outlier_residual_top_p)
-            for cat, cfg in resolved_category_cfgs.items()
-            if not (0.0 < float(cfg.outlier_residual_top_p) <= 1.0)
-        }
-        if invalid_top_p:
-            raise ValueError(
-                "residual_sparse mode requires 0 < outlier_residual_top_p <= 1 for all active categories, got "
-                + ",".join(f"{cat}:{top_p}" for cat, top_p in invalid_top_p.items())
-            )
-    distill_tables = (
-        (cat_args.lora_rank, "--lora_rank"),
-        (cat_args.lora_alpha, "--lora_alpha"),
-        (cat_args.lora_dropout, "--lora_dropout"),
-        (cat_args.distill_steps, "--distill_steps"),
-        (cat_args.distill_batch_size, "--distill_batch_size"),
-        (cat_args.distill_lr, "--distill_lr"),
-        (cat_args.distill_weight_decay, "--distill_weight_decay"),
-        (cat_args.distill_log_every, "--distill_log_every"),
-        (cat_args.distill_temperature, "--distill_temperature"),
-        (cat_args.distill_loss_alpha, "--distill_loss_alpha"),
-        (cat_args.distill_loss_type, "--distill_loss_type"),
-        (cat_args.distill_hidden_loss_weight, "--distill_hidden_loss_weight"),
-        (cat_args.distill_pre_mlp_hidden_loss_weight, "--distill_pre_mlp_hidden_loss_weight"),
-        (cat_args.distill_prompt_kd_weight, "--distill_prompt_kd_weight"),
-        (cat_args.lora_use_dora, "--lora_use_dora"),
-    )
-    for table, arg_name in distill_tables:
-        validate_category_keys(table, active_categories, arg_name)
-
     category_codebook: Dict[str, Tuple[int, int]] = {
         cat: (
             int(resolved_category_cfgs[cat].codebook_bits),
@@ -2732,18 +1939,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         )
         for cat in active_categories
     }
-    category_residual_vae_codebook: Dict[str, Tuple[int, int]] = {
-        cat: (
-            int(resolved_category_cfgs[cat].outlier_residual_vae_codebook_bits),
-            int(resolved_category_cfgs[cat].outlier_residual_vae_codebook_dim),
-        )
-        for cat in active_categories
-    }
-    category_outlier_protect_count: Dict[str, int] = {
-        cat: int(resolved_category_cfgs[cat].outlier_protect_count) for cat in active_categories
-    }
-    category_outlier_residual_top_p: Dict[str, float] = {
-        cat: float(resolved_category_cfgs[cat].outlier_residual_top_p) for cat in active_categories
+    category_channel_protect_count: Dict[str, int] = {
+        cat: int(resolved_category_cfgs[cat].channel_protect_count) for cat in active_categories
     }
     category_sort_modes: Dict[str, str] = {
         cat: str(resolved_category_cfgs[cat].intra_part_sort_mode)
@@ -2762,32 +1959,22 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     any_amse = any(str(resolved_category_cfgs[cat].recon_loss_type).strip(
     ).lower() == "amse" for cat in active_categories)
     any_channel_weight_loss = any_wa_mse or any_amse
-    any_outlier_protect = any(count > 0 for count in category_outlier_protect_count.values())
+    any_channel_protect = any(count > 0 for count in category_channel_protect_count.values())
     channel_protect_needs_activation = (
-        resolved_outlier_mode in {"channel", "channel_residual_vae"}
-        and resolved_outlier_rank_metric in {
+        resolved_channel_mode == "channel"
+        and resolved_channel_rank_metric in {
             "channel_weight_actmax_abs",
             "channel_weight_actmean_abs",
-            "channel_residual_actmax_abs",
-            "channel_residual_actmean_abs",
-            "channel_residual_actrms_abs",
         }
-        and any_outlier_protect
+        and any_channel_protect
     )
     mlp_channel_protect_needs_activation = (
-        is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
-        and resolved_outlier_mode == "channel"
+        is_mlp_aligned_rank_metric(resolved_channel_mlp_rank_metric)
+        and resolved_channel_mode == "channel"
         and any(
-            int(category_outlier_protect_count.get(cat, 0)) > 0
+            int(category_channel_protect_count.get(cat, 0)) > 0
             for cat in MLP_CATEGORIES
             if cat in active_categories
-        )
-    )
-    residual_sparse_needs_activation = (
-        resolved_outlier_mode == "residual_sparse"
-        and (
-            resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMAX
-            or resolved_outlier_rank_metric in _RESIDUAL_SPARSE_RANK_METRICS_NEED_ACTMEAN
         )
     )
     sort_needs_act = False  # 排序代码，已关闭。
@@ -2796,8 +1983,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         or channel_protect_needs_activation
         or mlp_channel_protect_needs_activation
         or sort_needs_act
-        or residual_sparse_needs_activation
-    ) and (not inline_distributed or is_distill_main_process()):
+    ) and activation_runtime is None and (not inline_distributed or is_distill_main_process()):
         activation_dataset = str(cat_args.activation_calib_dataset).strip()
         if not activation_dataset:
             raise ValueError(
@@ -2822,11 +2008,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         if any_amse:
             enabled_features.append("amse")
         if channel_protect_needs_activation:
-            enabled_features.append("outlier_protect")
+            enabled_features.append("channel_protection")
         if mlp_channel_protect_needs_activation:
-            enabled_features.append("mlp_outlier_protect")
-        if residual_sparse_needs_activation:
-            enabled_features.append("residual_sparse_score")
+            enabled_features.append("mlp_channel_protection")
         log.info(
             "Dynamic activation calibration enabled for %s: dataset=%s nsamples=%d seqlen=%d seed=%d device=%s",
             ",".join(enabled_features),
@@ -2863,13 +2047,18 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
             str(activation_runtime["device"]),
         )
 
-    mlp_channel_plan_by_linear: Optional[Dict[str, torch.Tensor]] = None
+    mlp_channel_plan_by_linear: Optional[Dict[str, torch.Tensor]] = (
+        None
+        if activation_runtime is None
+        else activation_runtime.get("mlp_channel_plan_by_linear")
+    )
     if (
-        is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
-        and resolved_outlier_mode == "channel"
+        is_mlp_aligned_rank_metric(resolved_channel_mlp_rank_metric)
+        and resolved_channel_mode == "channel"
+        and mlp_channel_plan_by_linear is None
         and (not inline_distributed or is_distill_main_process())
     ):
-        mlp_protect_count = int(category_outlier_protect_count.get("gate_proj", 0))
+        mlp_protect_count = int(category_channel_protect_count.get("gate_proj", 0))
         if mlp_protect_count > 0:
             if activation_runtime is None:
                 raise ValueError(
@@ -2906,8 +2095,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 model=model,
                 stats_by_mlp_block=stats_by_mlp_block,
                 protect_count=int(mlp_protect_count),
-                fuse_weights=cat_args.outlier_mlp_fuse_weights,
-                rank_metric=resolved_outlier_mlp_rank_metric,
+                fuse_weights=cat_args.channel_mlp_fuse_weights,
+                rank_metric=resolved_channel_mlp_rank_metric,
                 skip_layer_keys=skip_layer_keys,
             )
             activation_runtime["mlp_channel_plan_by_linear"] = mlp_channel_plan_by_linear
@@ -2916,8 +2105,8 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 summary_path,
                 summary_by_layer=mlp_summary_by_layer,
                 protect_count=int(mlp_protect_count),
-                fuse_weights=cat_args.outlier_mlp_fuse_weights,
-                rank_metric=resolved_outlier_mlp_rank_metric,
+                fuse_weights=cat_args.channel_mlp_fuse_weights,
+                rank_metric=resolved_channel_mlp_rank_metric,
             )
             log.info(
                 "MLP aligned channel plan ready: layers=%d linears=%d protect_count=%d summary=%s",
@@ -2927,39 +2116,13 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 summary_path,
             )
 
-    if any_outlier_protect:
+    if any_channel_protect:
         enabled_counts = ",".join(
             f"{cat}:{count}"
-            for cat, count in category_outlier_protect_count.items()
+            for cat, count in category_channel_protect_count.items()
             if count > 0
         )
-        log.info("Outlier protection enabled: axis=%s count_by_category=%s", outlier_protect_axis, enabled_counts)
-    if resolved_outlier_mode == "residual_sparse":
-        unique_top_p = sorted(set(category_outlier_residual_top_p.values()))
-        if len(unique_top_p) == 1:
-            log.info(
-                "Residual sparse protection enabled: top_p=%.6f rank_metric=%s min_abs=%.6e codec=%s index_bits=%d value_bits=%d block=%dx%d",
-                unique_top_p[0],
-                resolved_outlier_rank_metric,
-                float(cat_args.outlier_residual_min_abs),
-                cat_args.outlier_residual_codec,
-                int(cat_args.outlier_residual_index_bits),
-                int(cat_args.outlier_residual_value_bits),
-                int(cat_args.outlier_residual_block_shape[0]),
-                int(cat_args.outlier_residual_block_shape[1]),
-            )
-        else:
-            log.info(
-                "Residual sparse protection enabled: top_p_by_category={%s} rank_metric=%s min_abs=%.6e codec=%s index_bits=%d value_bits=%d block=%dx%d",
-                ",".join(f"{cat}:{category_outlier_residual_top_p[cat]:.6f}" for cat in active_categories),
-                resolved_outlier_rank_metric,
-                float(cat_args.outlier_residual_min_abs),
-                cat_args.outlier_residual_codec,
-                int(cat_args.outlier_residual_index_bits),
-                int(cat_args.outlier_residual_value_bits),
-                int(cat_args.outlier_residual_block_shape[0]),
-                int(cat_args.outlier_residual_block_shape[1]),
-            )
+        log.info("Channel protection enabled: axis=%s count_by_category=%s", channel_axis, enabled_counts)
     log.info(
         "并行配置: linear_group_size=%d, intra_part_sort_mode=%s, total_num_models=%d",
         linear_group_size,
@@ -3016,67 +2179,230 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         resume_progress = load_cat_resume_distill_progress(
             getattr(cat_args, "resume_from_checkpoint", None)
         )
-        completed_distill_categories: List[str] = list(resume_progress.completed_categories)
-        completed_distill_category_set = set(completed_distill_categories)
-        lora_round_idx = len(completed_distill_categories)
+        completed_categories: List[str] = list(resume_progress.completed_categories)
+        completed_category_set = set(completed_categories)
+        lora_round_idx = int(resume_progress.lora_round_idx)
+        resume_active_category = (
+            None if resume_progress.active_category is None else str(resume_progress.active_category)
+        )
+        resume_step_checkpoint = resume_progress.training_step_checkpoint
         distill_stage_history: List[dict] = [
             dict(item) for item in resume_progress.distill_stage_history
         ]
-        if completed_distill_categories or distill_stage_history:
+        if completed_categories or distill_stage_history:
             log.info(
-                "Inline CAT resume distill progress: completed_categories=%s lora_round_idx=%d history_entries=%d",
-                ",".join(completed_distill_categories) if completed_distill_categories else "(none)",
+                "Inline CAT resume progress: completed_categories=%s lora_round_idx=%d history_entries=%d",
+                ",".join(completed_categories) if completed_categories else "(none)",
                 int(lora_round_idx),
                 int(len(distill_stage_history)),
             )
-        any_distill_after_overrides = any(table.is_override_enabled() for table, _ in distill_tables)
-        if any_distill_after_overrides:
-            log.info(
-                "Distill after-category overrides enabled: keys=%s",
-                ",".join(
-                    sorted(
-                        {
-                            key
-                            for table, _arg_name in distill_tables
-                            for key in table.by_after_category.keys()
-                        }
-                    )
-                ),
+        global_adaptive_plan: Optional[AdaptiveChannelPlan] = restored_global_adaptive_plan
+        global_raw_budget_value = (
+            0 if global_adaptive_plan is None else int(global_adaptive_plan.raw_budget)
+        )
+        plan_is_main = (not inline_distributed) or is_distill_main_process()
+        plan_world_size = int(world_size) if inline_distributed else 1
+        if (
+            resolved_channel_mode == "channel"
+            and str(cat_args.channel_scope).strip().lower() == "global"
+        ):
+            validate_global_channel_runtime(
+                channel_scope="global",
+                channel_protect_mode=str(resolved_channel_mode),
+                channel_axis=str(channel_axis),
             )
+            if global_adaptive_plan is not None:
+                validate_adaptive_channel_tail_policy(
+                    scope="global",
+                    budget=int(global_raw_budget_value),
+                    allow_tail_group=bool(cat_args.allow_tail_group),
+                )
+                if plan_is_main:
+                    log.info(
+                        "Restored global channel plan: raw_budget=%d used_channels=%d",
+                        int(global_adaptive_plan.raw_budget),
+                        int(global_adaptive_plan.used_channels),
+                    )
+            else:
+                ratio = float(getattr(cat_args, "channel_protect_count_ratio", 0.0) or 0.0)
+                all_specs: List[ChannelLinearSpec] = []
+                all_refs: List[LinearRef] = []
+                ref_pos = 0
+                for cat in active_categories:
+                    if str(cat) in completed_category_set:
+                        continue
+                    refs_sorted, _missing = _collect_sorted_category_refs(
+                        model,
+                        category=cat,
+                        transpose_modules=transpose_modules,
+                        only_decoder_projections=only_decoder_projections,
+                        compression_categories=compression_categories,
+                    )
+                    pairs = _filter_eligible_vae_refs(refs_sorted, skip_layer_keys)
+                    if target_layers != "all":
+                        allowed_layers = {int(idx) for idx in target_layers}
+                        pairs = [
+                            (layer_idx, ref)
+                            for layer_idx, ref in pairs
+                            if int(layer_idx) in allowed_layers
+                        ]
+                    cat_cfg = resolved_category_cfgs[cat]
+                    intra_parallel = tuple(getattr(cat_cfg, "intra_parallel", (1, 1)))
+                    for _layer_idx, ref in pairs:
+                        all_specs.append(
+                            _channel_spec_from_ref(
+                                ref,
+                                codebook_dim=int(cat_cfg.codebook_dim),
+                                intra_parallel=intra_parallel,
+                                ref_position=int(ref_pos),
+                                axis=str(channel_axis),
+                                category=str(cat),
+                            )
+                        )
+                        all_refs.append(ref)
+                        ref_pos += 1
+                global_raw_budget_value = global_raw_budget(all_specs, ratio)
+                validate_adaptive_channel_tail_policy(
+                    scope="global",
+                    budget=int(global_raw_budget_value),
+                    allow_tail_group=bool(cat_args.allow_tail_group),
+                )
+                if int(global_raw_budget_value) > 0:
+                    refs_by_name = {ref.name: ref for ref in all_refs}
+
+                    def _global_activation_views(_specs: Sequence[ChannelLinearSpec]):
+                        return _activation_views_for_refs(
+                            all_refs,
+                            activation_runtime,
+                            category="global",
+                            rank_metric=resolved_channel_rank_metric,
+                        )
+
+                    def _global_score_specs(specs, act_weight, act_mean):
+                        return _score_channel_specs(
+                            specs,
+                            refs_by_name,
+                            metric=resolved_channel_rank_metric,
+                            axis=str(channel_axis),
+                            activation_weight_by_linear=act_weight,
+                            activation_abs_mean_by_linear=act_mean,
+                        )
+
+                    global_adaptive_plan = resolve_adaptive_channel_plan(
+                        all_specs,
+                        raw_budget=int(global_raw_budget_value),
+                        min_per_layer=int(cat_args.channel_min_per_layer),
+                        linear_group_size=int(linear_group_size),
+                        metric=str(resolved_channel_rank_metric),
+                        axis=str(channel_axis),
+                        scope="global",
+                        group_by_category=True,
+                        is_main=bool(plan_is_main),
+                        world_size=int(plan_world_size),
+                        broadcast_fn=broadcast_adaptive_channel_plan,
+                        activation_view_fn=_global_activation_views,
+                        score_fn=_global_score_specs,
+                        run_output_dir=str(run_output_dir) if plan_is_main else None,
+                    )
+                    if plan_is_main:
+                        log.info(
+                            "global channel plan: eligible_linears=%d raw_budget=%d used_channels=%d",
+                            len(all_specs),
+                            int(global_adaptive_plan.raw_budget),
+                            int(global_adaptive_plan.used_channels),
+                        )
+
         for cat_idx, cat in enumerate(active_categories):
-            if str(cat) in completed_distill_category_set:
+            if str(cat) in completed_category_set:
                 log.info(
                     "[%s] resume progress: category already completed; skip VAE compression and after-category recovery.",
                     str(cat),
                 )
                 continue
-            refs_sorted, missing = _collect_sorted_category_refs(
-                model,
-                category=cat,
-                transpose_modules=transpose_modules,
-                only_decoder_projections=only_decoder_projections,
-                target_categories=target_categories,
+            resuming_active_recovery = bool(
+                resume_step_checkpoint is not None
+                and resume_active_category is not None
+                and str(cat) == resume_active_category
             )
+            if resume_step_checkpoint is not None and not resuming_active_recovery:
+                raise RuntimeError(
+                    "CAT training-step resume reached a non-completed category before its active recovery round: "
+                    f"active_category={resume_active_category!r}, current={cat!r}, "
+                    f"completed={completed_categories}."
+                )
+            if resuming_active_recovery and after_category_mode == "none":
+                raise ValueError(
+                    "CAT training-step resume requires an active after-category recovery mode; "
+                    "after_category_mode=none has no Trainer step state to resume."
+                )
+
+            current_category_target_names: Optional[Tuple[str, ...]] = None
+            resume_newly_compressed_target_count = 0
+            if resuming_active_recovery:
+                resume_source = getattr(cat_args, "_v6_resume_source", None)
+                if resume_source is None or getattr(resume_source, "model_checkpoint_kind", None) != "round_base":
+                    raise RuntimeError("CAT training-step resume is missing its resolved v6 round_base source.")
+                round_base_meta = dict(resume_source.model_checkpoint_meta)
+                compressed_names = set(str(name) for name in round_base_meta.get("compressed_targets") or ())
+                allowed_resume_layers = (
+                    None if target_layers == "all" else {int(v) for v in target_layers}
+                )
+                current_category_target_names = tuple(
+                    str(name)
+                    for (layer_idx, category), name in inventory.items()
+                    if str(category) == str(cat)
+                    and (allowed_resume_layers is None or int(layer_idx) in allowed_resume_layers)
+                    and (int(layer_idx), str(category)) not in skip_layer_keys
+                    and str(name) in compressed_names
+                )
+                resume_newly_compressed_target_count = len(current_category_target_names)
+                if not current_category_target_names:
+                    raise RuntimeError(
+                        "CAT training-step round_base contains no compressed targets for its active category: "
+                        f"category={cat!r}."
+                    )
+                log.info(
+                    "[%s] exact step resume: reuse round_base compressed state for %d targets; "
+                    "skip VAE compression and resume after-category Trainer from %s.",
+                    str(cat),
+                    int(resume_newly_compressed_target_count),
+                    str(resume_step_checkpoint),
+                )
+                refs_sorted, missing = [], 0
+            else:
+                refs_sorted, missing = _collect_sorted_category_refs(
+                    model,
+                    category=cat,
+                    transpose_modules=transpose_modules,
+                    only_decoder_projections=only_decoder_projections,
+                    compression_categories=compression_categories,
+                )
             if missing:
                 log.warning("[%s] %d modules missing layer_idx, skipped.", cat, missing)
-            if not refs_sorted:
+            if not refs_sorted and not resuming_active_recovery:
                 continue
 
             cat_cfg = resolved_category_cfgs[cat]
-            eligible_vae_pairs = _filter_eligible_vae_refs(refs_sorted, skip_layer_keys)
+            eligible_vae_pairs = (
+                [] if resuming_active_recovery else _filter_eligible_vae_refs(refs_sorted, skip_layer_keys)
+            )
+            if target_layers != "all":
+                allowed_layers = {int(idx) for idx in target_layers}
+                eligible_vae_pairs = [
+                    (layer_idx, ref)
+                    for layer_idx, ref in eligible_vae_pairs
+                    if int(layer_idx) in allowed_layers
+                ]
             refs = [ref for _, ref in eligible_vae_pairs]
             cat_codebook_bits, cat_codebook_dim = category_codebook[cat]
-            cat_residual_vae_codebook_bits, cat_residual_vae_codebook_dim = category_residual_vae_codebook[cat]
             log.info(
-                "=== Category: %s (%d eligible linears, %d discovered linears, residual_stages=%d, codebook_bits=%d, codebook_dim=%d, residual_vae_codebook_bits=%d, residual_vae_codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
+                "=== Category: %s (%d eligible linears, %d discovered linears, residual_stages=%d, codebook_bits=%d, codebook_dim=%d, recon_loss=%s, sort=%s, steps=%d) ===",
                 cat,
                 len(refs),
                 len(refs_sorted),
                 int(cat_cfg.residual_stages),
                 int(cat_codebook_bits),
                 int(cat_codebook_dim),
-                int(cat_residual_vae_codebook_bits),
-                int(cat_residual_vae_codebook_dim),
                 str(cat_cfg.recon_loss_type),
                 category_sort_mode_desc[cat],
                 int(cat_cfg.steps),
@@ -3085,104 +2411,211 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 # int(cat_cfg.joint_decoder_group_size),
                 # "none" if cat_cfg.joint_decoder_batch_size is None else str(int(cat_cfg.joint_decoder_batch_size)),
             )
-            if bool(cat_args.allow_tail_group):
-                planned_eligible_pairs = list(eligible_vae_pairs)
-            else:
-                planned_count = (len(eligible_vae_pairs) // int(linear_group_size)) * int(linear_group_size)
-                planned_eligible_pairs = list(eligible_vae_pairs[:planned_count])
-            planned_refs = [ref for _, ref in planned_eligible_pairs]
-            if not eligible_vae_pairs:
+            if not eligible_vae_pairs and not resuming_active_recovery:
                 log.info("[%s] no eligible VAE refs after skip filtering; skipping VAE groups.", cat)
 
-            category_protect_axis = outlier_protect_axis
+            category_protect_axis = channel_axis
             if (
-                is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
+                is_mlp_aligned_rank_metric(resolved_channel_mlp_rank_metric)
                 and cat in MLP_CATEGORIES
             ):
                 category_protect_axis = mlp_protect_axis_for_category(cat)
 
-            outlier_channel_plan: Optional[Dict[str, torch.Tensor]] = None
+            channel_scope = str(cat_args.channel_scope).strip().lower()
+            intra_parallel = tuple(getattr(cat_cfg, "intra_parallel", (1, 1)))
+            adaptive_budget = 0
             if (
-                resolved_outlier_mode == "channel"
-                and int(cat_cfg.outlier_protect_count) > 0
-                and (not inline_distributed or is_distill_main_process())
+                not resuming_active_recovery
+                and resolved_channel_mode == "channel"
+                and channel_scope == "category"
             ):
-                if (
-                    is_mlp_aligned_rank_metric(resolved_outlier_mlp_rank_metric)
-                    and cat in MLP_CATEGORIES
-                    and mlp_channel_plan_by_linear is not None
-                ):
-                    outlier_channel_plan = {}
-                    for ref in planned_refs:
-                        if ref.name not in mlp_channel_plan_by_linear:
-                            raise KeyError(f"[{cat}] missing MLP aligned outlier channel plan for eligible linear {ref.name}.")
-                        outlier_channel_plan[ref.name] = mlp_channel_plan_by_linear[ref.name].detach().to(
-                            device="cpu",
-                            dtype=torch.long,
-                        ).contiguous()
-                    log.info(
-                        "[%s] MLP aligned outlier channel plan: eligible_linears=%d total_channels=%d axis=%s",
-                        cat,
-                        len(planned_refs),
-                        sum(int(v.numel()) for v in outlier_channel_plan.values()),
-                        category_protect_axis,
+                category_specs = [
+                    _channel_spec_from_ref(
+                        ref,
+                        codebook_dim=int(cat_cfg.codebook_dim),
+                        intra_parallel=intra_parallel,
+                        ref_position=int(pos),
+                        axis=str(category_protect_axis),
+                        category=str(cat),
+                    )
+                    for pos, (_layer_idx, ref) in enumerate(eligible_vae_pairs)
+                ]
+                adaptive_budget = category_raw_budget(category_specs, int(cat_cfg.channel_protect_count))
+            elif (
+                not resuming_active_recovery
+                and resolved_channel_mode == "channel"
+                and channel_scope == "global"
+            ):
+                adaptive_budget = int(global_raw_budget_value)
+            validate_adaptive_channel_tail_policy(
+                scope=channel_scope,
+                budget=int(adaptive_budget),
+                allow_tail_group=bool(cat_args.allow_tail_group),
+            )
+
+            pair_by_name = {ref.name: (int(layer_idx), ref) for layer_idx, ref in eligible_vae_pairs}
+            channel_plan: Optional[Dict[str, torch.Tensor]] = None
+            group_seed_offsets: List[int]
+            if (
+                not resuming_active_recovery
+                and resolved_channel_mode == "channel"
+                and channel_scope in {"category", "global"}
+                and int(adaptive_budget) > 0
+            ):
+                if channel_scope == "global":
+                    if global_adaptive_plan is None:
+                        raise RuntimeError("global channel plan was not built before category grouping.")
+                    name_groups = list(global_adaptive_plan.groups_by_category.get(str(cat), []))
+                    group_seed_offsets = list(
+                        global_adaptive_plan.group_seed_offsets_by_category.get(str(cat), [])
+                    )
+                    channel_plan = _outlier_plan_from_adaptive(
+                        global_adaptive_plan,
+                        names=set(pair_by_name),
+                    )
+                    used_channels = sum(
+                        int(global_adaptive_plan.counts.get(name, 0)) for name in pair_by_name
                     )
                 else:
-                    plan_activation_weight: Optional[Dict[str, torch.Tensor]] = None
-                    plan_activation_abs_mean: Optional[Dict[str, torch.Tensor]] = None
-                    if resolved_outlier_rank_metric in {"channel_weight_actmax_abs", "channel_weight_actmean_abs"}:
-                        if activation_runtime is None:
-                            raise ValueError(
-                                f"[{cat}] dynamic activation runtime is required for activation-weighted outlier channel scoring."
-                            )
-                        stats_by_linear = activation_runtime.get("stats_by_linear")
-                        if not isinstance(stats_by_linear, dict):
-                            raise ValueError(
-                                f"[{cat}] precomputed activation stats are required but missing from activation_runtime."
-                            )
-                        subset_stats = subset_activation_stats(
-                            stats_by_linear,
-                            [r.name for r in planned_refs],
-                        )
-                        plan_activation_weight, plan_activation_abs_mean, _ = activation_stats_to_views(subset_stats)
-                    plan_refs = [
-                        LinearPrepRef(
-                            name=r.name,
-                            weight=r.module.weight,
-                            in_features=int(r.module.in_features),
-                            out_features=int(r.module.out_features),
-                            transpose=bool(r.transpose),
-                        )
-                        for r in planned_refs
-                    ]
-                    outlier_channel_plan = build_outlier_channel_index_plan(
-                        group_refs=plan_refs,
-                        activation_weight_by_linear=plan_activation_weight,
-                        activation_abs_mean_by_linear=plan_activation_abs_mean,
-                        outlier_protect_count=int(cat_cfg.outlier_protect_count),
-                        outlier_protect_axis=category_protect_axis,
-                        outlier_channel_scope=str(cat_args.outlier_channel_scope),
-                        outlier_rank_metric=resolved_outlier_rank_metric,
-                        outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
-                    )
-                    log.info(
-                        "[%s] outlier channel plan: mode=%s scope=%s eligible_linears=%d total_channels=%d",
-                        cat,
-                        resolved_outlier_mode,
-                        str(cat_args.outlier_channel_scope),
-                        len(plan_refs),
-                        sum(int(v.numel()) for v in outlier_channel_plan.values()),
-                    )
+                    refs_for_plan = [ref for _layer_idx, ref in eligible_vae_pairs]
+                    refs_by_name = {ref.name: ref for ref in refs_for_plan}
 
-            newly_compressed_target_count = 0
+                    def _category_activation_views(_specs: Sequence[ChannelLinearSpec]):
+                        return _activation_views_for_refs(
+                            refs_for_plan,
+                            activation_runtime,
+                            category=str(cat),
+                            rank_metric=resolved_channel_rank_metric,
+                        )
+
+                    def _category_score_specs(specs, act_weight, act_mean):
+                        return _score_channel_specs(
+                            specs,
+                            refs_by_name,
+                            metric=resolved_channel_rank_metric,
+                            axis=str(category_protect_axis),
+                            activation_weight_by_linear=act_weight,
+                            activation_abs_mean_by_linear=act_mean,
+                        )
+
+                    category_plan = resolve_adaptive_channel_plan(
+                        category_specs,
+                        raw_budget=int(adaptive_budget),
+                        min_per_layer=int(cat_args.channel_min_per_layer),
+                        linear_group_size=int(linear_group_size),
+                        metric=str(resolved_channel_rank_metric),
+                        axis=str(category_protect_axis),
+                        scope="category",
+                        category=str(cat),
+                        is_main=bool(plan_is_main),
+                        world_size=int(plan_world_size),
+                        broadcast_fn=broadcast_adaptive_channel_plan,
+                        activation_view_fn=_category_activation_views,
+                        score_fn=_category_score_specs,
+                        run_output_dir=str(run_output_dir) if plan_is_main else None,
+                    )
+                    name_groups = list(category_plan.groups)
+                    group_seed_offsets = list(category_plan.group_seed_offsets)
+                    channel_plan = _outlier_plan_from_adaptive(category_plan)
+                    used_channels = int(category_plan.used_channels)
+                vae_groups = _pairs_from_name_groups(name_groups, pair_by_name)
+                if len(group_seed_offsets) != len(vae_groups):
+                    raise RuntimeError(
+                        f"[{cat}] adaptive group seed offsets ({len(group_seed_offsets)}) "
+                        f"do not match vae_groups ({len(vae_groups)})."
+                    )
+                if plan_is_main:
+                    log.info(
+                        "[%s] adaptive channel plan: scope=%s eligible_linears=%d used_channels=%d groups=%d",
+                        cat,
+                        channel_scope,
+                        len(pair_by_name),
+                        int(used_channels),
+                        len(vae_groups),
+                    )
+            else:
+                eligible_names = [ref.name for _layer_idx, ref in eligible_vae_pairs]
+                name_groups = group_layer_scope_inventory(
+                    eligible_names,
+                    linear_group_size=int(linear_group_size),
+                    allow_tail_group=bool(cat_args.allow_tail_group),
+                )
+                group_seed_offsets = layer_scope_group_seed_offsets(
+                    eligible_names,
+                    linear_group_size=int(linear_group_size),
+                    allow_tail_group=bool(cat_args.allow_tail_group),
+                )
+                vae_groups = _pairs_from_name_groups(name_groups, pair_by_name)
+                planned_refs = [ref for group in vae_groups for _layer_idx, ref in group]
+                if (
+                    resolved_channel_mode == "channel"
+                    and int(cat_cfg.channel_protect_count) > 0
+                    and (not inline_distributed or is_distill_main_process())
+                ):
+                    if (
+                        is_mlp_aligned_rank_metric(resolved_channel_mlp_rank_metric)
+                        and cat in MLP_CATEGORIES
+                        and mlp_channel_plan_by_linear is not None
+                    ):
+                        channel_plan = {}
+                        for ref in planned_refs:
+                            if ref.name not in mlp_channel_plan_by_linear:
+                                raise KeyError(f"[{cat}] missing MLP aligned channel plan for eligible linear {ref.name}.")
+                            channel_plan[ref.name] = mlp_channel_plan_by_linear[ref.name].detach().to(
+                                device="cpu",
+                                dtype=torch.long,
+                            ).contiguous()
+                        log.info(
+                            "[%s] MLP aligned channel plan: eligible_linears=%d total_channels=%d axis=%s",
+                            cat,
+                            len(planned_refs),
+                            sum(int(v.numel()) for v in channel_plan.values()),
+                            category_protect_axis,
+                        )
+                    else:
+                        plan_activation_weight, plan_activation_abs_mean = _activation_views_for_refs(
+                            planned_refs,
+                            activation_runtime,
+                            category=str(cat),
+                            rank_metric=resolved_channel_rank_metric,
+                        )
+                        plan_refs = [
+                            LinearPrepRef(
+                                name=r.name,
+                                weight=r.module.weight,
+                                in_features=int(r.module.in_features),
+                                out_features=int(r.module.out_features),
+                                transpose=bool(r.transpose),
+                            )
+                            for r in planned_refs
+                        ]
+                        channel_plan = build_outlier_channel_index_plan(
+                            group_refs=plan_refs,
+                            activation_weight_by_linear=plan_activation_weight,
+                            activation_abs_mean_by_linear=plan_activation_abs_mean,
+                            channel_protect_count=int(cat_cfg.channel_protect_count),
+                            channel_axis=category_protect_axis,
+                            channel_scope="layer",
+                            channel_rank_metric=resolved_channel_rank_metric,
+                            channel_min_per_layer=int(cat_args.channel_min_per_layer),
+                        )
+                        log.info(
+                            "[%s] channel plan: mode=%s scope=layer eligible_linears=%d total_channels=%d",
+                            cat,
+                            resolved_channel_mode,
+                            len(plan_refs),
+                            sum(int(v.numel()) for v in channel_plan.values()),
+                        )
+
+            newly_compressed_target_count = int(resume_newly_compressed_target_count)
+            planned_eligible_pairs = [pair for group in vae_groups for pair in group]
             if not bool(cat_args.allow_tail_group) and len(eligible_vae_pairs) != len(planned_eligible_pairs):
                 log.info(
                     "[%s] tail eligible group size=%d skipped (set --allow_tail_group to include).",
                     cat,
                     len(eligible_vae_pairs) - len(planned_eligible_pairs),
                 )
-            for start in range(0, len(planned_eligible_pairs), linear_group_size):
-                group_pairs = planned_eligible_pairs[start:start + linear_group_size]
+            for group_idx, group_pairs in enumerate(vae_groups):
                 group_refs = [ref for _, ref in group_pairs]
                 layer_indices = [idx for idx, _ in group_pairs]
                 group_tag = f"{cat}.L{layer_indices[0]}-{layer_indices[-1]}"
@@ -3209,26 +2642,21 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     eval_blocks=cat_args.eval_blocks,
                     gpu_resident_data=bool(getattr(cat_args, "gpu_resident_data", False)),
                     activation_runtime=activation_runtime,
-                    outlier_protect_mode=resolved_outlier_mode,
-                    outlier_channel_plan=outlier_channel_plan,
-                    outlier_channel_scope=str(cat_args.outlier_channel_scope),
-                    outlier_rank_metric=resolved_outlier_rank_metric,
-                    outlier_residual_min_abs=cat_args.outlier_residual_min_abs,
-                    outlier_protect_axis=category_protect_axis,
-                    outlier_protect_channel_quant=outlier_protect_channel_quant,
-                    outlier_protect_min_per_layer=int(cat_args.outlier_protect_min_per_layer),
-                    outlier_residual_codec=cat_args.outlier_residual_codec,
-                    outlier_residual_index_bits=cat_args.outlier_residual_index_bits,
-                    outlier_residual_value_bits=cat_args.outlier_residual_value_bits,
-                    outlier_residual_block_shape=cat_args.outlier_residual_block_shape,
-                    outlier_residual_vae_decoder_share_scope=cat_args.outlier_residual_vae_decoder_share_scope,
-                    outlier_residual_vae_batch_multiplier=cat_args.outlier_residual_vae_batch_multiplier,
-                    outlier_residual_vae_steps=cat_args.outlier_residual_vae_steps,
-                    outlier_residual_vae_lr=cat_args.outlier_residual_vae_lr,
+                    channel_protect_mode=resolved_channel_mode,
+                    channel_plan=channel_plan,
+                    channel_scope=str(cat_args.channel_scope),
+                    channel_rank_metric=resolved_channel_rank_metric,
+                    channel_axis=category_protect_axis,
+                    channel_quant=channel_quant,
+                    channel_min_per_layer=int(cat_args.channel_min_per_layer),
                     deterministic=bool(cat_args.deterministic),
-                    shuffle_seed=int(cat_args.seed) + int(cat_idx) * 100000 + int(start),
+                    shuffle_seed=vae_group_shuffle_seed(
+                        int(cat_args.seed),
+                        int(cat_idx),
+                        int(group_seed_offsets[group_idx]),
+                    ),
                 )
-            if run_category_eval and distill_after_category == "none":
+            if run_category_eval and after_category_mode == "none":
                 log.info("类别训练后评估...")
                 _eval_after_category(
                     model=model,
@@ -3244,8 +2672,94 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     run_output_dir=run_output_dir,
                 )
 
-            if distill_after_category != "none":
-                category_steps = int(resolve_after_category_value(cat_args.distill_steps, cat))
+            distill_result = None
+            run_this_category_eval = False
+            category_steps = (
+                int(cat_args.resolve_after_category_config(cat).opt.steps)
+                if after_category_mode != "none"
+                else 0
+            )
+            v6_step_checkpoint = None
+            save_strategy = str(getattr(training_args, "save_strategy", "steps") or "steps").strip().lower()
+            needs_v6_step_runtime = bool(
+                after_category_mode != "none"
+                and category_steps > 0
+                and (resuming_active_recovery or save_strategy != "no")
+            )
+            if needs_v6_step_runtime:
+                from train_utils.cat_step_resume_v6 import resolve_cat_round_root
+
+                if resuming_active_recovery:
+                    resume_source = getattr(cat_args, "_v6_resume_source", None)
+                    if resume_source is None:
+                        raise RuntimeError("CAT step resume lost its resolved resume source.")
+                    round_base_dir = os.path.abspath(str(resume_source.model_checkpoint_dir))
+                    round_base_meta = dict(resume_source.model_checkpoint_meta)
+                    trainer_output_dir = os.path.dirname(os.path.abspath(str(resume_step_checkpoint)))
+                else:
+                    round_root = resolve_cat_round_root(
+                        run_output_dir,
+                        category=str(cat),
+                        round_idx=int(lora_round_idx),
+                    )
+                    round_base_dir = os.path.join(round_root, "round_base")
+                    trainer_output_dir = os.path.join(round_root, "trainer_state")
+                    is_round_main = (not inline_distributed) or is_distill_main_process()
+                    round_tokenizer = None
+                    if is_round_main:
+                        round_tokenizer = _load_checkpoint_tokenizer(
+                            vae_args.model_path,
+                            hf_args.access_token,
+                        )
+                    round_save = save_cat_v6_full_checkpoint(
+                        model,
+                        round_base_dir,
+                        checkpoint_kind="round_base",
+                        category=str(cat),
+                        completed_categories=completed_categories,
+                        compression_categories=compression_category_values,
+                        cat_args=cat_args,
+                        vae_args=vae_args,
+                        training_args=training_args,
+                        tokenizer=round_tokenizer,
+                        base_model_path=vae_args.model_path,
+                        distill_stage_meta=None,
+                        distill_stage_history=distill_stage_history,
+                        round_idx=lora_round_idx,
+                        cat_runtime_state=(
+                            build_cat_runtime_state(
+                                activation_runtime=activation_runtime,
+                                global_adaptive_plan=global_adaptive_plan,
+                                runtime_identity=cat_runtime_identity,
+                            )
+                            if is_round_main
+                            else None
+                        ),
+                        is_main_process=is_round_main,
+                        distributed_barrier=(distill_distributed_barrier if inline_distributed else None),
+                    )
+                    round_base_meta = dict(round_save["meta_payload"])
+                    log.info(
+                        "[%s] saved CAT v6 round_base checkpoint_id=%s path=%s",
+                        str(cat),
+                        str(round_base_meta["checkpoint_id"]),
+                        str(round_base_dir),
+                    )
+                v6_step_checkpoint = {
+                    "round_base_dir": str(round_base_dir),
+                    "round_base_checkpoint_id": str(round_base_meta["checkpoint_id"]),
+                    "round_base_meta": round_base_meta,
+                    "active_category": str(cat),
+                    "trainer_output_dir": str(trainer_output_dir),
+                    "resume_from_checkpoint": (
+                        str(resume_step_checkpoint) if resuming_active_recovery else None
+                    ),
+                    "base_model_path": str(vae_args.model_path),
+                    "distill_stage_history": [dict(item) for item in distill_stage_history],
+                    "round_idx": int(lora_round_idx),
+                }
+
+            if after_category_mode != "none":
                 run_this_category_eval = bool(run_category_eval) and category_steps > 0
                 if run_category_eval and not run_this_category_eval:
                     log.info(
@@ -3253,7 +2767,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         str(cat),
                         category_steps,
                     )
-                if run_this_category_eval:
+                if run_this_category_eval and not resuming_active_recovery:
                     log.info("每类后蒸馏前评估...")
                     _eval_after_category(
                         model=model,
@@ -3278,96 +2792,22 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     lora_round_idx=lora_round_idx,
                     transpose_modules=transpose_modules,
                     only_decoder_projections=only_decoder_projections,
-                    target_categories=target_categories,
+                    compression_categories=compression_categories,
                     teacher_runtime=teacher_runtime,
                     newly_compressed_target_count=newly_compressed_target_count,
+                    current_category_target_names=current_category_target_names,
+                    v6_step_checkpoint=v6_step_checkpoint,
+                    online_cat=True,
                 )
                 model = distill_result.model
                 lora_round_idx = int(distill_result.next_lora_round_idx)
                 if distill_result.distill_meta is not None:
                     distill_stage_history.append(dict(distill_result.distill_meta))
-                if bool(distill_result.did_train):
-                    if str(cat) not in completed_distill_category_set:
-                        completed_distill_categories.append(str(cat))
-                        completed_distill_category_set.add(str(cat))
                 if inline_distributed:
                     model.to("cpu")
                     torch.cuda.empty_cache()
                     log.info("Cat inline distill complete: model moved to CPU on rank=%d", distill_rank())
                     distill_distributed_barrier()
-
-                if (
-                    inline_distributed
-                    and bool(distill_result.did_train)
-                    and bool(cat_args.save_model)
-                ):
-                    from e2e_common.compressed_subspace_lora import iter_named_compressed_subspace_peft_proxies
-                    from e2e_common.peft_proxy import iter_named_peft_vae_proxies
-                    from litebsq.vae_linear import clear_model_vae_linear_cache
-
-                    leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
-                    leftover_subspace_proxies = [
-                        name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
-                    ]
-                    if leftover_proxies or leftover_subspace_proxies:
-                        raise RuntimeError(
-                            "After-category save found unexported PEFT proxy modules: "
-                            + ", ".join(leftover_proxies + leftover_subspace_proxies)
-                        )
-                    clear_model_vae_linear_cache(model)
-                    distill_distributed_barrier()
-
-                if (
-                    bool(distill_result.did_train)
-                    and bool(cat_args.save_model)
-                    and (not inline_distributed or is_distill_main_process())
-                ):
-                    from transformers import AutoTokenizer
-                    from e2e_common.compressed_subspace_lora import (
-                        iter_named_compressed_subspace_peft_proxies,
-                    )
-                    from e2e_common.peft_proxy import iter_named_peft_vae_proxies
-                    from litebsq.vae_linear import clear_model_vae_linear_cache
-
-                    after_dir = os.path.join(run_output_dir, f"after_{cat}")
-                    tok = AutoTokenizer.from_pretrained(
-                        vae_args.model_path, use_fast=True, token=hf_args.access_token
-                    )
-                    leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
-                    leftover_subspace_proxies = [
-                        name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
-                    ]
-                    if leftover_proxies or leftover_subspace_proxies:
-                        raise RuntimeError(
-                            "After-category save found unexported PEFT proxy modules: "
-                            + ", ".join(leftover_proxies + leftover_subspace_proxies)
-                        )
-                    cleared = clear_model_vae_linear_cache(model)
-                    log.info(
-                        "After-category save [%s]: cleared decoded cache for %d VAELinear modules.",
-                        cat,
-                        cleared,
-                    )
-                    save_paths = save_model_checkpoint(
-                        model,
-                        after_dir,
-                        base_model_path=vae_args.model_path,
-                        tokenizer=tok,
-                        save_config=True,
-                        extra_meta={
-                            "stage": "after_category",
-                            "category": str(cat),
-                            "completed_categories": list(completed_distill_categories),
-                            "distill_after_category": str(distill_after_category),
-                            "distill_stage": distill_result.distill_meta,
-                            "distill_stage_history": list(distill_stage_history),
-                        },
-                        unload_vae_original_weights=False,
-                    )
-                    log.info("Saved after-category model to %s", save_paths["output_dir"])
-                if inline_distributed and bool(distill_result.did_train) and bool(cat_args.save_model):
-                    distill_distributed_barrier()
-
                 if run_this_category_eval:
                     log.info("每类后蒸馏后评估...")
                     _eval_after_category(
@@ -3383,6 +2823,92 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         tokenizer=eval_tokenizer,
                         run_output_dir=run_output_dir,
                     )
+
+            if str(cat) in completed_category_set:
+                raise RuntimeError(f"CAT category {cat!r} was completed twice in one run.")
+            completed_categories.append(str(cat))
+            completed_category_set.add(str(cat))
+            if resuming_active_recovery:
+                resume_step_checkpoint = None
+                resume_active_category = None
+
+            if bool(cat_args.save_model):
+                if not bool(cat_args.convert):
+                    raise ValueError("--save_model requires --convert")
+                from transformers import AutoTokenizer
+                from e2e_common.full_lora import iter_named_full_compressed_peft_proxies
+                from litebsq.vae_linear import clear_model_vae_linear_cache
+
+                if inline_distributed:
+                    model.to("cpu")
+                    torch.cuda.empty_cache()
+                    distill_distributed_barrier()
+                leftover_proxies = [name for name, _proxy in iter_named_full_compressed_peft_proxies(model)]
+                if leftover_proxies:
+                    raise RuntimeError(
+                        "CAT category-boundary save found unexported PEFT proxy modules: "
+                        + ", ".join(leftover_proxies)
+                    )
+                cleared = clear_model_vae_linear_cache(model)
+                def _save_category_boundary():
+                    after_dir = os.path.join(run_output_dir, f"after_{cat}")
+                    tok = AutoTokenizer.from_pretrained(
+                        vae_args.model_path, use_fast=True, token=hf_args.access_token
+                    )
+                    return save_cat_v6_full_checkpoint(
+                        model,
+                        after_dir,
+                        checkpoint_kind="category_boundary",
+                        category=str(cat),
+                        completed_categories=completed_categories,
+                        compression_categories=compression_category_values,
+                        cat_args=cat_args,
+                        vae_args=vae_args,
+                        training_args=training_args,
+                        tokenizer=tok,
+                        base_model_path=vae_args.model_path,
+                        distill_stage_meta=(None if distill_result is None else distill_result.distill_meta),
+                        distill_stage_history=distill_stage_history,
+                        round_idx=lora_round_idx,
+                        cat_runtime_state=build_cat_runtime_state(
+                            activation_runtime=activation_runtime,
+                            global_adaptive_plan=global_adaptive_plan,
+                            runtime_identity=cat_runtime_identity,
+                        ),
+                        is_main_process=True,
+                        distributed_barrier=None,
+                    )
+                save_paths = (
+                    distributed_guarded_main(_save_category_boundary, barrier=True)
+                    if inline_distributed
+                    else _save_category_boundary()
+                )
+                if not inline_distributed or is_distill_main_process():
+                    log.info(
+                        "Category-boundary save [%s]: cleared decoded cache for %d VAELinear modules.",
+                        cat,
+                        cleared,
+                    )
+                    log.info("Saved v6 category-boundary model to %s", save_paths["output_dir"])
+
+                def _prune_completed_rounds():
+                    return prune_completed_cat_round_roots(
+                        run_output_dir,
+                        save_total_limit=getattr(training_args, "save_total_limit", None),
+                    )
+                removed_round_roots = (
+                    distributed_guarded_main(_prune_completed_rounds, barrier=True)
+                    if inline_distributed
+                    else _prune_completed_rounds()
+                )
+                if not inline_distributed or is_distill_main_process():
+                    if removed_round_roots:
+                        log.info(
+                            "CAT round retention removed %d completed round root(s): %s",
+                            len(removed_round_roots),
+                            list(removed_round_roots),
+                        )
+
             if inline_distributed:
                 model.to("cpu")
                 torch.cuda.empty_cache()
@@ -3429,65 +2955,61 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
         elif cat_args.save_model:
             if not cat_args.convert:
                 raise ValueError("--save_model requires --convert")
+            if tuple(completed_categories) != tuple(str(v) for v in active_categories):
+                raise RuntimeError(
+                    "Final CAT save requires every active category to be completed: "
+                    f"completed={completed_categories}, active={active_categories}."
+                )
             from transformers import AutoTokenizer
-            from e2e_common.compressed_subspace_lora import (
-                iter_named_compressed_subspace_peft_proxies,
-            )
-            from e2e_common.peft_proxy import iter_named_peft_vae_proxies
+            from e2e_common.full_lora import iter_named_full_compressed_peft_proxies
             from litebsq.vae_linear import clear_model_vae_linear_cache
 
-            leftover_proxies = [name for name, _proxy in iter_named_peft_vae_proxies(model)]
-            leftover_subspace_proxies = [
-                name for name, _proxy in iter_named_compressed_subspace_peft_proxies(model)
-            ]
-            if leftover_proxies or leftover_subspace_proxies:
+            leftover_proxies = [name for name, _proxy in iter_named_full_compressed_peft_proxies(model)]
+            if leftover_proxies:
                 raise RuntimeError(
                     "Final save found unexported PEFT proxy modules: "
-                    + ", ".join(leftover_proxies + leftover_subspace_proxies)
+                    + ", ".join(leftover_proxies)
                 )
             cleared = clear_model_vae_linear_cache(model)
             if not inline_distributed or is_distill_main_process():
                 log.info("Final save: cleared decoded cache for %d VAELinear modules.", cleared)
-            if inline_distributed:
-                distill_distributed_barrier()
-            if not inline_distributed or is_distill_main_process():
+            def _save_final_model():
                 model_out = os.path.join(run_output_dir, "final_model")
                 tok = AutoTokenizer.from_pretrained(
                     vae_args.model_path, use_fast=True, token=hf_args.access_token
                 )
-                save_paths = save_model_checkpoint(
+                return save_cat_v6_full_checkpoint(
                     model,
                     model_out,
-                    base_model_path=vae_args.model_path,
+                    checkpoint_kind="final_model",
+                    category=None,
+                    completed_categories=completed_categories,
+                    compression_categories=compression_category_values,
+                    cat_args=cat_args,
+                    vae_args=vae_args,
+                    training_args=training_args,
                     tokenizer=tok,
-                    save_config=True,
-                    extra_meta={
-                        "stage": "final",
-                        "completed_categories": list(completed_distill_categories),
-                        "distill_after_category": str(distill_after_category),
-                        "distill_stage_history": list(distill_stage_history),
-                    },
-                    unload_vae_original_weights=False,
+                    base_model_path=vae_args.model_path,
+                    distill_stage_meta=None,
+                    distill_stage_history=distill_stage_history,
+                    round_idx=lora_round_idx,
+                    cat_runtime_state=build_cat_runtime_state(
+                        activation_runtime=activation_runtime,
+                        global_adaptive_plan=global_adaptive_plan,
+                        runtime_identity=cat_runtime_identity,
+                    ),
+                    is_main_process=True,
+                    distributed_barrier=None,
                 )
-                log.info("Saved final model to %s", save_paths["output_dir"])
-            if inline_distributed:
-                distill_distributed_barrier()
+            save_paths = (
+                distributed_guarded_main(_save_final_model, barrier=True)
+                if inline_distributed
+                else _save_final_model()
+            )
+            if not inline_distributed or is_distill_main_process():
+                log.info("Saved v6 final model to %s", save_paths["output_dir"])
     finally:
         # 排序代码，已关闭：sort_executor 始终为 None。
         pass
 
     log.info("Done.")
-
-
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    cat_args, hf_args, training_args, vae_args = process_cat_train_args(argv)
-    return run_cat_train(
-        cat_args=cat_args,
-        hf_args=hf_args,
-        training_args=training_args,
-        vae_args=vae_args,
-    )
-
-
-if __name__ == "__main__":
-    main()

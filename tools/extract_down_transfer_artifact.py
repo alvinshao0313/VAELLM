@@ -12,10 +12,9 @@ from typing import Any
 
 import torch
 
-from train_utils.model_checkpoint_io import (
+from train_utils.checkpoint_v6 import (
     META_FILENAME as CHECKPOINT_META_FILENAME,
-    _torch_load_state_dict,
-    resolve_checkpoint_dir,
+    resolve_v6_checkpoint_dir,
 )
 
 ARTIFACT_FORMAT = "vaellm_down_proj_transfer_artifact"
@@ -227,7 +226,7 @@ def extract_down_transfer_artifact(
     source_checkpoint: str,
     output_dir: str,
 ) -> dict[str, Any]:
-    source_dir = resolve_checkpoint_dir(source_checkpoint)
+    source_dir = resolve_v6_checkpoint_dir(source_checkpoint)
     source_meta = _load_checkpoint_meta(source_dir)
 
     converted_modules = source_meta.get("converted_modules", [])
@@ -240,7 +239,7 @@ def extract_down_transfer_artifact(
     if not os.path.isfile(source_state_path):
         raise FileNotFoundError(f"Missing source state dict: {source_state_path}")
 
-    source_state = _torch_load_state_dict(source_state_path, map_location="cpu")
+    source_state = torch.load(source_state_path, map_location="cpu", weights_only=True)
     compressed_state = _extract_compressed_state(source_state, module_names)
     _validate_compressed_state(compressed_state, down_specs)
     _verify_bit_exact(compressed_state, source_state)

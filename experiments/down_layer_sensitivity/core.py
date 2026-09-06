@@ -11,7 +11,7 @@ from torch import nn
 from e2e_common.proxy_trainables import iter_named_vae_module_refs
 from litebsq.vae_linear import NamedVAELinearTarget, VAELinear
 from litebsq.vae_linear_prewarm import decode_named_vae_linear_weights
-from train_utils.model_checkpoint_io import load_model_checkpoint
+from train_utils.v6_model_loader import load_v6_model_checkpoint
 
 _DOWN_RE = re.compile(r"^model\.layers\.(\d+)\.mlp\.down_proj$")
 _FORMAL_NUM_LAYERS = 36
@@ -427,7 +427,7 @@ def compute_down_weight_metrics(down_layers: list[DownLayerRef]) -> list[dict[st
 
 
 def load_worker_model(checkpoint_dir: str, device, prewarm_group_size: int) -> dict[str, Any]:
-    model, meta, _load_result = load_model_checkpoint(
+    model, meta, _load_result = load_v6_model_checkpoint(
         checkpoint_dir,
         map_location="cpu",
         strict=True,

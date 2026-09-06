@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import torch
 from torch import nn
 
-from e2e_common.low_rank_lora import iter_lora_target_modules
 from e2e_common.post_norm_head import resolve_post_norm_linear
-from litebsq.low_rank_scope import LOW_RANK_SCOPE_COMPRESSED_SUBSPACE, LOW_RANK_SCOPE_FULL
-from litebsq.vae_linear import VAELinear
 from rotation.model_utils import get_model_type, get_pre_head_layernorm
 
 AUX_CHECKPOINT_FILE = "e2e_aux_trainables.pt"
@@ -51,43 +48,18 @@ def _register_parameter(mapping: Dict[str, nn.Parameter], key: str, param: nn.Pa
 def enable_compressed_lora_auxiliary_trainables(
     model: nn.Module,
     *,
-    selected_vae_modules: Sequence[Tuple[str, VAELinear]],
-    low_rank_scope: str,
+    selected_vae_modules: Sequence[Tuple[str, Any]],
     sparse_bit_tuning: bool,
-    vae_tune_bias: bool,
     tune_final_norm: bool,
     use_post_norm_head_linear: bool,
 ) -> AuxiliaryTrainableSelection:
-    """Enable non-adapter continuous params after PEFT/proxy construction.
+    """Enable non-adapter continuous params after PEFT/proxy construction."""
+    del selected_vae_modules, sparse_bit_tuning
 
-    This is deliberately called only for compressed_lora. Existing configurations with
-    all auxiliary switches false never enter this helper.
-    """
     mapping: Dict[str, nn.Parameter] = {}
     bias_modules: list[str] = []
     final_norm_modules: list[str] = []
     post_norm_head_modules: list[str] = []
-
-    scope = str(low_rank_scope)
-    if bool(vae_tune_bias):
-        if scope == LOW_RANK_SCOPE_FULL and not bool(sparse_bit_tuning):
-            lora_targets = dict(iter_lora_target_modules(model))
-            for module_name, _old_vae in selected_vae_modules:
-                carrier = lora_targets.get(str(module_name))
-                if carrier is None:
-                    raise RuntimeError(f"{module_name}: full PEFT LoRA target missing for bias tuning.")
-                base_layer = getattr(carrier, "base_layer", None)
-                bias = getattr(base_layer, "bias", None)
-                if isinstance(bias, nn.Parameter):
-                    _register_parameter(mapping, f"vae_bias::{module_name}", bias)
-                    bias_modules.append(str(module_name))
-        else:
-            # compressed-subspace and all Bit-aware paths retain the original VAELinear as base.
-            for module_name, base_layer in selected_vae_modules:
-                bias = getattr(base_layer, "bias", None)
-                if isinstance(bias, nn.Parameter):
-                    _register_parameter(mapping, f"vae_bias::{module_name}", bias)
-                    bias_modules.append(str(module_name))
 
     root = _base_model(model)
     if bool(tune_final_norm):
@@ -179,18 +151,16 @@ def apply_auxiliary_payload_to_compressed_model(
     payload: Mapping[str, torch.Tensor],
 ) -> int:
     root = _base_model(model)
-    vae_modules = {str(name): module for name, module in root.named_modules() if isinstance(module, VAELinear)}
     final_norm = None
     post_norm = None
     written = 0
     for key, value in payload.items():
         text = str(key)
         if text.startswith("vae_bias::"):
-            module_name = text.split("::", 1)[1]
-            module = vae_modules.get(module_name)
-            if module is None or not isinstance(module.bias, nn.Parameter):
-                raise RuntimeError(f"{module_name}: export VAELinear bias target missing.")
-            target = module.bias
+            raise ValueError(
+                f"vae_bias auxiliary payload is no longer supported: {text}. "
+                "Re-export without VAE bias trainables."
+            )
         elif text.startswith("final_norm::"):
             if final_norm is None:
                 final_norm = get_pre_head_layernorm(root, get_model_type(root))

@@ -3,15 +3,10 @@ import copy
 import torch
 import transformers
 
-from compressed_e2e_fintuning.trainer import _causal_lm_cross_entropy
 from e2e_common.dense_loss import compute_dense_loss_from_offloaded_teacher
 from e2e_common.lazy_datasets import build_edgerazor_data_collator
-from train_utils.cat_train_args import CatTrainHFTrainingArguments
-from train_utils.distill_losses import (
-    build_distill_token_regions,
-    compute_kl_topk,
-    compute_teacher_entropy_mean_and_gamma,
-)
+from train_utils.cat_category_runtime import CatTrainHFTrainingArguments
+from train_utils.distill_loss_core import compute_model_level_loss
 from train_utils.lora_training import compute_distill_hidden_alignment_loss
 
 
@@ -138,68 +133,51 @@ def _make_hidden_state_pairs():
     )
 
 
-def _cat_kl_top100_prompt_loss(
+def _model_level_loss(
     *,
+    loss_type: str,
     student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
+    teacher_logits: torch.Tensor | None,
     batch: dict,
+    prompt_loss_weight: float = 0.03,
+    top_k: int = 100,
+    alpha: float = 0.5,
 ) -> torch.Tensor:
-    regions = build_distill_token_regions(
+    return compute_model_level_loss(
+        loss_type=loss_type,
+        student_logits=student_logits,
+        input_ids=batch["input_ids"],
         labels=batch["labels"],
         attention_mask=batch["attention_mask"],
-        reference_logits=student_logits,
-    )
-    response = compute_kl_topk(
-        student_logits=student_logits,
         teacher_logits=teacher_logits,
-        mask=regions.response_mask,
-        k=100,
         temperature=1.0,
+        alpha=alpha,
+        top_k=top_k,
+        prompt_loss_weight=prompt_loss_weight,
     )
-    prompt = compute_kl_topk(
-        student_logits=student_logits,
-        teacher_logits=teacher_logits,
-        mask=regions.prompt_mask,
-        k=100,
-        temperature=1.0,
-    )
-    return response + 0.03 * prompt
 
 
-def _offloaded_eakld_test_loss(
+def _offloaded_model_level_loss(
     *,
     loss_type: str,
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     batch: dict,
-    ce_loss: torch.Tensor | None = None,
+    prompt_loss_weight: float = 0.0,
+    top_k: int = 100,
+    alpha: float = 0.5,
 ) -> torch.Tensor:
-    teacher_logits_cpu = teacher_logits.detach().to("cpu")
-    regions = build_distill_token_regions(
-        labels=batch["labels"],
-        attention_mask=batch["attention_mask"],
-        reference_logits=student_logits,
-    )
-    entropy_mean, gamma, valid_count = compute_teacher_entropy_mean_and_gamma(
-        teacher_logits_cpu,
-        regions.response_mask,
-        confidence_k=16,
-    )
     return compute_dense_loss_from_offloaded_teacher(
         loss_type=loss_type,
         student_logits=student_logits,
-        teacher_logits_cpu=teacher_logits_cpu,
-        teacher_gamma_cpu=gamma,
-        teacher_entropy_mean_cpu=entropy_mean,
-        teacher_valid_token_count_cpu=valid_count,
-        ce_loss=ce_loss,
-        mask=regions.response_mask,
+        teacher_logits_cpu=teacher_logits.detach().cpu(),
+        input_ids=batch["input_ids"],
+        labels=batch["labels"],
+        attention_mask=batch["attention_mask"],
         temperature=1.0,
-        alpha=0.5,
-        eakld_confidence_k=16,
-        sequence_chunk_size=8,
-        prompt_mask=regions.prompt_mask,
-        prompt_kd_weight=0.0,
+        alpha=alpha,
+        top_k=top_k,
+        prompt_loss_weight=prompt_loss_weight,
     )
 
 
@@ -347,54 +325,37 @@ def test_cat_hf_argument_parses_distill_dynamic_padding():
     assert default_parsed.distill_dynamic_padding is False
 
 
-def test_distill_token_regions_are_invariant_to_removed_padding():
-    fixed_batch, dynamic_batch = _make_fixed_and_dynamic_batches()
-    (
-        teacher_logits_fixed,
-        student_logits_fixed,
-        teacher_logits_dynamic,
-        student_logits_dynamic,
-    ) = _make_logit_pairs()
-    del teacher_logits_fixed, teacher_logits_dynamic
+def test_prediction_masks_are_invariant_to_removed_padding():
+    from train_utils.distill_loss_core import build_prediction_token_masks
 
-    regions_fixed = build_distill_token_regions(
+    fixed_batch, dynamic_batch = _make_fixed_and_dynamic_batches()
+
+    resp_f, prompt_f = build_prediction_token_masks(
         labels=fixed_batch["labels"],
         attention_mask=fixed_batch["attention_mask"],
-        reference_logits=student_logits_fixed,
     )
-    regions_dynamic = build_distill_token_regions(
+    resp_d, prompt_d = build_prediction_token_masks(
         labels=dynamic_batch["labels"],
         attention_mask=dynamic_batch["attention_mask"],
-        reference_logits=student_logits_dynamic,
     )
 
     for row, valid_len in enumerate(_VALID_LENGTHS):
-        # causal position t predicts token t+1, so only positions before the
-        # final effective token can be active.
         causal_valid_len = max(valid_len - 1, 0)
         torch.testing.assert_close(
-            regions_fixed.response_mask[row, :causal_valid_len],
-            regions_dynamic.response_mask[row, :causal_valid_len],
+            resp_f[row, :causal_valid_len],
+            resp_d[row, :causal_valid_len],
         )
         torch.testing.assert_close(
-            regions_fixed.prompt_mask[row, :causal_valid_len],
-            regions_dynamic.prompt_mask[row, :causal_valid_len],
+            prompt_f[row, :causal_valid_len],
+            prompt_d[row, :causal_valid_len],
         )
-        assert torch.count_nonzero(
-            regions_fixed.response_mask[row, causal_valid_len:]
-        ).item() == 0
-        assert torch.count_nonzero(
-            regions_fixed.prompt_mask[row, causal_valid_len:]
-        ).item() == 0
-        assert torch.count_nonzero(
-            regions_dynamic.response_mask[row, causal_valid_len:]
-        ).item() == 0
-        assert torch.count_nonzero(
-            regions_dynamic.prompt_mask[row, causal_valid_len:]
-        ).item() == 0
+        assert torch.count_nonzero(resp_f[row, causal_valid_len:]).item() == 0
+        assert torch.count_nonzero(prompt_f[row, causal_valid_len:]).item() == 0
+        assert torch.count_nonzero(resp_d[row, causal_valid_len:]).item() == 0
+        assert torch.count_nonzero(prompt_d[row, causal_valid_len:]).item() == 0
 
 
-def test_cat_kl_top_100_prompt_loss_is_padding_invariant():
+def test_cat_kl_top_with_top_k_100_prompt_loss_is_padding_invariant():
     fixed_batch, dynamic_batch = _make_fixed_and_dynamic_batches()
     (
         teacher_logits_fixed,
@@ -403,15 +364,21 @@ def test_cat_kl_top_100_prompt_loss_is_padding_invariant():
         student_logits_dynamic,
     ) = _make_logit_pairs()
 
-    loss_fixed = _cat_kl_top100_prompt_loss(
+    loss_fixed = _model_level_loss(
+        loss_type="kl_top",
         student_logits=student_logits_fixed,
         teacher_logits=teacher_logits_fixed,
         batch=fixed_batch,
+        top_k=100,
+        prompt_loss_weight=0.03,
     )
-    loss_dynamic = _cat_kl_top100_prompt_loss(
+    loss_dynamic = _model_level_loss(
+        loss_type="kl_top",
         student_logits=student_logits_dynamic,
         teacher_logits=teacher_logits_dynamic,
         batch=dynamic_batch,
+        top_k=100,
+        prompt_loss_weight=0.03,
     )
     torch.testing.assert_close(
         loss_fixed,
@@ -467,13 +434,19 @@ def test_e2e_sft_ce_is_padding_invariant():
     ) = _make_logit_pairs()
     del teacher_logits_fixed, teacher_logits_dynamic
 
-    ce_fixed = _causal_lm_cross_entropy(
-        student_logits_fixed,
-        fixed_batch["labels"],
+    ce_fixed = _model_level_loss(
+        loss_type="sft",
+        student_logits=student_logits_fixed,
+        teacher_logits=None,
+        batch=fixed_batch,
+        prompt_loss_weight=0.0,
     )
-    ce_dynamic = _causal_lm_cross_entropy(
-        student_logits_dynamic,
-        dynamic_batch["labels"],
+    ce_dynamic = _model_level_loss(
+        loss_type="sft",
+        student_logits=student_logits_dynamic,
+        teacher_logits=None,
+        batch=dynamic_batch,
+        prompt_loss_weight=0.0,
     )
     torch.testing.assert_close(
         ce_fixed,
@@ -483,7 +456,7 @@ def test_e2e_sft_ce_is_padding_invariant():
     )
 
 
-def test_e2e_offloaded_eakld_is_padding_invariant():
+def test_e2e_offloaded_kl_is_padding_invariant():
     fixed_batch, dynamic_batch = _make_fixed_and_dynamic_batches()
     (
         teacher_logits_fixed,
@@ -492,14 +465,14 @@ def test_e2e_offloaded_eakld_is_padding_invariant():
         student_logits_dynamic,
     ) = _make_logit_pairs()
 
-    loss_fixed = _offloaded_eakld_test_loss(
-        loss_type="eakld",
+    loss_fixed = _offloaded_model_level_loss(
+        loss_type="kl",
         student_logits=student_logits_fixed,
         teacher_logits=teacher_logits_fixed,
         batch=fixed_batch,
     )
-    loss_dynamic = _offloaded_eakld_test_loss(
-        loss_type="eakld",
+    loss_dynamic = _offloaded_model_level_loss(
+        loss_type="kl",
         student_logits=student_logits_dynamic,
         teacher_logits=teacher_logits_dynamic,
         batch=dynamic_batch,
@@ -512,7 +485,7 @@ def test_e2e_offloaded_eakld_is_padding_invariant():
     )
 
 
-def test_e2e_offloaded_eakld_top_100_is_padding_invariant():
+def test_e2e_offloaded_kl_top_with_top_k_100_is_padding_invariant():
     fixed_batch, dynamic_batch = _make_fixed_and_dynamic_batches()
     (
         teacher_logits_fixed,
@@ -521,17 +494,19 @@ def test_e2e_offloaded_eakld_top_100_is_padding_invariant():
         student_logits_dynamic,
     ) = _make_logit_pairs()
 
-    loss_fixed = _offloaded_eakld_test_loss(
-        loss_type="eakld_top_100",
+    loss_fixed = _offloaded_model_level_loss(
+        loss_type="kl_top",
         student_logits=student_logits_fixed,
         teacher_logits=teacher_logits_fixed,
         batch=fixed_batch,
+        top_k=100,
     )
-    loss_dynamic = _offloaded_eakld_test_loss(
-        loss_type="eakld_top_100",
+    loss_dynamic = _offloaded_model_level_loss(
+        loss_type="kl_top",
         student_logits=student_logits_dynamic,
         teacher_logits=teacher_logits_dynamic,
         batch=dynamic_batch,
+        top_k=100,
     )
     torch.testing.assert_close(
         loss_fixed,
@@ -541,7 +516,7 @@ def test_e2e_offloaded_eakld_top_100_is_padding_invariant():
     )
 
 
-def test_e2e_offloaded_eakld_kd_is_padding_invariant():
+def test_e2e_offloaded_kd_is_padding_invariant():
     fixed_batch, dynamic_batch = _make_fixed_and_dynamic_batches()
     (
         teacher_logits_fixed,
@@ -550,27 +525,21 @@ def test_e2e_offloaded_eakld_kd_is_padding_invariant():
         student_logits_dynamic,
     ) = _make_logit_pairs()
 
-    ce_fixed = _causal_lm_cross_entropy(
-        student_logits_fixed,
-        fixed_batch["labels"],
-    )
-    ce_dynamic = _causal_lm_cross_entropy(
-        student_logits_dynamic,
-        dynamic_batch["labels"],
-    )
-    loss_fixed = _offloaded_eakld_test_loss(
-        loss_type="eakld_kd",
+    loss_fixed = _offloaded_model_level_loss(
+        loss_type="kd",
         student_logits=student_logits_fixed,
         teacher_logits=teacher_logits_fixed,
         batch=fixed_batch,
-        ce_loss=ce_fixed,
+        alpha=0.5,
+        prompt_loss_weight=0.0,
     )
-    loss_dynamic = _offloaded_eakld_test_loss(
-        loss_type="eakld_kd",
+    loss_dynamic = _offloaded_model_level_loss(
+        loss_type="kd",
         student_logits=student_logits_dynamic,
         teacher_logits=teacher_logits_dynamic,
         batch=dynamic_batch,
-        ce_loss=ce_dynamic,
+        alpha=0.5,
+        prompt_loss_weight=0.0,
     )
     torch.testing.assert_close(
         loss_fixed,

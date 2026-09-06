@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import os
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -35,10 +36,10 @@ from mix_bit.state_fingerprint import (
     verify_saved_checkpoint_state,
     write_state_fingerprint_manifest,
 )
-from train_utils.model_checkpoint_io import (
+from train_utils.checkpoint_v6 import (
     META_FILENAME,
     STATE_DICT_FILENAME,
-    save_model_checkpoint,
+    save_v6_full_checkpoint,
 )
 from transformers import AutoTokenizer
 
@@ -313,13 +314,24 @@ def save_full_checkpoint_from_assignments(
         device=device,
     )
     try:
-        save_paths = save_model_checkpoint(
+        compressed_targets = []
+        for name, module in model.named_modules():
+            if not isinstance(module, VAELinear):
+                continue
+            module.unload_original_linear()
+            compressed_targets.append(str(name))
+        save_paths = save_v6_full_checkpoint(
             model,
             output_dir,
+            checkpoint_kind="final_model",
+            compressed_targets=tuple(compressed_targets),
+            pending_dense_targets=(),
+            skip_targets=(),
+            train_mode="none",
+            lora_config=None,
             base_model_path=profile.model_path,
             tokenizer=source_tokenizer,
             save_config=True,
-            unload_vae_original_weights=True,
             extra_meta={"mix_bit": enriched_provenance},
         )
         # Fixed short-batch reference for Task-12 disk reload numerical check.
@@ -1158,6 +1170,7 @@ def assemble_optimal_mixed_checkpoint(
                 f"Refusing to overwrite existing mixed model at {out_dir} "
                 f"({reason}); require identical mix_bit provenance or pass overwrite=True"
             )
+        shutil.rmtree(out_dir)
 
     save_result = save_full_checkpoint_from_assignments(
         resolved=resolved,
@@ -1177,4 +1190,3 @@ def assemble_optimal_mixed_checkpoint(
     save_result["allocation_sha256"] = allocation_sha256
     save_result["assignment_count"] = len(assignments)
     return save_result
-

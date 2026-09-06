@@ -11,24 +11,41 @@ from sparse_bit_tuning.config import (
 )
 
 
-def test_parser_defaults_keep_bit_off_and_legacy_mode():
+def test_parser_defaults_use_canonical_train_mode_and_bit_config():
     parser = build_parser()
     ns, _ = parser.parse_known_args(["--student_checkpoint_dir", "/tmp/fake"])
-    assert ns.sparse_bit_tuning is False
-    assert ns.finetune_mode == "decoder"
+    assert ns.train_mode == "decoder"
     assert ns.bit_active_ratio == 0.01
     assert ns.bit_optimizer == "rms_sgd"
     assert ns.bit_lr == "auto"
     assert ns.bit_round_steps == "auto"
 
 
-@pytest.mark.parametrize("mode", ["none", "decoder", "compressed_lora", "both"])
-def test_parser_accepts_all_finetune_modes(mode):
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "decoder",
+        "lora",
+        "sparse_bit",
+        "decoder_lora",
+        "decoder_sparse_bit",
+        "lora_sparse_bit",
+        "decoder_lora_sparse_bit",
+    ],
+)
+def test_parser_accepts_canonical_train_modes(mode):
     parser = build_parser()
     ns, _ = parser.parse_known_args(
-        ["--student_checkpoint_dir", "/tmp/fake", "--finetune_mode", mode]
+        ["--student_checkpoint_dir", "/tmp/fake", "--train_mode", mode]
     )
-    assert ns.finetune_mode == mode
+    assert ns.train_mode == mode
+
+
+@pytest.mark.parametrize("flag", ["--finetune_mode", "--sparse_bit_tuning"])
+def test_parser_rejects_deleted_mode_flags(flag):
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--student_checkpoint_dir", "/tmp/fake", flag, "true"])
 
 
 def test_active_count_and_auto_round_steps():

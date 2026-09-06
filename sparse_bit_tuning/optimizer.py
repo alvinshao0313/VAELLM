@@ -156,6 +156,86 @@ class BitOptimizerManager:
         for key in list(self._state):
             self._state[key] = _BitState()
 
+    def state_dict(self) -> dict:
+        """Serialize the optimizer-owned live bit state without touching private fields externally."""
+        chunks = {}
+        for chunk_id in sorted(self._state):
+            state = self._state[int(chunk_id)]
+            chunks[str(int(chunk_id))] = {
+                "exp_avg": None
+                if state.exp_avg is None
+                else state.exp_avg.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                "exp_avg_sq": None
+                if state.exp_avg_sq is None
+                else state.exp_avg_sq.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+            }
+        return {
+            "format": "sparse_bit_optimizer_state",
+            "version": 1,
+            "optimizer_name": str(self.optimizer_name),
+            "lr": float(self.lr),
+            "weight_decay": float(self.weight_decay),
+            "chunks": chunks,
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state_dict: dict) -> None:
+        if not isinstance(state_dict, dict):
+            raise TypeError(f"BitOptimizerManager state must be dict, got {type(state_dict)}.")
+        if str(state_dict.get("format")) != "sparse_bit_optimizer_state" or int(
+            state_dict.get("version", -1)
+        ) != 1:
+            raise ValueError(
+                "unsupported BitOptimizerManager state format/version: "
+                f"{state_dict.get('format')!r}/{state_dict.get('version')!r}."
+            )
+        if str(state_dict.get("optimizer_name")) != str(self.optimizer_name):
+            raise ValueError(
+                f"bit optimizer mismatch: checkpoint={state_dict.get('optimizer_name')!r} "
+                f"current={self.optimizer_name!r}."
+            )
+        if float(state_dict.get("lr")) != float(self.lr):
+            raise ValueError(f"bit lr mismatch: checkpoint={state_dict.get('lr')} current={self.lr}.")
+        if float(state_dict.get("weight_decay")) != float(self.weight_decay):
+            raise ValueError(
+                f"bit weight_decay mismatch: checkpoint={state_dict.get('weight_decay')} "
+                f"current={self.weight_decay}."
+            )
+        chunks = state_dict.get("chunks")
+        if not isinstance(chunks, dict):
+            raise TypeError("BitOptimizerManager state 'chunks' must be a dict.")
+        expected = {str(int(chunk_id)) for chunk_id in self._state}
+        provided = {str(key) for key in chunks}
+        if provided != expected:
+            raise ValueError(
+                "bit optimizer chunk set mismatch: "
+                f"missing={sorted(expected - provided)} extra={sorted(provided - expected)}"
+            )
+        for chunk_id in sorted(self._state):
+            payload = chunks[str(int(chunk_id))]
+            if not isinstance(payload, dict):
+                raise TypeError(f"bit optimizer chunk {chunk_id} payload must be dict.")
+            score = self.module.score_chunks[int(chunk_id)]
+            exp_avg = payload.get("exp_avg")
+            exp_avg_sq = payload.get("exp_avg_sq")
+            if (exp_avg is None) != (exp_avg_sq is None):
+                raise ValueError(f"bit optimizer chunk {chunk_id} has partial Adam state.")
+            if exp_avg is None:
+                self._state[int(chunk_id)] = _BitState()
+                continue
+            if not torch.is_tensor(exp_avg) or not torch.is_tensor(exp_avg_sq):
+                raise TypeError(f"bit optimizer chunk {chunk_id} Adam state must contain tensors.")
+            if tuple(exp_avg.shape) != tuple(score.shape) or tuple(exp_avg_sq.shape) != tuple(score.shape):
+                raise ValueError(
+                    f"bit optimizer chunk {chunk_id} state shape mismatch: "
+                    f"exp_avg={tuple(exp_avg.shape)} exp_avg_sq={tuple(exp_avg_sq.shape)} "
+                    f"score={tuple(score.shape)}."
+                )
+            self._state[int(chunk_id)] = _BitState(
+                exp_avg=exp_avg.detach().to(device=score.device, dtype=torch.float32).contiguous(),
+                exp_avg_sq=exp_avg_sq.detach().to(device=score.device, dtype=torch.float32).contiguous(),
+            )
+
     def offload_state_for_eval(self) -> dict:
         token: dict[int, Tuple[Optional[torch.device], Optional[torch.device]]] = {}
         for chunk_id, state in self._state.items():

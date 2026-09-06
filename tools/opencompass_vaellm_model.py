@@ -61,7 +61,7 @@ class VAELLMOpenCompassModel(HuggingFaceBaseModel):
         adapter_dir = None if self.adapter_dir is None else _resolve_adapter_dir(self.adapter_dir)
 
         if adapter_dir is not None:
-            if checkpoint_loader != "cat":
+            if checkpoint_loader != "v6":
                 raise ValueError(
                     "adapter_dir requires a compressed cat checkpoint. "
                     f"Current checkpoint loader detected: {checkpoint_loader}."
@@ -126,31 +126,10 @@ class VAELLMOpenCompassModel(HuggingFaceBaseModel):
                 if has_post_norm_head_linear(model):
                     raise RuntimeError("post_norm_linear fusion returned success, but LMHeadWithPostNormLinear remains.")
             checkpoint_loader = "cat+adapter"
-        elif checkpoint_loader == "e2e":
-            from e2e_common.checkpoint_io import load_e2e_model_checkpoint
-            from e2e_common.temporary_mode import set_model_temporary
-            from litebsq.vae_linear import clear_model_vae_linear_cache
-
-            model, meta, load_result = load_e2e_model_checkpoint(
-                ckpt_dir,
-                access_token=self.access_token,
-                base_model_path=self.base_model_path,
-                map_location=self.map_location,
-                strict=self.strict,
-                materialize_proxy_decoded_linears=False,
-                proxy_group_size=self.prewarm_group_size,
-            )
-            set_model_temporary(model, True)
-            clear_model_vae_linear_cache(model)
-            logger.info(
-                "Loaded e2e checkpoint for OpenCompass: missing_keys=%d unexpected_keys=%d",
-                len(getattr(load_result, "missing_keys", [])),
-                len(getattr(load_result, "unexpected_keys", [])),
-            )
         else:
-            from train_utils.model_checkpoint_io import load_model_checkpoint
+            from train_utils.v6_model_loader import load_v6_model_checkpoint
 
-            model, meta, load_result = load_model_checkpoint(
+            model, meta, load_result = load_v6_model_checkpoint(
                 ckpt_dir,
                 access_token=self.access_token,
                 base_model_path=self.base_model_path,

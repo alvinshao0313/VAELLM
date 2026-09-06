@@ -16,6 +16,7 @@ class TeacherTopKTargets:
     indices_cpu: torch.Tensor
     logits_cpu: torch.Tensor
     k: int
+    transfer_chunk_size: Optional[int] = None
 
     def clear(self) -> None:
         self.indices_cpu = torch.empty(0, dtype=torch.long)
@@ -23,20 +24,36 @@ class TeacherTopKTargets:
 
 
 def is_selective_student_topk_loss(loss_type: str) -> bool:
+    """True only for canonical kl_top (or temporary legacy kl_top_<K> strings)."""
     norm = str(loss_type or "").strip().lower()
     return norm == "kl_top" or norm.startswith("kl_top_")
 
 
-def parse_selective_student_topk_k(loss_type: str, *, default_k: int = 1000) -> int:
+def parse_selective_student_topk_k(loss_type: str, *, top_k: int) -> int:
+    """Resolve selective K from DistillLossConfig.top_k (single truth).
+
+    ``top_k`` is required; wrappers must not guess 1000/100. Legacy ``kl_top_<K>``
+    strings are accepted only when callers have not yet split them; the suffix K
+    must match the provided ``top_k`` if both are present.
+    """
+    resolved = int(top_k)
+    if resolved < 1:
+        raise ValueError(f"top_k must be >= 1, got {top_k}.")
     norm = str(loss_type or "").strip().lower()
     if norm == "kl_top":
-        return int(default_k)
+        return resolved
     if not norm.startswith("kl_top_"):
         raise ValueError(f"Selective student top-k only supports kl_top[_K], got {loss_type!r}.")
     suffix = norm[len("kl_top_") :]
     if not suffix.isdigit() or int(suffix) < 1:
         raise ValueError(f"Invalid kl_top suffix in {loss_type!r}.")
-    return int(suffix)
+    suffix_k = int(suffix)
+    if suffix_k != resolved:
+        raise ValueError(
+            f"Selective student top-k mismatch: loss_type={loss_type!r} encodes K={suffix_k} "
+            f"but DistillLossConfig.top_k={resolved}."
+        )
+    return resolved
 
 
 @torch.no_grad()
@@ -93,18 +110,55 @@ def move_teacher_topk_targets_to_device(
     targets: TeacherTopKTargets,
     *,
     device: torch.device,
+    sequence_chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     target_device = torch.device(device)
-    indices = targets.indices_cpu.to(
-        device=target_device,
+    if sequence_chunk_size is None:
+        sequence_chunk_size = targets.transfer_chunk_size
+    if sequence_chunk_size is None or target_device.type != "cuda":
+        indices = targets.indices_cpu.to(
+            device=target_device,
+            dtype=torch.long,
+            non_blocking=bool(targets.indices_cpu.is_pinned() and target_device.type == "cuda"),
+        )
+        logits = targets.logits_cpu.to(
+            device=target_device,
+            dtype=torch.float32,
+            non_blocking=bool(targets.logits_cpu.is_pinned() and target_device.type == "cuda"),
+        )
+        return indices, logits
+
+    chunk_size = int(sequence_chunk_size)
+    if chunk_size < 1:
+        raise ValueError(f"sequence_chunk_size must be >= 1, got {sequence_chunk_size}.")
+    if targets.indices_cpu.ndim != 3 or targets.logits_cpu.ndim != 3:
+        raise ValueError("teacher top-k targets must have shape [B,L,K].")
+    if tuple(targets.indices_cpu.shape) != tuple(targets.logits_cpu.shape):
+        raise ValueError("teacher top-k indices/logits shape mismatch.")
+
+    indices = torch.empty(
+        targets.indices_cpu.shape,
         dtype=torch.long,
-        non_blocking=bool(targets.indices_cpu.is_pinned() and target_device.type == "cuda"),
-    )
-    logits = targets.logits_cpu.to(
         device=target_device,
-        dtype=torch.float32,
-        non_blocking=bool(targets.logits_cpu.is_pinned() and target_device.type == "cuda"),
     )
+    logits = torch.empty(
+        targets.logits_cpu.shape,
+        dtype=torch.float32,
+        device=target_device,
+    )
+    non_blocking_indices = bool(targets.indices_cpu.is_pinned())
+    non_blocking_logits = bool(targets.logits_cpu.is_pinned())
+    seq_len = int(targets.indices_cpu.shape[1])
+    for start in range(0, seq_len, chunk_size):
+        end = min(seq_len, start + chunk_size)
+        indices[:, start:end, :].copy_(
+            targets.indices_cpu[:, start:end, :],
+            non_blocking=non_blocking_indices,
+        )
+        logits[:, start:end, :].copy_(
+            targets.logits_cpu[:, start:end, :],
+            non_blocking=non_blocking_logits,
+        )
     return indices, logits
 
 
