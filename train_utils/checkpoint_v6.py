@@ -15,6 +15,7 @@ from peft import PeftModel
 from peft.tuners.lora.layer import LoraLayer
 from torch import Tensor, nn
 
+from e2e_common.post_norm_head import ensure_post_norm_head_linear, has_post_norm_head_linear
 from litebsq.autoencoder import Decoder
 from litebsq.bitpack import validate_bitpack_u8_spec
 from litebsq.misc import set_module_by_name
@@ -25,68 +26,6 @@ from train_utils.shared_protected_residual import (
     validate_shared_protected_residual_decoder_ref,
 )
 from train_utils.distributed_guard import distributed_guarded_main
-
-
-class _LMHeadWithPostNormLinear(nn.Module):
-    """Local copy of e2e_common.post_norm_head.LMHeadWithPostNormLinear.
-
-    Avoids importing ``e2e_common`` package ``__init__`` (which pulls legacy checkpoint I/O).
-    """
-
-    def __init__(self, lm_head: nn.Module):
-        if not isinstance(lm_head, nn.Linear):
-            raise TypeError(f"LMHeadWithPostNormLinear expects nn.Linear lm_head, got {type(lm_head)}")
-        super().__init__()
-        hidden_size = int(lm_head.in_features)
-        if int(lm_head.out_features) <= 0:
-            raise ValueError(f"Invalid lm_head out_features={lm_head.out_features}")
-        self.post_norm_linear = nn.Linear(hidden_size, hidden_size, bias=False)
-        with torch.no_grad():
-            self.post_norm_linear.weight.copy_(
-                torch.eye(hidden_size, dtype=self.post_norm_linear.weight.dtype)
-            )
-        self.lm_head = lm_head
-
-    @property
-    def weight(self):
-        return self.lm_head.weight
-
-    @property
-    def bias(self):
-        return self.lm_head.bias
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(self.post_norm_linear(hidden_states))
-
-
-def _is_post_norm_head_linear(module: Optional[nn.Module]) -> bool:
-    if module is None or not isinstance(module, nn.Module):
-        return False
-    if isinstance(module, _LMHeadWithPostNormLinear):
-        return True
-    # Duck-type the e2e_common class without importing it.
-    return (
-        type(module).__name__ == "LMHeadWithPostNormLinear"
-        and hasattr(module, "post_norm_linear")
-        and hasattr(module, "lm_head")
-    )
-
-
-def has_post_norm_head_linear(model: nn.Module) -> bool:
-    return _is_post_norm_head_linear(getattr(model, "lm_head", None))
-
-
-def ensure_post_norm_head_linear(model: nn.Module) -> bool:
-    lm_head = getattr(model, "lm_head", None)
-    if _is_post_norm_head_linear(lm_head):
-        return False
-    if not isinstance(lm_head, nn.Linear):
-        raise TypeError(f"Model lm_head must be nn.Linear to attach post-norm linear, got {type(lm_head)}")
-    wrapped = _LMHeadWithPostNormLinear(lm_head)
-    wrapped.train(lm_head.training)
-    wrapped.to(device=lm_head.weight.device, dtype=lm_head.weight.dtype)
-    model.lm_head = wrapped
-    return True
 
 
 FORMAT_V6 = "vaellm_model_checkpoint_v6"

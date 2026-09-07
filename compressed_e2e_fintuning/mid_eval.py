@@ -6,10 +6,12 @@ import argparse
 import json
 import os
 from contextlib import contextmanager
+from types import MethodType
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
+from accelerate.utils.operations import ConvertOutputsToFp32
 from transformers import TrainerCallback
 
 from litebsq.vae_linear import VAELinear
@@ -47,6 +49,29 @@ def _iter_trainable_decode_modules(model: nn.Module) -> Iterator[VAELinear]:
 
 
 @contextmanager
+def temporary_disable_fp32_output_conversion(model: nn.Module):
+    """Temporarily remove Accelerate's output-to-fp32 wrapper but keep inner AMP/autocast."""
+    wrapped_forward = model.forward
+    converter = getattr(wrapped_forward, "__wrapped__", None)
+
+    if not isinstance(converter, ConvertOutputsToFp32):
+        yield
+        return
+
+    amp_forward = converter.model_forward
+    if getattr(amp_forward, "__self__", None) is model:
+        eval_forward = amp_forward
+    else:
+        eval_forward = MethodType(amp_forward, model)
+
+    model.forward = eval_forward
+    try:
+        yield
+    finally:
+        model.forward = wrapped_forward
+
+
+@contextmanager
 def temporary_inference_decode_mode(
     model: nn.Module,
     *,
@@ -54,8 +79,9 @@ def temporary_inference_decode_mode(
 ):
     """Disable trainable_decode for eval, then restore via the shared execution resolver.
 
-    Mid-training eval keeps cache_decoded_weight=False so full dense weights are not
-    retained on GPU alongside optimizer/teacher memory.
+    Mid-training eval keeps cache_decoded_weight=False so full decoded weights are
+    not cached; VAELinear also treats no-cache/no-grad inference as packed-first and
+    releases per-forward decode runtime scratch immediately.
     """
     enabled_modules = list(_iter_trainable_decode_modules(model))
     restore_modes = []
@@ -361,7 +387,10 @@ class EvalAfterSaveCallback(TrainerCallback):
     def _resolve_eval_model(self, model: Optional[nn.Module]) -> nn.Module:
         trainer = self._trainer
         if trainer is not None and getattr(trainer, "accelerator", None) is not None:
-            return trainer.accelerator.unwrap_model(trainer.model)
+            return trainer.accelerator.unwrap_model(
+                trainer.model,
+                keep_fp32_wrapper=True,
+            )
         if model is not None:
             return model
         if trainer is not None and getattr(trainer, "model", None) is not None:
@@ -429,17 +458,18 @@ class EvalAfterSaveCallback(TrainerCallback):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         try:
-            run_e2e_lm_eval(
-                model=eval_model,
-                tokenizer=self.tokenizer,
-                args=self.e2e_args,
-                base_model_path=self.base_model_path,
-                output_dir=self.run_output_dir,
-                log=self.log,
-                eval_tag=eval_tag,
-                move_to_device=bool(move_to_device),
-                cache_decoded_weight=False,
-            )
+            with temporary_disable_fp32_output_conversion(eval_model):
+                run_e2e_lm_eval(
+                    model=eval_model,
+                    tokenizer=self.tokenizer,
+                    args=self.e2e_args,
+                    base_model_path=self.base_model_path,
+                    output_dir=self.run_output_dir,
+                    log=self.log,
+                    eval_tag=eval_tag,
+                    move_to_device=bool(move_to_device),
+                    cache_decoded_weight=False,
+                )
         finally:
             _clear_post_eval_decoded_cache(eval_model, eval_tag=eval_tag, log=self.log)
             if trainer is not None:

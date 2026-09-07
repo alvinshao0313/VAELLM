@@ -13,9 +13,11 @@ import pytest
 import torch
 from torch import nn
 
+from e2e_common.post_norm_head import LMHeadWithPostNormLinear, ensure_post_norm_head_linear
 from litebsq.autoencoder import Decoder
 from litebsq.vae_linear import VAELinear
 from train_utils import checkpoint_v6 as v6
+from train_utils.model_level_trainables import setup_lm_head_trainables
 from train_utils.shared_protected_residual import register_shared_protected_residual_decoder
 
 
@@ -245,6 +247,52 @@ def test_full_checkpoint_kinds_roundtrip(kind):
         assert torch.allclose(before, _decoded(loaded.proj), atol=0, rtol=0)
         x = torch.randn(2, 4)
         assert torch.allclose(model(x), loaded(x), atol=1e-5, rtol=1e-5)
+
+
+def test_v6_loaded_post_norm_head_linear_is_reused_by_linear_aux_mode():
+    model = _Host(_single_stage_vae())
+    model.lm_head = nn.Linear(4, 7, bias=False)
+    assert ensure_post_norm_head_linear(model) is True
+    assert isinstance(model.lm_head, LMHeadWithPostNormLinear)
+    with torch.no_grad():
+        expected = torch.tensor(
+            [
+                [1.0, 0.1, 0.0, 0.0],
+                [0.0, 1.0, 0.2, 0.0],
+                [0.0, 0.0, 1.0, 0.3],
+                [0.4, 0.0, 0.0, 1.0],
+            ],
+            dtype=model.lm_head.post_norm_linear.weight.dtype,
+        )
+        model.lm_head.post_norm_linear.weight.copy_(expected)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "with_post_norm")
+        v6.save_v6_full_checkpoint(
+            model,
+            out,
+            checkpoint_kind="final_model",
+            compressed_targets=["proj"],
+            pending_dense_targets=["pending"],
+            skip_targets=["skip"],
+            train_mode="none",
+        )
+        fresh = _skeleton_like(model)
+        fresh.lm_head = nn.Linear(4, 7, bias=False)
+        loaded, meta, _ = v6.load_v6_full_checkpoint_into_model(
+            fresh, out, expected_kind="final_model"
+        )
+
+        assert meta["post_norm_head_linear"] is True
+        assert isinstance(loaded.lm_head, LMHeadWithPostNormLinear)
+        restored_post = loaded.lm_head.post_norm_linear
+        restored_before = restored_post.weight.detach().clone()
+        selected = setup_lm_head_trainables(loaded, lm_head_train_mode="linear")
+        assert isinstance(loaded.lm_head, LMHeadWithPostNormLinear)
+        assert loaded.lm_head.post_norm_linear is restored_post
+        assert selected["lm_head_linear::weight"] is restored_post.weight
+        assert torch.equal(restored_post.weight.detach(), restored_before)
+        assert torch.equal(restored_post.weight.detach(), expected)
 
 
 def _assert_extended_full_roundtrip(model: _Host, tmp: str) -> tuple[_Host, dict]:

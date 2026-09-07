@@ -2351,13 +2351,16 @@ class VAELinear(nn.Module):
         decode_device = param.device if param is not None else torch.device("cpu")
         decode_dtype = param.dtype if param is not None else dtype
 
-        # Decoder optimization (grad enabled) prioritizes the packed uint8 path
-        # to avoid materializing dense VQ latents. Ordinary inference/cache
-        # prewarm runs under no_grad; for the already-optimized resblock=0
-        # symmetric case, preserve the existing whole-decoder fused kernel first
-        # so this memory optimization does not silently regress inference speed.
+        # Grad-enabled decoder optimization and no-cache inference both prefer the
+        # packed uint8 path so dense grouped VQ is not materialized unnecessarily.
+        # Cached ordinary inference/prewarm keeps the existing whole-decoder fused
+        # path first for inference throughput. Dense fallback remains supported when
+        # packed decode is unavailable.
         stage_out = None
         grouped_vq = None
+        prefer_packed_u8 = torch.is_grad_enabled() or not bool(
+            getattr(self, "cache_decoded_weight", True)
+        )
         full_fuse_eligible = (
             int(self.parallel_parts) == 1
             and bool(getattr(self, "_parallel_stage_layout_is_stage_major", False))
@@ -2366,7 +2369,7 @@ class VAELinear(nn.Module):
             and torch.device(decode_device).type == "cuda"
             and bool(_TRITON_AVAILABLE)
         )
-        if not torch.is_grad_enabled() and full_fuse_eligible:
+        if not prefer_packed_u8 and full_fuse_eligible:
             grouped_vq = self._get_parallel_stage_grouped_vq(dtype=decode_dtype, device=decode_device)
             fused = self._try_fused_parallel_stage_decode(
                 packed_decoder,
@@ -3052,9 +3055,12 @@ class VAELinear(nn.Module):
                     w = self._decode_weight(dtype=x.dtype, include_low_rank=False)
             else:
                 w = self._decode_weight(dtype=x.dtype, include_low_rank=False)
+
             if can_use_cache:
                 self._cached_weight = w.detach()
                 self._clear_parallel_stage_decode_runtime_cache()
+            elif not torch.is_grad_enabled():
+                self.clear_decoded_weight_cache()
 
         bias = self.bias
         if bias is not None and bias.dtype != x.dtype:
