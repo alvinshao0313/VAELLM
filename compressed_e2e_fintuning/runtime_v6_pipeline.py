@@ -24,14 +24,17 @@ from compressed_e2e_fintuning.runtime_v6 import (
     _cleanup_runtime,
     _collect_existing_full_low_rank,
     _finalize_decoders,
+    _format_e2e_runtime_parameters,
     _install_run_file_logger,
     _is_main_process,
     _load_teacher,
     _load_v6_student,
     _module_suffixes,
     _place_student_model,
+    _resolve_round_base,
     _resolve_run_output_dir,
     _resolve_train_components,
+    _save_normalized_e2e_runtime_snapshot,
     _sync_model_padding_config,
 )
 from compressed_e2e_fintuning.trainer import (
@@ -522,12 +525,41 @@ def _run_final_lm_eval(*, model, tokenizer, cfg, base_model_path: str, output_di
 
 def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
     log = get_logger("compressed_e2e_fintuning")
-    model, round_base_dir, round_base_meta, step_meta, base_model_path = _load_v6_student(
-        cfg, hf_args, log=log
-    )
+    round_base_dir, round_base_meta, step_meta = _resolve_round_base(cfg)
+    base_model_path = str(round_base_meta.get("base_model_path") or "").strip()
+    if not base_model_path:
+        raise ValueError("v6 round base is missing non-empty base_model_path.")
     run_output_dir = _resolve_run_output_dir(cfg, base_model_path=base_model_path)
     _install_run_file_logger(log, run_output_dir)
     log.info("Run output directory: %s", run_output_dir)
+    training_args.output_dir = os.path.join(run_output_dir, "trainer_state")
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    if _is_main_process():
+        snapshot_path = _save_normalized_e2e_runtime_snapshot(
+            cfg=cfg,
+            hf_args=hf_args,
+            training_args=training_args,
+            run_output_dir=run_output_dir,
+        )
+        log.info("Saved normalized parameter snapshot: %s", snapshot_path)
+        log.info(
+            "Runtime parameters:\n%s",
+            _format_e2e_runtime_parameters(
+                cfg=cfg,
+                hf_args=hf_args,
+                training_args=training_args,
+                run_output_dir=run_output_dir,
+            ),
+        )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        _barrier()
+
+    model, round_base_dir, round_base_meta, step_meta, base_model_path = _load_v6_student(
+        cfg,
+        hf_args,
+        log=log,
+        resolved_round_base=(round_base_dir, round_base_meta, step_meta),
+    )
 
     _validate_v6_step_training_args(training_args)
     train_decoder, train_lora, train_sparse = _resolve_train_components(cfg.train_mode)
@@ -682,8 +714,6 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
     )
     immutable_contract["lora"] = exact_lora_config
 
-    training_args.output_dir = os.path.join(run_output_dir, "trainer_state")
-    os.makedirs(training_args.output_dir, exist_ok=True)
     training_args.remove_unused_columns = False
     training_args.save_safetensors = False
 

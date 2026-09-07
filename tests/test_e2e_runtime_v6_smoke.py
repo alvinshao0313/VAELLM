@@ -136,6 +136,16 @@ def test_runtime_v6_tiny_decoder_smoke_runs_to_atomic_final_model(tmp_path: Path
     result = run(cfg, hf_args, training_args)
 
     assert int(result["global_step"]) == 1
+    run_dir = Path(str(result["run_output_dir"]))
+    snapshot_path = run_dir / "normalized_e2e_runtime_args.json"
+    assert snapshot_path.is_file()
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot["canonical_config"]["train_mode"] == "decoder"
+    assert snapshot["canonical_config"]["data"]["train_file"] == str(train_file)
+    assert snapshot["canonical_config"]["opt"]["steps"] == 1
+    assert snapshot["training_args"]["output_dir"] == str(run_dir / "trainer_state")
+    assert "Runtime parameters:" in (run_dir / "compressed_e2e_fintuning.log").read_text(encoding="utf-8")
+
     final_dir = Path(str(result["saved_model_dir"]))
     assert final_dir.is_dir()
     meta = load_v6_meta(str(final_dir))

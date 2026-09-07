@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=1,2,3,4
 export DISTILL_NCCL_TIMEOUT_SEC=10800
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 export PYTHONHASHSEED=31
@@ -12,9 +12,9 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-torchrun --standalone --nproc_per_node=8 tools/cat_train.py \
+torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
-  --output_dir "/root/data/ckpts/result/catlora" \
+  --output_dir "./result/catlora" \
   --compression_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --target_layers all \
   --skip_layers "" \
@@ -78,10 +78,10 @@ torchrun --standalone --nproc_per_node=8 tools/cat_train.py \
   --channel_min_per_layer 0 \
   --channel_quant int8 \
   --channel_axis input \
-  --channel_protect_count "default=32,cat:o_proj=64,cat:down_proj=256" \
+  --channel_protect_count "default=32,cat:v_proj=64,cat:o_proj=64,cat:gate_proj=64,cat:down_proj=256" \
   --after_category_mode remaining_lora_prefix_decoder \
   --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --dataset_task sft \
+  --dataset_task lm \
   --model_max_length 1024 \
   --dynamic_padding true \
   --group_by_length true \
@@ -89,13 +89,13 @@ torchrun --standalone --nproc_per_node=8 tools/cat_train.py \
   --lora_alpha "default=24" \
   --lora_dropout "default=0.03" \
   --steps "default=5000" \
-  --batch_size "default=4" \
+  --batch_size "default=16" \
   --learning_rate "default=1e-4" \
   --decoder_lr "default=1e-5" \
   --weight_decay "default=0.001" \
   --logging_steps "default=100" \
   --loss_type "default=kl_top" \
-  --top_k "default=100" \
+  --top_k "default=1000" \
   --temperature "default=1" \
   --alpha "default=0.5" \
   --prompt_loss_weight "default=0" \
@@ -106,8 +106,8 @@ torchrun --standalone --nproc_per_node=8 tools/cat_train.py \
   --teacher_model_offload none \
   --selective_student_topk true \
   --selective_student_topk_chunk_rows 32 \
-  --norm_train_mode final \
-  --lm_head_train_mode linear \
+  --norm_train_mode none \
+  --lm_head_train_mode none \
   --gradient_accumulation_steps 1 \
   --gradient_checkpointing true \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \

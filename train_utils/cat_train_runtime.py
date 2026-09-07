@@ -1,9 +1,8 @@
-import argparse
 import json
 import os
 import re
 import time
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -21,6 +20,11 @@ from train_utils.checkpoint_v6 import (
     validate_v6_meta,
 )
 from train_utils.distributed_guard import distributed_guarded_main
+from train_utils.runtime_snapshot import (
+    format_runtime_snapshot,
+    to_runtime_jsonable,
+    write_runtime_snapshot,
+)
 from train_utils.utils import get_logger
 
 
@@ -283,26 +287,36 @@ def normalize_cat_runtime_vae_original_state(model: nn.Module) -> int:
     return stripped
 
 
-def _to_jsonable(value):
-    if hasattr(value, "to_jsonable") and callable(getattr(value, "to_jsonable")):
-        return value.to_jsonable()
-    if hasattr(value, "value") and not isinstance(value, (str, bytes, bytearray)):
-        return _to_jsonable(value.value)
-    if is_dataclass(value):
-        return {k: _to_jsonable(v) for k, v in asdict(value).items()}
-    if isinstance(value, argparse.Namespace):
-        return {
-            k: _to_jsonable(v)
-            for k, v in vars(value).items()
-            if not str(k).startswith("_") and not callable(v)
+def build_cat_runtime_parameter_payload(
+    *,
+    cat_args,
+    vae_args,
+    training_args,
+    resolved_category_cfgs: Optional[Dict[str, ResolvedCategoryRuntimeConfig]] = None,
+) -> Dict[str, object]:
+    canonical_cfg = getattr(cat_args, "_common_cat_config", None)
+    payload: Dict[str, object] = {
+        "canonical_config": to_runtime_jsonable(canonical_cfg),
+        "cat_args": to_runtime_jsonable(cat_args),
+        "vae_args": to_runtime_jsonable(vae_args),
+        "training_args": to_runtime_jsonable(training_args),
+    }
+    if resolved_category_cfgs is not None:
+        payload["resolved_category_runtime"] = {
+            category: to_runtime_jsonable(cfg)
+            for category, cfg in resolved_category_cfgs.items()
         }
-    if isinstance(value, dict):
-        return {str(k): _to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (set, frozenset)):
-        return [_to_jsonable(v) for v in sorted(value, key=repr)]
-    if isinstance(value, (list, tuple)):
-        return [_to_jsonable(v) for v in value]
-    return value
+    return payload
+
+
+def format_cat_runtime_parameters(*, cat_args, vae_args, training_args) -> str:
+    return format_runtime_snapshot(
+        build_cat_runtime_parameter_payload(
+            cat_args=cat_args,
+            vae_args=vae_args,
+            training_args=training_args,
+        )
+    )
 
 
 def _resolve_rot_block_size(codebook_dim_value) -> int:
@@ -322,18 +336,13 @@ def save_normalized_cat_train_snapshot(
     resolved_category_cfgs: Dict[str, ResolvedCategoryRuntimeConfig],
 ) -> str:
     snapshot_path = os.path.join(run_output_dir, "normalized_cat_runtime_args.json")
-    payload = {
-        "cat_args": _to_jsonable(cat_args),
-        "vae_args": _to_jsonable(vae_args),
-        "training_args": _to_jsonable(training_args),
-        "resolved_category_runtime": {
-            category: _to_jsonable(cfg)
-            for category, cfg in resolved_category_cfgs.items()
-        },
-    }
-    with open(snapshot_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    return snapshot_path
+    payload = build_cat_runtime_parameter_payload(
+        cat_args=cat_args,
+        vae_args=vae_args,
+        training_args=training_args,
+        resolved_category_cfgs=resolved_category_cfgs,
+    )
+    return write_runtime_snapshot(snapshot_path, payload)
 
 
 def load_model_for_cat_train(*, cat_args, hf_args, vae_args) -> nn.Module:

@@ -55,6 +55,7 @@ from train_utils.shared_protected_residual import (
     get_shared_protected_residual_decoder_registry,
     register_shared_protected_residual_decoder,
 )
+from train_utils.runtime_snapshot import format_runtime_snapshot, to_runtime_jsonable, write_runtime_snapshot
 from train_utils.v6_model_loader import load_v6_model_checkpoint
 from train_utils.train_args import _parse_bool_like, create_optimizer
 from train_utils.utils import (
@@ -1599,6 +1600,12 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
     os.environ["LOG_FILE"] = os.path.join(args.output_dir, "residual_from_base.log")
     logger = get_logger("residual_from_base")
 
+    config_path = os.path.join(args.output_dir, "config.json")
+    config_payload = to_runtime_jsonable(vars(args))
+    write_runtime_snapshot(config_path, config_payload)
+    logger.info("Saved runtime parameter snapshot: %s", config_path)
+    logger.info("Runtime parameters:\n%s", format_runtime_snapshot(config_payload))
+
     target_categories = split_csv(args.target_categories)
     if not target_categories:
         raise ValueError("--target_categories cannot be empty.")
@@ -1862,7 +1869,6 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
     )
 
     train_time_sec = float(time.time() - run_start)
-    config_payload = _jsonable(vars(args))
     metrics_payload = {
         "outlier_protect_mode": str(args.outlier_protect_mode),
         "outlier_rank_metric": args.outlier_rank_metric,
@@ -1871,8 +1877,6 @@ def run_residual_from_base(args: argparse.Namespace) -> None:
         "categories": category_metrics,
         "eval_results": eval_results,
     }
-    with open(os.path.join(args.output_dir, "config.json"), "w", encoding="utf-8") as handle:
-        json.dump(config_payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
     with open(os.path.join(args.output_dir, "metrics.json"), "w", encoding="utf-8") as handle:
         json.dump(_jsonable(metrics_payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
     with open(os.path.join(args.output_dir, "payload_summary.json"), "w", encoding="utf-8") as handle:

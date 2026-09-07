@@ -23,6 +23,7 @@ from train_utils.distributed_guard import distributed_guarded_main
 from train_utils.cat_train_runtime import (
     build_cat_run_output_dir as _build_run_output_dir,
     build_distributed_cat_run_output_dir as _build_distributed_run_output_dir,
+    format_cat_runtime_parameters as _format_cat_runtime_parameters,
     load_cat_resume_distill_progress,
     load_model_for_cat_train as _load_model_for_cat_train,
     save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
@@ -113,7 +114,6 @@ from train_utils.utils import (
     collect_linears as _collect_linears,
     configure_deterministic_mode,
     extract_layer_idx as _extract_layer_idx,
-    format_namespace as _format_namespace,
     get_logger,
     set_seed,
     split_csv as _split_csv,
@@ -1824,10 +1824,12 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     if bool(getattr(cat_args, "deterministic", False)):
         log.info("Deterministic mode enabled: torch deterministic algorithms on, TF32 disabled.")
     log.info(
-        "Args:\nscript=%s\nvae=%s\ntraining=%s",
-        _format_namespace(cat_args),
-        _format_namespace(vae_args),
-        _format_namespace(training_args),
+        "Runtime parameters:\n%s",
+        _format_cat_runtime_parameters(
+            cat_args=cat_args,
+            vae_args=vae_args,
+            training_args=training_args,
+        ),
     )
 
     model = _load_model_for_cat_train(cat_args=cat_args, hf_args=hf_args, vae_args=vae_args)

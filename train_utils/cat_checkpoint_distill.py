@@ -17,6 +17,7 @@ from train_utils.cat_category_runtime import resolve_category_runtime_configs
 from train_utils.cat_train_eval import eval_after_category as _eval_after_category
 from train_utils.cat_train_runtime import (
     build_distributed_cat_run_output_dir as _build_distributed_run_output_dir,
+    format_cat_runtime_parameters as _format_cat_runtime_parameters,
     save_normalized_cat_train_snapshot as _save_normalized_cat_train_snapshot,
 )
 from train_utils.base_reference import clone_frozen_linear_from_reference
@@ -38,7 +39,6 @@ from train_utils.cat_checkpoint_distill_v6 import (
 )
 from train_utils.utils import (
     configure_deterministic_mode,
-    format_namespace as _format_namespace,
     get_logger,
     set_seed,
     split_csv as _split_csv,
@@ -510,10 +510,12 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     if bool(getattr(cat_args, "deterministic", False)):
         logger.info("Deterministic mode enabled: torch deterministic algorithms on, TF32 disabled.")
     logger.info(
-        "Args:\nscript=%s\nvae=%s\ntraining=%s",
-        _format_namespace(cat_args),
-        _format_namespace(vae_args),
-        _format_namespace(training_args),
+        "Runtime parameters:\n%s",
+        _format_cat_runtime_parameters(
+            cat_args=cat_args,
+            vae_args=vae_args,
+            training_args=training_args,
+        ),
     )
 
     model, source = load_checkpoint_distill_v6_source(

@@ -41,6 +41,7 @@ from train_utils.checkpoint_v6 import (
 from train_utils.distill_teacher import resolve_distill_teacher_dtype, resolve_distill_teacher_required
 from train_utils.distributed_guard import distributed_guarded_main
 from train_utils.hif4_act import remove_hif4_act_hooks
+from train_utils.runtime_snapshot import format_runtime_snapshot, to_runtime_jsonable, write_runtime_snapshot
 
 
 _TRAIN_MODE_COMPONENTS = {
@@ -174,8 +175,11 @@ def _resolve_train_components(train_mode: str) -> Tuple[bool, bool, bool]:
         raise ValueError(f"Unsupported canonical train_mode={train_mode!r}.") from exc
 
 
-def _load_v6_student(cfg, hf_args, *, log):
-    round_base_dir, round_base_meta, step_meta = _resolve_round_base(cfg)
+def _load_v6_student(cfg, hf_args, *, log, resolved_round_base=None):
+    if resolved_round_base is None:
+        round_base_dir, round_base_meta, step_meta = _resolve_round_base(cfg)
+    else:
+        round_base_dir, round_base_meta, step_meta = resolved_round_base
     base_model_path = str(round_base_meta.get("base_model_path") or "").strip()
     if not base_model_path:
         raise ValueError("v6 round base is missing non-empty base_model_path.")
@@ -198,6 +202,42 @@ def _load_v6_student(cfg, hf_args, *, log):
         base_model_path,
     )
     return model, round_base_dir, round_base_meta, step_meta, base_model_path
+
+
+def _build_e2e_runtime_parameter_payload(*, cfg, hf_args, training_args, run_output_dir: str) -> dict:
+    return {
+        "canonical_config": to_runtime_jsonable(cfg),
+        "hf_args": to_runtime_jsonable(hf_args),
+        "training_args": to_runtime_jsonable(training_args),
+        "resolved_runtime": {
+            "run_output_dir": os.path.abspath(str(run_output_dir)),
+            "trainer_output_dir": os.path.abspath(os.path.join(str(run_output_dir), "trainer_state")),
+        },
+    }
+
+
+def _save_normalized_e2e_runtime_snapshot(*, cfg, hf_args, training_args, run_output_dir: str) -> str:
+    payload = _build_e2e_runtime_parameter_payload(
+        cfg=cfg,
+        hf_args=hf_args,
+        training_args=training_args,
+        run_output_dir=run_output_dir,
+    )
+    return write_runtime_snapshot(
+        os.path.join(run_output_dir, "normalized_e2e_runtime_args.json"),
+        payload,
+    )
+
+
+def _format_e2e_runtime_parameters(*, cfg, hf_args, training_args, run_output_dir: str) -> str:
+    return format_runtime_snapshot(
+        _build_e2e_runtime_parameter_payload(
+            cfg=cfg,
+            hf_args=hf_args,
+            training_args=training_args,
+            run_output_dir=run_output_dir,
+        )
+    )
 
 
 def _unwrap_peft_root(model: nn.Module) -> nn.Module:
