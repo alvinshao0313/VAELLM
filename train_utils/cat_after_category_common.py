@@ -6,6 +6,7 @@ trainer/runtime used by every supported mode.
 
 from __future__ import annotations
 
+import gc
 import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
@@ -20,7 +21,7 @@ from e2e_common.full_lora import (
     iter_named_peft_lora_layers,
 )
 from e2e_common.lazy_datasets import default_dataloader_num_workers
-from litebsq.vae_linear import VAELinear
+from litebsq.vae_linear import VAELinear, clear_model_vae_linear_cache
 from litebsq.vae_linear_prewarm import NamedVAELinearTarget
 from train_utils.config.configs import (
     AfterCategoryResolvedConfig,
@@ -676,6 +677,36 @@ def _prepare_after_category_dataset(
     return tokenizer, bundle
 
 
+def _release_cat_trainer_training_state(trainer, *, logger) -> None:
+    """Drop training-only Trainer/Accelerate references before CAT model finalization."""
+    released = []
+    for attr in ("optimizer", "lr_scheduler", "scaler"):
+        if getattr(trainer, attr, None) is not None:
+            setattr(trainer, attr, None)
+            released.append(attr)
+
+    accelerator = getattr(trainer, "accelerator", None)
+    if accelerator is not None:
+        for attr in ("_optimizers", "_schedulers", "_dataloaders"):
+            values = getattr(accelerator, attr, None)
+            if isinstance(values, list) and values:
+                values.clear()
+                released.append(f"accelerator.{attr}")
+
+    callback_handler = getattr(trainer, "callback_handler", None)
+    callbacks = getattr(callback_handler, "callbacks", ()) if callback_handler is not None else ()
+    for callback in tuple(callbacks or ()):
+        if getattr(callback, "_trainer", None) is trainer:
+            callback._trainer = None
+            released.append(f"callback:{type(callback).__name__}._trainer")
+
+    if released:
+        logger.info("Released CAT Trainer training state before finalization: %s", ", ".join(released))
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _train_model_level_selection(
     *,
     selection,
@@ -840,14 +871,17 @@ def _train_model_level_selection(
         controller.enabled = True
     if selection.decoder_parameters:
         VAELinear.reset_fuse_stats()
+    trained_model = trainer.model
     try:
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        trained_model = trainer.model
     finally:
         if controller is not None:
             controller.enabled = False
         remove_hif4_act_hooks(hif4_handles)
+        _release_cat_trainer_training_state(trainer, logger=logger)
     distill_distributed_barrier()
-    return trainer.model
+    return trained_model
 
 
 def _prewarm_non_current_vae_linears(
@@ -1051,6 +1085,12 @@ def _run_canonical_current_family(
     )
     for param in model.parameters():
         param.requires_grad_(False)
+    cleared_cache_count = int(clear_model_vae_linear_cache(model))
+    logger.info(
+        "CAT %s: cleared decoded VAELinear cache for %d modules after recovery finalization.",
+        str(expected_mode),
+        cleared_cache_count,
+    )
     if previous_use_cache is not None and hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = bool(previous_use_cache)
 
@@ -1374,6 +1414,12 @@ def _run_canonical_remaining_family(
     )
     for param in model.parameters():
         param.requires_grad_(False)
+    cleared_cache_count = int(clear_model_vae_linear_cache(model))
+    logger.info(
+        "CAT %s: cleared decoded VAELinear cache for %d modules after recovery finalization.",
+        str(expected_mode),
+        cleared_cache_count,
+    )
     if previous_use_cache is not None and hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = bool(previous_use_cache)
 

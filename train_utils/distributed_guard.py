@@ -14,6 +14,10 @@ class DistributedMainError(RuntimeError):
     pass
 
 
+class DistributedRankError(RuntimeError):
+    pass
+
+
 def distributed_guarded_main(
     operation: Callable[[], T],
     *,
@@ -51,4 +55,49 @@ def distributed_guarded_main(
     return resolved.get("result")
 
 
-__all__ = ["DistributedMainError", "distributed_guarded_main"]
+def distributed_guarded_all(
+    operation: Callable[[], T],
+    *,
+    barrier: bool = False,
+) -> T:
+    """Run a local operation on every rank and propagate any rank-local failure to all ranks."""
+    distributed = bool(torch.distributed.is_available() and torch.distributed.is_initialized())
+    if not distributed:
+        return operation()
+
+    rank = int(torch.distributed.get_rank())
+    result = None
+    status = {"rank": rank, "ok": True, "error_type": None, "error_message": None}
+    try:
+        result = operation()
+    except Exception as exc:
+        status = {
+            "rank": rank,
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+
+    statuses = [None for _ in range(int(torch.distributed.get_world_size()))]
+    torch.distributed.all_gather_object(statuses, status)
+    failures = [item for item in statuses if isinstance(item, dict) and item.get("ok") is False]
+    invalid = [item for item in statuses if not isinstance(item, dict) or not isinstance(item.get("ok"), bool)]
+    if invalid:
+        raise DistributedRankError("rank-local operation gathered an invalid status payload")
+    if failures:
+        details = "; ".join(
+            f"rank {item.get('rank')}: {item.get('error_type', 'Exception')}: {item.get('error_message', '')}"
+            for item in failures
+        )
+        raise DistributedRankError(f"rank-local operation failed: {details}")
+    if barrier:
+        torch.distributed.barrier()
+    return result
+
+
+__all__ = [
+    "DistributedMainError",
+    "DistributedRankError",
+    "distributed_guarded_all",
+    "distributed_guarded_main",
+]

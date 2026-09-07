@@ -101,6 +101,76 @@ def test_distill_teacher_runtime_cpu_offload_moves_same_object(monkeypatch):
     assert teacher.to_calls == ["cpu", "cpu", "cpu"]
 
 
+def test_distill_teacher_eval_offload_temporarily_frees_gpu_residency():
+    class _FakeResidentTeacher:
+        def __init__(self):
+            self.device = torch.device("cuda:2")
+            self.to_calls = []
+
+        def parameters(self):
+            return iter((SimpleNamespace(device=self.device),))
+
+        def buffers(self):
+            return iter(())
+
+        def to(self, device):
+            self.to_calls.append(str(device))
+            self.device = torch.device(device)
+            return self
+
+    runtime = DistillTeacherRuntime(
+        model_path="base",
+        access_token=None,
+        forward_device="cuda:2",
+        dtype=torch.bfloat16,
+        model_offload="none",
+        logger=None,
+    )
+    teacher = _FakeResidentTeacher()
+    runtime._model = teacher
+
+    with runtime.eval_offload(restore=True):
+        assert teacher.device == torch.device("cpu")
+
+    assert teacher.device == torch.device("cuda:2")
+    assert teacher.to_calls == ["cpu", "cuda:2"]
+
+
+def test_distill_teacher_final_eval_offload_can_skip_restore():
+    class _FakeResidentTeacher:
+        def __init__(self):
+            self.device = torch.device("cuda:1")
+            self.to_calls = []
+
+        def parameters(self):
+            return iter((SimpleNamespace(device=self.device),))
+
+        def buffers(self):
+            return iter(())
+
+        def to(self, device):
+            self.to_calls.append(str(device))
+            self.device = torch.device(device)
+            return self
+
+    runtime = DistillTeacherRuntime(
+        model_path="base",
+        access_token=None,
+        forward_device="cuda:1",
+        dtype=torch.bfloat16,
+        model_offload="none",
+        logger=None,
+    )
+    teacher = _FakeResidentTeacher()
+    runtime._model = teacher
+
+    with runtime.eval_offload(restore=False):
+        assert teacher.device == torch.device("cpu")
+
+    assert teacher.device == torch.device("cpu")
+    assert teacher.to_calls == ["cpu"]
+
+
 def test_resolve_distill_teacher_dtype_prefers_training_precision_flags():
     student = nn.Linear(2, 2).to(dtype=torch.float64)
 

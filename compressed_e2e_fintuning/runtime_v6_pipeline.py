@@ -60,6 +60,7 @@ from train_utils.decoder_execution import (
     prime_named_vae_linear_cache_with_group_fallback,
 )
 from train_utils.distill_data import build_distill_data_collator, build_distill_dataset
+from train_utils.distributed_guard import distributed_guarded_all, distributed_guarded_main
 from train_utils.hif4_act import build_hif4_act_controller, register_hif4_act_hooks
 from train_utils.model_level_optimizer import ModelLevelOptimizerLRConfig, attach_model_level_optimizer_contract
 from train_utils.model_level_trainables import (
@@ -212,6 +213,26 @@ def _release_trainer_training_state(trainer, *, log) -> None:
         if getattr(trainer, attr, None) is not None:
             setattr(trainer, attr, None)
             released.append(attr)
+
+    if getattr(trainer, "_sparse_bit_main_optimizer", None) is not None:
+        trainer._sparse_bit_main_optimizer = None
+        released.append("_sparse_bit_main_optimizer")
+
+    accelerator = getattr(trainer, "accelerator", None)
+    if accelerator is not None:
+        for attr in ("_optimizers", "_schedulers", "_dataloaders"):
+            values = getattr(accelerator, attr, None)
+            if isinstance(values, list) and values:
+                values.clear()
+                released.append(f"accelerator.{attr}")
+
+    callback_handler = getattr(trainer, "callback_handler", None)
+    callbacks = getattr(callback_handler, "callbacks", ()) if callback_handler is not None else ()
+    for callback in tuple(callbacks or ()):
+        if getattr(callback, "_trainer", None) is trainer:
+            callback._trainer = None
+            released.append(f"callback:{type(callback).__name__}._trainer")
+
     if released:
         log.info("Released Trainer training state before finalization: %s", ", ".join(released))
     gc.collect()
@@ -700,6 +721,9 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
         streaming_offload_manager=streaming_manager,
         teacher_output_offload=str(cfg.runtime.teacher_output_offload),
         teacher_model_offload=str(cfg.runtime.teacher_model_offload),
+        teacher_layer_device_map=(
+            layer_device_map if str(cfg.runtime.parallel_mode) == "layer_mp" else None
+        ),
         teacher_output_pin_memory=bool(cfg.runtime.teacher_output_pin_memory),
         teacher_output_chunk_tokens=int(cfg.runtime.teacher_output_chunk_tokens),
         sparse_bit_manager=sparse_bit_manager,
@@ -789,175 +813,205 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
         teacher_model.to("cpu")
     _release_trainer_training_state(trainer, log=log)
 
-    lora_before_sparse = (
-        _snapshot_peft_lora_parameters(final_model)
-        if sparse_bit_manager is not None
-        else {}
-    )
     packed_after_commit = None
     if sparse_bit_manager is not None:
-        sparse_bit_manager.final_commit()
-        if lora_before_sparse:
-            _assert_tensor_snapshot_equal(
-                lora_before_sparse,
-                _snapshot_peft_lora_parameters(final_model),
-                label="LoRA parameters across Sparse Bit final_commit",
-            )
-        packed_after_commit = _snapshot_packed_payloads(selected)
-        sparse_bit_manager.detach_runtime()
+        active_sparse_manager = sparse_bit_manager
 
-    finalization_probe_inputs = None
-    finalization_probe_before = None
-    finalization_probe_dtype = None
-    if _is_main_process():
-        finalization_probe_inputs = _build_finalization_probe_inputs(tokenizer)
-        finalization_probe_before, finalization_probe_dtype = _run_finalization_probe(
-            final_model,
-            finalization_probe_inputs,
-        )
+        def _commit_sparse_runtime():
+            lora_before_sparse = _snapshot_peft_lora_parameters(final_model)
+            active_sparse_manager.final_commit()
+            if lora_before_sparse:
+                _assert_tensor_snapshot_equal(
+                    lora_before_sparse,
+                    _snapshot_peft_lora_parameters(final_model),
+                    label="LoRA parameters across Sparse Bit final_commit",
+                )
+            packed_snapshot = _snapshot_packed_payloads(selected)
+            active_sparse_manager.detach_runtime()
+            return packed_snapshot
+
+        packed_after_commit = distributed_guarded_all(_commit_sparse_runtime)
+        trainer.sparse_bit_manager = None
+        trainer._sparse_bit_main_parameters = ()
+        sparse_bit_manager = None
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    probe_state = {}
+
+    def _capture_initial_finalization_probe():
+        probe_inputs = _build_finalization_probe_inputs(tokenizer)
+        probe_before, probe_dtype = _run_finalization_probe(final_model, probe_inputs)
+        probe_state["inputs"] = probe_inputs
+        probe_state["before"] = probe_before
+        probe_state["dtype"] = probe_dtype
+        return {"dtype": str(probe_dtype)}
+
+    distributed_guarded_main(_capture_initial_finalization_probe, barrier=False)
 
     if train_decoder or train_sparse:
-        _finalize_decoders(selected)
+        distributed_guarded_all(lambda: _finalize_decoders(selected))
 
     compressed_proxy_names = [str(name) for name, _module in selected] if train_lora else []
     if list(iter_named_peft_lora_layers(final_model)):
-        final_model = finalize_model_level_lora(
-            final_model,
-            compressed_proxy_names=compressed_proxy_names or None,
+        final_model = distributed_guarded_all(
+            lambda: finalize_model_level_lora(
+                final_model,
+                compressed_proxy_names=compressed_proxy_names or None,
+            )
         )
 
     if packed_after_commit is not None and lora_active:
-        _assert_packed_payloads_equal(
-            packed_after_commit,
-            _snapshot_packed_payloads(selected),
-            label="Sparse Bit hard payload across LoRA finalization",
+        distributed_guarded_all(
+            lambda: _assert_packed_payloads_equal(
+                packed_after_commit,
+                _snapshot_packed_payloads(selected),
+                label="Sparse Bit hard payload across LoRA finalization",
+            )
         )
 
-    core_structural_parity = None
-    core_structural_probe = None
-    if _is_main_process():
-        core_structural_probe, core_structural_dtype = _run_finalization_probe(
+    core_probe_state = {}
+
+    def _capture_core_structural_probe():
+        core_probe, core_dtype = _run_finalization_probe(
             final_model,
-            finalization_probe_inputs,
+            probe_state["inputs"],
         )
-        if core_structural_dtype != finalization_probe_dtype:
+        if core_dtype != probe_state["dtype"]:
             raise RuntimeError(
                 "Core structural finalization output dtype changed: "
-                f"before={finalization_probe_dtype} after={core_structural_dtype}."
+                f"before={probe_state['dtype']} after={core_dtype}."
             )
-        core_structural_parity = _assert_finalization_probe_close(
-            finalization_probe_before,
-            core_structural_probe,
-            output_dtype=finalization_probe_dtype,
+        core_probe_state["probe"] = core_probe
+        return _assert_finalization_probe_close(
+            probe_state["before"],
+            core_probe,
+            output_dtype=probe_state["dtype"],
             label="Core structural finalization parity",
         )
 
-    lm_head_fused = finalize_lm_head_linear_if_needed(
-        final_model,
-        lm_head_train_mode=str(cfg.aux.lm_head_train_mode),
+    core_structural_parity = distributed_guarded_main(
+        _capture_core_structural_probe,
+        barrier=False,
     )
 
-    structural_probe_after = None
-    structural_parity = None
-    if _is_main_process():
-        structural_probe_after, structural_probe_dtype = _run_finalization_probe(
+    lm_head_fused = distributed_guarded_all(
+        lambda: finalize_lm_head_linear_if_needed(
             final_model,
-            finalization_probe_inputs,
+            lm_head_train_mode=str(cfg.aux.lm_head_train_mode),
         )
-        if structural_probe_dtype != finalization_probe_dtype:
+    )
+
+    structural_probe_state = {}
+
+    def _capture_structural_probe():
+        structural_probe, structural_dtype = _run_finalization_probe(
+            final_model,
+            probe_state["inputs"],
+        )
+        if structural_dtype != probe_state["dtype"]:
             raise RuntimeError(
                 "Structural finalization output dtype changed: "
-                f"before={finalization_probe_dtype} after={structural_probe_dtype}."
+                f"before={probe_state['dtype']} after={structural_dtype}."
             )
-        structural_parity = _assert_finalization_probe_close(
-            finalization_probe_before,
-            structural_probe_after,
-            output_dtype=finalization_probe_dtype,
+        structural_probe_state["probe"] = structural_probe
+        structural = _assert_finalization_probe_close(
+            probe_state["before"],
+            structural_probe,
+            output_dtype=probe_state["dtype"],
             label="Structural finalization parity",
-            # Reassociating two large linear operators into one is mathematically
-            # exact but changes floating-point accumulation. Core decoder/LoRA parity was
-            # already checked above with the strict default tolerance.
             ulp_multiplier=32.0 if lm_head_fused else 2.0,
             rtol_override=1e-3 if lm_head_fused else None,
             atol_override=0.25 if lm_head_fused else None,
             relative_l2_limit=5e-3 if lm_head_fused else None,
         )
+        fusion = None
         if lm_head_fused:
-            checkpoint_context["runtime_audit"]["lm_head_fusion_forward_parity"] = (
-                _assert_finalization_probe_close(
-                    core_structural_probe,
-                    structural_probe_after,
-                    output_dtype=finalization_probe_dtype,
-                    label="LM-head fusion forward parity",
-                    ulp_multiplier=32.0,
-                    rtol_override=1e-3,
-                    atol_override=0.25,
-                    relative_l2_limit=5e-3,
-                )
+            fusion = _assert_finalization_probe_close(
+                core_probe_state["probe"],
+                structural_probe,
+                output_dtype=probe_state["dtype"],
+                label="LM-head fusion forward parity",
+                ulp_multiplier=32.0,
+                rtol_override=1e-3,
+                atol_override=0.25,
+                relative_l2_limit=5e-3,
             )
+        return {"structural": structural, "fusion": fusion}
 
-    _cleanup_runtime(
-        final_model,
-        hook_handles=hook_handles,
-        streaming_manager=streaming_manager,
-        hif4_handles=hif4_handles,
+    structural_payload = distributed_guarded_main(
+        _capture_structural_probe,
+        barrier=False,
     )
-    _assert_final_runtime_clean(final_model)
+    if not isinstance(structural_payload, dict):
+        raise RuntimeError("Structural finalization parity result was not resolved on all ranks.")
+    structural_parity = structural_payload["structural"]
+    if structural_payload.get("fusion") is not None:
+        checkpoint_context["runtime_audit"]["lm_head_fusion_forward_parity"] = structural_payload["fusion"]
 
-    finalization_parity = None
-    runtime_cleanup_parity = None
-    if _is_main_process():
+    def _cleanup_final_runtime():
+        _cleanup_runtime(
+            final_model,
+            hook_handles=hook_handles,
+            streaming_manager=streaming_manager,
+            hif4_handles=hif4_handles,
+        )
+        _assert_final_runtime_clean(final_model)
+
+    distributed_guarded_all(_cleanup_final_runtime)
+
+    def _capture_final_probe():
         probe_handles, probe_streaming_manager = _install_post_finalize_probe_runtime(
             final_model,
             cfg=cfg,
             layer_device_map=layer_device_map,
         )
         try:
-            finalization_probe_after, finalization_probe_after_dtype = _run_finalization_probe(
+            final_probe, final_dtype = _run_finalization_probe(
                 final_model,
-                finalization_probe_inputs,
+                probe_state["inputs"],
             )
-            if finalization_probe_after_dtype != finalization_probe_dtype:
+            if final_dtype != probe_state["dtype"]:
                 raise RuntimeError(
                     "Finalization parity output dtype changed: "
-                    f"before={finalization_probe_dtype} after={finalization_probe_after_dtype}."
+                    f"before={probe_state['dtype']} after={final_dtype}."
                 )
-            runtime_cleanup_parity = _assert_finalization_probe_close(
-                structural_probe_after,
-                finalization_probe_after,
-                output_dtype=finalization_probe_dtype,
+            runtime_cleanup = _assert_finalization_probe_close(
+                structural_probe_state["probe"],
+                final_probe,
+                output_dtype=probe_state["dtype"],
                 label="Runtime cleanup/reinstall parity",
             )
-            finalization_parity = _assert_finalization_probe_close(
-                finalization_probe_before,
-                finalization_probe_after,
-                output_dtype=finalization_probe_dtype,
+            end_to_end = _assert_finalization_probe_close(
+                probe_state["before"],
+                final_probe,
+                output_dtype=probe_state["dtype"],
                 label="End-to-end finalization parity",
                 ulp_multiplier=32.0 if lm_head_fused else 2.0,
                 rtol_override=1e-3 if lm_head_fused else None,
                 atol_override=0.25 if lm_head_fused else None,
                 relative_l2_limit=5e-3 if lm_head_fused else None,
             )
+            return {"runtime_cleanup": runtime_cleanup, "end_to_end": end_to_end}
         finally:
             _remove_post_finalize_probe_runtime(
                 final_model,
                 probe_handles,
                 probe_streaming_manager,
             )
+
+    final_probe_payload = distributed_guarded_main(_capture_final_probe, barrier=False)
+    if not isinstance(final_probe_payload, dict):
+        raise RuntimeError("Finalization forward parity result was not resolved on all ranks.")
+    parity_payload = {
+        "structural": structural_parity,
+        "runtime_cleanup": final_probe_payload["runtime_cleanup"],
+        "end_to_end": final_probe_payload["end_to_end"],
+    }
     dist_ready = bool(torch.distributed.is_available() and torch.distributed.is_initialized())
-    parity_payload = (
-        {
-            "structural": structural_parity,
-            "runtime_cleanup": runtime_cleanup_parity,
-            "end_to_end": finalization_parity,
-        }
-        if _is_main_process()
-        else None
-    )
-    if dist_ready:
-        payload = [parity_payload]
-        torch.distributed.broadcast_object_list(payload, src=0)
-        parity_payload = payload[0]
     if not isinstance(parity_payload, dict):
         raise RuntimeError("Finalization forward parity result was not resolved on all ranks.")
     for key in ("structural", "runtime_cleanup", "end_to_end"):

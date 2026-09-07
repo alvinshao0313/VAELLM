@@ -11,7 +11,9 @@ from e2e_common.full_lora import finalize_model_level_lora, iter_named_peft_lora
 from litebsq.autoencoder import Decoder
 from litebsq.vae_linear import VAELinear
 import train_utils.cat_after_category_distill as cat_after_distill
+import train_utils.cat_after_category_common as cat_common
 from train_utils.cat_after_category_common import (
+    _release_cat_trainer_training_state,
     get_or_build_cat_projection_name_inventory,
     resolve_canonical_after_category_mode,
     resolve_exact_current_compressed_targets,
@@ -75,6 +77,104 @@ def _clone_tensors(params):
 
 def _any_changed(before, params) -> bool:
     return any(not torch.equal(old, param.detach()) for old, param in zip(before, params))
+
+
+def test_release_cat_trainer_training_state_breaks_callback_cycle_and_optimizer_refs():
+    callback = SimpleNamespace(_trainer=None)
+    optimizer = object()
+    scheduler = object()
+    scaler = object()
+    accelerator = SimpleNamespace(
+        _optimizers=[optimizer],
+        _schedulers=[scheduler],
+        _dataloaders=[object()],
+    )
+    trainer = SimpleNamespace(
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        scaler=scaler,
+        accelerator=accelerator,
+        callback_handler=SimpleNamespace(callbacks=[callback]),
+    )
+    callback._trainer = trainer
+    logger = mock.Mock()
+
+    _release_cat_trainer_training_state(trainer, logger=logger)
+
+    assert trainer.optimizer is None
+    assert trainer.lr_scheduler is None
+    assert trainer.scaler is None
+    assert accelerator._optimizers == []
+    assert accelerator._schedulers == []
+    assert accelerator._dataloaders == []
+    assert callback._trainer is None
+    logger.info.assert_called_once()
+
+
+def test_current_recovery_clears_decoded_cache_without_eval_or_save():
+    model = _TinyCatModel()
+    cfg = SimpleNamespace(
+        aux=SimpleNamespace(norm_train_mode="none", lm_head_train_mode="none", norm_lr=None, lm_head_lr=None),
+        opt=SimpleNamespace(
+            steps=1,
+            learning_rate=1e-4,
+            weight_decay=0.0,
+            resolved_decoder_lr=lambda: 2e-4,
+        ),
+        lora=SimpleNamespace(rank=2, alpha=4.0, dropout=0.0, rank_explicit=True),
+        runtime=SimpleNamespace(
+            teacher_output_offload="cpu",
+            teacher_output_pin_memory=False,
+            teacher_output_chunk_tokens=8,
+        ),
+        data=SimpleNamespace(),
+    )
+    stage = SimpleNamespace(
+        mode="current_decoder",
+        config=cfg,
+        train_device="cpu",
+        bf16=False,
+    )
+    logger = mock.Mock()
+    decoder_param = next(model.q_proj.parameters())
+
+    def _fake_prewarm(*_args, **_kwargs):
+        model.q_proj._cached_weight = torch.ones((4, 4), dtype=torch.float32)
+        model.k_proj._cached_weight = torch.ones((4, 4), dtype=torch.float32)
+
+    selection = SimpleNamespace(
+        peft_model=model,
+        lora_parameters=(),
+        decoder_parameters=(decoder_param,),
+    )
+    with mock.patch.object(cat_common, "_prepare_after_category_dataset", return_value=(object(), object())), mock.patch.object(
+        cat_common, "_prewarm_non_current_vae_linears", side_effect=_fake_prewarm
+    ), mock.patch.object(
+        cat_common, "build_model_level_trainable_selection", return_value=selection
+    ), mock.patch.object(
+        cat_common, "_train_model_level_selection", return_value=model
+    ), mock.patch.object(
+        cat_common, "finalize_main_decoder_targets", return_value=1
+    ), mock.patch.object(
+        cat_common, "iter_named_peft_lora_layers", return_value=[]
+    ), mock.patch.object(
+        cat_common, "finalize_lm_head_linear_if_needed", return_value=None
+    ):
+        result = cat_common.run_canonical_current_decoder(
+            model=model,
+            category="q_proj",
+            current_target_names=("q_proj",),
+            newly_compressed_target_count=1,
+            stage=stage,
+            vae_args=SimpleNamespace(),
+            logger=logger,
+            teacher_runtime=None,
+            v6_step_checkpoint=None,
+        )
+
+    assert result.model is model
+    assert model.q_proj._cached_weight is None
+    assert model.k_proj._cached_weight is None
 
 
 def test_after_category_mode_resolution_uses_canonical_value_directly():

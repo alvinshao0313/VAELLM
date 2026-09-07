@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from typing import Optional, Union
 
 import torch
@@ -105,3 +106,41 @@ class DistillTeacherRuntime:
     def finish_forward(self) -> None:
         if self.model_offload == "cpu" and self._model is not None:
             self._model.to("cpu")
+
+    def _loaded_device(self) -> Optional[torch.device]:
+        if self._model is None:
+            return None
+        for tensor in self._model.parameters():
+            return tensor.device
+        for tensor in self._model.buffers():
+            return tensor.device
+        return torch.device("cpu")
+
+    def offload_for_eval(self) -> Optional[torch.device]:
+        """Temporarily free teacher GPU residency before student-only evaluation."""
+        previous = self._loaded_device()
+        if previous is None or previous.type == "cpu":
+            return previous
+        self._model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return previous
+
+    def restore_after_eval(self, previous_device: Optional[torch.device]) -> None:
+        if (
+            self._model is None
+            or previous_device is None
+            or previous_device.type == "cpu"
+            or self.model_offload != "none"
+        ):
+            return
+        self._model.to(previous_device)
+
+    @contextmanager
+    def eval_offload(self, *, restore: bool = True):
+        previous = self.offload_for_eval()
+        try:
+            yield
+        finally:
+            if bool(restore):
+                self.restore_after_eval(previous)

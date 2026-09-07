@@ -12,6 +12,7 @@ from compressed_e2e_fintuning.runtime_v6_pipeline import (
     _build_finalization_probe_inputs,
     _load_completed_resume_state,
     _run_finalization_probe,
+    _release_trainer_training_state,
     _unwrap_model_for_finalization,
 )
 
@@ -110,6 +111,43 @@ def test_finalization_unwrap_removes_accelerate_fp32_forward_wrapper():
 
     assert _unwrap_model_for_finalization(trainer) is model
     assert accelerator.calls == [(model, False)]
+
+
+def test_release_trainer_training_state_clears_accelerate_and_sparse_optimizer_refs():
+    optimizer = object()
+    scheduler = object()
+    scaler = object()
+    sparse_main_optimizer = object()
+    callback = SimpleNamespace(_trainer=None)
+    accelerator = SimpleNamespace(
+        _optimizers=[optimizer],
+        _schedulers=[scheduler],
+        _dataloaders=[object()],
+    )
+    trainer = SimpleNamespace(
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        scaler=scaler,
+        _sparse_bit_main_optimizer=sparse_main_optimizer,
+        accelerator=accelerator,
+        callback_handler=SimpleNamespace(callbacks=[callback]),
+    )
+    callback._trainer = trainer
+
+    class _Log:
+        def info(self, *_args, **_kwargs):
+            return None
+
+    _release_trainer_training_state(trainer, log=_Log())
+
+    assert trainer.optimizer is None
+    assert trainer.lr_scheduler is None
+    assert trainer.scaler is None
+    assert trainer._sparse_bit_main_optimizer is None
+    assert accelerator._optimizers == []
+    assert accelerator._schedulers == []
+    assert accelerator._dataloaders == []
+    assert callback._trainer is None
 
 
 def test_completed_resume_state_prevents_extra_iterable_dataset_step(tmp_path):

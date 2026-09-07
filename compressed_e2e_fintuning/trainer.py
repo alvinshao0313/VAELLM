@@ -42,6 +42,7 @@ from train_utils.distill_losses import (
     build_distill_token_regions,
 )
 from train_utils.distill_token_stats import DistillTokenStatsAccumulator
+from train_utils.distributed_guard import distributed_guarded_main
 from train_utils.lora_training import (
     _capture_pre_mlp_hiddens_from_modules,
     _compute_named_pre_mlp_hidden_alignment_loss,
@@ -245,6 +246,7 @@ class VAEDecoderE2ETrainer(Trainer):
         streaming_offload_manager=None,
         teacher_output_offload: str = "none",
         teacher_model_offload: str = "none",
+        teacher_layer_device_map=None,
         teacher_output_pin_memory: bool = True,
         teacher_output_chunk_tokens: int = 8,
         selective_student_topk: bool = False,
@@ -303,6 +305,11 @@ class VAEDecoderE2ETrainer(Trainer):
             raise ValueError(
                 "teacher_model_offload=cpu requires teacher_output_offload=cpu."
             )
+        self.teacher_layer_device_map = {
+            int(layer_idx): torch.device(device)
+            for layer_idx, device in dict(teacher_layer_device_map or {}).items()
+        }
+        self._teacher_layer_hook_handles = []
         self.teacher_output_pin_memory = bool(teacher_output_pin_memory)
         self.teacher_output_chunk_tokens = int(teacher_output_chunk_tokens)
         if self.teacher_output_chunk_tokens < 1:
@@ -334,6 +341,18 @@ class VAEDecoderE2ETrainer(Trainer):
         # Logging-window token telemetry; consumed by E2EDistillTokenStatsCallback.
         self.distill_token_stats = DistillTokenStatsAccumulator()
         super().__init__(*args, **kwargs)
+        if self.teacher_model is not None:
+            if self.teacher_layer_device_map:
+                if self.teacher_model_offload == "none":
+                    self._place_teacher_layer_sharded()
+                else:
+                    self.teacher_model.to("cpu")
+                    self._teacher_device = torch.device("cpu")
+            else:
+                try:
+                    self._teacher_device = next(self.teacher_model.parameters()).device
+                except StopIteration:
+                    self._teacher_device = torch.device("cpu")
         if self.sparse_bit_manager is not None:
             if int(getattr(self.args, 'n_gpu', 0)) > 1 and int(getattr(self.accelerator, 'num_processes', 1)) == 1 and not bool(getattr(self, 'is_model_parallel', False)):
                 raise RuntimeError(
@@ -528,10 +547,13 @@ class VAEDecoderE2ETrainer(Trainer):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             distributed_barrier = torch.distributed.barrier
 
-        if is_main and self.sparse_bit_manager is not None:
+        if self.sparse_bit_manager is not None:
             from sparse_bit_tuning.exact_checkpoint import save_exact_sidecar
 
-            save_exact_sidecar(output_dir, self.sparse_bit_manager)
+            distributed_guarded_main(
+                lambda: save_exact_sidecar(output_dir, self.sparse_bit_manager),
+                barrier=False,
+            )
 
         unwrapped = (
             self.accelerator.unwrap_model(self.model)
@@ -771,8 +793,35 @@ class VAEDecoderE2ETrainer(Trainer):
             ]
         return super()._issue_warnings_after_load(load_result)
 
+    def _remove_teacher_layer_hooks(self) -> None:
+        for handle in tuple(self._teacher_layer_hook_handles):
+            handle.remove()
+        self._teacher_layer_hook_handles = []
+
+    def _place_teacher_layer_sharded(self) -> None:
+        if self.teacher_model is None or not self.teacher_layer_device_map:
+            return
+        from compressed_e2e_fintuning.device_map import apply_layer_device_map
+
+        self._remove_teacher_layer_hooks()
+        handles, _hf_device_map = apply_layer_device_map(
+            self.teacher_model,
+            layer_device_map=self.teacher_layer_device_map,
+        )
+        self._teacher_layer_hook_handles = list(handles)
+        self._teacher_device = torch.device(
+            "cuda"
+            if any(device.type == "cuda" for device in self.teacher_layer_device_map.values())
+            else "cpu"
+        )
+        self.teacher_model.eval()
+
     def _ensure_teacher_device(self, device: torch.device) -> None:
         if self.teacher_model is None:
+            return
+        if self.teacher_layer_device_map:
+            if not self._teacher_layer_hook_handles:
+                self._place_teacher_layer_sharded()
             return
         if self._teacher_device == device:
             return
@@ -781,10 +830,11 @@ class VAEDecoderE2ETrainer(Trainer):
         self._teacher_device = device
 
     def offload_teacher_to_cpu(self) -> Optional[torch.device]:
-        """Move teacher off GPU for eval; returns previous device for restore."""
+        """Move teacher off GPU for eval; returns previous residency marker for restore."""
         if self.teacher_model is None:
             return None
         previous = self._teacher_device
+        self._remove_teacher_layer_hooks()
         self.teacher_model.to("cpu")
         self._teacher_device = torch.device("cpu")
         return previous
@@ -794,6 +844,9 @@ class VAEDecoderE2ETrainer(Trainer):
             return
         if device.type == "cpu":
             self.offload_teacher_to_cpu()
+            return
+        if self.teacher_layer_device_map:
+            self._place_teacher_layer_sharded()
             return
         self._ensure_teacher_device(device)
 

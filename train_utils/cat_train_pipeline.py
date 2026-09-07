@@ -1772,6 +1772,17 @@ def _train_group_vae_and_replace_inline_distributed(
     return len(group_refs)
 
 
+def _run_eval_without_reference_residency(*, runtime, restore_runtime: bool, **kwargs):
+    residency = None
+    if runtime is not None:
+        residency = runtime.offload_for_eval()
+    try:
+        return _eval_after_category(**kwargs)
+    finally:
+        if runtime is not None and bool(restore_runtime):
+            runtime.restore_after_eval(residency)
+
+
 def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
     global log
     after_category_mode = str(getattr(cat_args, "after_category_mode", "none")).strip().lower()
@@ -2769,7 +2780,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     )
                 if run_this_category_eval and not resuming_active_recovery:
                     log.info("每类后蒸馏前评估...")
-                    _eval_after_category(
+                    _run_eval_without_reference_residency(
+                        runtime=teacher_runtime,
+                        restore_runtime=True,
                         model=model,
                         vae_args=vae_args,
                         ppl_limit=cat_args.ppl_limit,
@@ -2810,7 +2823,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                     distill_distributed_barrier()
                 if run_this_category_eval:
                     log.info("每类后蒸馏后评估...")
-                    _eval_after_category(
+                    _run_eval_without_reference_residency(
+                        runtime=teacher_runtime,
+                        restore_runtime=True,
                         model=model,
                         vae_args=vae_args,
                         ppl_limit=cat_args.ppl_limit,
@@ -2924,7 +2939,9 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
 
         if run_category_eval:
             log.info("所有类别训练完成后最终评估...")
-            _eval_after_category(
+            _run_eval_without_reference_residency(
+                runtime=teacher_runtime,
+                restore_runtime=False,
                 model=model,
                 vae_args=vae_args,
                 ppl_limit=cat_args.ppl_limit,

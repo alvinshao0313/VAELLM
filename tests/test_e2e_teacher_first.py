@@ -111,6 +111,7 @@ def _build_trainer(
     prompt_kd_weight: float = 0.0,
     teacher_output_offload: str = "cpu",
     teacher_model_offload: str = "none",
+    teacher_layer_device_map=None,
     top_k: int = 100,
 ):
     events: list[str] = []
@@ -141,6 +142,7 @@ def _build_trainer(
         prompt_kd_weight=prompt_kd_weight,
         teacher_output_offload=teacher_output_offload,
         teacher_model_offload=teacher_model_offload,
+        teacher_layer_device_map=teacher_layer_device_map,
         teacher_output_pin_memory=False,
         teacher_output_chunk_tokens=2,
     )
@@ -173,6 +175,26 @@ def _patch_tiny_get_layers(monkeypatch):
     monkeypatch.setattr(
         "compressed_e2e_fintuning.teacher_targets.get_layers",
         lambda model: model.model.layers,
+    )
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.device_map.get_layers",
+        lambda model: model.model.layers,
+    )
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.device_map.get_model_type",
+        lambda model: "tiny",
+    )
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.device_map.get_embeddings",
+        lambda model, _model_type: [model.embed_tokens],
+    )
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.device_map.get_pre_head_layernorm",
+        lambda model, _model_type: model.model.layers[-1].post_attention_layernorm,
+    )
+    monkeypatch.setattr(
+        "compressed_e2e_fintuning.device_map.get_lm_head",
+        lambda model, _model_type: model.lm_head,
     )
 
 
@@ -373,6 +395,47 @@ def test_teacher_model_offload_cpu_returns_teacher_to_cpu(tmp_path):
     loss = trainer.compute_loss(student, _inputs())
     assert events == ["teacher_forward", "student_forward"]
     assert teacher.to_calls
+    assert teacher.to_calls[-1] == "cpu"
+    assert trainer._teacher_device == torch.device("cpu")
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_layer_sharded_teacher_does_not_move_whole_model_to_input_device(tmp_path):
+    trainer, student, teacher, events = _build_trainer(
+        tmp_path,
+        loss_type="kl_top",
+        hidden_loss_weight=0.0,
+        teacher_output_offload="cpu",
+        teacher_model_offload="none",
+        teacher_layer_device_map={0: "cpu", 1: "cpu", 2: "cpu", 3: "cpu"},
+    )
+    assert trainer._teacher_layer_hook_handles
+    loss = trainer.compute_loss(student, _inputs())
+    assert events == ["teacher_forward", "student_forward"]
+    # Layer-MP placement moves individual modules, never teacher_model.to(input_device).
+    assert teacher.to_calls == []
+    try:
+        loss.backward()
+    finally:
+        trainer._release_active_teacher_targets()
+
+
+def test_layer_sharded_teacher_cpu_offload_removes_hooks_and_returns_to_cpu(tmp_path):
+    trainer, student, teacher, events = _build_trainer(
+        tmp_path,
+        loss_type="kl_top",
+        hidden_loss_weight=0.0,
+        teacher_output_offload="cpu",
+        teacher_model_offload="cpu",
+        teacher_layer_device_map={0: "cpu", 1: "cpu", 2: "cpu", 3: "cpu"},
+    )
+    assert trainer._teacher_layer_hook_handles == []
+    loss = trainer.compute_loss(student, _inputs())
+    assert events == ["teacher_forward", "student_forward"]
+    assert trainer._teacher_layer_hook_handles == []
     assert teacher.to_calls[-1] == "cpu"
     assert trainer._teacher_device == torch.device("cpu")
     try:

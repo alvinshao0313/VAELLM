@@ -468,6 +468,17 @@ def _save_after_category_checkpoint(
         )
 
 
+def _run_eval_without_reference_residency(*, runtime, restore_runtime: bool, **kwargs):
+    residency = None
+    if runtime is not None:
+        residency = runtime.offload_for_eval()
+    try:
+        return _eval_after_category(**kwargs)
+    finally:
+        if runtime is not None and bool(restore_runtime):
+            runtime.restore_after_eval(residency)
+
+
 def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) -> None:
     mode = resolve_checkpoint_distill_mode(cat_args)
     if not str(getattr(cat_args, "resume_from_checkpoint", "") or "").strip():
@@ -641,7 +652,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         if run_this_category_eval:
             if is_distill_main_process():
                 logger.info("每类后蒸馏前评估...")
-            _eval_after_category(
+            _run_eval_without_reference_residency(
+                runtime=teacher_runtime,
+                restore_runtime=True,
                 model=model,
                 vae_args=vae_args,
                 ppl_limit=cat_args.ppl_limit,
@@ -716,7 +729,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
         if run_this_category_eval:
             if is_distill_main_process():
                 logger.info("每类后蒸馏后评估...")
-            _eval_after_category(
+            _run_eval_without_reference_residency(
+                runtime=teacher_runtime,
+                restore_runtime=True,
                 model=model,
                 vae_args=vae_args,
                 ppl_limit=cat_args.ppl_limit,
@@ -748,7 +763,9 @@ def run_cat_checkpoint_distill(*, cat_args, hf_args, training_args, vae_args) ->
     if run_category_eval:
         if is_distill_main_process():
             logger.info("所有类别蒸馏完成后最终评估（VAELinear 路径）...")
-        _eval_after_category(
+        _run_eval_without_reference_residency(
+            runtime=teacher_runtime,
+            restore_runtime=False,
             model=model,
             vae_args=vae_args,
             ppl_limit=cat_args.ppl_limit,
