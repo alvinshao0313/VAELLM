@@ -8,7 +8,7 @@ from typing import Optional, Tuple  # Tuple kept for mask helpers
 import torch
 import torch.nn.functional as F
 
-MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top")
+MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass")
 
 
 def _require_temperature(temperature: float) -> float:
@@ -458,13 +458,22 @@ def compute_model_level_loss(
             teacher_logits=pred_teacher,
             temperature=temperature,
         )
-    else:
+    elif norm == "kd_top":
         kl_token = compute_kl_top_token_loss(
             student_logits=pred_student,
             teacher_logits=pred_teacher,
             temperature=temperature,
             top_k=resolved_top_k,
         )
+    elif norm == "kd_top_mass":
+        kl_token = compute_kl_top_mass_token_loss(
+            student_logits=pred_student,
+            teacher_logits=pred_teacher,
+            temperature=temperature,
+            top_k=resolved_top_k,
+        )
+    else:
+        raise RuntimeError(f"Unhandled KD loss type: {norm}.")
     ce = reduce_weighted_token_loss(
         ce_token,
         response_mask=response_mask,

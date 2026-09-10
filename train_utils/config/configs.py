@@ -15,8 +15,8 @@ from litebsq.protected_channel_quant import (
 from train_utils.config.overrides import parse_float_text
 
 
-LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top")
-LOSS_TYPES_NEED_TEACHER = frozenset({"kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top"})
+LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass")
+LOSS_TYPES_NEED_TEACHER = frozenset({"kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass"})
 HIDDEN_LAYER_WEIGHTING_STATIC = ("uniform", "linear_depth", "adaptive")
 TRAIN_MODES = (
     "none",

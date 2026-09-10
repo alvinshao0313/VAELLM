@@ -135,6 +135,10 @@ def test_cli_accepts_new_losses_and_restricts_selective_mass():
     mass_cfg = _e2e(["--loss_type", "kl_top_mass", "--top_k", "100"])
     assert mass_cfg.loss.loss_type == "kl_top_mass"
 
+    kd_mass_cfg = _e2e(["--loss_type", "kd_top_mass", "--top_k", "100", "--alpha", "0.4"])
+    assert kd_mass_cfg.loss.loss_type == "kd_top_mass"
+    assert kd_mass_cfg.loss.alpha == pytest.approx(0.4)
+
     mse_cfg = _e2e(
         [
             "--loss_type",
@@ -156,6 +160,16 @@ def test_cli_accepts_new_losses_and_restricts_selective_mass():
             [
                 "--loss_type",
                 "kl_top_mass",
+                "--selective_student_topk",
+                "true",
+            ]
+        )
+
+    with pytest.raises((SystemExit, ValueError)):
+        _e2e(
+            [
+                "--loss_type",
+                "kd_top_mass",
                 "--selective_student_topk",
                 "true",
             ]
