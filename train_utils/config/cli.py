@@ -312,6 +312,12 @@ _TOP_K_SPEC = make_positive_int_override_spec(
     allowed_selectors=_AFTER_SELECTORS,
     example="default=100,after:q_proj=50",
 )
+_TOP_MSE_WEIGHT_SPEC = make_override_spec(
+    arg_name="--top_mse_weight",
+    parse_value=lambda raw: parse_float_text(raw, arg_name="--top_mse_weight", min_value=0.0),
+    allowed_selectors=_AFTER_SELECTORS,
+    example="default=1.0,after:q_proj=0.1",
+)
 _TEMPERATURE_SPEC = make_override_spec(
     arg_name="--temperature",
     parse_value=lambda raw: parse_float_text(
@@ -419,6 +425,7 @@ def _add_loss_args(parser: argparse.ArgumentParser, *, cat_overrides: bool) -> N
     if cat_overrides:
         parser.add_argument("--loss_type", type=str, default="default=sft")
         parser.add_argument("--top_k", type=str, default="default=100")
+        parser.add_argument("--top_mse_weight", type=str, default="default=1.0")
         parser.add_argument("--temperature", type=str, default="default=1.0")
         parser.add_argument("--alpha", type=str, default="default=0.5")
         parser.add_argument("--prompt_loss_weight", type=str, default="default=0.0")
@@ -427,6 +434,7 @@ def _add_loss_args(parser: argparse.ArgumentParser, *, cat_overrides: bool) -> N
     else:
         parser.add_argument("--loss_type", type=parse_loss_type, default="sft")
         parser.add_argument("--top_k", type=int, default=100)
+        parser.add_argument("--top_mse_weight", type=float, default=1.0)
         parser.add_argument("--temperature", type=float, default=1.0)
         parser.add_argument("--alpha", type=float, default=0.5)
         parser.add_argument("--prompt_loss_weight", type=float, default=0.0)
@@ -798,6 +806,7 @@ class CatCLIConfig:
     logging_steps: OverrideTable
     loss_type: OverrideTable
     top_k: OverrideTable
+    top_mse_weight: OverrideTable
     temperature: OverrideTable
     alpha: OverrideTable
     prompt_loss_weight: OverrideTable
@@ -922,6 +931,7 @@ class CatCLIConfig:
         loss = DistillLossConfig(
             loss_type=resolve_after_category_value(self.loss_type, category),
             top_k=int(resolve_after_category_value(self.top_k, category)),
+            top_mse_weight=float(resolve_after_category_value(self.top_mse_weight, category)),
             temperature=float(resolve_after_category_value(self.temperature, category)),
             alpha=float(resolve_after_category_value(self.alpha, category)),
             prompt_loss_weight=float(resolve_after_category_value(self.prompt_loss_weight, category)),
@@ -984,6 +994,7 @@ def parse_e2e_cli(argv: Optional[Sequence[str]] = None) -> E2ECLIConfig:
         loss = DistillLossConfig(
             loss_type=ns.loss_type,
             top_k=int(ns.top_k),
+            top_mse_weight=float(ns.top_mse_weight),
             temperature=float(ns.temperature),
             alpha=float(ns.alpha),
             prompt_loss_weight=float(ns.prompt_loss_weight),
@@ -1145,6 +1156,7 @@ def parse_cat_cli(argv: Optional[Sequence[str]] = None) -> CatCLIConfig:
         logging_steps = _parse_override(ns.logging_steps, _LOGGING_STEPS_SPEC)
         loss_type = _parse_override(ns.loss_type, _LOSS_TYPE_SPEC)
         top_k = _parse_override(ns.top_k, _TOP_K_SPEC)
+        top_mse_weight = _parse_override(ns.top_mse_weight, _TOP_MSE_WEIGHT_SPEC)
         temperature = _parse_override(ns.temperature, _TEMPERATURE_SPEC)
         alpha = _parse_override(ns.alpha, _ALPHA_SPEC)
         prompt_loss_weight = _parse_override(ns.prompt_loss_weight, _PROMPT_LOSS_WEIGHT_SPEC)
@@ -1164,6 +1176,7 @@ def parse_cat_cli(argv: Optional[Sequence[str]] = None) -> CatCLIConfig:
             logging_steps,
             loss_type,
             top_k,
+            top_mse_weight,
             temperature,
             alpha,
             prompt_loss_weight,
@@ -1255,6 +1268,7 @@ def parse_cat_cli(argv: Optional[Sequence[str]] = None) -> CatCLIConfig:
             logging_steps=logging_steps,
             loss_type=loss_type,
             top_k=top_k,
+            top_mse_weight=top_mse_weight,
             temperature=temperature,
             alpha=alpha,
             prompt_loss_weight=prompt_loss_weight,

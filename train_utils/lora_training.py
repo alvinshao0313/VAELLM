@@ -19,6 +19,7 @@ from e2e_common.selective_topk_head import (
 from train_utils.distill_loss_core import (
     compute_model_level_loss,
     compute_selected_kl_top_model_level_loss,
+    compute_selected_kl_top_mse_model_level_loss,
     normalize_model_level_loss_type,
 )
 from train_utils.distill_token_stats import DistillTokenStatsAccumulator
@@ -758,6 +759,7 @@ else:
             *args,
             loss_type: str = "sft",
             top_k: int = 100,
+            top_mse_weight: float = 1.0,
             temperature: float = 1.0,
             loss_alpha: float = 0.5,
             hidden_loss_weight: float = 0.0,
@@ -781,6 +783,7 @@ else:
                 self.loss_config = DistillLossConfig(
                     loss_type=normalize_model_level_loss_type(loss_type),
                     top_k=int(top_k),
+                    top_mse_weight=float(top_mse_weight),
                     temperature=float(temperature),
                     alpha=float(loss_alpha),
                     prompt_loss_weight=float(prompt_kd_weight),
@@ -793,6 +796,7 @@ else:
                 self.loss_config.validate()
             self.loss_type = str(self.loss_config.loss_type)
             self.top_k = int(self.loss_config.top_k)
+            self.top_mse_weight = float(self.loss_config.top_mse_weight)
             self.temperature = float(self.loss_config.temperature)
             self.loss_alpha = float(self.loss_config.alpha)
             self.hidden_loss_weight = float(self.loss_config.hidden_loss_weight)
@@ -808,7 +812,7 @@ else:
             if self.selective_teacher_topk_chunk_tokens < 1:
                 raise ValueError("selective_teacher_topk_chunk_tokens must be >= 1.")
             if self.selective_student_topk and not is_selective_student_topk_loss(self.loss_type):
-                raise ValueError("selective_student_topk only supports loss_type=kl_top.")
+                raise ValueError("selective_student_topk only supports loss_type=kl_top or kl_top_mse.")
             self.distill_hif4_act_controller = distill_hif4_act_controller
             self.teacher_runtime = teacher_runtime
             self.teacher_required = resolve_distill_teacher_required(
@@ -832,6 +836,7 @@ else:
             cfg = DistillLossConfig(
                 loss_type=canonical,
                 top_k=resolved_top_k,
+                top_mse_weight=float(getattr(self, "top_mse_weight", 1.0)),
                 temperature=float(getattr(self, "temperature", 1.0)),
                 alpha=float(getattr(self, "loss_alpha", 0.5)),
                 prompt_loss_weight=float(getattr(self, "prompt_kd_weight", 0.0)),
@@ -849,6 +854,7 @@ else:
             self.loss_config = cfg
             self.loss_type = str(cfg.loss_type)
             self.top_k = int(cfg.top_k)
+            self.top_mse_weight = float(cfg.top_mse_weight)
             return cfg
 
         def _resolve_runtime_view_cache(self, model, pre_mlp_hidden_loss_enabled: bool):
@@ -1140,7 +1146,7 @@ else:
 
                 prepare_student_path()
                 if (
-                    canonical_loss == "kl_top"
+                    canonical_loss in {"kl_top", "kl_top_mse"}
                     and self.selective_student_topk
                 ):
                     if teacher_targets is None or teacher_targets.selective_topk is None:
@@ -1160,14 +1166,25 @@ else:
                         chunk_rows=self.selective_student_topk_chunk_rows,
                     ):
                         outputs = student_forward(student_inputs)
-                    loss = compute_selected_kl_top_model_level_loss(
-                        student_selected_logits=outputs.logits,
-                        teacher_selected_logits=selected_teacher_logits,
-                        labels=labels,
-                        attention_mask=attention_mask,
-                        temperature=float(loss_cfg.temperature),
-                        prompt_loss_weight=float(loss_cfg.prompt_loss_weight),
-                    )
+                    if canonical_loss == "kl_top_mse":
+                        loss = compute_selected_kl_top_mse_model_level_loss(
+                            student_selected_logits=outputs.logits,
+                            teacher_selected_logits=selected_teacher_logits,
+                            labels=labels,
+                            attention_mask=attention_mask,
+                            temperature=float(loss_cfg.temperature),
+                            top_mse_weight=float(loss_cfg.top_mse_weight),
+                            prompt_loss_weight=float(loss_cfg.prompt_loss_weight),
+                        )
+                    else:
+                        loss = compute_selected_kl_top_model_level_loss(
+                            student_selected_logits=outputs.logits,
+                            teacher_selected_logits=selected_teacher_logits,
+                            labels=labels,
+                            attention_mask=attention_mask,
+                            temperature=float(loss_cfg.temperature),
+                            prompt_loss_weight=float(loss_cfg.prompt_loss_weight),
+                        )
                 else:
                     outputs = student_forward(student_inputs)
                     teacher_logits = None
@@ -1185,6 +1202,7 @@ else:
                         temperature=float(loss_cfg.temperature),
                         alpha=float(loss_cfg.alpha),
                         top_k=resolved_top_k,
+                        top_mse_weight=float(loss_cfg.top_mse_weight),
                         prompt_loss_weight=float(loss_cfg.prompt_loss_weight),
                     )
 

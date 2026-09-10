@@ -24,9 +24,14 @@ class TeacherTopKTargets:
 
 
 def is_selective_student_topk_loss(loss_type: str) -> bool:
-    """True only for canonical kl_top (or temporary legacy kl_top_<K> strings)."""
+    """True for selective-safe canonical losses or numeric legacy kl_top_<K>."""
     norm = str(loss_type or "").strip().lower()
-    return norm == "kl_top" or norm.startswith("kl_top_")
+    if norm in {"kl_top", "kl_top_mse"}:
+        return True
+    if not norm.startswith("kl_top_"):
+        return False
+    suffix = norm[len("kl_top_") :]
+    return suffix.isdigit() and int(suffix) >= 1
 
 
 def parse_selective_student_topk_k(loss_type: str, *, top_k: int) -> int:
@@ -40,10 +45,12 @@ def parse_selective_student_topk_k(loss_type: str, *, top_k: int) -> int:
     if resolved < 1:
         raise ValueError(f"top_k must be >= 1, got {top_k}.")
     norm = str(loss_type or "").strip().lower()
-    if norm == "kl_top":
+    if norm in {"kl_top", "kl_top_mse"}:
         return resolved
     if not norm.startswith("kl_top_"):
-        raise ValueError(f"Selective student top-k only supports kl_top[_K], got {loss_type!r}.")
+        raise ValueError(
+            f"Selective student top-k only supports kl_top, kl_top_mse, or legacy kl_top_<K>; got {loss_type!r}."
+        )
     suffix = norm[len("kl_top_") :]
     if not suffix.isdigit() or int(suffix) < 1:
         raise ValueError(f"Invalid kl_top suffix in {loss_type!r}.")

@@ -8,7 +8,7 @@ from typing import Optional, Tuple  # Tuple kept for mask helpers
 import torch
 import torch.nn.functional as F
 
-MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kd", "kd_top")
+MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top")
 
 
 def _require_temperature(temperature: float) -> float:
@@ -143,6 +143,94 @@ def compute_kl_top_token_loss(
     return token_kl * (temp * temp)
 
 
+def compute_kl_top_mass_token_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+) -> torch.Tensor:
+    """Forward KL on teacher Top-K tokens plus one aggregated outside-mass bin."""
+    if tuple(student_logits.shape) != tuple(teacher_logits.shape):
+        raise ValueError(
+            "student/teacher logits shape mismatch: "
+            f"{tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}."
+        )
+    if int(top_k) <= 0:
+        raise ValueError(f"top_k must be > 0, got {top_k}.")
+    temp = _require_temperature(temperature)
+    vocab = int(student_logits.shape[-1])
+    k_eff = min(int(top_k), vocab)
+    if k_eff == vocab:
+        return compute_kl_token_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            temperature=temp,
+        )
+
+    student_scaled = student_logits.float() / temp
+    teacher_scaled = teacher_logits.detach().float() / temp
+    teacher_top_values, indices = teacher_scaled.topk(k_eff, dim=-1, sorted=False)
+    student_top_values = student_scaled.gather(-1, indices)
+
+    teacher_log_z = torch.logsumexp(teacher_scaled, dim=-1, keepdim=True)
+    student_log_z = torch.logsumexp(student_scaled, dim=-1, keepdim=True)
+    teacher_top_log_prob = teacher_top_values - teacher_log_z
+    student_top_log_prob = student_top_values - student_log_z
+    teacher_top_prob = teacher_top_log_prob.exp()
+    student_top_prob = student_top_log_prob.exp()
+
+    top_term = (
+        teacher_top_prob * (teacher_top_log_prob - student_top_log_prob)
+    ).sum(dim=-1)
+
+    teacher_other_prob = (1.0 - teacher_top_prob.sum(dim=-1)).clamp(min=0.0, max=1.0)
+    student_other_prob = (1.0 - student_top_prob.sum(dim=-1)).clamp(min=0.0, max=1.0)
+    tiny = torch.finfo(student_other_prob.dtype).tiny
+    safe_teacher_other = teacher_other_prob.clamp_min(tiny)
+    safe_student_other = student_other_prob.clamp_min(tiny)
+    other_term = torch.where(
+        teacher_other_prob > 0.0,
+        teacher_other_prob * (safe_teacher_other.log() - safe_student_other.log()),
+        torch.zeros_like(teacher_other_prob),
+    )
+    return (top_term + other_term) * (temp * temp)
+
+
+def compute_kl_top_mse_token_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    top_mse_weight: float,
+) -> torch.Tensor:
+    """Renormalized Top-K KL plus raw-logit MSE on the teacher Top-K set."""
+    if tuple(student_logits.shape) != tuple(teacher_logits.shape):
+        raise ValueError(
+            "student/teacher logits shape mismatch: "
+            f"{tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}."
+        )
+    if int(top_k) <= 0:
+        raise ValueError(f"top_k must be > 0, got {top_k}.")
+    weight = float(top_mse_weight)
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError(f"top_mse_weight must be finite and >= 0, got {top_mse_weight}.")
+
+    token_kl = compute_kl_top_token_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        temperature=temperature,
+        top_k=top_k,
+    )
+    k_eff = min(int(top_k), int(student_logits.shape[-1]))
+    _, indices = teacher_logits.detach().float().topk(k_eff, dim=-1, sorted=False)
+    student_selected = student_logits.float().gather(-1, indices)
+    teacher_selected = teacher_logits.detach().float().gather(-1, indices)
+    token_mse = (student_selected - teacher_selected).square().mean(dim=-1)
+    return token_kl + weight * token_mse
+
+
 def compute_selected_kl_top_token_loss(
     *,
     student_selected_logits: torch.Tensor,
@@ -160,6 +248,33 @@ def compute_selected_kl_top_token_loss(
     teacher_prob = F.softmax(teacher_selected_logits.detach().float() / temp, dim=-1)
     token_kl = F.kl_div(student_log_prob, teacher_prob, reduction="none").sum(dim=-1)
     return token_kl * (temp * temp)
+
+
+def compute_selected_kl_top_mse_token_loss(
+    *,
+    student_selected_logits: torch.Tensor,
+    teacher_selected_logits: torch.Tensor,
+    temperature: float,
+    top_mse_weight: float,
+) -> torch.Tensor:
+    """Selective-head equivalent of compute_kl_top_mse_token_loss."""
+    if tuple(student_selected_logits.shape) != tuple(teacher_selected_logits.shape):
+        raise ValueError(
+            "selected student/teacher top-k shape mismatch: "
+            f"{tuple(student_selected_logits.shape)} vs {tuple(teacher_selected_logits.shape)}."
+        )
+    weight = float(top_mse_weight)
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError(f"top_mse_weight must be finite and >= 0, got {top_mse_weight}.")
+    token_kl = compute_selected_kl_top_token_loss(
+        student_selected_logits=student_selected_logits,
+        teacher_selected_logits=teacher_selected_logits,
+        temperature=temperature,
+    )
+    token_mse = (
+        student_selected_logits.float() - teacher_selected_logits.detach().float()
+    ).square().mean(dim=-1)
+    return token_kl + weight * token_mse
 
 
 def compute_selected_kl_top_model_level_loss(
@@ -182,6 +297,37 @@ def compute_selected_kl_top_model_level_loss(
         student_selected_logits=student_selected_logits[:, :-1, :],
         teacher_selected_logits=teacher_selected_logits[:, :-1, :],
         temperature=temperature,
+    )
+    return reduce_weighted_token_loss(
+        token_loss,
+        response_mask=response_mask,
+        prompt_mask=prompt_mask,
+        prompt_loss_weight=prompt_loss_weight,
+    )
+
+
+def compute_selected_kl_top_mse_model_level_loss(
+    *,
+    student_selected_logits: torch.Tensor,
+    teacher_selected_logits: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+    temperature: float = 1.0,
+    top_mse_weight: float = 1.0,
+    prompt_loss_weight: float = 0.0,
+) -> torch.Tensor:
+    """Model-level reduction for selective-head kl_top_mse."""
+    response_mask, prompt_mask = build_prediction_token_masks(
+        labels=labels,
+        attention_mask=attention_mask,
+    )
+    if int(student_selected_logits.shape[1]) < 2:
+        raise ValueError("sequence length must be >= 2 for causal next-token loss.")
+    token_loss = compute_selected_kl_top_mse_token_loss(
+        student_selected_logits=student_selected_logits[:, :-1, :],
+        teacher_selected_logits=teacher_selected_logits[:, :-1, :],
+        temperature=temperature,
+        top_mse_weight=top_mse_weight,
     )
     return reduce_weighted_token_loss(
         token_loss,
@@ -220,6 +366,7 @@ def compute_model_level_loss(
     temperature: float = 1.0,
     alpha: float = 0.5,
     top_k: int = 100,
+    top_mse_weight: float = 1.0,
     prompt_loss_weight: float = 0.0,
 ) -> torch.Tensor:
     norm = normalize_model_level_loss_type(loss_type)
@@ -270,6 +417,36 @@ def compute_model_level_loss(
             prompt_mask=prompt_mask,
             prompt_loss_weight=prompt_loss_weight,
         )
+
+    if norm == "kl_top_mass":
+        token_loss = compute_kl_top_mass_token_loss(
+            student_logits=pred_student,
+            teacher_logits=pred_teacher,
+            temperature=temperature,
+            top_k=resolved_top_k,
+        )
+        return reduce_weighted_token_loss(
+            token_loss,
+            response_mask=response_mask,
+            prompt_mask=prompt_mask,
+            prompt_loss_weight=prompt_loss_weight,
+        )
+
+    if norm == "kl_top_mse":
+        token_loss = compute_kl_top_mse_token_loss(
+            student_logits=pred_student,
+            teacher_logits=pred_teacher,
+            temperature=temperature,
+            top_k=resolved_top_k,
+            top_mse_weight=top_mse_weight,
+        )
+        return reduce_weighted_token_loss(
+            token_loss,
+            response_mask=response_mask,
+            prompt_mask=prompt_mask,
+            prompt_loss_weight=prompt_loss_weight,
+        )
+
 
     alpha_f = float(alpha)
     if alpha_f < 0.0 or alpha_f > 1.0:

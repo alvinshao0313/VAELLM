@@ -15,8 +15,8 @@ from litebsq.protected_channel_quant import (
 from train_utils.config.overrides import parse_float_text
 
 
-LOSS_TYPES = ("sft", "kl", "kl_top", "kd", "kd_top")
-LOSS_TYPES_NEED_TEACHER = frozenset({"kl", "kl_top", "kd", "kd_top"})
+LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top")
+LOSS_TYPES_NEED_TEACHER = frozenset({"kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top"})
 HIDDEN_LAYER_WEIGHTING_STATIC = ("uniform", "linear_depth", "adaptive")
 TRAIN_MODES = (
     "none",
@@ -222,6 +222,7 @@ class DistillDataConfig:
 class DistillLossConfig:
     loss_type: str = "sft"
     top_k: int = 100
+    top_mse_weight: float = 1.0
     temperature: float = 1.0
     alpha: float = 0.5
     prompt_loss_weight: float = 0.0
@@ -241,7 +242,7 @@ class DistillLossConfig:
         self.alpha = _require_finite(self.alpha, arg_name="alpha")
         if self.alpha < 0.0 or self.alpha > 1.0:
             raise ValueError(f"alpha must be in [0, 1], got {self.alpha}.")
-        for name in ("prompt_loss_weight", "hidden_loss_weight", "pre_mlp_hidden_loss_weight"):
+        for name in ("top_mse_weight", "prompt_loss_weight", "hidden_loss_weight", "pre_mlp_hidden_loss_weight"):
             value = _require_finite(getattr(self, name), arg_name=name)
             if value < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {value}.")
@@ -249,8 +250,11 @@ class DistillLossConfig:
         self.hidden_layer_weighting = parse_hidden_layer_weighting(self.hidden_layer_weighting)
         if int(self.selective_student_topk_chunk_rows) < 1:
             raise ValueError("selective_student_topk_chunk_rows must be >= 1.")
-        if bool(self.selective_student_topk) and self.loss_type != "kl_top":
-            raise ValueError("selective_student_topk=true is only allowed when loss_type=kl_top.")
+        if bool(self.selective_student_topk) and self.loss_type not in {"kl_top", "kl_top_mse"}:
+            raise ValueError(
+                "selective_student_topk=true is only allowed for loss_type=kl_top or kl_top_mse; "
+                "kl_top_mass requires full-vocabulary student logits to compute exact outside mass."
+            )
 
 
 def teacher_required(loss: DistillLossConfig) -> bool:

@@ -28,6 +28,7 @@ def compute_dense_loss_from_logits(
     temperature: float = 1.0,
     alpha: float = 0.5,
     top_k: int = 100,
+    top_mse_weight: float = 1.0,
     prompt_loss_weight: float = 0.0,
     prompt_kd_weight: Optional[float] = None,
 ) -> torch.Tensor:
@@ -48,6 +49,7 @@ def compute_dense_loss_from_logits(
         temperature=temperature,
         alpha=alpha,
         top_k=int(top_k),
+        top_mse_weight=top_mse_weight,
         prompt_loss_weight=resolved_prompt_weight,
     )
 
@@ -63,6 +65,7 @@ def compute_dense_loss_from_offloaded_teacher(
     temperature: float = 1.0,
     alpha: float = 0.5,
     top_k: int = 100,
+    top_mse_weight: float = 1.0,
     prompt_loss_weight: float = 0.0,
     prompt_kd_weight: Optional[float] = None,
     teacher_output_chunk_tokens: int = 8,
@@ -86,6 +89,7 @@ def compute_dense_loss_from_offloaded_teacher(
         temperature=temperature,
         alpha=alpha,
         top_k=top_k,
+        top_mse_weight=top_mse_weight,
         prompt_loss_weight=prompt_loss_weight,
         prompt_kd_weight=prompt_kd_weight,
     )

@@ -548,6 +548,8 @@ def _install_counting_copy_helper(monkeypatch):
 CPU_OFFLOAD_DENSE_DISTILL_LOSS_TYPES = (
     "kl",
     "kl_top",
+    "kl_top_mass",
+    "kl_top_mse",
     "kd",
     "kd_top",
 )
@@ -558,7 +560,7 @@ def test_cpu_offload_all_dense_distillation_losses_backward(tmp_path, loss_type)
     trainer, student, _teacher, events = _build_trainer(
         tmp_path,
         loss_type=loss_type,
-        top_k=7 if loss_type.endswith("_top") else 100,
+        top_k=7 if loss_type in {"kl_top", "kl_top_mass", "kl_top_mse", "kd_top"} else 100,
         hidden_loss_weight=0.0,
         prompt_kd_weight=0.03,
         teacher_output_offload="cpu",

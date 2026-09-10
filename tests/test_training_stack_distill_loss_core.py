@@ -22,8 +22,16 @@ def _manual_forward_kl(student_logits, teacher_logits, temperature: float):
     return (q * (torch.log(q.clamp_min(1e-12)) - log_p)).sum(dim=-1) * (temp * temp)
 
 
-def test_model_level_loss_types_are_exactly_five():
-    assert MODEL_LEVEL_LOSS_TYPES == ("sft", "kl", "kl_top", "kd", "kd_top")
+def test_model_level_loss_types_are_exactly_seven():
+    assert MODEL_LEVEL_LOSS_TYPES == (
+        "sft",
+        "kl",
+        "kl_top",
+        "kl_top_mass",
+        "kl_top_mse",
+        "kd",
+        "kd_top",
+    )
 
 
 def test_prediction_masks_use_target_token_positions():

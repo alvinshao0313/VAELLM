@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=1,2,3,4
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export DISTILL_NCCL_TIMEOUT_SEC=10800
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 export PYTHONHASHSEED=31
@@ -70,6 +70,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --eval_every 0 \
   --eval_blocks 256 \
   --skip_ppl_eval true \
+  --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
   --channel_protect_mode channel \
   --channel_rank_metric channel_weight_actmean_abs \
   --channel_mlp_rank_metric none \
@@ -88,16 +89,17 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --lora_rank "default=12" \
   --lora_alpha "default=24" \
   --lora_dropout "default=0.03" \
-  --steps "default=5000" \
+  --steps "default=5000,after:q_proj=10000,after:k_proj=10000,after:gate_proj=10000,after:up_proj=10000" \
   --batch_size "default=16" \
   --learning_rate "default=1e-4" \
   --decoder_lr "default=1e-5" \
   --weight_decay "default=0.001" \
   --logging_steps "default=100" \
   --loss_type "default=kl_top" \
-  --top_k "default=1000" \
+  --top_k "default=100" \
   --temperature "default=1" \
   --alpha "default=0.5" \
+  --top_mse_weight "default=1.0" \
   --prompt_loss_weight "default=0" \
   --hidden_loss_weight "default=0.1" \
   --pre_mlp_hidden_loss_weight "default=0.001" \

@@ -34,6 +34,7 @@ from e2e_common.selective_topk_head import (
 )
 from train_utils.distill_loss_core import (
     compute_selected_kl_top_model_level_loss,
+    compute_selected_kl_top_mse_model_level_loss,
     normalize_model_level_loss_type,
 )
 from train_utils.config.configs import DistillLossConfig
@@ -235,6 +236,7 @@ class VAEDecoderE2ETrainer(Trainer):
         *args,
         loss_type: str = "sft",
         top_k: int = 100,
+        top_mse_weight: float = 1.0,
         teacher_model: Optional[nn.Module] = None,
         distill_temperature: float = 1.0,
         distill_alpha: float = 0.5,
@@ -266,6 +268,7 @@ class VAEDecoderE2ETrainer(Trainer):
             self.loss_config = DistillLossConfig(
                 loss_type=normalize_model_level_loss_type(loss_type),
                 top_k=int(top_k),
+                top_mse_weight=float(top_mse_weight),
                 temperature=float(distill_temperature),
                 alpha=float(distill_alpha),
                 prompt_loss_weight=float(prompt_kd_weight),
@@ -278,6 +281,7 @@ class VAEDecoderE2ETrainer(Trainer):
             self.loss_config.validate()
         self.loss_type = str(self.loss_config.loss_type)
         self.top_k = int(self.loss_config.top_k)
+        self.top_mse_weight = float(self.loss_config.top_mse_weight)
         self.teacher_model = teacher_model
         self.distill_temperature = float(self.loss_config.temperature)
         self.distill_alpha = float(self.loss_config.alpha)
@@ -317,7 +321,7 @@ class VAEDecoderE2ETrainer(Trainer):
         self.selective_student_topk = bool(self.loss_config.selective_student_topk)
         self.selective_student_topk_chunk_rows = int(self.loss_config.selective_student_topk_chunk_rows)
         if self.selective_student_topk and not is_selective_student_topk_loss(self.loss_type):
-            raise ValueError("selective_student_topk only supports loss_type=kl_top.")
+            raise ValueError("selective_student_topk only supports loss_type=kl_top or kl_top_mse.")
         self._active_teacher_targets: Optional[TeacherTargetBatch] = None
         self._last_teacher_target_stats: Dict[str, object] = {}
         self._logged_teacher_target_stats = False
@@ -1134,6 +1138,7 @@ class VAEDecoderE2ETrainer(Trainer):
             temperature=float(self.loss_config.temperature),
             alpha=float(self.loss_config.alpha),
             top_k=resolved_top_k,
+            top_mse_weight=float(self.loss_config.top_mse_weight),
             prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
         )
         hidden_loss = None
@@ -1262,14 +1267,25 @@ class VAEDecoderE2ETrainer(Trainer):
             if self.selective_student_topk:
                 if selective_teacher_logits is None:
                     raise RuntimeError("selective student top-k teacher logits are missing.")
-                distill_loss = compute_selected_kl_top_model_level_loss(
-                    student_selected_logits=logits,
-                    teacher_selected_logits=selective_teacher_logits,
-                    labels=labels,
-                    attention_mask=attention_mask,
-                    temperature=float(self.loss_config.temperature),
-                    prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
-                )
+                if canonical_loss == "kl_top_mse":
+                    distill_loss = compute_selected_kl_top_mse_model_level_loss(
+                        student_selected_logits=logits,
+                        teacher_selected_logits=selective_teacher_logits,
+                        labels=labels,
+                        attention_mask=attention_mask,
+                        temperature=float(self.loss_config.temperature),
+                        top_mse_weight=float(self.loss_config.top_mse_weight),
+                        prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
+                    )
+                else:
+                    distill_loss = compute_selected_kl_top_model_level_loss(
+                        student_selected_logits=logits,
+                        teacher_selected_logits=selective_teacher_logits,
+                        labels=labels,
+                        attention_mask=attention_mask,
+                        temperature=float(self.loss_config.temperature),
+                        prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
+                    )
             elif canonical_loss == "sft":
                 if targets is not None and targets.logits_cpu is not None:
                     raise RuntimeError("sft must not cache teacher logits.")
@@ -1297,6 +1313,7 @@ class VAEDecoderE2ETrainer(Trainer):
                     temperature=float(self.loss_config.temperature),
                     alpha=float(self.loss_config.alpha),
                     top_k=resolved_top_k,
+                    top_mse_weight=float(self.loss_config.top_mse_weight),
                     prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
                     teacher_output_chunk_tokens=int(self.teacher_output_chunk_tokens),
                 )
