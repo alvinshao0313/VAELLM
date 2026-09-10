@@ -8,7 +8,7 @@ from typing import Optional, Tuple  # Tuple kept for mask helpers
 import torch
 import torch.nn.functional as F
 
-MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass")
+MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_partial", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass")
 
 
 def _require_temperature(temperature: float) -> float:
@@ -141,6 +141,46 @@ def compute_kl_top_token_loss(
     student_log_prob = F.log_softmax(student_scaled.gather(-1, indices), dim=-1)
     token_kl = F.kl_div(student_log_prob, teacher_prob, reduction="none").sum(dim=-1)
     return token_kl * (temp * temp)
+
+
+def compute_kl_top_partial_token_loss(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+) -> torch.Tensor:
+    """Forward-KL contribution from teacher Top-K tokens using full-vocabulary normalization."""
+    if tuple(student_logits.shape) != tuple(teacher_logits.shape):
+        raise ValueError(
+            "student/teacher logits shape mismatch: "
+            f"{tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}."
+        )
+    if int(top_k) <= 0:
+        raise ValueError(f"top_k must be > 0, got {top_k}.")
+    temp = _require_temperature(temperature)
+    vocab = int(student_logits.shape[-1])
+    k_eff = min(int(top_k), vocab)
+    if k_eff == vocab:
+        return compute_kl_token_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            temperature=temp,
+        )
+
+    student_scaled = student_logits.float() / temp
+    teacher_scaled = teacher_logits.detach().float() / temp
+    teacher_top_values, indices = teacher_scaled.topk(k_eff, dim=-1, sorted=False)
+    student_top_values = student_scaled.gather(-1, indices)
+    teacher_log_z = torch.logsumexp(teacher_scaled, dim=-1, keepdim=True)
+    student_log_z = torch.logsumexp(student_scaled, dim=-1, keepdim=True)
+    teacher_top_log_prob = teacher_top_values - teacher_log_z
+    student_top_log_prob = student_top_values - student_log_z
+    teacher_top_prob = teacher_top_log_prob.exp()
+    token_partial_kl = (
+        teacher_top_prob * (teacher_top_log_prob - student_top_log_prob)
+    ).sum(dim=-1)
+    return token_partial_kl * (temp * temp)
 
 
 def compute_kl_top_mass_token_loss(
@@ -340,7 +380,7 @@ def compute_selected_kl_top_mse_model_level_loss(
 def normalize_model_level_loss_type(loss_type: str) -> str:
     """Return exact canonical type. Rejects deleted types and suffix encodings.
 
-    Shared core accepts only ``sft|kl|kl_top|kd|kd_top``. Encoded forms such as
+    Shared core accepts only canonical names from MODEL_LEVEL_LOSS_TYPES. Encoded forms such as
     ``kl_top_100`` / ``kd_top_100`` must be split at a legacy parser/wrapper
     caller before invoking the shared core.
     """
@@ -406,6 +446,20 @@ def compute_model_level_loss(
 
     if norm == "kl_top":
         token_loss = compute_kl_top_token_loss(
+            student_logits=pred_student,
+            teacher_logits=pred_teacher,
+            temperature=temperature,
+            top_k=resolved_top_k,
+        )
+        return reduce_weighted_token_loss(
+            token_loss,
+            response_mask=response_mask,
+            prompt_mask=prompt_mask,
+            prompt_loss_weight=prompt_loss_weight,
+        )
+
+    if norm == "kl_top_partial":
+        token_loss = compute_kl_top_partial_token_loss(
             student_logits=pred_student,
             teacher_logits=pred_teacher,
             temperature=temperature,

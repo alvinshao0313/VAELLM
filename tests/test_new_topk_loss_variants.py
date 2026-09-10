@@ -8,6 +8,7 @@ from train_utils.distill_loss_core import (
     compute_kl_token_loss,
     compute_kl_top_mass_token_loss,
     compute_kl_top_mse_token_loss,
+    compute_kl_top_partial_token_loss,
     compute_selected_kl_top_mse_token_loss,
 )
 
@@ -24,6 +25,51 @@ def _e2e(extra):
             *extra,
         ]
     )
+
+
+def test_kl_top_partial_matches_fullprob_topk_contribution():
+    torch.manual_seed(11)
+    student = torch.randn(2, 3, 13, dtype=torch.float32)
+    teacher = torch.randn(2, 3, 13, dtype=torch.float32)
+    temperature = 1.6
+    top_k = 4
+
+    actual = compute_kl_top_partial_token_loss(
+        student_logits=student,
+        teacher_logits=teacher,
+        temperature=temperature,
+        top_k=top_k,
+    )
+
+    s = student / temperature
+    t = teacher / temperature
+    q = F.softmax(t, dim=-1)
+    log_p = F.log_softmax(s, dim=-1)
+    log_q = F.log_softmax(t, dim=-1)
+    _, indices = t.topk(top_k, dim=-1, sorted=False)
+    manual = (
+        q.gather(-1, indices)
+        * (log_q.gather(-1, indices) - log_p.gather(-1, indices))
+    ).sum(dim=-1) * (temperature * temperature)
+    torch.testing.assert_close(actual, manual, rtol=1e-5, atol=1e-6)
+
+
+def test_kl_top_partial_becomes_full_kl_when_k_covers_vocab():
+    torch.manual_seed(15)
+    student = torch.randn(2, 4, 9, dtype=torch.float32)
+    teacher = torch.randn(2, 4, 9, dtype=torch.float32)
+    full = compute_kl_token_loss(
+        student_logits=student,
+        teacher_logits=teacher,
+        temperature=1.25,
+    )
+    partial = compute_kl_top_partial_token_loss(
+        student_logits=student,
+        teacher_logits=teacher,
+        temperature=1.25,
+        top_k=9,
+    )
+    torch.testing.assert_close(partial, full, rtol=1e-6, atol=1e-7)
 
 
 def test_kl_top_mass_matches_manual_k_plus_one_and_full_kl_topk_gradient():
@@ -132,6 +178,9 @@ def test_kl_top_mse_is_topk_kl_plus_raw_logit_mse_and_selective_matches_dense():
 
 
 def test_cli_accepts_new_losses_and_restricts_selective_mass():
+    partial_cfg = _e2e(["--loss_type", "kl_top_partial", "--top_k", "100"])
+    assert partial_cfg.loss.loss_type == "kl_top_partial"
+
     mass_cfg = _e2e(["--loss_type", "kl_top_mass", "--top_k", "100"])
     assert mass_cfg.loss.loss_type == "kl_top_mass"
 
@@ -170,6 +219,16 @@ def test_cli_accepts_new_losses_and_restricts_selective_mass():
             [
                 "--loss_type",
                 "kd_top_mass",
+                "--selective_student_topk",
+                "true",
+            ]
+        )
+
+    with pytest.raises((SystemExit, ValueError)):
+        _e2e(
+            [
+                "--loss_type",
+                "kl_top_partial",
                 "--selective_student_topk",
                 "true",
             ]

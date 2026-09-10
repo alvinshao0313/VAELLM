@@ -9,6 +9,7 @@ from train_utils.distill_loss_core import (
     build_prediction_token_masks,
     compute_kl_token_loss,
     compute_kl_top_mass_token_loss,
+    compute_kl_top_partial_token_loss,
     compute_kl_top_token_loss,
     compute_model_level_loss,
     compute_sft_token_loss,
@@ -23,11 +24,12 @@ def _manual_forward_kl(student_logits, teacher_logits, temperature: float):
     return (q * (torch.log(q.clamp_min(1e-12)) - log_p)).sum(dim=-1) * (temp * temp)
 
 
-def test_model_level_loss_types_are_exactly_eight():
+def test_model_level_loss_types_are_exactly_nine():
     assert MODEL_LEVEL_LOSS_TYPES == (
         "sft",
         "kl",
         "kl_top",
+        "kl_top_partial",
         "kl_top_mass",
         "kl_top_mse",
         "kd",
