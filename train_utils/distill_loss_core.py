@@ -8,7 +8,7 @@ from typing import Optional, Tuple  # Tuple kept for mask helpers
 import torch
 import torch.nn.functional as F
 
-MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_partial", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass")
+MODEL_LEVEL_LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_partial", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_partial", "kd_top_mass")
 
 
 def _require_temperature(temperature: float) -> float:
@@ -514,6 +514,13 @@ def compute_model_level_loss(
         )
     elif norm == "kd_top":
         kl_token = compute_kl_top_token_loss(
+            student_logits=pred_student,
+            teacher_logits=pred_teacher,
+            temperature=temperature,
+            top_k=resolved_top_k,
+        )
+    elif norm == "kd_top_partial":
+        kl_token = compute_kl_top_partial_token_loss(
             student_logits=pred_student,
             teacher_logits=pred_teacher,
             temperature=temperature,

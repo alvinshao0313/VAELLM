@@ -88,28 +88,30 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --group_by_length true \
   --lora_rank "default=12" \
   --lora_alpha "default=24" \
-  --lora_dropout "default=0.03" \
-  --steps "default=5000,after:q_proj=10000,after:k_proj=10000,after:gate_proj=10000,after:up_proj=10000" \
-  --batch_size "default=16" \
+  --lora_dropout "default=0.1" \
+  --steps "default=5000,after:q_proj=10000,after:k_proj=10000,after:gate_proj=10000,after:up_proj=10000,after:down_proj=10000" \
+  --batch_size "default=8" \
   --learning_rate "default=1e-4" \
   --decoder_lr "default=1e-5" \
   --weight_decay "default=0.001" \
   --logging_steps "default=100" \
-  --loss_type "default=kl_top" \
+  --loss_type "default=kl_top_partial" \
   --top_k "default=100" \
   --temperature "default=1" \
   --alpha "default=0.5" \
   --top_mse_weight "default=1.0" \
   --prompt_loss_weight "default=0" \
   --hidden_loss_weight "default=0.1" \
-  --pre_mlp_hidden_loss_weight "default=0.001" \
+  --pre_mlp_hidden_loss_weight "default=0.01" \
   --hidden_layer_weighting linear_depth \
   --teacher_output_offload cpu \
   --teacher_model_offload none \
-  --selective_student_topk true \
+  --selective_student_topk false \
   --selective_student_topk_chunk_rows 32 \
   --norm_train_mode none \
+  --norm_lr 1e-5 \
   --lm_head_train_mode none \
+  --lm_head_lr 1e-4 \
   --gradient_accumulation_steps 1 \
   --gradient_checkpointing true \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \

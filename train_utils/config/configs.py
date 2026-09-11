@@ -15,8 +15,8 @@ from litebsq.protected_channel_quant import (
 from train_utils.config.overrides import parse_float_text
 
 
-LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_partial", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass")
-LOSS_TYPES_NEED_TEACHER = frozenset({"kl", "kl_top", "kl_top_partial", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_mass"})
+LOSS_TYPES = ("sft", "kl", "kl_top", "kl_top_partial", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_partial", "kd_top_mass")
+LOSS_TYPES_NEED_TEACHER = frozenset({"kl", "kl_top", "kl_top_partial", "kl_top_mass", "kl_top_mse", "kd", "kd_top", "kd_top_partial", "kd_top_mass"})
 HIDDEN_LAYER_WEIGHTING_STATIC = ("uniform", "linear_depth", "adaptive")
 TRAIN_MODES = (
     "none",
@@ -253,7 +253,7 @@ class DistillLossConfig:
         if bool(self.selective_student_topk) and self.loss_type not in {"kl_top", "kl_top_mse"}:
             raise ValueError(
                 "selective_student_topk=true is only allowed for loss_type=kl_top or kl_top_mse; "
-                "kl_top_partial and kl_top_mass require full-vocabulary student normalization."
+                "kl_top_partial/kd_top_partial and kl_top_mass/kd_top_mass require full-vocabulary student normalization."
             )
 
 

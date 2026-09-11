@@ -24,7 +24,7 @@ def _manual_forward_kl(student_logits, teacher_logits, temperature: float):
     return (q * (torch.log(q.clamp_min(1e-12)) - log_p)).sum(dim=-1) * (temp * temp)
 
 
-def test_model_level_loss_types_are_exactly_nine():
+def test_model_level_loss_types_are_exactly_ten():
     assert MODEL_LEVEL_LOSS_TYPES == (
         "sft",
         "kl",
@@ -34,6 +34,7 @@ def test_model_level_loss_types_are_exactly_nine():
         "kl_top_mse",
         "kd",
         "kd_top",
+        "kd_top_partial",
         "kd_top_mass",
     )
 
@@ -252,6 +253,50 @@ def test_kd_top_uses_same_blend_with_topk_kl():
     )
     expected = (1.0 - alpha) * ce_r + alpha * kl_r
     assert torch.allclose(loss, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_kd_top_partial_uses_ce_plus_topk_partial_kl():
+    torch.manual_seed(41)
+    student = torch.randn(1, 5, 11, dtype=torch.float32)
+    teacher = torch.randn(1, 5, 11, dtype=torch.float32)
+    input_ids = torch.arange(5, dtype=torch.long).unsqueeze(0)
+    labels = input_ids.clone()
+    attention = torch.ones_like(labels)
+    alpha = 0.35
+    top_k = 4
+    temperature = 1.3
+
+    loss = compute_model_level_loss(
+        loss_type="kd_top_partial",
+        student_logits=student,
+        teacher_logits=teacher,
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=attention,
+        temperature=temperature,
+        alpha=alpha,
+        top_k=top_k,
+        prompt_loss_weight=0.0,
+    )
+    response_mask, prompt_mask = build_prediction_token_masks(
+        labels=labels,
+        attention_mask=attention,
+    )
+    ce = compute_sft_token_loss(student_logits=student, input_ids=input_ids)
+    kl = compute_kl_top_partial_token_loss(
+        student_logits=student[:, :-1],
+        teacher_logits=teacher[:, :-1],
+        temperature=temperature,
+        top_k=top_k,
+    )
+    ce_r = reduce_weighted_token_loss(
+        ce, response_mask=response_mask, prompt_mask=prompt_mask, prompt_loss_weight=0.0
+    )
+    kl_r = reduce_weighted_token_loss(
+        kl, response_mask=response_mask, prompt_mask=prompt_mask, prompt_loss_weight=0.0
+    )
+    expected = (1.0 - alpha) * ce_r + alpha * kl_r
+    torch.testing.assert_close(loss, expected, rtol=1e-5, atol=1e-6)
 
 
 def test_kd_top_mass_uses_ce_plus_topk_mass_kl():
