@@ -398,6 +398,12 @@ def test_channel_layer_scope_keeps_integer_override():
     assert k_vae.channel.channel_protect_count == 8
 
 
+def test_channel_refresh_after_category_is_a_cat_channel_cli_flag():
+    assert _cat([]).channel_refresh_after_category is False
+    cfg = _cat(["--channel_refresh_after_category", "true"])
+    assert cfg.channel_refresh_after_category is True
+
+
 def test_loss_type_rejects_legacy_encoded_topk_and_old_family():
     with pytest.raises((SystemExit, ValueError, argparse.ArgumentTypeError)):
         _e2e(["--loss_type", "kl_top_100"])
@@ -490,6 +496,7 @@ def test_cat_production_entry_uses_common_parser_and_internal_adapter(monkeypatc
         "--compression_categories", "q_proj,k_proj",
         "--target_layers", "0-1",
         "--after_category_mode", "current_lora_decoder",
+        "--channel_refresh_after_category", "true",
         "--dataset_mix", "openorca",
         "--vae_steps", "default=100,cat:k_proj=200",
         "--vae_batch_size", "64",
@@ -502,6 +509,7 @@ def test_cat_production_entry_uses_common_parser_and_internal_adapter(monkeypatc
     ]
     cat_args, _hf_args, training_args, vae_args = parse_cat_runtime_args(argv)
     assert cat_args.after_category_mode == "current_lora_decoder"
+    assert cat_args.channel_refresh_after_category is True
     assert cat_args.compression_categories == "q_proj,k_proj"
     assert cat_args.target_layers == "0,1"
     assert cat_args.batch_size == 64
@@ -512,6 +520,7 @@ def test_cat_production_entry_uses_common_parser_and_internal_adapter(monkeypatc
     monkeypatch.setattr(cat_train_entry, "run_cat_train", lambda **kwargs: captured.update(kwargs))
     cat_train_entry.main(argv)
     assert captured["cat_args"].after_category_mode == "current_lora_decoder"
+    assert captured["cat_args"].channel_refresh_after_category is True
     assert captured["cat_args"]._common_cat_config.resolve_after_category_config("q_proj").opt.steps == 5
 
     with pytest.raises(SystemExit):

@@ -80,6 +80,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --channel_quant int8 \
   --channel_axis input \
   --channel_protect_count "default=32,cat:v_proj=64,cat:o_proj=64,cat:gate_proj=64,cat:down_proj=256" \
+  --channel_refresh_after_category true \
   --after_category_mode remaining_lora_prefix_decoder \
   --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
   --dataset_task lm \

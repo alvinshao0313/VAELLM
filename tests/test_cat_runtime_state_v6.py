@@ -57,6 +57,12 @@ def _activation_runtime():
                 "abs_mean": torch.tensor([0.1, 0.2, 0.3, 0.4]),
             }
         },
+        "channel_refresh_stats": {
+            "model.layers.0.k_proj": {
+                "max": torch.tensor([4.0, 3.0, 2.0, 1.0]),
+                "abs_mean": torch.tensor([0.4, 0.3, 0.2, 0.1]),
+            }
+        },
         "mlp_channel_plan_by_linear": {
             "model.layers.0.up_proj": torch.tensor([1, 3], dtype=torch.long)
         },
@@ -89,6 +95,10 @@ def test_cat_runtime_state_roundtrip_preserves_planning_state_and_excludes_token
     assert torch.equal(
         restored_runtime["stats_by_linear"]["model.layers.0.k_proj"]["absmax"],
         torch.tensor([1.0, 2.0, 3.0, 4.0]),
+    )
+    assert torch.equal(
+        restored_runtime["channel_refresh_stats"]["model.layers.0.k_proj"]["abs_mean"],
+        torch.tensor([0.4, 0.3, 0.2, 0.1]),
     )
     assert restored_plan.scope == "global"
     assert restored_plan.selected_indices == _plan().selected_indices

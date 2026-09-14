@@ -57,6 +57,7 @@ _CAT_IDENTITY_FIELDS = (
     "channel_mlp_fuse_weights",
     "channel_axis",
     "channel_quant",
+    "channel_refresh_after_category",
     "channel_protect_count_ratio",
     "channel_min_per_layer",
     "activation_calib_dataset",
@@ -190,7 +191,13 @@ def serialize_activation_runtime(runtime: Optional[Mapping[str, object]]):
         if key in runtime:
             payload[key] = _cpu_nested(runtime.get(key))
     payload["cache"] = _serialize_cache(runtime.get("cache"))
-    for key in ("stats_by_linear", "stats_by_mlp_block", "mlp_channel_plan_by_linear"):
+    for key in (
+        "stats_by_linear",
+        "channel_refresh_stats",
+        "stats_by_mlp_block",
+        "channel_mlp_stats_by_block",
+        "mlp_channel_plan_by_linear",
+    ):
         if key in runtime:
             payload[key] = _cpu_nested(runtime.get(key))
     return payload

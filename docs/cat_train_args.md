@@ -22,7 +22,7 @@ python tools/cat_train.py \
 
 - 压缩范围：`--compression_categories`、`--target_layers`、`--skip_layers`。
 - VAE：`--vae_steps`、`--vae_batch_size`、`--vae_learning_rate`、`--vae_weight_decay`、`--vae_optim`、`--vae_lr_scheduler_type`，以及 codebook/decoder/recon 参数。
-- channel protection：`--channel_protect_mode` 只支持 `none`/`channel`，配合 `--channel_scope`、`--channel_protect_count`、`--channel_rank_metric`、`--channel_axis`、`--channel_quant`。
+- channel protection：`--channel_protect_mode` 只支持 `none`/`channel`，配合 `--channel_scope`、`--channel_protect_count`、`--channel_rank_metric`、`--channel_axis`、`--channel_quant`；`--channel_refresh_after_category=true` 会在每类压缩/补偿完成后，以当前 student 状态刷新下一类别的保护统计（global scope 则对全部 remaining categories 重规划剩余预算）。
 - 数据：`--dataset_mix`/`--train_file`、`--dataset_task`、`--model_max_length`、`--dynamic_padding`。
 - 恢复训练：`--steps`、`--batch_size`、`--learning_rate`、`--decoder_lr`、`--weight_decay`、`--logging_steps`。
 - LoRA/辅助参数：plain full-space `--lora_rank`、`--lora_alpha`、`--lora_dropout`，以及 `--norm_train_mode`、`--lm_head_train_mode`。

@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 import sys
 import time
 import math
@@ -703,6 +704,11 @@ def _activation_views_for_refs(
         raise ValueError(
             f"[{category}] precomputed activation stats are required but missing from activation_runtime."
         )
+    refreshed_stats = activation_runtime.get("channel_refresh_stats")
+    if refreshed_stats is not None:
+        if not isinstance(refreshed_stats, dict):
+            raise TypeError("channel_refresh_stats must be a dict when present.")
+        stats_by_linear = {**stats_by_linear, **refreshed_stats}
     subset_stats = subset_activation_stats(stats_by_linear, [ref.name for ref in refs])
     weight_view, abs_mean_view, _ = activation_stats_to_views(subset_stats)
     return weight_view, abs_mean_view
@@ -730,6 +736,423 @@ def _outlier_plan_from_adaptive(
         for name, indices in selected.items()
     }
 
+
+
+def _channel_rank_metric_needs_activation(metric: str) -> bool:
+    return str(metric).strip().lower() in {
+        "channel_weight_actmax_abs",
+        "channel_weight_actmean_abs",
+    }
+
+
+def _eligible_category_pairs_for_refresh(
+    model: nn.Module,
+    *,
+    category: str,
+    transpose_modules: Sequence[str],
+    only_decoder_projections: bool,
+    compression_categories: Sequence[str],
+    target_layers,
+    skip_layer_keys: Set[Tuple[int, str]],
+) -> List[Tuple[int, LinearRef]]:
+    refs_sorted, _missing = _collect_sorted_category_refs(
+        model,
+        category=str(category),
+        transpose_modules=transpose_modules,
+        only_decoder_projections=only_decoder_projections,
+        compression_categories=compression_categories,
+    )
+    pairs = _filter_eligible_vae_refs(refs_sorted, skip_layer_keys)
+    if target_layers != "all":
+        allowed_layers = {int(idx) for idx in target_layers}
+        pairs = [
+            (layer_idx, ref)
+            for layer_idx, ref in pairs
+            if int(layer_idx) in allowed_layers
+        ]
+    return pairs
+
+
+def _refresh_channel_activation_stats(
+    *,
+    model: nn.Module,
+    refs: Sequence[LinearRef],
+    activation_runtime: Optional[Dict[str, object]],
+    logger,
+) -> Optional[Dict[str, object]]:
+    if not refs:
+        return activation_runtime
+    if activation_runtime is None:
+        raise ValueError("Dynamic channel refresh requires activation_runtime for activation-weighted ranking.")
+    stats_by_linear, cache = collect_activation_stats_for_linears(
+        model=model,
+        linear_items=[(ref.name, ref.module) for ref in refs],
+        model_path=str(activation_runtime["model_path"]),
+        access_token=activation_runtime.get("access_token"),
+        dataset=str(activation_runtime.get("dataset", "")),
+        nsamples=int(activation_runtime["nsamples"]),
+        seqlen=int(activation_runtime["seqlen"]),
+        seed=int(activation_runtime["seed"]),
+        device=str(activation_runtime["device"]),
+        cache=activation_runtime.get("cache"),
+        log_every=int(activation_runtime["log_every"]),
+        logger=logger,
+    )
+    activation_runtime["cache"] = cache
+    refreshed = activation_runtime.get("channel_refresh_stats")
+    if refreshed is None:
+        refreshed = {}
+    if not isinstance(refreshed, dict):
+        raise TypeError("channel_refresh_stats must be a dict when present.")
+    refreshed = dict(refreshed)
+    refreshed.update(stats_by_linear)
+    activation_runtime["channel_refresh_stats"] = refreshed
+    return activation_runtime
+
+
+def _refresh_mlp_aligned_channel_plan(
+    *,
+    model: nn.Module,
+    next_category: str,
+    current_category: str,
+    refs: Sequence[LinearRef],
+    activation_runtime: Optional[Dict[str, object]],
+    protect_count: int,
+    fuse_weights: Sequence[float],
+    rank_metric: str,
+    skip_layer_keys: Set[Tuple[int, str]],
+    run_output_dir: str,
+    logger,
+) -> Optional[Dict[str, object]]:
+    if activation_runtime is None:
+        raise ValueError("Dynamic MLP channel refresh requires activation_runtime.")
+    layer_indices = sorted(
+        {
+            int(layer_idx)
+            for ref in refs
+            for layer_idx in [_extract_layer_idx(ref.name)]
+            if layer_idx is not None
+        }
+    )
+    stats_by_mlp_block, cache = collect_mlp_block_activation_stats(
+        model=model,
+        layer_indices=layer_indices,
+        model_path=str(activation_runtime["model_path"]),
+        access_token=activation_runtime.get("access_token"),
+        dataset=str(activation_runtime.get("dataset", "")),
+        nsamples=int(activation_runtime["nsamples"]),
+        seqlen=int(activation_runtime["seqlen"]),
+        seed=int(activation_runtime["seed"]),
+        device=str(activation_runtime["device"]),
+        cache=activation_runtime.get("cache"),
+        skip_layer_keys=skip_layer_keys,
+        log_every=int(activation_runtime["log_every"]),
+        logger=logger,
+    )
+    activation_runtime["cache"] = cache
+    activation_runtime["channel_mlp_stats_by_block"] = stats_by_mlp_block
+    plan_by_linear, summary_by_layer = build_mlp_aligned_plans_all_layers(
+        model=model,
+        stats_by_mlp_block=stats_by_mlp_block,
+        protect_count=int(protect_count),
+        fuse_weights=fuse_weights,
+        rank_metric=rank_metric,
+        skip_layer_keys=skip_layer_keys,
+    )
+    existing_mlp_plan = activation_runtime["mlp_channel_plan_by_linear"] if "mlp_channel_plan_by_linear" in activation_runtime else None
+    if isinstance(existing_mlp_plan, dict):
+        existing_mlp_plan.clear()
+        existing_mlp_plan.update(plan_by_linear)
+        plan_by_linear = existing_mlp_plan
+    activation_runtime["mlp_channel_plan_by_linear"] = plan_by_linear
+    summary_path = os.path.join(
+        run_output_dir,
+        f"mlp_channel_selection_summary_after_{current_category}.json",
+    )
+    write_mlp_channel_selection_summary(
+        summary_path,
+        summary_by_layer=summary_by_layer,
+        protect_count=int(protect_count),
+        fuse_weights=fuse_weights,
+        rank_metric=rank_metric,
+    )
+    logger.info(
+        "[%s] channel refresh: rebuilt MLP aligned plan for next category=%s layers=%d linears=%d summary=%s",
+        str(current_category),
+        str(next_category),
+        len(summary_by_layer),
+        len(plan_by_linear),
+        summary_path,
+    )
+    return activation_runtime
+
+
+def _build_dynamic_global_channel_plan(
+    *,
+    model: nn.Module,
+    future_categories: Sequence[str],
+    raw_budget: int,
+    resolved_category_cfgs: Dict[str, ResolvedCategoryRuntimeConfig],
+    transpose_modules: Sequence[str],
+    only_decoder_projections: bool,
+    compression_categories: Sequence[str],
+    target_layers,
+    skip_layer_keys: Set[Tuple[int, str]],
+    channel_axis: str,
+    rank_metric: str,
+    channel_min_per_layer: int,
+    linear_group_size: int,
+    allow_tail_group: bool,
+    activation_runtime: Optional[Dict[str, object]],
+    plan_is_main: bool,
+    plan_world_size: int,
+    run_output_dir: str,
+    logger,
+) -> Tuple[Optional[AdaptiveChannelPlan], Optional[Dict[str, object]]]:
+    all_specs: List[ChannelLinearSpec] = []
+    all_refs: List[LinearRef] = []
+    ref_pos = 0
+    for category in future_categories:
+        pairs = _eligible_category_pairs_for_refresh(
+            model,
+            category=str(category),
+            transpose_modules=transpose_modules,
+            only_decoder_projections=only_decoder_projections,
+            compression_categories=compression_categories,
+            target_layers=target_layers,
+            skip_layer_keys=skip_layer_keys,
+        )
+        cat_cfg = resolved_category_cfgs[str(category)]
+        intra_parallel = tuple(getattr(cat_cfg, "intra_parallel", (1, 1)))
+        for _layer_idx, ref in pairs:
+            all_specs.append(
+                _channel_spec_from_ref(
+                    ref,
+                    codebook_dim=int(cat_cfg.codebook_dim),
+                    intra_parallel=intra_parallel,
+                    ref_position=int(ref_pos),
+                    axis=str(channel_axis),
+                    category=str(category),
+                )
+            )
+            all_refs.append(ref)
+            ref_pos += 1
+
+    validate_adaptive_channel_tail_policy(
+        scope="global",
+        budget=int(raw_budget),
+        allow_tail_group=bool(allow_tail_group),
+    )
+    if int(raw_budget) <= 0 or not all_specs:
+        return None, activation_runtime
+
+    if bool(plan_is_main) and _channel_rank_metric_needs_activation(rank_metric):
+        activation_runtime = _refresh_channel_activation_stats(
+            model=model,
+            refs=all_refs,
+            activation_runtime=activation_runtime,
+            logger=logger,
+        )
+    refs_by_name = {ref.name: ref for ref in all_refs}
+
+    def _activation_views(_specs: Sequence[ChannelLinearSpec]):
+        return _activation_views_for_refs(
+            all_refs,
+            activation_runtime,
+            category="global_refresh",
+            rank_metric=rank_metric,
+        )
+
+    def _score_specs(specs, act_weight, act_mean):
+        return _score_channel_specs(
+            specs,
+            refs_by_name,
+            metric=rank_metric,
+            axis=str(channel_axis),
+            activation_weight_by_linear=act_weight,
+            activation_abs_mean_by_linear=act_mean,
+        )
+
+    plan = resolve_adaptive_channel_plan(
+        all_specs,
+        raw_budget=int(raw_budget),
+        min_per_layer=int(channel_min_per_layer),
+        linear_group_size=int(linear_group_size),
+        metric=str(rank_metric),
+        axis=str(channel_axis),
+        scope="global",
+        group_by_category=True,
+        is_main=bool(plan_is_main),
+        world_size=int(plan_world_size),
+        broadcast_fn=broadcast_adaptive_channel_plan,
+        activation_view_fn=_activation_views,
+        score_fn=_score_specs,
+        run_output_dir=str(run_output_dir) if plan_is_main else None,
+    )
+    return plan, activation_runtime
+
+
+def _refresh_channel_protection_after_category(
+    *,
+    model: nn.Module,
+    current_category: str,
+    current_category_idx: int,
+    active_categories: Sequence[str],
+    cat_args,
+    resolved_category_cfgs: Dict[str, ResolvedCategoryRuntimeConfig],
+    transpose_modules: Sequence[str],
+    only_decoder_projections: bool,
+    compression_categories: Sequence[str],
+    target_layers,
+    skip_layer_keys: Set[Tuple[int, str]],
+    activation_runtime: Optional[Dict[str, object]],
+    global_adaptive_plan: Optional[AdaptiveChannelPlan],
+    global_raw_budget_value: int,
+    resolved_channel_mode: str,
+    resolved_channel_rank_metric: str,
+    resolved_channel_mlp_rank_metric: str,
+    channel_axis: str,
+    category_channel_protect_count: Dict[str, int],
+    linear_group_size: int,
+    plan_is_main: bool,
+    plan_world_size: int,
+    run_output_dir: str,
+    logger,
+) -> Tuple[Optional[Dict[str, object]], Optional[AdaptiveChannelPlan], int]:
+    if not bool(getattr(cat_args, "channel_refresh_after_category", False)):
+        return activation_runtime, global_adaptive_plan, int(global_raw_budget_value)
+    future_categories = tuple(str(v) for v in active_categories[int(current_category_idx) + 1 :])
+    if not future_categories or str(resolved_channel_mode) != "channel":
+        return activation_runtime, global_adaptive_plan, int(global_raw_budget_value)
+
+    channel_scope = str(cat_args.channel_scope).strip().lower()
+    if channel_scope == "global":
+        if global_adaptive_plan is None:
+            if int(global_raw_budget_value) != 0:
+                raise RuntimeError("Dynamic global channel refresh lost the active global plan.")
+            return activation_runtime, None, 0
+        current_groups = global_adaptive_plan.groups_by_category.get(str(current_category), [])
+        current_names = {str(name) for group in current_groups for name in group}
+        committed_channels = sum(
+            int(global_adaptive_plan.counts.get(name, 0))
+            for name in current_names
+        )
+        remaining_budget = int(global_adaptive_plan.raw_budget) - int(committed_channels)
+        if remaining_budget < 0:
+            raise RuntimeError(
+                "Dynamic global channel budget underflow: "
+                f"raw_budget={global_adaptive_plan.raw_budget} committed={committed_channels}."
+            )
+        next_plan, activation_runtime = _build_dynamic_global_channel_plan(
+            model=model,
+            future_categories=future_categories,
+            raw_budget=int(remaining_budget),
+            resolved_category_cfgs=resolved_category_cfgs,
+            transpose_modules=transpose_modules,
+            only_decoder_projections=only_decoder_projections,
+            compression_categories=compression_categories,
+            target_layers=target_layers,
+            skip_layer_keys=skip_layer_keys,
+            channel_axis=str(channel_axis),
+            rank_metric=str(resolved_channel_rank_metric),
+            channel_min_per_layer=int(cat_args.channel_min_per_layer),
+            linear_group_size=int(linear_group_size),
+            allow_tail_group=bool(cat_args.allow_tail_group),
+            activation_runtime=activation_runtime,
+            plan_is_main=bool(plan_is_main),
+            plan_world_size=int(plan_world_size),
+            run_output_dir=str(run_output_dir),
+            logger=logger,
+        )
+        logger.info(
+            "[%s] channel refresh: scope=global committed=%d remaining_raw_budget=%d future=%s used=%d",
+            str(current_category),
+            int(committed_channels),
+            int(remaining_budget),
+            ",".join(future_categories),
+            0 if next_plan is None else int(next_plan.used_channels),
+        )
+        return activation_runtime, next_plan, int(remaining_budget)
+
+    next_category = str(future_categories[0])
+    next_count = int(category_channel_protect_count.get(next_category, 0))
+    if next_count <= 0:
+        logger.info(
+            "[%s] channel refresh: next category=%s has protect_count=0; skip.",
+            str(current_category),
+            next_category,
+        )
+        return activation_runtime, global_adaptive_plan, int(global_raw_budget_value)
+
+    next_pairs = _eligible_category_pairs_for_refresh(
+        model,
+        category=next_category,
+        transpose_modules=transpose_modules,
+        only_decoder_projections=only_decoder_projections,
+        compression_categories=compression_categories,
+        target_layers=target_layers,
+        skip_layer_keys=skip_layer_keys,
+    )
+    next_refs = [ref for _layer_idx, ref in next_pairs]
+
+    if (
+        channel_scope == "layer"
+        and is_mlp_aligned_rank_metric(resolved_channel_mlp_rank_metric)
+        and next_category in MLP_CATEGORIES
+    ):
+        if not bool(plan_is_main):
+            return activation_runtime, global_adaptive_plan, int(global_raw_budget_value)
+        committed_mlp = {
+            str(category)
+            for category in active_categories[: int(current_category_idx) + 1]
+            if str(category) in MLP_CATEGORIES
+        }
+        if committed_mlp:
+            logger.info(
+                "[%s] channel refresh: MLP aligned plan locked after committed categories=%s; reuse for next=%s.",
+                str(current_category),
+                ",".join(sorted(committed_mlp)),
+                next_category,
+            )
+            return activation_runtime, global_adaptive_plan, int(global_raw_budget_value)
+        mlp_count = int(category_channel_protect_count.get("gate_proj", next_count))
+        activation_runtime = _refresh_mlp_aligned_channel_plan(
+            model=model,
+            next_category=next_category,
+            current_category=str(current_category),
+            refs=next_refs,
+            activation_runtime=activation_runtime,
+            protect_count=int(mlp_count),
+            fuse_weights=cat_args.channel_mlp_fuse_weights,
+            rank_metric=str(resolved_channel_mlp_rank_metric),
+            skip_layer_keys=skip_layer_keys,
+            run_output_dir=str(run_output_dir),
+            logger=logger,
+        )
+        return activation_runtime, global_adaptive_plan, int(global_raw_budget_value)
+
+    if bool(plan_is_main) and _channel_rank_metric_needs_activation(resolved_channel_rank_metric):
+        activation_runtime = _refresh_channel_activation_stats(
+            model=model,
+            refs=next_refs,
+            activation_runtime=activation_runtime,
+            logger=logger,
+        )
+        logger.info(
+            "[%s] channel refresh: recalibrated next category=%s linears=%d metric=%s.",
+            str(current_category),
+            next_category,
+            len(next_refs),
+            str(resolved_channel_rank_metric),
+        )
+    else:
+        logger.info(
+            "[%s] channel refresh: next category=%s metric=%s reads live weights; no activation recalibration needed.",
+            str(current_category),
+            next_category,
+            str(resolved_channel_rank_metric),
+        )
+    return activation_runtime, global_adaptive_plan, int(global_raw_budget_value)
 
 def _is_skipped_linear_ref(ref: LinearRef, skip_layer_keys: Set[Tuple[int, str]]) -> bool:
     layer_idx = _extract_layer_idx(ref.name)
@@ -2474,6 +2897,7 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                 and resolved_channel_mode == "channel"
                 and channel_scope in {"category", "global"}
                 and int(adaptive_budget) > 0
+                and bool(eligible_vae_pairs)
             ):
                 if channel_scope == "global":
                     if global_adaptive_plan is None:
@@ -2840,6 +3264,53 @@ def run_cat_train(*, cat_args, hf_args, training_args, vae_args) -> None:
                         tokenizer=eval_tokenizer,
                         run_output_dir=run_output_dir,
                     )
+
+            refresh_needs_activation = (
+                bool(getattr(cat_args, "channel_refresh_after_category", False))
+                and bool(plan_is_main)
+                and int(cat_idx) + 1 < len(active_categories)
+                and str(resolved_channel_mode) == "channel"
+                and (
+                    _channel_rank_metric_needs_activation(resolved_channel_rank_metric)
+                    or is_mlp_aligned_rank_metric(resolved_channel_mlp_rank_metric)
+                )
+            )
+            refresh_context = (
+                teacher_runtime.eval_offload(restore=True)
+                if refresh_needs_activation and teacher_runtime is not None
+                else nullcontext()
+            )
+            with refresh_context:
+                activation_runtime, global_adaptive_plan, global_raw_budget_value = (
+                    _refresh_channel_protection_after_category(
+                        model=model,
+                        current_category=str(cat),
+                        current_category_idx=int(cat_idx),
+                        active_categories=active_categories,
+                        cat_args=cat_args,
+                        resolved_category_cfgs=resolved_category_cfgs,
+                        transpose_modules=transpose_modules,
+                        only_decoder_projections=only_decoder_projections,
+                        compression_categories=compression_categories,
+                        target_layers=target_layers,
+                        skip_layer_keys=skip_layer_keys,
+                        activation_runtime=activation_runtime,
+                        global_adaptive_plan=global_adaptive_plan,
+                        global_raw_budget_value=int(global_raw_budget_value),
+                        resolved_channel_mode=resolved_channel_mode,
+                        resolved_channel_rank_metric=resolved_channel_rank_metric,
+                        resolved_channel_mlp_rank_metric=resolved_channel_mlp_rank_metric,
+                        channel_axis=channel_axis,
+                        category_channel_protect_count=category_channel_protect_count,
+                        linear_group_size=int(linear_group_size),
+                        plan_is_main=bool(plan_is_main),
+                        plan_world_size=int(plan_world_size),
+                        run_output_dir=str(run_output_dir),
+                        logger=log,
+                    )
+                )
+            if inline_distributed and bool(getattr(cat_args, "channel_refresh_after_category", False)):
+                distill_distributed_barrier()
 
             if str(cat) in completed_category_set:
                 raise RuntimeError(f"CAT category {cat!r} was completed twice in one run.")

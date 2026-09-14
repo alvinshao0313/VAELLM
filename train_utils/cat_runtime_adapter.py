@@ -71,6 +71,7 @@ def adapt_cat_cli_config(cfg: CatCLIConfig):
         channel_mlp_fuse_weights=tuple(cfg.channel_mlp_fuse_weights),
         channel_axis=str(cfg.channel_axis),
         channel_quant=str(cfg.channel_quant),
+        channel_refresh_after_category=bool(cfg.channel_refresh_after_category),
         activation_calib_dataset=str(cfg.activation_calib_dataset),
         activation_calib_nsamples=int(cfg.activation_calib_nsamples),
         activation_calib_seqlen=int(cfg.activation_calib_seqlen),

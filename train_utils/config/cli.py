@@ -598,6 +598,11 @@ def _add_channel_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--channel_quant", type=str, default="none")
     parser.add_argument("--channel_axis", type=str, default="input", choices=list(CHANNEL_AXES))
     parser.add_argument("--channel_protect_count", type=str, default="default=0")
+    parser.add_argument(
+        "--channel_refresh_after_category",
+        type=_bool_type("--channel_refresh_after_category"),
+        default=False,
+    )
 
 
 def _add_sparse_bit_args(parser: argparse.ArgumentParser) -> None:
@@ -793,6 +798,7 @@ class CatCLIConfig:
     channel_min_per_layer: int
     channel_quant: str
     channel_axis: str
+    channel_refresh_after_category: bool
     vae_opt_template: VAEOptimizationConfig
     core_template: VAECoreConfig
     lora_rank: OverrideTable
@@ -1255,6 +1261,7 @@ def parse_cat_cli(argv: Optional[Sequence[str]] = None) -> CatCLIConfig:
             channel_min_per_layer=int(ns.channel_min_per_layer),
             channel_quant=str(ns.channel_quant),
             channel_axis=str(ns.channel_axis),
+            channel_refresh_after_category=ns.channel_refresh_after_category,
             vae_opt_template=vae_opt_template,
             core_template=core_template,
             lora_rank=lora_rank,
