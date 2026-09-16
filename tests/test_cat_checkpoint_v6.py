@@ -46,7 +46,7 @@ def _decoder(scale: float) -> Decoder:
         for idx, param in enumerate(module.parameters()):
             values = torch.arange(param.numel(), dtype=param.dtype).view_as(param)
             param.copy_(values.mul_(0.01).add_(float(scale) + idx * 0.001))
-    return module
+    return module.extract_single(0)
 
 
 def _vae(scale: float) -> VAELinear:
@@ -59,7 +59,7 @@ def _vae(scale: float) -> VAELinear:
         ],
         dtype=torch.bool,
     )
-    return VAELinear(
+    layer = VAELinear(
         in_features=4,
         out_features=4,
         bias=None,
@@ -71,6 +71,8 @@ def _vae(scale: float) -> VAELinear:
         always_use_original=False,
         protect_original_weight=False,
     )
+    layer.pack_parallel_stage_decoder_(trainable=False)
+    return layer
 
 
 class _Layer(nn.Module):

@@ -63,7 +63,7 @@ def _decoder() -> Decoder:
         decoder_type="linear",
         use_checkpoint=False,
         num_models=1,
-    ).to(dtype=torch.float32)
+    ).to(dtype=torch.float32).extract_single(0)
 
 
 def _vae_linear() -> VAELinear:
@@ -76,7 +76,7 @@ def _vae_linear() -> VAELinear:
         ],
         dtype=torch.bool,
     )
-    return VAELinear(
+    layer = VAELinear(
         in_features=4,
         out_features=4,
         bias=None,
@@ -86,6 +86,8 @@ def _vae_linear() -> VAELinear:
         codebook_dim=4,
         transpose=False,
     )
+    layer.pack_parallel_stage_decoder_(trainable=False)
+    return layer
 
 
 class _TinyModel(nn.Module):

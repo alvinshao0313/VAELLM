@@ -1231,18 +1231,25 @@ def _build_vae_linear_from_stage_payload(
         protect_original_weight=False,
     )
     if residual_stages == 1:
-        return VAELinear(
+        layer = VAELinear(
             vq_weight=stage_part_bits_payload[0],
             decoder=stage_part_decoders_payload[0],
             **common_kwargs,
         )
-    return VAELinear(
-        vq_weight=None,
-        decoder=None,
-        stage_vq_weights=list(stage_part_bits_payload),
-        stage_decoders=list(stage_part_decoders_payload),
-        **common_kwargs,
-    )
+    else:
+        layer = VAELinear(
+            vq_weight=None,
+            decoder=None,
+            stage_vq_weights=list(stage_part_bits_payload),
+            stage_decoders=list(stage_part_decoders_payload),
+            **common_kwargs,
+        )
+    # CAT installs only finalized decoder topology, even when recovery is disabled.
+    try:
+        layer.pack_parallel_stage_decoder_(trainable=False)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"[{split_meta.linear_name}] CAT decoder packing failed: {exc}") from exc
+    return layer
 
 
 

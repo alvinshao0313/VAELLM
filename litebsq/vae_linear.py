@@ -1778,6 +1778,7 @@ class VAELinear(nn.Module):
             self.parallel_stage_decode = False
 
     def pack_parallel_stage_decoder_(self, *, trainable: bool = False) -> bool:
+        """Pack stage/part decoders in place, including the single-decoder case."""
         packed_decoder = getattr(self, "_parallel_stage_decoder", None)
         if packed_decoder is not None:
             packed_decoder.requires_grad_(bool(trainable))
@@ -1787,9 +1788,6 @@ class VAELinear(nn.Module):
                 self._build_parallel_stage_decode_plan()
             return True
         decoders, layout = self._iter_stage_part_decoders_for_pack()
-        if len(decoders) <= 1:
-            self.parallel_stage_decode = False
-            return False
         stage_codebook_dims = [int(v) for v in getattr(self, "stage_codebook_dims", [])]
         if len(stage_codebook_dims) != int(self.residual_stages):
             raise ValueError(

@@ -177,6 +177,33 @@ def build_cat_v6_target_inventory(
     )
 
 
+def _validate_cat_packed_decoders(model: nn.Module) -> None:
+    """Validate finalized CAT topology without changing modules or parameters."""
+    for name, module in iter_named_vae_linears(model):
+        packed = module._modules.get("_parallel_stage_decoder")
+        if not isinstance(packed, nn.Module) or not bool(module.parallel_stage_decode):
+            raise ValueError(
+                f"[{name}] CAT checkpoint requires a registered packed main decoder with "
+                "parallel_stage_decode=True; finalize packing during CAT conversion before saving."
+            )
+        expected_models = int(module.residual_stages) * int(module.parallel_parts)
+        if int(getattr(packed, "num_models", 0)) != expected_models:
+            raise ValueError(
+                f"[{name}] CAT packed decoder num_models={getattr(packed, 'num_models', None)} "
+                f"!= residual_stages * parallel_parts={expected_models}."
+            )
+        serial_names = [
+            child_name
+            for child_name in module._modules
+            if child_name in {"decoder", "decoders"}
+            or child_name.startswith(("decoder_s", "decoders_s"))
+        ]
+        if serial_names:
+            raise ValueError(
+                f"[{name}] CAT packed decoder still has registered serial decoders: {serial_names}."
+            )
+
+
 def save_cat_v6_full_checkpoint(
     model: nn.Module,
     output_dir: str,
@@ -206,6 +233,7 @@ def save_cat_v6_full_checkpoint(
         raise ValueError(f"CAT {checkpoint_kind} save requires category.")
     if checkpoint_kind == "final_model" and category is not None:
         raise ValueError("CAT final_model save requires category=None.")
+    _validate_cat_packed_decoders(model)
     inventory = build_cat_v6_target_inventory(
         model,
         vae_args=vae_args,
