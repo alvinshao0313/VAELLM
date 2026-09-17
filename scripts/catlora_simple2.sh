@@ -14,7 +14,7 @@ export HF_DATASETS_OFFLINE=1
 
 torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
-  --output_dir "./result/catlora" \
+  --output_dir "/root/data/ckpts/result/catlora/remaining_lora_mass" \
   --compression_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --target_layers all \
   --skip_layers "" \
@@ -80,28 +80,29 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --channel_quant int8 \
   --channel_axis input \
   --channel_protect_count "default=32,cat:v_proj=64,cat:o_proj=64,cat:gate_proj=64,cat:down_proj=256" \
-  --channel_refresh_after_category true \
+  --channel_refresh_after_category false \
   --after_category_mode remaining_lora_prefix_decoder \
+  --distill_fp32_components none \
   --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
-  --dataset_task lm \
+  --dataset_task sft \
   --model_max_length 1024 \
   --dynamic_padding true \
   --group_by_length true \
   --lora_rank "default=12" \
   --lora_alpha "default=24" \
   --lora_dropout "default=0.1" \
-  --steps "default=5000,after:q_proj=10000,after:k_proj=10000,after:gate_proj=10000,after:up_proj=10000,after:down_proj=10000" \
+  --steps "default=5000,after:q_proj=10000,after:k_proj=10000,after:gate_proj=10000,after:up_proj=10000,after:down_proj=0" \
   --batch_size "default=8" \
   --learning_rate "default=1e-4" \
   --decoder_lr "default=1e-5" \
   --weight_decay "default=0.001" \
   --logging_steps "default=100" \
-  --loss_type "default=kl_top_partial" \
+  --loss_type "default=kl_top_mass" \
   --top_k "default=100" \
   --temperature "default=1" \
   --alpha "default=0.5" \
   --top_mse_weight "default=1.0" \
-  --prompt_loss_weight "default=0" \
+  --prompt_loss_weight "default=0.3" \
   --hidden_loss_weight "default=0.1" \
   --pre_mlp_hidden_loss_weight "default=0.01" \
   --hidden_layer_weighting linear_depth \

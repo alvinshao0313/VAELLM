@@ -1805,7 +1805,11 @@ def load_v6_full_checkpoint_into_model(
     state_dict_file = str(meta.get("state_dict_file", STATE_DICT_FILENAME))
     state_dict_path = os.path.join(resolved, state_dict_file)
     state_dict = _torch_load(state_dict_path, map_location=map_location)
+    from train_utils.distill_precision import restore_parameter_dtypes, install_precision_runtime
+
+    restore_parameter_dtypes(model, state_dict)
     load_result = model.load_state_dict(state_dict, strict=strict)
+    install_precision_runtime(model)
     refresh_vae_linear_runtime_after_state_load(model)
     model.eval()
     return model, meta, load_result

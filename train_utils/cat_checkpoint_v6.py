@@ -7,6 +7,8 @@ not a fallback path.
 
 from __future__ import annotations
 
+from train_utils.distill_precision import prepare_model_export
+
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -233,6 +235,7 @@ def save_cat_v6_full_checkpoint(
         raise ValueError(f"CAT {checkpoint_kind} save requires category.")
     if checkpoint_kind == "final_model" and category is not None:
         raise ValueError("CAT final_model save requires category=None.")
+    prepare_model_export(model, training_args)
     _validate_cat_packed_decoders(model)
     inventory = build_cat_v6_target_inventory(
         model,

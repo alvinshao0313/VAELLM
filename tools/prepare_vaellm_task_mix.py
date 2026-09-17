@@ -207,9 +207,9 @@ KEEP_TASK_CONFIGS: Dict[str, Dict[str, Any]] = {
         "dataset_path": "super_glue",
         "dataset_name": "rte",
         "training_split": "train",
-        "doc_to_text": "{{sentence1}}\nQuestion: {{sentence2}} True or False?\nAnswer:",
+        "doc_to_text": "{{premise}}\nQuestion: {{hypothesis}} True or False?\nAnswer:",
         "doc_to_target": "{{label}}",
-        "doc_to_choice": ["False", "True"],
+        "doc_to_choice": ["True", "False"],
     },
 }
 

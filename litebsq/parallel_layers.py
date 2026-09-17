@@ -59,10 +59,13 @@ class ParallelLinear(nn.Module):
             )
 
     def forward(self, x: Tensor) -> Tensor:
+        dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
+        x = x.to(dtype=dtype)
         if self.num_models == 1:
+            bias = None if self.linear.bias is None else self.linear.bias.to(dtype=dtype)
             if x.dim() == 3 and x.shape[1] == 1:
-                return self.linear(x.squeeze(1)).unsqueeze(1)
-            return self.linear(x)
+                return F.linear(x.squeeze(1), self.linear.weight.to(dtype=dtype), bias).unsqueeze(1)
+            return F.linear(x, self.linear.weight.to(dtype=dtype), bias)
 
         # Keep conv weight storage for checkpoint compatibility, but compute with
         # batched GEMM. Grouped Conv1d(k=1) is much slower for shapes like 32->128.
@@ -71,7 +74,8 @@ class ParallelLinear(nn.Module):
             self.num_models, self.out_features, self.in_features
         )
         bias = self.conv.bias.view(self.num_models, self.out_features)
-        return torch.einsum("bmi,moi->bmo", x, weight) + bias
+        out = torch.einsum("bmi,moi->bmo", x, weight.to(dtype=dtype))
+        return out + bias.to(dtype=out.dtype)
 
     def extract_single(self, model_idx: int) -> nn.Linear:
         _validate_model_index(model_idx, num_models=self.num_models)
@@ -244,7 +248,10 @@ class Normalize(nn.Module):
         if self.norm_type == "no":
             return self.norm(x)
         if self.norm_type == "layer":
-            out = self.norm(x)
+            if self.num_models == 1:
+                out = F.layer_norm(x, self.norm.normalized_shape, self.norm.weight.to(x.dtype), self.norm.bias.to(x.dtype), self.norm.eps)
+            else:
+                out = self.norm(x)
             if out.dtype != x.dtype:
                 out = out.to(dtype=x.dtype)
             if self.num_models == 1:
@@ -253,7 +260,10 @@ class Normalize(nn.Module):
             bias = self.bias if self.bias.dtype == x.dtype else self.bias.to(dtype=x.dtype)
             return out * weight.unsqueeze(0) + bias.unsqueeze(0)
         if self.norm_type == "rms":
-            out = self.norm(x)
+            if self.num_models == 1:
+                out = F.rms_norm(x, self.norm.normalized_shape, self.norm.weight.to(x.dtype), self.norm.eps)
+            else:
+                out = self.norm(x)
             if out.dtype != x.dtype:
                 out = out.to(dtype=x.dtype)
             if self.num_models == 1:
@@ -262,7 +272,11 @@ class Normalize(nn.Module):
             return out * weight.unsqueeze(0)
 
         flat = self._flatten_parallel(x)
-        out = self.norm(flat)
+        if self.norm_type == "group":
+            out = F.group_norm(flat, self.norm.num_groups, self.norm.weight.to(x.dtype), self.norm.bias.to(x.dtype), self.norm.eps)
+        else:
+            out = self.norm(flat)
+        out = out.to(dtype=x.dtype)
         if x.dim() == 2 and self.num_models == 1:
             return out
         return out.view(int(x.shape[0]), self.num_models, self.in_channels)

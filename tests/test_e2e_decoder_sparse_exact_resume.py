@@ -16,6 +16,7 @@ from sparse_bit_tuning.manager import SparseBitTuningManager
 from train_utils import checkpoint_v6 as v6
 from train_utils.config.configs import AuxTrainableConfig
 from train_utils.decoder_execution import enable_vae_linear_by_execution_plan
+from train_utils.distill_precision import configure_distill_precision
 from train_utils.model_level_optimizer import ModelLevelOptimizerLRConfig, attach_model_level_optimizer_contract
 from train_utils.model_level_trainables import build_model_level_trainable_selection
 
@@ -143,6 +144,7 @@ def _build_trainer(
     round_base_checkpoint_id: str,
     output_dir: Path,
     stop_at_two: bool,
+    fp32_decoder: bool = False,
 ):
     device = torch.device("cuda:0")
     model = _load_round_base(round_base).to(device=device, dtype=torch.bfloat16)
@@ -200,6 +202,7 @@ def _build_trainer(
     # This is intentionally a single-process/single-GPU exact-resume fixture.
     # The production guard against torch.nn.DataParallel must remain enabled.
     args._n_gpu = 1
+    configure_distill_precision(selection, components=("decoder",) if fp32_decoder else (), training_args=args)
     trainer = _SparseMSETrainer(
         model=model,
         args=args,
@@ -249,7 +252,8 @@ def _decoder_state(model: _TinyModel) -> dict:
     return {name: tensor.detach().cpu().clone() for name, tensor in decoder.state_dict().items()}
 
 
-def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp_path: Path):
+@pytest.mark.parametrize("fp32_decoder", [False, True])
+def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp_path: Path, fp32_decoder: bool):
     torch.manual_seed(77)
     round_base_model = _TinyModel()
     round_base = tmp_path / "round_base"
@@ -269,6 +273,7 @@ def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp
         round_base_checkpoint_id=round_base_id,
         output_dir=tmp_path / "continuous",
         stop_at_two=False,
+        fp32_decoder=fp32_decoder,
     )
     continuous.train()
     assert int(continuous.state.global_step) == 4
@@ -278,18 +283,23 @@ def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp
         round_base_checkpoint_id=round_base_id,
         output_dir=tmp_path / "interrupted",
         stop_at_two=True,
+        fp32_decoder=fp32_decoder,
     )
     interrupted.train()
     assert int(interrupted.state.global_step) == 2
     step_dir = tmp_path / "interrupted" / "checkpoint-2"
     assert (step_dir / v6.META_FILENAME).is_file()
     assert (step_dir / v6.TRAINING_MODEL_STATE_FILENAME).is_file()
+    if fp32_decoder:
+        state = torch.load(step_dir / v6.TRAINING_MODEL_STATE_FILENAME, weights_only=True)
+        assert all(value.dtype == torch.float32 for value in state.values())
 
     resumed, resumed_model, resumed_manager = _build_trainer(
         round_base=round_base,
         round_base_checkpoint_id=round_base_id,
         output_dir=tmp_path / "interrupted",
         stop_at_two=False,
+        fp32_decoder=fp32_decoder,
     )
     resumed.train(resume_from_checkpoint=str(step_dir))
     assert resumed._v6_exact_resume_loaded is True

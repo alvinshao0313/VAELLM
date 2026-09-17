@@ -116,6 +116,7 @@ def test_current_recovery_clears_decoded_cache_without_eval_or_save():
     cfg = SimpleNamespace(
         aux=SimpleNamespace(norm_train_mode="none", lm_head_train_mode="none", norm_lr=None, lm_head_lr=None),
         opt=SimpleNamespace(
+            distill_fp32_components=(),
             steps=1,
             learning_rate=1e-4,
             weight_decay=0.0,

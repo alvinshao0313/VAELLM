@@ -357,6 +357,7 @@ def enable_model_level_lora_targets(
     alpha: float,
     dropout: float,
     rank_explicit: bool = False,
+    fp32_components: Sequence[str] = (),
     initial_low_rank_payloads: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> nn.Module:
     """Create at most one PEFT adapter for compressed and/or dense/lm_head targets."""
@@ -373,6 +374,7 @@ def enable_model_level_lora_targets(
             alpha=float(alpha),
             dropout=float(dropout),
             rank_explicit=bool(rank_explicit),
+            fp32_components=fp32_components,
             include_lm_head=bool(include_lm_head_lora),
             dense_target_modules=dense_target_modules,
         )
@@ -448,6 +450,7 @@ def build_model_level_trainable_selection(
     alpha: float,
     dropout: float,
     rank_explicit: bool = False,
+    fp32_components: Sequence[str] = (),
     initial_low_rank_payloads: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
     train_decoder: bool = False,
     train_lora: bool = True,
@@ -483,6 +486,7 @@ def build_model_level_trainable_selection(
         alpha=float(alpha),
         dropout=float(dropout),
         rank_explicit=bool(rank_explicit),
+        fp32_components=fp32_components,
         initial_low_rank_payloads=initial_low_rank_payloads if bool(train_lora) else None,
     )
 

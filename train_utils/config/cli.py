@@ -40,6 +40,7 @@ from train_utils.config.configs import (
     parse_loss_type,
     parse_optional_positive_float,
     parse_train_mode,
+    parse_distill_fp32_components,
     validate_train_mode_aux,
 )
 from train_utils.config.overrides import (
@@ -450,6 +451,10 @@ def _add_loss_args(parser: argparse.ArgumentParser, *, cat_overrides: bool) -> N
 
 
 def _add_opt_args(parser: argparse.ArgumentParser, *, cat_overrides: bool) -> None:
+    parser.add_argument(
+        "--distill_fp32_components", type=parse_distill_fp32_components, default=(),
+        help="FP32 trainable parameter components: none or comma-separated lora,decoder,norm,lm_head; computation follows bf16/fp16.",
+    )
     if cat_overrides:
         parser.add_argument("--steps", type=str, default="default=50")
         parser.add_argument("--batch_size", type=str, default="default=2")
@@ -856,6 +861,8 @@ class CatCLIConfig:
     ppl_limit: int
     eval_hif4_act: bool
 
+    distill_fp32_components: Tuple[str, ...] = ()
+
     def resolve_category_config(self, category: str) -> Tuple[VAECompressionConfig, VAEOptimizationConfig]:
         if category not in self.compression_categories:
             raise ValueError(
@@ -961,6 +968,7 @@ class CatCLIConfig:
             warmup_ratio=self.warmup_ratio,
             lr_scheduler_type=self.lr_scheduler_type,
             optim=self.optim,
+            distill_fp32_components=self.distill_fp32_components,
             gradient_checkpointing=self.gradient_checkpointing,
             gradient_checkpointing_kwargs=dict(self.gradient_checkpointing_kwargs),
             logging_steps=int(resolve_after_category_value(self.logging_steps, category)),
@@ -1022,6 +1030,7 @@ def parse_e2e_cli(argv: Optional[Sequence[str]] = None) -> E2ECLIConfig:
             warmup_ratio=float(ns.warmup_ratio),
             lr_scheduler_type=str(ns.lr_scheduler_type),
             optim=str(ns.optim),
+            distill_fp32_components=ns.distill_fp32_components,
             gradient_checkpointing=bool(ns.gradient_checkpointing),
             gradient_checkpointing_kwargs=_parse_gc_kwargs(ns.gradient_checkpointing_kwargs),
             logging_steps=int(ns.logging_steps),
@@ -1289,6 +1298,7 @@ def parse_cat_cli(argv: Optional[Sequence[str]] = None) -> CatCLIConfig:
             warmup_ratio=float(ns.warmup_ratio),
             lr_scheduler_type=str(ns.lr_scheduler_type),
             optim=str(ns.optim),
+            distill_fp32_components=ns.distill_fp32_components,
             gradient_checkpointing=bool(ns.gradient_checkpointing),
             gradient_checkpointing_kwargs=_parse_gc_kwargs(ns.gradient_checkpointing_kwargs),
             lora_rank_explicit="--lora_rank" in explicit,

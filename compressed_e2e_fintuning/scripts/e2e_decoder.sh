@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-.}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONHASHSEED=0
 export TOKENIZERS_PARALLELISM=false
@@ -11,7 +11,7 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
-STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora/Qwen_Qwen3-8B_20260828_183213/final_model/}"
+STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora/remaining_lora_mass/Qwen_Qwen3-8B_20260910_180322/final_model/}"
 PARALLEL_MODE="${PARALLEL_MODE:-dp}"   # dp | layer_mp
 
 export DISTILL_NCCL_TIMEOUT_SEC="${DISTILL_NCCL_TIMEOUT_SEC:-10800}"
@@ -37,34 +37,35 @@ fi
 
 if [[ "${PARALLEL_MODE}" == "dp" ]]; then
   # 原正式 recipe：decoder + Sparse Bit；不启用 backbone LoRA。
-  torchrun --standalone --nproc_per_node=8 -m compressed_e2e_fintuning.main \
+  torchrun --standalone --nproc_per_node=4 -m compressed_e2e_fintuning.main \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
-    --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning \
-    --train_mode decoder_sparse_bit \
+    --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning/only_lora \
+    --train_mode lora \
+    --distill_fp32_components none \
     --seed 0 \
     --data_seed 0 \
-    --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
+    --dataset_mix "edgerazor_ii_7m=0.614,edgerazor_ii_gen=0.121,edgerazor_tulu=0.050,edgerazor_am=0.115,vaellm_eval_task=0.100" \
     --dataset_task sft \
     --dynamic_padding true \
     --model_max_length 1024 \
     --group_by_length true \
     --target_layers 0-35 \
     --target_modules all \
-    --loss_type kl_top \
+    --loss_type kl_top_partial \
     --top_k 100 \
     --temperature 1.0 \
     --alpha 0.5 \
-    --prompt_loss_weight 0.0 \
-    --hidden_loss_weight 0.1 \
-    --pre_mlp_hidden_loss_weight 0.001 \
-    --hidden_layer_weighting linear_depth \
-    --selective_student_topk true \
+    --prompt_loss_weight 0.3 \
+    --hidden_loss_weight 0.0 \
+    --pre_mlp_hidden_loss_weight 0.0 \
+    --hidden_layer_weighting adaptive_top_3 \
+    --selective_student_topk false \
     --selective_student_topk_chunk_rows 32 \
-    --steps 5000 \
+    --steps 10000 \
     --batch_size 8 \
     --gradient_accumulation_steps 1 \
     --decoder_lr 1e-5 \
-    --learning_rate 1e-5 \
+    --learning_rate 1e-4 \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \
     --weight_decay 0.001 \
@@ -72,11 +73,13 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --logging_steps 10 \
     --gradient_checkpointing true \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
-    --lora_rank 12 \
-    --lora_alpha 24 \
-    --lora_dropout 0.03 \
+    --lora_rank 8 \
+    --lora_alpha 16 \
+    --lora_dropout 0.1 \
     --norm_train_mode final \
+    --norm_lr 1e-4 \
     --lm_head_train_mode linear \
+    --lm_head_lr 1e-4 \
     --bit_active_ratio 0.03 \
     --bit_optimizer rms_sgd \
     --bit_lr auto \
@@ -114,6 +117,7 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --student_checkpoint_dir "${STUDENT_CKPT}" \
     --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning \
     --train_mode decoder_lora \
+    --distill_fp32_components none \
     --seed 0 \
     --data_seed 0 \
     --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \

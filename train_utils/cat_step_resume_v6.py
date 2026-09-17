@@ -178,6 +178,8 @@ def build_cat_step_immutable_resume_contract(
     opt = _jsonable(cfg.opt)
     if isinstance(opt, dict):
         opt.pop("logging_steps", None)
+        if not opt.get("distill_fp32_components"):
+            opt.pop("distill_fp32_components", None)
     tokenizer_name, tokenizer_revision = tokenizer_identity(tokenizer)
     return {
         "version": 1,

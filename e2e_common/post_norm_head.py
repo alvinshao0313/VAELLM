@@ -70,6 +70,10 @@ def fuse_post_norm_head_linear(model: nn.Module) -> bool:
     base_lm_head = lm_head.lm_head
     post_norm_linear = lm_head.post_norm_linear
     with torch.no_grad():
+        dtype = getattr(model, "_distill_model_compute_dtype", None) or torch.promote_types(
+            base_lm_head.weight.dtype, post_norm_linear.weight.dtype,
+        )
+        destination = base_lm_head.weight if dtype == base_lm_head.weight.dtype else torch.empty_like(base_lm_head.weight, dtype=dtype)
         post_weight = post_norm_linear.weight.detach().to(device=base_lm_head.weight.device, dtype=torch.float32)
         out_features = int(base_lm_head.weight.shape[0])
         row_chunk_size = 1024
@@ -77,7 +81,12 @@ def fuse_post_norm_head_linear(model: nn.Module) -> bool:
             row_end = min(row_begin + row_chunk_size, out_features)
             weight_chunk = base_lm_head.weight[row_begin:row_end].detach().to(dtype=torch.float32)
             fused_chunk = torch.matmul(weight_chunk, post_weight)
-            base_lm_head.weight[row_begin:row_end].copy_(fused_chunk.to(dtype=base_lm_head.weight.dtype))
+            destination[row_begin:row_end].copy_(fused_chunk)
+        base_lm_head.weight.data = destination.data
+    if dtype == torch.float32:
+        from train_utils.distill_precision import install_precision_runtime
+
+        install_precision_runtime(base_lm_head, getattr(model, "_distill_model_compute_dtype", None))
 
     base_lm_head.train(lm_head.training)
     model.lm_head = base_lm_head

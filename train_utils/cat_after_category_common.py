@@ -6,6 +6,8 @@ trainer/runtime used by every supported mode.
 
 from __future__ import annotations
 
+from train_utils.distill_precision import configure_distill_precision, install_precision_runtime, mixed_precision_dtype, prepare_model_export
+
 import gc
 import os
 from dataclasses import dataclass
@@ -740,6 +742,7 @@ def _train_model_level_selection(
             raise ValueError("CAT exact-step resume requires save_only_model=false.")
         if bool(getattr(training_args, "ignore_data_skip", False)):
             raise ValueError("CAT exact-step resume requires ignore_data_skip=false.")
+    configure_distill_precision(selection, components=cfg.opt.distill_fp32_components, training_args=training_args, logger=logger)
     controller = build_hif4_act_controller(bool(cfg.runtime.distill_hif4_act))
     trainer = CanonicalCatSFTTrainer(
         model=model,
@@ -1014,6 +1017,7 @@ def _run_canonical_current_family(
         previous_use_cache = bool(model.config.use_cache)
         model.config.use_cache = False
 
+    install_precision_runtime(model, mixed_precision_dtype(stage))
     _prewarm_non_current_vae_linears(
         model,
         selected_names=([name for name, _ in targets] if effective_train_decoder else ()),
@@ -1025,6 +1029,7 @@ def _run_canonical_current_family(
     selection = build_model_level_trainable_selection(
         model,
         aux=cfg.aux,
+        fp32_components=cfg.opt.distill_fp32_components,
         compressed_modules=targets,
         rank=int(cfg.lora.rank),
         alpha=float(cfg.lora.alpha),
@@ -1083,6 +1088,7 @@ def _run_canonical_current_family(
         model,
         lm_head_train_mode=str(cfg.aux.lm_head_train_mode),
     )
+    prepare_model_export(model, stage)
     for param in model.parameters():
         param.requires_grad_(False)
     cleared_cache_count = int(clear_model_vae_linear_cache(model))
@@ -1337,6 +1343,7 @@ def _run_canonical_remaining_family(
         previous_use_cache = bool(model.config.use_cache)
         model.config.use_cache = False
 
+    install_precision_runtime(model, mixed_precision_dtype(stage))
     _prewarm_non_current_vae_linears(
         model,
         selected_names=[name for name, _module in decoder_targets],
@@ -1348,6 +1355,7 @@ def _run_canonical_remaining_family(
     selection = build_model_level_trainable_selection(
         model,
         aux=cfg.aux,
+        fp32_components=cfg.opt.distill_fp32_components,
         compressed_modules=(),
         dense_target_modules=remaining_names,
         decoder_modules=decoder_targets,
@@ -1412,6 +1420,7 @@ def _run_canonical_remaining_family(
         model,
         lm_head_train_mode=str(cfg.aux.lm_head_train_mode),
     )
+    prepare_model_export(model, stage)
     for param in model.parameters():
         param.requires_grad_(False)
     cleared_cache_count = int(clear_model_vae_linear_cache(model))

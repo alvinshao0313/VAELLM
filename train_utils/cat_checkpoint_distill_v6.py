@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from train_utils.distill_precision import prepare_model_export
+
 from dataclasses import dataclass
 import os
 from typing import Dict, Mapping, Optional, Sequence, Tuple
@@ -288,6 +290,7 @@ def save_checkpoint_distill_v6_model(
         }
     )
 
+    prepare_model_export(model, training_args)
     result = save_v6_full_checkpoint(
         model,
         output_dir,

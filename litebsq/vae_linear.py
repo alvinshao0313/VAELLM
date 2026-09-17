@@ -1987,11 +1987,7 @@ class VAELinear(nn.Module):
 
         param = next(decoder.parameters(), None)
         decode_device = param.device if param is not None else packed_vq.device
-        compute_dtype = (
-            activation_dtype
-            if torch.is_grad_enabled()
-            else (param.dtype if param is not None else activation_dtype)
-        )
+        compute_dtype = getattr(self, "_decoder_compute_dtype", None) or activation_dtype
         if torch.device(decode_device).type != "cuda":
             return _unsupported(f"decoder device must be CUDA, got {decode_device}")
         if int(getattr(decoder, "num_models", 0)) != M:
@@ -2089,7 +2085,7 @@ class VAELinear(nn.Module):
         # 再在外层统一转回目标 dtype。
         param = next(decoder.parameters(), None)
         decode_device = param.device if param is not None else vq_weight.device
-        decode_dtype = param.dtype if param is not None else dtype
+        decode_dtype = getattr(self, "_decoder_compute_dtype", None) or dtype
         w_blocks = decoder(vq_weight.to(device=decode_device, dtype=decode_dtype, non_blocking=True))
         return w_blocks.permute(1, 0, 2).contiguous().view(-1)
 
@@ -2347,7 +2343,7 @@ class VAELinear(nn.Module):
 
         param = next(packed_decoder.parameters(), None)
         decode_device = param.device if param is not None else torch.device("cpu")
-        decode_dtype = param.dtype if param is not None else dtype
+        decode_dtype = getattr(self, "_decoder_compute_dtype", None) or dtype
 
         # Grad-enabled decoder optimization and no-cache inference both prefer the
         # packed uint8 path so dense grouped VQ is not materialized unnecessarily.
@@ -2445,6 +2441,7 @@ class VAELinear(nn.Module):
         return w_split.contiguous()
 
     def _decode_compressed_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        dtype = getattr(self, "_decoder_compute_dtype", None) or dtype
         w_split = self._decode_split_weight(dtype=dtype)
         if self.transpose:
             return w_split.t().contiguous()
@@ -2752,6 +2749,7 @@ class VAELinear(nn.Module):
         include_low_rank: bool = True,
         include_sparse_residual: bool = True,
     ) -> torch.Tensor:
+        dtype = getattr(self, "_decoder_compute_dtype", None) or dtype
         compressed_weight = self._decode_compressed_weight(dtype=dtype)
         return self._finalize_decoded_weight_from_compressed(
             compressed_weight,
@@ -3025,6 +3023,9 @@ class VAELinear(nn.Module):
         return True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        compute_dtype = getattr(self, "_decoder_compute_dtype", None)
+        if compute_dtype is not None:
+            x = x.to(dtype=compute_dtype)
         use_original = bool(getattr(self, "always_use_original", False)) or not bool(getattr(self, "temporary", True))
         if use_original:
             if self.original_weight is None:

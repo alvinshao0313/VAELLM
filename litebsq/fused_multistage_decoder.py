@@ -737,7 +737,10 @@ def fused_decode_packed_symmetric_decoder(
     *,
     eps: float = 1e-5,
 ) -> Tensor:
-    w_in, b_in, ln_w, ln_b, w_out, b_out = extract_packed_symmetric_stage_weights(decoder)
+    w_in, b_in, ln_w, ln_b, w_out, b_out = (
+        weight.to(dtype=grouped_vq.dtype)
+        for weight in extract_packed_symmetric_stage_weights(decoder)
+    )
     return fused_multistage_symmetric_decode(
         grouped_vq, w_in, b_in, ln_w, ln_b, w_out, b_out, eps=eps
     )
@@ -853,7 +856,10 @@ def fused_decode_batched_same_shape_decoders(
                 for dec, vq in zip(decoders, grouped_vqs)
             ]
 
-    weight_packs = [extract_packed_symmetric_stage_weights(decoder) for decoder in decoders]
+    weight_packs = [
+        tuple(weight.to(dtype=vq.dtype) for weight in extract_packed_symmetric_stage_weights(decoder))
+        for decoder, vq in zip(decoders, grouped_vqs)
+    ]
     first_vq = grouped_vqs[0]
     B, S, IN = int(first_vq.shape[0]), int(first_vq.shape[1]), int(first_vq.shape[2])
     device = first_vq.device

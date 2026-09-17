@@ -183,6 +183,8 @@ def build_e2e_immutable_resume_contract(
     # logging/save cadence can change without altering optimizer/data/RNG math.
     if isinstance(opt, dict):
         opt.pop("logging_steps", None)
+        if not opt.get("distill_fp32_components"):
+            opt.pop("distill_fp32_components", None)
     runtime = _jsonable(cfg.runtime)
     tokenizer_name, tokenizer_revision = tokenizer_identity(tokenizer)
     eval_after_save = bool(getattr(cfg.runtime.evaluation, "eval_after_save", False))

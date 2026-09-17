@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from train_utils.distill_precision import configure_distill_precision, prepare_model_export
+
 import json
 import os
 from typing import Dict, Optional, Sequence, Tuple
@@ -392,7 +394,9 @@ def _run_finalization_probe(
 ) -> Tuple[torch.Tensor, torch.dtype]:
     device = _model_input_device(model)
     inputs = {name: tensor.to(device=device) for name, tensor in probe_inputs.items()}
-    outputs = model(**inputs)
+    compute_dtype = getattr(model, "_distill_model_compute_dtype", None)
+    with torch.autocast(device.type, dtype=compute_dtype or torch.bfloat16, enabled=compute_dtype is not None):
+        outputs = model(**inputs)
     logits = get_output_logits(outputs)
     if not torch.is_tensor(logits):
         raise TypeError(f"Finalization parity probe expected tensor logits, got {type(logits)}.")
@@ -609,6 +613,7 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
     selection = build_model_level_trainable_selection(
         model,
         aux=cfg.aux,
+        fp32_components=cfg.opt.distill_fp32_components,
         compressed_modules=selected,
         dense_target_modules=(),
         rank=int(effective_lora.rank),
@@ -622,6 +627,7 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
         freeze=True,
     )
     model = selection.peft_model or model
+    configure_distill_precision(selection, components=cfg.opt.distill_fp32_components, training_args=training_args, logger=log)
     exact_lora_config = collect_exact_peft_lora_config(
         model,
         default_rank=int(effective_lora.rank),
@@ -1004,6 +1010,7 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
                 final_model,
                 probe_state["inputs"],
             )
+            probe_state["pre_export"] = final_probe
             if final_dtype != probe_state["dtype"]:
                 raise RuntimeError(
                     "Finalization parity output dtype changed: "
@@ -1056,6 +1063,29 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
     )
     checkpoint_context["runtime_audit"]["runtime_cleanup_forward_parity"] = runtime_cleanup_parity
     checkpoint_context["runtime_audit"]["finalization_forward_parity"] = finalization_parity
+
+    export_dtype = prepare_model_export(final_model, training_args)
+    checkpoint_context["runtime_audit"]["export_dtype"] = str(export_dtype)
+
+    def _capture_export_precision_probe():
+        handles, manager = _install_post_finalize_probe_runtime(
+            final_model, cfg=cfg, layer_device_map=layer_device_map,
+        )
+        try:
+            exported, output_dtype = _run_finalization_probe(final_model, probe_state["inputs"])
+            before = probe_state["pre_export"]
+            delta = exported - before
+            return {
+                "output_dtype": str(output_dtype),
+                "max_abs": float(delta.abs().max()),
+                "relative_l2": float(delta.norm() / before.norm().clamp_min(1e-12)),
+            }
+        finally:
+            _remove_post_finalize_probe_runtime(final_model, handles, manager)
+
+    export_probe = distributed_guarded_main(_capture_export_precision_probe, barrier=False)
+    checkpoint_context["runtime_audit"]["export_precision_probe"] = export_probe
+    log.info("Export precision probe (separate from structural fusion): %s", export_probe)
 
     final_lm_eval = None
     has_eval_tasks = bool(str(cfg.runtime.evaluation.eval_tasks or "").strip())

@@ -170,6 +170,7 @@ def build_full_compressed_peft_model(
     alpha: float,
     dropout: float,
     rank_explicit: bool = False,
+    fp32_components: Sequence[str] = (),
     include_lm_head: bool = False,
     dense_target_modules: Optional[Sequence[str]] = None,
 ) -> nn.Module:
@@ -254,6 +255,13 @@ def build_full_compressed_peft_model(
         dense_module_names=dense_names,
         include_lm_head=include_lm_head,
     )
+    # Promote before copying an existing FP32 low-rank payload.
+    for peft_name, layer in iter_named_peft_lora_layers(peft_model):
+        component = "lm_head" if _logical_adapter_target_name(peft_name) == "lm_head" else "lora"
+        if component in fp32_components:
+            for parameter in layer.parameters():
+                if parameter.requires_grad:
+                    parameter.data = parameter.data.to(dtype=torch.float32)
     if initial_low_rank_payloads is not None:
         init_names = [name for name in names if name in initial_low_rank_payloads]
         initialize_full_proxy_lora_from_low_rank(
@@ -373,6 +381,10 @@ def initialize_full_proxy_lora_from_low_rank(
         proxy.base_layer._validate_low_rank_payload_tensors(low_rank_a, low_rank_b)
         lora_a = carrier.lora_A[adapter].weight
         lora_b = carrier.lora_B[adapter].weight
+        if low_rank_b.dtype == torch.float32:
+            lora_a.data = lora_a.data.float()
+        if low_rank_a.dtype == torch.float32:
+            lora_b.data = lora_b.data.float()
         scaling = float(carrier.scaling[adapter])
         if tuple(lora_a.shape) != tuple(low_rank_b.shape) or tuple(lora_b.shape) != tuple(low_rank_a.shape):
             raise RuntimeError(f"{module_name}: full LoRA payload shape mismatch.")
@@ -441,15 +453,27 @@ def _resolve_peft_delta_weight(lora_layer: nn.Module, adapter_name: str) -> torc
 
 
 @torch.no_grad()
-def _merge_dense_peft_lora_into_base(lora_layer: nn.Module) -> nn.Module:
+def _merge_dense_peft_lora_into_base(lora_layer: nn.Module, export_dtype=None) -> nn.Module:
     if not is_peft_lora_linear(lora_layer):
         raise TypeError(f"expected plain PEFT LoRA layer, got {type(lora_layer)}.")
     adapter = _get_default_adapter_name(lora_layer)
     base = lora_layer.get_base_layer() if hasattr(lora_layer, "get_base_layer") else lora_layer.base_layer
     if not isinstance(base, nn.Linear):
         raise TypeError(f"dense LoRA finalize expects nn.Linear base, got {type(base)}.")
-    delta = _resolve_peft_delta_weight(lora_layer, adapter)
-    base.weight.add_(delta.to(device=base.weight.device, dtype=base.weight.dtype))
+    a = lora_layer.lora_A[adapter].weight
+    b = lora_layer.lora_B[adapter].weight
+    dtype = export_dtype or torch.promote_types(base.weight.dtype, torch.promote_types(a.dtype, b.dtype))
+    destination = base.weight if dtype == base.weight.dtype else torch.empty_like(base.weight, dtype=dtype)
+    a32 = a.float()
+    for begin in range(0, base.weight.shape[0], 1024):
+        end = min(begin + 1024, base.weight.shape[0])
+        delta = (b[begin:end].float() @ a32) * float(lora_layer.scaling[adapter])
+        destination[begin:end].copy_(base.weight[begin:end].float() + delta)
+    base.weight.data = destination.data
+    if dtype == torch.float32:
+        from train_utils.distill_precision import install_precision_runtime
+
+        install_precision_runtime(base, export_dtype)
     return base
 
 
@@ -523,9 +547,10 @@ def finalize_model_level_lora(
     selectively merge ordinary dense targets (e.g. lm_head), unwrap proxies, never
     call global merge_and_unload().
 
-    Path B (no compressed proxy): standard PEFT merge_and_unload().
+    Path B (no compressed proxy): merge dense adapters with FP32 accumulation.
     """
     proxy_refs = list(iter_named_full_compressed_peft_proxies(model))
+    export_dtype = getattr(model, "_distill_model_compute_dtype", None)
     if compressed_proxy_names is not None:
         wanted = {str(name) for name in compressed_proxy_names}
         proxy_refs = [(name, proxy) for name, proxy in proxy_refs if name in wanted]
@@ -534,6 +559,12 @@ def finalize_model_level_lora(
             raise RuntimeError(f"finalize missing compressed proxies: {missing}")
 
     if not proxy_refs:
+        layers = list(iter_named_peft_lora_layers(model))
+        if layers:
+            root = _proxy_root(model)
+            for name, layer in layers:
+                set_module_by_name(root, _logical_adapter_target_name(name), _merge_dense_peft_lora_into_base(layer, export_dtype))
+            return root
         merge_and_unload = getattr(model, "merge_and_unload", None)
         if not callable(merge_and_unload):
             raise TypeError("Path-B finalize requires a PEFT model with merge_and_unload().")
@@ -566,7 +597,7 @@ def finalize_model_level_lora(
         dense_lora_layers.append((logical, peft_name, lora_layer))
 
     for logical, peft_name, lora_layer in dense_lora_layers:
-        merged_base = _merge_dense_peft_lora_into_base(lora_layer)
+        merged_base = _merge_dense_peft_lora_into_base(lora_layer, export_dtype)
         set_module_by_name(root, logical, merged_base)
 
     unwrap_full_compressed_peft_proxies(model, module_names=compressed_names)

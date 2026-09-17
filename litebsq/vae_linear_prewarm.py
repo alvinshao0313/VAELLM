@@ -173,6 +173,9 @@ def _normalize_named_vae_decode_targets(named_targets: Sequence[Any]) -> List[Na
 
 
 def _resolve_cache_dtype_for_layer(base_layer: "VAELinear", dtype: Optional[torch.dtype]) -> torch.dtype:
+    compute_dtype = getattr(base_layer, "_decoder_compute_dtype", None)
+    if compute_dtype is not None:
+        return compute_dtype
     if dtype is not None:
         return dtype
     for param in base_layer.parameters():
@@ -333,7 +336,10 @@ def _decode_named_vae_linear_weights_chunk(
             packed_decoder = base_layer._parallel_stage_decoder
             param = next(packed_decoder.parameters())
             grouped_vqs.append(
-                base_layer._get_parallel_stage_grouped_vq(dtype=param.dtype, device=param.device)
+                base_layer._get_parallel_stage_grouped_vq(
+                    dtype=getattr(base_layer, "_decoder_compute_dtype", None) or target_dtype,
+                    device=param.device,
+                )
             )
             decoders.append(packed_decoder)
         fused_blocks_list = fused_decode_batched_same_shape_decoders(decoders, grouped_vqs)

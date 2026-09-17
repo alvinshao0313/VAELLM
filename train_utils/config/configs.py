@@ -40,6 +40,24 @@ AFTER_CATEGORY_MODES = (
 DATASET_TASKS = ("lm", "sft")
 NORM_TRAIN_MODES = ("none", "final", "all")
 LM_HEAD_TRAIN_MODES = ("none", "linear", "lora", "full")
+DISTILL_FP32_COMPONENTS = ("lora", "decoder", "norm", "lm_head")
+
+
+def parse_distill_fp32_components(raw) -> Tuple[str, ...]:
+    if isinstance(raw, str):
+        values = [value.strip().lower() for value in raw.split(",")]
+    elif isinstance(raw, (tuple, list)):
+        values = list(raw)
+    else:
+        raise ValueError("distill_fp32_components must be none or a comma-separated component list.")
+    if values == ["none"] or not values:
+        return ()
+    invalid = set(values) - set(DISTILL_FP32_COMPONENTS)
+    if invalid:
+        raise ValueError(f"Invalid distill_fp32_components {sorted(invalid)}; choose lora,decoder,norm,lm_head or none alone.")
+    return tuple(name for name in DISTILL_FP32_COMPONENTS if name in values)
+
+
 TEACHER_OFFLOAD_MODES = ("none", "cpu")
 PARALLEL_MODES = ("dp", "layer_mp")
 OFFLOAD_MODES = ("none", "saved_tensors", "streaming")
@@ -345,6 +363,7 @@ class AuxTrainableConfig:
 
 @dataclass
 class DistillOptimizationConfig:
+    distill_fp32_components: Tuple[str, ...] = ()
     steps: int = 50
     batch_size: int = 2
     learning_rate: float = 1e-4
@@ -362,6 +381,7 @@ class DistillOptimizationConfig:
     logging_steps: int = 1
 
     def validate(self) -> None:
+        self.distill_fp32_components = parse_distill_fp32_components(self.distill_fp32_components)
         if int(self.steps) < 0:
             raise ValueError(f"steps must be >= 0, got {self.steps}.")
         if int(self.batch_size) < 1:
