@@ -17,6 +17,7 @@ from train_utils.config import (
     validate_lora_against_checkpoint,
     vae_num_warmup_steps,
 )
+from train_utils.config.configs import ActivationCalibrationConfig
 from train_utils.config.targets import (
     parse_compression_categories,
     parse_skip_layers,
@@ -50,6 +51,19 @@ def _e2e(extra):
             *extra,
         ]
     )
+
+
+def test_activation_calibration_accepts_zero_seqlen_and_rejects_negative():
+    config = ActivationCalibrationConfig(
+        activation_calib_dataset="mmlu=1.0",
+        activation_calib_nsamples=1,
+        activation_calib_seqlen=0,
+    )
+    config.validate()
+
+    config.activation_calib_seqlen = -1
+    with pytest.raises(ValueError, match="activation_calib_seqlen must be >= 0"):
+        config.validate()
 
 
 def test_e2e_parses_new_model_level_cli_names():

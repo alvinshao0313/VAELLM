@@ -464,11 +464,17 @@ def _merge_dense_peft_lora_into_base(lora_layer: nn.Module, export_dtype=None) -
     b = lora_layer.lora_B[adapter].weight
     dtype = export_dtype or torch.promote_types(base.weight.dtype, torch.promote_types(a.dtype, b.dtype))
     destination = base.weight if dtype == base.weight.dtype else torch.empty_like(base.weight, dtype=dtype)
-    a32 = a.float()
+    # Match the configured inference compute dtype when finalizing.  FP32
+    # trainable LoRA parameters remain FP32 until this point, but a BF16/FP16
+    # final model must use the same arithmetic as the low-precision forward
+    # path that ran during training.
+    a_compute = a.to(dtype=dtype)
+    b_compute = b.to(dtype=dtype)
     for begin in range(0, base.weight.shape[0], 1024):
         end = min(begin + 1024, base.weight.shape[0])
-        delta = (b[begin:end].float() @ a32) * float(lora_layer.scaling[adapter])
-        destination[begin:end].copy_(base.weight[begin:end].float() + delta)
+        delta = (b_compute[begin:end] @ a_compute) * float(lora_layer.scaling[adapter])
+        base_chunk = base.weight[begin:end].to(dtype=dtype)
+        destination[begin:end].copy_(base_chunk + delta)
     base.weight.data = destination.data
     if dtype == torch.float32:
         from train_utils.distill_precision import install_precision_runtime
@@ -547,7 +553,9 @@ def finalize_model_level_lora(
     selectively merge ordinary dense targets (e.g. lm_head), unwrap proxies, never
     call global merge_and_unload().
 
-    Path B (no compressed proxy): merge dense adapters with FP32 accumulation.
+    Path B (no compressed proxy): merge dense adapters in the configured
+    export/compute dtype so the finalized forward matches low-precision
+    inference when one is configured.
     """
     proxy_refs = list(iter_named_full_compressed_peft_proxies(model))
     export_dtype = getattr(model, "_distill_model_compute_dtype", None)

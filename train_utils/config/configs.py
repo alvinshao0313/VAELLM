@@ -769,8 +769,8 @@ class ActivationCalibrationConfig:
             parse_dataset_mix_spec(dataset)
         if int(self.activation_calib_nsamples) < 1:
             raise ValueError("activation_calib_nsamples must be >= 1.")
-        if int(self.activation_calib_seqlen) < 1:
-            raise ValueError("activation_calib_seqlen must be >= 1.")
+        if int(self.activation_calib_seqlen) < 0:
+            raise ValueError("activation_calib_seqlen must be >= 0.")
         if int(self.activation_calib_log_every) < 0:
             raise ValueError("activation_calib_log_every must be >= 0.")
 

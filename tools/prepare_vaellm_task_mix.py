@@ -15,36 +15,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import load_dataset
 from jinja2 import Template
 from tqdm import tqdm
 
-from e2e_common.data import _MMLU_NO_TRAIN_SUBJECTS, record_to_mcqa_example
-
-LONGBENCH_SUBSETS = (
-    "narrativeqa",
-    "qasper",
-    "multifieldqa_en",
-    "multifieldqa_zh",
-    "hotpotqa",
-    "2wikimqa",
-    "musique",
-    "dureader",
-    "gov_report",
-    "qmsum",
-    "multi_news",
-    "vcsum",
-    "trec",
-    "triviaqa",
-    "samsum",
-    "lsht",
-    "passage_count",
-    "passage_retrieval_en",
-    "passage_retrieval_zh",
-    "lcc",
-    "repobench-p",
-)
-
+from e2e_common.data import record_to_mcqa_example
 
 def _hellaswag_preprocess(text: str) -> str:
     text = text.strip()
@@ -250,74 +225,23 @@ def _iter_task_config_records(
 
 def _iter_mmlu_records(*, max_samples: Optional[int] = None) -> Iterable[Dict[str, List[Dict[str, str]]]]:
     produced = 0
-    for subject in _MMLU_NO_TRAIN_SUBJECTS:
-        dataset = _load_hf_dataset("hails/mmlu_no_train", str(subject))
-        for split_name in ("dev", "validation"):
-            if split_name not in dataset:
-                continue
-            for record in dataset[split_name]:
-                if "subject" not in record:
-                    record = dict(record)
-                    record["subject"] = str(subject)
-                example = record_to_mcqa_example(record, text_format="mmlu_mcqa")
-                if example is None:
-                    continue
-                answer_letter = chr(ord("A") + int(example["answer_index"]))
-                yield {
-                    "messages": [
-                        {"role": "user", "content": str(example["prompt"])},
-                        {"role": "assistant", "content": f" {answer_letter}"},
-                    ]
-                }
-                produced += 1
-                if max_samples is not None and produced >= int(max_samples):
-                    return
-
-
-def _iter_longbench_records(*, max_samples: Optional[int] = None) -> Iterable[Dict[str, List[Dict[str, str]]]]:
-    import zipfile
-
-    from huggingface_hub import hf_hub_download
-
-    # THUDM/LongBench 以 data.zip + 脚本仓库分发；datasets.load_dataset 容易长时间卡住。
-    # 直接下载 zip 后按 subset 读取本地 jsonl。
-    try:
-        zip_path = hf_hub_download("THUDM/LongBench", "data.zip", repo_type="dataset")
-    except Exception as exc:
-        print(f"Warning: skip LongBench (data.zip download failed): {exc}", flush=True)
-        return
-
-    produced = 0
-    with zipfile.ZipFile(zip_path) as zf:
-        available = set(zf.namelist())
-        for subset in LONGBENCH_SUBSETS:
-            member = f"data/{subset}.jsonl"
-            if member not in available:
-                print(f"Warning: skip LongBench subset {subset}: missing {member}", flush=True)
-                continue
-            try:
-                with zf.open(member) as handle:
-                    for raw in handle:
-                        record = json.loads(raw)
-                        user_text = str(record.get("input", "")).strip()
-                        answers = record.get("answers")
-                        if not user_text or not answers:
-                            continue
-                        answer_text = str(answers[0]).strip()
-                        if not answer_text:
-                            continue
-                        yield {
-                            "messages": [
-                                {"role": "user", "content": user_text},
-                                {"role": "assistant", "content": " " + answer_text},
-                            ]
-                        }
-                        produced += 1
-                        if max_samples is not None and produced >= int(max_samples):
-                            return
-            except Exception as exc:
-                print(f"Warning: skip LongBench subset {subset}: {exc}", flush=True)
-                continue
+    dataset = _load_hf_dataset("cais/mmlu", "auxiliary_train")
+    if "train" not in dataset:
+        raise ValueError("cais/mmlu auxiliary_train dataset is missing the train split.")
+    for record in dataset["train"]:
+        example = record_to_mcqa_example(record, text_format="mmlu_mcqa")
+        if example is None:
+            continue
+        answer_letter = chr(ord("A") + int(example["answer_index"]))
+        yield {
+            "messages": [
+                {"role": "user", "content": str(example["prompt"])},
+                {"role": "assistant", "content": f" {answer_letter}"},
+            ]
+        }
+        produced += 1
+        if max_samples is not None and produced >= int(max_samples):
+            return
 
 
 def _write_task_jsonl(
@@ -346,12 +270,6 @@ def _write_task_jsonl(
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
         stats["mmlu"] = int(count)
-
-        count = 0
-        for record in tqdm(_iter_longbench_records(max_samples=max_samples_per_task), desc="task:longbench"):
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            count += 1
-        stats["longbench"] = int(count)
 
     return stats
 

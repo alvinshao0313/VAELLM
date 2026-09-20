@@ -883,8 +883,8 @@ def build_calibration_input_ids_lazy(
     block_size = int(seqlen)
     if target_blocks < 0:
         raise ValueError(f"--activation_calib_nsamples must be >= 0, got {target_blocks}.")
-    if block_size <= 0:
-        raise ValueError(f"--activation_calib_seqlen must be > 0, got {block_size}.")
+    if block_size < 0:
+        raise ValueError(f"--activation_calib_seqlen must be >= 0, got {block_size}.")
     if target_blocks == 0:
         return []
 
@@ -894,6 +894,29 @@ def build_calibration_input_ids_lazy(
         seed=int(seed),
     )
     blocks: List[torch.Tensor] = []
+    if block_size == 0:
+        for text in stream.iter_texts():
+            encoded = tokenizer(
+                text,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            input_ids = encoded.get("input_ids")
+            if input_ids is None:
+                raise ValueError("Tokenizer output for calibration lazy stream is missing input_ids.")
+            if len(input_ids) == 0:
+                continue
+            blocks.append(torch.tensor([int(token) for token in input_ids], dtype=torch.long).unsqueeze(0))
+            if len(blocks) >= target_blocks:
+                break
+        if len(blocks) != target_blocks:
+            raise ValueError(
+                f"Calibration dataset mix does not contain enough valid samples to build "
+                f"{target_blocks} untruncated samples. Built only {len(blocks)} samples."
+            )
+        return blocks
+
     token_buffer: List[int] = []
     for text in stream.iter_texts():
         encoded = tokenizer(

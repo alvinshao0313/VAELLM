@@ -1425,6 +1425,64 @@ class DistillDataTest(unittest.TestCase):
         self.assertEqual(tuple(blocks[0].shape), (1, 4))
         self.assertEqual(tuple(blocks[1].shape), (1, 4))
 
+    def test_mmlu_calibration_uses_auxiliary_train_and_keeps_samples_separate(self):
+        rows = {
+            "question": ["short question", "a much longer calibration question"],
+            "choices": [
+                ["option a", "option b", "option c", "option d"],
+                ["first", "second", "third", "fourth"],
+            ],
+            "answer": [0, 3],
+            "subject": ["sample_subject", "another_subject"],
+        }
+
+        def fake_load_dataset(*, path, name=None, **_kwargs):
+            self.assertEqual(path, "cais/mmlu")
+            self.assertEqual(name, "auxiliary_train")
+            return DatasetDict({"train": Dataset.from_dict(rows)})
+
+        with mock.patch("e2e_common.data.load_dataset", side_effect=fake_load_dataset):
+            blocks = build_calibration_input_ids(
+                "mmlu=1.0",
+                tokenizer=self.tokenizer,
+                nsamples=2,
+                seqlen=0,
+                seed=7,
+            )
+
+        expected_lengths = []
+        for idx in range(2):
+            record = {key: values[idx] for key, values in rows.items()}
+            text = _record_to_text(record, text_field="question", text_format="mmlu_mcqa")
+            expected_lengths.append(len(self.tokenizer(text)["input_ids"]))
+        self.assertEqual(sorted(int(block.shape[-1]) for block in blocks), sorted(expected_lengths))
+        self.assertTrue(all(tuple(block.shape[:1]) == (1,) for block in blocks))
+
+    def test_mmlu_task_records_use_auxiliary_train(self):
+        from tools.prepare_vaellm_task_mix import _iter_mmlu_records
+
+        rows = Dataset.from_dict(
+            {
+                "question": ["Which answer?"],
+                "choices": [["one", "two", "three", "four"]],
+                "answer": [2],
+                "subject": ["sample_subject"],
+            }
+        )
+
+        def fake_load_dataset(path, name=None, **_kwargs):
+            self.assertEqual(path, "cais/mmlu")
+            self.assertEqual(name, "auxiliary_train")
+            return DatasetDict({"train": rows})
+
+        with mock.patch("tools.prepare_vaellm_task_mix._load_hf_dataset", side_effect=fake_load_dataset):
+            records = list(_iter_mmlu_records(max_samples=1))
+
+        self.assertEqual(len(records), 1)
+        self.assertIn("A. one", records[0]["messages"][0]["content"])
+        self.assertIn("D. four", records[0]["messages"][0]["content"])
+        self.assertEqual(records[0]["messages"][1]["content"], " C")
+
     def test_build_calibration_input_ids_rejects_empty_text_source(self):
         def fake_load_dataset(*, path, name=None, **_kwargs):
             if path == "Open-Orca/OpenOrca":

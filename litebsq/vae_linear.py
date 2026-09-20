@@ -2815,12 +2815,31 @@ class VAELinear(nn.Module):
         if low_rank_a is None or low_rank_b is None:
             raise RuntimeError("Low-rank payload is incomplete.")
         self._validate_low_rank_payload_tensors(low_rank_a, low_rank_b)
+
+        # Keep FP32 payloads for parameter/optimizer precision, but make the
+        # activation residual follow the same low-precision compute contract as
+        # the decoder and the rest of the model.  This is especially important
+        # after model-level LoRA finalization: PEFT's FP32 LoRA parameters are
+        # computed in ``_distill_model_compute_dtype`` before finalization,
+        # whereas the VAELinear payloads retain their storage dtype.
+        compute_dtype = getattr(self, "_decoder_compute_dtype", None) or low_rank_b.dtype
+        compute_device = low_rank_b.device
+        low_rank_a = low_rank_a.to(
+            device=compute_device,
+            dtype=compute_dtype,
+            non_blocking=True,
+        )
+        low_rank_b = low_rank_b.to(
+            device=compute_device,
+            dtype=compute_dtype,
+            non_blocking=True,
+        )
         low_rank_hidden = F.linear(
-            x.to(device=low_rank_b.device, dtype=low_rank_b.dtype),
+            x.to(device=compute_device, dtype=compute_dtype),
             low_rank_b,
         )
         low_rank_out = F.linear(
-            low_rank_hidden.to(device=low_rank_a.device, dtype=low_rank_a.dtype),
+            low_rank_hidden,
             low_rank_a,
         )
         if low_rank_out.device != base_out.device:

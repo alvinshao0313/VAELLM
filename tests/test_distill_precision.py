@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
-from e2e_common.full_lora import finalize_model_level_lora
+from e2e_common.full_lora import collect_logical_adapter_target_names, finalize_model_level_lora
 from litebsq.autoencoder import Decoder
 from litebsq.parallel_layers import ParallelLinear
 from litebsq.vae_linear import VAELinear
@@ -183,6 +183,72 @@ def test_export_reload_and_category_continuation(tmp_path, dtype):
         assert torch.equal(results[0][name], results[1][name]), name
 
 
+def test_fp32_lora_finalized_checkpoint_roundtrip(tmp_path):
+    torch.manual_seed(99)
+    model, layer = _model(torch.bfloat16)
+    selection = build_model_level_trainable_selection(
+        model,
+        aux=AuxTrainableConfig(norm_train_mode="all", lm_head_train_mode="lora"),
+        compressed_modules=[(TARGET, layer)],
+        rank=2,
+        alpha=4.0,
+        dropout=0.0,
+        train_decoder=False,
+        train_lora=True,
+        fp32_components=ALL,
+    )
+    configure_distill_precision(
+        selection,
+        components=ALL,
+        training_args=_args(torch.bfloat16),
+    )
+    selection.peft_model.eval()
+    for parameter in selection.peft_model.parameters():
+        if parameter.requires_grad:
+            parameter.data.normal_(mean=0.0, std=0.05)
+
+    finalized = finalize_model_level_lora(
+        selection.peft_model,
+        compressed_proxy_names=[TARGET],
+    )
+    assert not collect_logical_adapter_target_names(finalized)
+    assert finalized.model.layers[0].self_attn.q_proj.low_rank_a.dtype == torch.float32
+    assert finalized.model.layers[0].self_attn.q_proj.low_rank_b.dtype == torch.float32
+
+    prepare_model_export(finalized, _args(torch.bfloat16))
+    finalized.eval()
+    inputs = torch.tensor([[1, 2, 3]])
+    with torch.no_grad():
+        expected = finalized(input_ids=inputs).logits
+
+    output_dir = tmp_path / "final_model"
+    saved = save_v6_full_checkpoint(
+        finalized,
+        str(output_dir),
+        checkpoint_kind="final_model",
+        compressed_targets=[TARGET],
+        train_mode="lora",
+        norm_train_mode="all",
+        lm_head_train_mode="lora",
+        finalized_status={"inference_forward_parity": True},
+        runtime_audit={"finalization_forward_parity": {"max_abs": 0.0}},
+    )
+
+    initial, _ = _model(torch.bfloat16)
+    loaded, meta, _ = load_v6_full_checkpoint_into_model(initial, saved["output_dir"])
+    loaded.eval()
+    with torch.no_grad():
+        actual = loaded(input_ids=inputs).logits
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    assert loaded.model.layers[0].self_attn.q_proj.low_rank_a.dtype == torch.bfloat16
+    assert loaded.model.layers[0].self_attn.q_proj.low_rank_b.dtype == torch.bfloat16
+    assert not collect_logical_adapter_target_names(loaded)
+    assert meta["finalized_status"]["inference_forward_parity"] is True
+    assert meta["runtime_audit"]["finalization_forward_parity"]["max_abs"] == 0.0
+
+
 def test_fp16_scaler_rejects_unselected_half_parameters():
     model, layer = _model(torch.float16)
     with pytest.raises(ValueError, match="GradScaler"):
@@ -207,7 +273,7 @@ def test_head_inventory_and_inactive_components(mode):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, None])
-def test_dense_lora_fuses_with_one_rounding(dtype):
+def test_dense_lora_fuses_in_requested_compute_dtype(dtype):
     from peft.tuners.lora.layer import Linear
     from e2e_common.full_lora import _merge_dense_peft_lora_into_base
 
@@ -218,7 +284,12 @@ def test_dense_lora_fuses_with_one_rounding(dtype):
     with torch.no_grad():
         layer.lora_A["default"].weight.fill_(0.10001)
         layer.lora_B["default"].weight.fill_(0.20001)
-    expected = base.weight.float() + layer.lora_B["default"].weight @ layer.lora_A["default"].weight
+    compute_dtype = dtype or torch.float32
+    expected = (
+        base.weight.to(compute_dtype)
+        + layer.lora_B["default"].weight.to(compute_dtype)
+        @ layer.lora_A["default"].weight.to(compute_dtype)
+    )
     fused = _merge_dense_peft_lora_into_base(layer, dtype)
     assert fused.weight.dtype == (dtype or torch.float32)
     torch.testing.assert_close(fused.weight, expected.to(dtype or torch.float32), rtol=0, atol=0)

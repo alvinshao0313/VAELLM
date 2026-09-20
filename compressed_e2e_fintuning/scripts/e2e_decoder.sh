@@ -41,10 +41,10 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --student_checkpoint_dir "${STUDENT_CKPT}" \
     --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning/only_lora \
     --train_mode lora \
-    --distill_fp32_components none \
+    --distill_fp32_components lora,lm_head,norm \
     --seed 0 \
     --data_seed 0 \
-    --dataset_mix "edgerazor_ii_7m=0.614,edgerazor_ii_gen=0.121,edgerazor_tulu=0.050,edgerazor_am=0.115,vaellm_eval_task=0.100" \
+    --dataset_mix "edgerazor_ii_7m=0.341,edgerazor_ii_gen=0.067,edgerazor_tulu=0.028,edgerazor_am=0.064,vaellm_eval_task=0.500" \
     --dataset_task sft \
     --dynamic_padding true \
     --model_max_length 1024 \
@@ -76,9 +76,9 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --lora_rank 8 \
     --lora_alpha 16 \
     --lora_dropout 0.1 \
-    --norm_train_mode final \
+    --norm_train_mode all \
     --norm_lr 1e-4 \
-    --lm_head_train_mode linear \
+    --lm_head_train_mode lora \
     --lm_head_lr 1e-4 \
     --bit_active_ratio 0.03 \
     --bit_optimizer rms_sgd \
@@ -109,7 +109,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --eval_strategy no \
     --save_strategy steps \
     --save_steps 1000 \
-    --save_total_limit 2 \
+    --save_total_limit 1 \
     "$@"
 elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
   # 原正式 recipe：decoder + full-space LoRA；Sparse Bit 关闭。

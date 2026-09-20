@@ -318,9 +318,9 @@ def validate_residual_from_base_args(args: argparse.Namespace, *, provided: set)
             raise ValueError(
                 f"{metric} requires --activation_calib_nsamples > 0, got {args.activation_calib_nsamples}."
             )
-        if int(args.activation_calib_seqlen) <= 0:
+        if int(args.activation_calib_seqlen) < 0:
             raise ValueError(
-                f"{metric} requires --activation_calib_seqlen > 0, got {args.activation_calib_seqlen}."
+                f"{metric} requires --activation_calib_seqlen >= 0, got {args.activation_calib_seqlen}."
             )
 
     channel_args = {

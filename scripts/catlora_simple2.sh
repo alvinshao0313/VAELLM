@@ -37,7 +37,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --vae_warmup_ratio 0 \
   --activation_calib_dataset "alpaca=1" \
   --activation_calib_nsamples 128 \
-  --activation_calib_seqlen 8192 \
+  --activation_calib_seqlen 0 \
   --activation_calib_seed 31 \
   --activation_calib_device "" \
   --activation_calib_log_every 0 \
@@ -80,10 +80,10 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --channel_quant int8 \
   --channel_axis input \
   --channel_protect_count "default=32,cat:v_proj=64,cat:o_proj=64,cat:gate_proj=64,cat:down_proj=256" \
-  --channel_refresh_after_category false \
-  --after_category_mode remaining_lora_prefix_decoder \
-  --distill_fp32_components none \
-  --dataset_mix "edgerazor_ii_7m=0.676,edgerazor_ii_gen=0.133,edgerazor_tulu=0.055,edgerazor_am=0.127,vaellm_eval_task=0.009" \
+  --channel_refresh_after_category true \
+  --after_category_mode remaining_lora \
+  --distill_fp32_components lora \
+  --dataset_mix "edgerazor_ii_7m=0.614,edgerazor_ii_gen=0.121,edgerazor_tulu=0.050,edgerazor_am=0.115,vaellm_eval_task=0.100" \
   --dataset_task sft \
   --model_max_length 1024 \
   --dynamic_padding true \
@@ -91,7 +91,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --lora_rank "default=12" \
   --lora_alpha "default=24" \
   --lora_dropout "default=0.1" \
-  --steps "default=5000,after:q_proj=10000,after:k_proj=10000,after:gate_proj=10000,after:up_proj=10000,after:down_proj=0" \
+  --steps "default=5000" \
   --batch_size "default=8" \
   --learning_rate "default=1e-4" \
   --decoder_lr "default=1e-5" \

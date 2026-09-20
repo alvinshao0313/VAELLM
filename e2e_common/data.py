@@ -142,9 +142,9 @@ DATASET_MIX_SOURCE_PRESETS: Dict[str, DatasetMixSourcePreset] = {
     ),
     "mmlu": DatasetMixSourcePreset(
         alias="mmlu",
-        path="hails/mmlu_no_train",
-        config=None,
-        train_split="dev+validation",
+        path="cais/mmlu",
+        config="auxiliary_train",
+        train_split="train",
         eval_split=None,
         text_field="question",
         text_format="mmlu_mcqa",
@@ -246,65 +246,6 @@ VAELLM_EDGERAZOR_SFT_ALIASES = {
 }
 
 _MCQA_CONTINUATIONS = [" A", " B", " C", " D"]
-_MMLU_NO_TRAIN_SUBJECTS = (
-    "abstract_algebra",
-    "anatomy",
-    "astronomy",
-    "business_ethics",
-    "clinical_knowledge",
-    "college_biology",
-    "college_chemistry",
-    "college_computer_science",
-    "college_mathematics",
-    "college_medicine",
-    "college_physics",
-    "computer_security",
-    "conceptual_physics",
-    "econometrics",
-    "electrical_engineering",
-    "elementary_mathematics",
-    "formal_logic",
-    "global_facts",
-    "high_school_biology",
-    "high_school_chemistry",
-    "high_school_computer_science",
-    "high_school_european_history",
-    "high_school_geography",
-    "high_school_government_and_politics",
-    "high_school_macroeconomics",
-    "high_school_mathematics",
-    "high_school_microeconomics",
-    "high_school_physics",
-    "high_school_psychology",
-    "high_school_statistics",
-    "high_school_us_history",
-    "high_school_world_history",
-    "human_aging",
-    "human_sexuality",
-    "international_law",
-    "jurisprudence",
-    "logical_fallacies",
-    "machine_learning",
-    "management",
-    "marketing",
-    "medical_genetics",
-    "miscellaneous",
-    "moral_disputes",
-    "moral_scenarios",
-    "nutrition",
-    "philosophy",
-    "prehistory",
-    "professional_accounting",
-    "professional_law",
-    "professional_medicine",
-    "professional_psychology",
-    "public_relations",
-    "security_studies",
-    "sociology",
-    "us_foreign_policy",
-    "virology",
-    "world_religions",
-)
 
 
 def build_tokenizer(model_path: str, access_token: Optional[str] = None):
@@ -544,10 +485,14 @@ def record_to_mcqa_example(
 ) -> Optional[Dict[str, object]]:
     normalized_text_format = str(text_format).strip().lower()
     if normalized_text_format == "mmlu_mcqa":
-        question = _stringify_text(record.get("question"))
-        options = _normalize_four_options(record.get("choices"))
-        answer_idx = _resolve_choice_index(record.get("answer"), 4)
-        subject = _stringify_text(record.get("subject")).replace("_", " ")
+        mmlu_record = record
+        nested_record = record.get("train")
+        if isinstance(nested_record, dict) and "question" not in record:
+            mmlu_record = nested_record
+        question = _stringify_text(mmlu_record.get("question"))
+        options = _normalize_four_options(mmlu_record.get("choices"))
+        answer_idx = _resolve_choice_index(mmlu_record.get("answer"), 4)
+        subject = _stringify_text(mmlu_record.get("subject")).replace("_", " ")
         if not question or options is None or answer_idx is None:
             return None
         prompt = _build_mcqa_prompt(question=question, options=options, subject=subject or None)
@@ -886,6 +831,13 @@ def _record_to_text(
         return _format_race_record(record)
     if normalized_text_format == "sciq_qa":
         return _format_sciq_record(record)
+    if normalized_text_format == "mmlu_mcqa":
+        example = record_to_mcqa_example(record, text_format="mmlu_mcqa")
+        if example is None:
+            return None
+        answer_idx = int(example["answer_index"])
+        answer_letter = chr(ord("A") + answer_idx)
+        return f"{example['prompt']} {answer_letter}"
     if normalized_text_format == "edgerazor_messages":
         return _format_edgerazor_messages_record(record)
     if normalized_text_format != "auto":
@@ -1442,22 +1394,6 @@ def _load_preset_raw_datasets(preset: DatasetMixSourcePreset) -> Tuple[Dataset, 
                 raise ValueError(f"Missing train split '{preset.train_split}' in local dataset {resolved_path}.")
             return dataset[str(preset.train_split)], None
         return dataset, None
-    if str(preset.alias) == "mmlu":
-        train_parts: List[Dataset] = []
-        for subject in _MMLU_NO_TRAIN_SUBJECTS:
-            dataset = load_dataset(str(preset.path), name=str(subject))
-            if not isinstance(dataset, DatasetDict):
-                raise RuntimeError(f"Expected DatasetDict from MMLU subject {subject}, got {type(dataset)}")
-            missing = [split for split in ("dev", "validation") if split not in dataset]
-            if missing:
-                raise ValueError(f"Missing MMLU splits for subject {subject}: {missing}")
-            subject_train = concatenate_datasets([dataset["dev"], dataset["validation"]])
-            if "subject" not in subject_train.column_names:
-                subject_train = subject_train.add_column("subject", [str(subject)] * len(subject_train))
-            train_parts.append(subject_train)
-        if not train_parts:
-            raise ValueError("MMLU subject list is empty.")
-        return concatenate_datasets(train_parts), None
     return _load_hf_dataset_splits(
         path=preset.path,
         config=preset.config,

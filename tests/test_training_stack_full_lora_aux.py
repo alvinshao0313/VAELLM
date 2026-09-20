@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -29,6 +31,7 @@ from train_utils.model_level_trainables import (
     is_backbone_norm_module,
     setup_lm_head_trainables,
 )
+from train_utils.distill_precision import configure_distill_precision
 
 
 def _vae_linear(dim: int = 4):
@@ -254,6 +257,53 @@ def test_finalize_compressed_lora_preserves_payload_dtype_and_bf16_forward():
     with torch.no_grad():
         after_cached = finalized.layer(x)
     torch.testing.assert_close(after_cached, before, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp32_lora_finalization_matches_low_precision_forward(dtype):
+    torch.manual_seed(17)
+    model = _TinyModel().to(dtype=dtype)
+    selection = build_model_level_trainable_selection(
+        model,
+        aux=AuxTrainableConfig(norm_train_mode="all", lm_head_train_mode="lora"),
+        compressed_modules=[("layer", model.layer)],
+        rank=4,
+        alpha=8.0,
+        dropout=0.0,
+        train_decoder=False,
+        train_lora=True,
+        fp32_components=("lora", "lm_head", "norm"),
+    )
+    configure_distill_precision(
+        selection,
+        components=("lora", "lm_head", "norm"),
+        training_args=SimpleNamespace(
+            bf16=dtype == torch.bfloat16,
+            fp16=dtype == torch.float16,
+        ),
+    )
+    selection.peft_model.eval()
+    for parameter in selection.peft_model.parameters():
+        if parameter.requires_grad:
+            parameter.data.normal_(mean=0.0, std=0.05)
+
+    inputs = torch.randn(4, 4, dtype=dtype)
+    with torch.no_grad():
+        before = selection.peft_model(inputs)
+
+    finalized = finalize_model_level_lora(
+        selection.peft_model,
+        compressed_proxy_names=["layer"],
+    )
+    finalized.eval()
+    with torch.no_grad():
+        after = finalized(inputs)
+
+    tolerance = 2.0 * float(torch.finfo(dtype).eps)
+    torch.testing.assert_close(before, after, rtol=tolerance, atol=tolerance)
+    assert before.dtype == after.dtype == dtype
+    assert finalized.layer.low_rank_a.dtype == torch.float32
+    assert finalized.layer.low_rank_b.dtype == torch.float32
 
 
 def test_aux_norm_final_and_lm_head_linear():
