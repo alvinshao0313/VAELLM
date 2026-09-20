@@ -37,7 +37,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --vae_warmup_ratio 0 \
   --activation_calib_dataset "alpaca=1" \
   --activation_calib_nsamples 128 \
-  --activation_calib_seqlen 0 \
+  --activation_calib_seqlen 8192 \
   --activation_calib_seed 31 \
   --activation_calib_device "" \
   --activation_calib_log_every 0 \
