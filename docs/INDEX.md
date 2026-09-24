@@ -254,7 +254,7 @@
 - [Task 9: Closed-Loop Verification Before the Expensive Formal Run](experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-brief.md) — `docs/experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-brief.md`
 - [Task 9 Report — BLOCKED (GPU memory)](experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-report.md) — `docs/experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-report.md`
 
-## 原位产物说明与自动报告（22）
+## 原位产物说明与自动报告（26）
 
 - [lm_eval_summary_final.md](../.result/compressed_e2e_fintuning/final_model_20260803_062606/lm_eval/lm_eval_summary_final.md) — `.result/compressed_e2e_fintuning/final_model_20260803_062606/lm_eval/lm_eval_summary_final.md`
 - [lm_eval_summary_step_2.md](../.result/compressed_e2e_fintuning/final_model_20260803_062606/lm_eval/lm_eval_summary_step_2.md) — `.result/compressed_e2e_fintuning/final_model_20260803_062606/lm_eval/lm_eval_summary_step_2.md`
@@ -275,6 +275,10 @@
 - [Model Card for Model ID](../result/catlora/final_model_20260901_192152/trainer_state/checkpoint-10000/README.md) — `result/catlora/final_model_20260901_192152/trainer_state/checkpoint-10000/README.md`
 - [Model Card for Model ID](../result/catlora/final_model_20260901_192152/trainer_state/checkpoint-9000/README.md) — `result/catlora/final_model_20260901_192152/trainer_state/checkpoint-9000/README.md`
 - [lm_eval_summary_step_200.md](../result/compressed_e2e_fintuning/decoder_lora_rank8_20260922/Qwen_Qwen3-8B_20260922_133903/lm_eval/lm_eval_summary_step_200.md) — `result/compressed_e2e_fintuning/decoder_lora_rank8_20260922/Qwen_Qwen3-8B_20260922_133903/lm_eval/lm_eval_summary_step_200.md`
+- [lm_eval_summary_step_200.md](../result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_ce10/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md) — `result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_ce10/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md`
+- [lm_eval_summary_step_200.md](../result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_kl/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md) — `result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_kl/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md`
+- [lm_eval_summary_step_200.md](../result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_kl_lr3e4/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md) — `result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_kl_lr3e4/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md`
+- [lm_eval_summary_step_200.md](../result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_task80/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md) — `result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_task80/Qwen_Qwen3-8B_20260924_102952/lm_eval/lm_eval_summary_step_200.md`
 - [lm_eval_summary_step_1000.md](../result/compressed_e2e_fintuning/only_lora/Qwen_Qwen3-8B_20260922_024034/lm_eval/lm_eval_summary_step_1000.md) — `result/compressed_e2e_fintuning/only_lora/Qwen_Qwen3-8B_20260922_024034/lm_eval/lm_eval_summary_step_1000.md`
 - [lm_eval_summary_step_2000.md](../result/compressed_e2e_fintuning/only_lora/Qwen_Qwen3-8B_20260922_024034/lm_eval/lm_eval_summary_step_2000.md) — `result/compressed_e2e_fintuning/only_lora/Qwen_Qwen3-8B_20260922_024034/lm_eval/lm_eval_summary_step_2000.md`
 - [输出对齐模型：蒸馏初始化 checkpoint](../result/linear_output/distill_init/README.md) — `result/linear_output/distill_init/README.md`

@@ -1,6 +1,6 @@
 # 全层恢复的两组 decoder 学习率对照（2026-09-24）
 
-运行状态：已启动，运行中；已确认真实优化持续推进，停止主动监控。结论状态：证据不足。用户本轮明确授权 GPU 0、1 各一个设置并行；仅此两组，不自动扩大搜索队列。
+运行状态：GPU0于2026-09-24 17:25（北京时间）从17层完成边界再次恢复，已通过正式身份校验并进入真实GPU教师前缀回放；回放后从block25首步续训。GPU1原实验继续运行。两次SIGINT来源仍未知，已加入信号来源记录；结论状态：证据不足，不扩大既定两组配置。
 
 ## 问题与依据
 
@@ -60,3 +60,36 @@
 用户补充允许在有依据时利用空闲显存增大batch。本次保留已验证的batch2：固定样本与epoch时，batch8会使每块更新从3968降至992，连同码阈值跨越和调度发生变化，现有证据不足以判断更优。两臂继续只比较decoder LR；该决定仅针对本次对照，不形成后续batch限制。
 
 启动核验完成时间（UTC）：2026-09-24T01:37:26.703845+00:00。正式两组4096×2048实际输入SHA与准备阶段一致。一次性数据验证token副本已删除67110213字节，实际正式运行token仍保留；11原始Arrow与初始checkpoint受保护。短测CLI/退出码/清理结果已合并到summary及单份validation.log，已用完的一次性脚本和重复小文件已清理。本轮未提交Git、未改环境，未以短测指标声称下游改善。
+
+## GPU0中断核查（2026-09-24）
+
+用户询问GPU0是否完成后，核实a.exit=1，run.json状态failed、stage=recovery、子进程exit_code=-2，结束时间2026-09-24T05:16:04.348Z（北京时间13:16）。日志为SIGINT/KeyboardInterrupt，停在block17反向传播，最后打印2336/3968步；日志无法确定信号发送者，不将其归因为算法或显存错误。
+
+已完成block0及9–16，共9/28个可训练block；block_metrics.json和最后的约967MiB原子latest_boundary.pt仍在。尚未产生最终导出或启动下游评测。边界仅保存完整层，后续若恢复须重做block17，不能续接未保存的本层第2336步。原始进程已不存在；GPU1的原工作流和恢复进程仍在运行，本次只作有限状态查询。
+
+未自动重启，未修改活动实验依赖。无新增算法经验；中断来源未知且本次目标未完成，保留用于该任务恢复的层边界、配置、原始指标和核心日志，不据此淘汰配置或删除恢复状态。本次无新增产物清理，释放0字节；未新增文档或改变导航路径。
+
+## 用户授权恢复GPU0（2026-09-24）
+
+用户明确要求查因、解决问题后重启。本次只读查因发现：训练源码无主动SIGINT/超时终止路径，原异常是恢复子进程signal -2、外层工作流记录CalledProcessError。可访问的同一时间窗口journal及针对PID/session的shell历史检索均未给出信号发送者；无可用信号审计记录。信号来源未查明，不归因为OOM、数值异常或SSH断线。
+
+重启前另发现独立阻断：`train_utils/config/cli.py` 在原任务启动后增加E2E `stop_after_step` 六行，导致CPU原样检查报training_code不匹配。初始payload、FP teacher、正式参数、校准token及runtime均无差异。未篡改边界或放宽检查；在 `.result/liftquant_recovery/full_layers_lr_20260924_01/restart_source_01` 保存136个必要Python文件（2,699,039字节），只在副本还原六行CLI，101个训练文件SHA与保存身份完全一致。复核413个native状态张量、354个浮点张量有限，9个完成块均3968步；实际parser/import通过。证据 `restart_check_20260924/report.json`、`check.log`；一次性诊断已清理，副本和旧断点保留供当前恢复进程使用。对应[保存/恢复经验](../../../lessons/checkpoint_lifecycle.md)已更新。
+
+新运行使用原全部训练/评测参数，新输出子目录 `decoder_1p25e5_resume_01`，重放原teacher前缀后从block17首步继续；已完成block0、9–16不重训。自动接原八任务初始baseline和成品评测，不覆盖旧结果。复现脚本 `experiments/liftquant_recovery/resume_full_decoder_1p25e5.sh`，caller激活bitvae后cd上述源码副本；脚本参数使用原模型/数据/输出的绝对路径，PYTHONPATH仅指向副本。
+
+本次以 `nohup setsid --fork --wait env --default-signal=INT,QUIT,TERM bash -lc ... </dev/null` 运行。独立session/进程组为3178749，无控制终端，stdin=/dev/null；保留正常INT/QUIT/TERM处理，仅nohup忽略HUP，不安装守护或自动重试。nohup launcher PID3178748，工作流PID3178776，恢复PID3178777。日志正式根目录 `a_resume_01.log`，最终退出码 `a_resume_01.exit`，实际命令/当前状态见新输出run.json。GPU1共享代码与原任务未修改。有限启动核验已通过（UTC 2026-09-24T05:48:28.042274+00:00）：正式入口严格载入9个完成层并进行真实GPU计算，日志确认block0的teacher input与native output均与保存样例逐元素一致。该次有限启动核验时仍在重放FP teacher前缀，随后从block17首步续训，未声称当时已开始该层更新或完成训练。核验后停止主动监控，保持后台任务运行。
+
+本轮文档index/check均退出0，relative_markdown_paths=1080、errors=0；检查结果已并入restart_check的单份report.json/check.log。已清理的一次性诊断文件及重复日志共19,553字节，源码副本、原断点和当前输出均有正在使用的明确用途，予以保留。
+
+第二次中断核查：用户反馈GPU0似乎再次停止，并明确表示没有主动停止该任务。`decoder_1p25e5_resume_01/run.json`记录结束时间2026-09-24T09:18:58.231532Z（北京时间17:18:58）、status=failed、stage=recovery、子进程exit_code=-2。`a_resume_01.log`显示block25最后打印3648/3968步，随后在训练参数有限性检查处收到KeyboardInterrupt，外层记录子进程SIGINT；异常落点本身不代表参数非有限。该进程已使用独立session、无控制终端和stdin=/dev/null，仍发生SIGINT，先前隔离措施未解决未知的信号发送源，不能归因SSH断线。信号发送者仍未知；GPU1原实验继续运行，未修改或停止。
+
+最新可恢复边界为正式根目录下 `decoder_1p25e5_resume_01/recovery/latest_boundary.pt`，大小1,952,972,384字节（约1.82GiB），mtime为2026-09-24T08:59:57.033253Z（北京时间16:59:57）。其中完整保存block0、9–24，共17/28层，每层3968步、805个允许修改的状态张量，以及17层重载输入/输出样例；原始block_metrics的完成层集合一致。bitvae CPU mmap加载及实际`_validate`的结构、manifest身份、可变状态集合和完整训练预算检查通过；`restart_source_01`的101个训练文件SHA仍全部匹配manifest和边界，无须再修源码。本次没有GPU计算、未重新计算初始/教师全量权重哈希，也未执行新一轮GPU恢复，正式入口仍须保留原身份与重放一致性校验。继续时应从这一最新边界重放教师前缀后重做block25全部3968步，不能续接未保存的第3648步；0、9–24无需重训。原边界和最新边界均保留供本任务恢复，配置、核心日志、原始指标及源码副本受保护。本次核查未清理产物，也未因中断改变算法或实验参数。
+
+第二次恢复沿用原算法、配置和`restart_source_01`，从上述17层边界启动，新输出为`decoder_1p25e5_resume_02`，复现入口`experiments/liftquant_recovery/resume_full_decoder_1p25e5_02.sh`。与resume01脚本只差新输出路径和最新边界路径。调用者仍激活bitvae、进入隔离源码副本，PYTHONPATH仅指向它；原训练/评测参数不变、GPU0单卡、64GiB上限，GPU1任务不变。
+
+本次在原nohup/setsid外层调用中加入现有`strace -f -qq --seccomp-bpf -e trace=none -e signal=SIGINT,SIGTERM,SIGHUP -ttt -o .../a_resume_02.signals.log`，只记录信号，不忽略INT、不捕获后继续训练、不自动重试。CPU自启临时进程的真实SIGINT验证通过，记录到已知发送者PID/UID（SI_USER），退出仍为-2；seccomp过滤确实启用。50万次getpid用时无跟踪0.190秒、跟踪0.194秒，仅为本次CPU过滤有效性证据，不当作GPU训练吞吐结论。已并入`restart_check_20260924/report.json`和单份`check.log`；临时信号日志261字节已删除。
+
+实际运行标识：nohup launcher PID3450834，独立session/进程组3450835，信号记录PID3450860，工作流PID3450865，恢复PID3450893。恢复进程stdin=/dev/null、TracerPid=3450860、Seccomp=2/filters=1，CUDA all-bit STE实算检查PASS。核心日志`a_resume_02.log`、信号记录`a_resume_02.signals.log`、最终退出码`a_resume_02.exit`；实际命令/状态在新输出run.json。有限启动核验已通过（UTC 2026-09-24T09:33:48.743027+00:00）：正式入口严格载入17个完成层，原输入/参数/模型/teacher/源码身份校验通过；GPU0已进入真实teacher前缀输入计算（进程RSS约40.4GiB并继续增长，GPU约1.76GiB/4%利用率），GPU数值检查PASS。复用前一轮相同源码的native逐元素回放证据，不重等完整前缀；此时尚未开始block25的新更新。到此交付并停止主动监控。
+
+
+本轮收尾：原9层boundary的全部413状态、9层输入输出样例及指标已由17层boundary完整同值覆盖；新进程只引用17层boundary，正式严格载入已通过。删除原9层boundary（1,013,668,112字节）、原始/resume01两份不被恢复入口读取的重复calibration_ids（各67,110,084字节）、已归并的两个失败退出码散文件（各2字节），合计1,147,888,284字节（约1.07GiB）。旧resume01脚本已注明被02替代，其已清理边界不再是当前恢复入口。核心日志、失败run.json、原指标、实际配置/源码身份仍保留；17层边界、原始数据、初始模型、当前源码副本和resume02输出受保护。信号探针临时日志另清理261字节，总计本轮清理1,147,888,545字节。文档index/check已通过（1079个相对路径、errors=0）。
