@@ -32,13 +32,14 @@ python -m compressed_e2e_fintuning.main \
 
 数据通过 `--dataset_mix` 或 `--train_file` 输入，`--dataset_task` 为 `sft` 或 `lm`。`--model_max_length` 是截断上限，`--dynamic_padding true` 按 micro-batch 动态 padding。
 
-模型级 loss 只有：
+当前模型级 loss 为：
 
 ```text
-sft, kl, kl_top, kd, kd_top
+sft, kl, kl_top, kl_top_partial, kl_top_mass, kl_top_mse,
+kd, kd_top, kd_top_partial, kd_top_mass
 ```
 
-`kl_top`/`kd_top` 的 K 用 `--top_k`；hidden 与 pre-MLP 对齐分别用 `--hidden_loss_weight`、`--pre_mlp_hidden_loss_weight`。
+Top-K 的 K 用 `--top_k`：`kl_top` 在教师 Top-K 集合内重新归一化；`kl_top_partial` 使用全词表归一化，只保留 Top-K 的 KL 项；`kl_top_mass` 额外把集合外的概率质量合为一项；`kl_top_mse` 在 Top-K KL 上加 logits MSE。`kd*` 为对应 KL 与 CE 的组合，`--alpha` 为 KL 权重；`kl*` 不含 CE，`sft` 只使用 CE。hidden 与 pre-MLP 对齐分别用 `--hidden_loss_weight`、`--pre_mlp_hidden_loss_weight`。
 
 ## 并行与正式脚本
 
@@ -52,6 +53,11 @@ sft, kl, kl_top, kd, kd_top
 ## 保存与续训
 
 `training_step` 用于精确恢复 optimizer/scheduler/RNG/组件状态，并通过 checkpoint id 绑定 `round_base`。稳定 `final_model` 可独立加载，所有临时 PEFT proxy 已 finalize，Sparse Bit score 已提交为硬 bit，`lora_config=null`。
+
+分阶段筛选可设 `--steps 4000 --stop_after_step 200 --save_steps 200 --eval_after_save true`，并配置评测任务。`stop_after_step` 是绝对 optimizer step，只控制本次执行预算：完成该步 checkpoint 和中途评测、保存评测后的各 rank RNG 后，以 `status=paused` 正常退出，不执行 finalization 或重复的最终评测，也不生成 `final_model`。停止点必须大于 0、小于 `steps` 且落在整数 `save_steps` 边界上；不设置时保持原有完整训练流程。
+
+晋级时从保留的 `trainer_state/checkpoint-200` 设置 `--resume_from_checkpoint`，将停止点提高（如 `--stop_after_step 400`），或去掉停止点继续到终局。总 `steps`、学习率调度、数据/损失、batch/累积、卡数/并行模式和评测保存间隔等 exact-resume 条件必须保持不变；停止点必须大于断点步数。阶段停止参数自身不进入数学恢复契约。用于已安排晋级的断点保留，淘汰候选按项目规范清理。
+
 
 ## 按组件保留 FP32 训练参数
 
@@ -77,4 +83,4 @@ CAT 在线压缩后的蒸馏、CAT checkpoint 蒸馏和 E2E 共用 `--distill_fp
 
 组件选择会进入配置快照和精确恢复约束。更改选择后可以从阶段/最终模型开始新实验，但不能作为同一个训练步断点的精确续训。默认 `none` 兼容旧断点的恢复约束。
 
-显存实测及验证范围见 [FP32 蒸馏验证记录](../docs/distill_fp32_validation.md)。
+显存实测及验证范围见 [FP32 蒸馏验证记录](../docs/experience/records/docs/distill_fp32_validation.md)。

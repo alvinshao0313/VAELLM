@@ -546,6 +546,7 @@ def finalize_model_level_lora(
     model: nn.Module,
     *,
     compressed_proxy_names: Optional[Sequence[str]] = None,
+    defer_dense_targets: Optional[Sequence[str]] = None,
 ) -> nn.Module:
     """Finalize one model-level PEFT adapter without harming compressed carriers.
 
@@ -558,6 +559,7 @@ def finalize_model_level_lora(
     inference when one is configured.
     """
     proxy_refs = list(iter_named_full_compressed_peft_proxies(model))
+    deferred_dense_targets = {str(name) for name in (defer_dense_targets or ())}
     export_dtype = getattr(model, "_distill_model_compute_dtype", None)
     if compressed_proxy_names is not None:
         wanted = {str(name) for name in compressed_proxy_names}
@@ -602,6 +604,8 @@ def finalize_model_level_lora(
         logical = _logical_adapter_target_name(peft_name)
         if logical in set(compressed_names):
             continue
+        if logical in deferred_dense_targets:
+            continue
         dense_lora_layers.append((logical, peft_name, lora_layer))
 
     for logical, peft_name, lora_layer in dense_lora_layers:
@@ -637,6 +641,11 @@ def finalize_model_level_lora(
         for name, module in finalized.named_modules()
         if is_peft_lora_linear(module)
     ]
-    if remaining_lora:
-        raise RuntimeError(f"PEFT LoRA layers still present after path-A finalize: {remaining_lora}")
+    remaining_logical = {_logical_adapter_target_name(name) for name in remaining_lora}
+    unexpected_remaining = sorted(remaining_logical - deferred_dense_targets)
+    if unexpected_remaining:
+        raise RuntimeError(
+            "PEFT LoRA layers still present after path-A finalize: "
+            f"{unexpected_remaining}"
+        )
     return finalized

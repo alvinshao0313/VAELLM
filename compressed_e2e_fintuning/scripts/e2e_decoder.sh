@@ -11,7 +11,7 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
-STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora/remaining_lora_mass/Qwen_Qwen3-8B_20260910_180322/final_model/}"
+STUDENT_CKPT="${STUDENT_CKPT:-result/catlora/Qwen_Qwen3-8B_20260910_094022/final_model/}"
 PARALLEL_MODE="${PARALLEL_MODE:-dp}"   # dp | layer_mp
 
 export DISTILL_NCCL_TIMEOUT_SEC="${DISTILL_NCCL_TIMEOUT_SEC:-10800}"
@@ -35,11 +35,15 @@ fi
 # [Evaluation]
 # "$@" 位于最后，可覆盖本脚本中的默认值。
 
+# 可选残差 LoRA：默认 none；通过末尾 CLI 覆盖 --residual_lora_mode additive 启用；rank 必须 <= 8。
+# additive：skip=x+(alpha/r)*B(A(x))；replace：只保留低秩映射。
+# --residual_lora_lr 未设置时跟随 learning_rate；可追加该参数单独指定。
+# exact-step 恢复不允许新增模块；启用时需去掉现有 --resume_from_checkpoint 行。
 if [[ "${PARALLEL_MODE}" == "dp" ]]; then
   # 原正式 recipe：decoder + Sparse Bit；不启用 backbone LoRA。
   torchrun --standalone --nproc_per_node=4 -m compressed_e2e_fintuning.main \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
-    --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning/only_lora \
+    --run_root_dir ./result/compressed_e2e_fintuning/only_lora \
     --train_mode lora \
     --distill_fp32_components lora,lm_head,norm \
     --seed 0 \
@@ -61,7 +65,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --hidden_layer_weighting adaptive_top_3 \
     --selective_student_topk false \
     --selective_student_topk_chunk_rows 32 \
-    --steps 10000 \
+    --steps 5000 \
     --batch_size 8 \
     --gradient_accumulation_steps 1 \
     --decoder_lr 1e-5 \
@@ -76,6 +80,10 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --lora_rank 8 \
     --lora_alpha 16 \
     --lora_dropout 0.1 \
+    --residual_lora_mode none \
+    --residual_lora_rank 8 \
+    --residual_lora_alpha 16 \
+    --residual_lora_dropout 0 \
     --norm_train_mode all \
     --norm_lr 1e-4 \
     --lm_head_train_mode lora \
@@ -152,6 +160,10 @@ elif [[ "${PARALLEL_MODE}" == "layer_mp" ]]; then
     --lora_rank 12 \
     --lora_alpha 24 \
     --lora_dropout 0.03 \
+    --residual_lora_mode none \
+    --residual_lora_rank 8 \
+    --residual_lora_alpha 16 \
+    --residual_lora_dropout 0 \
     --norm_train_mode none \
     --lm_head_train_mode none \
     --parallel_mode layer_mp \

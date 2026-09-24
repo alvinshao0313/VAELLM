@@ -1264,15 +1264,30 @@ class VAEDecoderE2ETrainer(Trainer):
             if not isinstance(attention_mask, torch.Tensor):
                 raise ValueError("model-level loss requires attention_mask.")
 
+            # In layer_mp the input tensors live on the first layer's device, while
+            # the sharded model returns logits on the device hosting the final
+            # layer/lm_head. Selective teacher targets are initially moved using
+            # the input device so the temporary selective head can consume them;
+            # align the loss operands after the student forward to the actual
+            # student logits device.
+            loss_input_ids = input_ids.to(device=logits.device)
+            loss_labels = labels.to(device=logits.device)
+            loss_attention_mask = attention_mask.to(device=logits.device)
             if self.selective_student_topk:
                 if selective_teacher_logits is None:
                     raise RuntimeError("selective student top-k teacher logits are missing.")
+                selective_teacher_logits = selective_teacher_logits.to(
+                    device=logits.device,
+                    non_blocking=bool(
+                        selective_teacher_logits.is_cuda and logits.device.type == "cuda"
+                    ),
+                )
                 if canonical_loss == "kl_top_mse":
                     distill_loss = compute_selected_kl_top_mse_model_level_loss(
                         student_selected_logits=logits,
                         teacher_selected_logits=selective_teacher_logits,
-                        labels=labels,
-                        attention_mask=attention_mask,
+                        labels=loss_labels,
+                        attention_mask=loss_attention_mask,
                         temperature=float(self.loss_config.temperature),
                         top_mse_weight=float(self.loss_config.top_mse_weight),
                         prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
@@ -1281,8 +1296,8 @@ class VAEDecoderE2ETrainer(Trainer):
                     distill_loss = compute_selected_kl_top_model_level_loss(
                         student_selected_logits=logits,
                         teacher_selected_logits=selective_teacher_logits,
-                        labels=labels,
-                        attention_mask=attention_mask,
+                        labels=loss_labels,
+                        attention_mask=loss_attention_mask,
                         temperature=float(self.loss_config.temperature),
                         prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
                     )
@@ -1292,9 +1307,9 @@ class VAEDecoderE2ETrainer(Trainer):
                 distill_loss = compute_dense_loss_from_logits(
                     loss_type="sft",
                     student_logits=logits,
-                    input_ids=input_ids,
-                    labels=labels,
-                    attention_mask=attention_mask,
+                    input_ids=loss_input_ids,
+                    labels=loss_labels,
+                    attention_mask=loss_attention_mask,
                     temperature=float(self.loss_config.temperature),
                     prompt_loss_weight=float(self.loss_config.prompt_loss_weight),
                 )
@@ -1307,9 +1322,9 @@ class VAEDecoderE2ETrainer(Trainer):
                     loss_type=canonical_loss,
                     student_logits=logits,
                     teacher_logits_cpu=targets.logits_cpu,
-                    input_ids=input_ids,
-                    labels=labels,
-                    attention_mask=attention_mask,
+                    input_ids=loss_input_ids,
+                    labels=loss_labels,
+                    attention_mask=loss_attention_mask,
                     temperature=float(self.loss_config.temperature),
                     alpha=float(self.loss_config.alpha),
                     top_k=resolved_top_k,

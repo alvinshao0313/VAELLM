@@ -141,6 +141,8 @@ def adapt_cat_cli_config(cfg: CatCLIConfig):
         zeta=float(cfg.core_template.zeta),
         inv_temperature=float(cfg.core_template.inv_temperature),
         normalize_weight=bool(cfg.core_template.normalize_weight),
+        weight_rotation=str(cfg.core_template.weight_rotation),
+        weight_rotation_block_size=int(cfg.core_template.weight_rotation_block_size),
         new_quant=bool(cfg.core_template.new_quant),
         lr=float(cfg.vae_opt_template.vae_learning_rate),
         weight_decay=float(cfg.vae_opt_template.vae_weight_decay),

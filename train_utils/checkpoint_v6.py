@@ -16,6 +16,7 @@ from peft.tuners.lora.layer import LoraLayer
 from torch import Tensor, nn
 
 from e2e_common.post_norm_head import ensure_post_norm_head_linear, has_post_norm_head_linear
+from e2e_common.residual_lora import get_residual_lora_topology, install_residual_lora
 from litebsq.autoencoder import Decoder
 from litebsq.bitpack import validate_bitpack_u8_spec
 from litebsq.misc import set_module_by_name
@@ -37,7 +38,7 @@ META_FILENAME = "checkpoint_meta.json"
 TRAINING_MODEL_STATE_FILENAME = "training_model_state.pt"
 CAT_RUNTIME_STATE_FILENAME = "cat_runtime_state.pt"
 MUTABLE_STATE_MANIFEST_KEY = "mutable_state_manifest"
-MUTABLE_COMPONENT_CLASSES = frozenset({"lora", "decoder", "norm", "lm_head", "other_trainable"})
+MUTABLE_COMPONENT_CLASSES = frozenset({"lora", "decoder", "norm", "lm_head", "residual_lora", "other_trainable"})
 
 _TMP_DIR_MARKER = ".tmp-"
 _FORBIDDEN_EXTRA_META_RESUME_KEYS = frozenset({"resume_contract", "immutable_resume_contract"})
@@ -310,6 +311,10 @@ def _validate_extended_converted_module_spec(
     module_name: str,
     shared_refs: set[str],
 ) -> None:
+    if raw.get("weight_rotation") is not None:
+        from rotation.weight_preprocess import validate_rotation_spec
+
+        validate_rotation_spec(raw["weight_rotation"])
     tensor_ndims = {
         "protected_residual_indices": 1,
         "sparse_residual_row_indices": 1,
@@ -1111,6 +1116,8 @@ def _collect_vae_linear_specs(model: nn.Module) -> List[Dict[str, Any]]:
             **_collect_sparse_residual_specs(module),
             **_collect_protected_residual_specs(module, module_name=name or "<root>"),
         }
+        if module.weight_rotation is not None:
+            spec["weight_rotation"] = module.weight_rotation.to_spec()
         specs.append(spec)
     return specs
 
@@ -1456,6 +1463,7 @@ def _rebuild_converted_modules(
             parallel_cols=int(spec.get("parallel_cols", 1)),
             compressed_in_features=int(spec.get("compressed_in_features", spec["in_features"])),
             compressed_out_features=int(spec.get("compressed_out_features", spec["out_features"])),
+            weight_rotation_spec=spec.get("weight_rotation"),
             protected_input_indices=protected_idx_payload,
             protected_input_weight=protected_weight_payload,
             protected_input_qvalues=protected_input_qvalues_payload,
@@ -1487,6 +1495,8 @@ def refresh_vae_linear_runtime_after_state_load(model: nn.Module) -> None:
     for module in model.modules():
         if not isinstance(module, VAELinear):
             continue
+        if module.weight_rotation is not None:
+            module.weight_rotation.validate_state()
         if getattr(module, "_parallel_stage_decoder", None) is not None:
             module._build_parallel_stage_decode_plan()
         if getattr(module, "_protected_residual_parallel_decoder", None) is not None:
@@ -1683,6 +1693,11 @@ def save_v6_full_checkpoint(
                 tokenizer.save_pretrained(tmp_dir)
 
             resolved_extra_meta = dict(extra_meta) if extra_meta is not None else {}
+            residual_topology = get_residual_lora_topology(model)
+            if "residual_lora" in resolved_extra_meta and resolved_extra_meta["residual_lora"] != residual_topology:
+                raise ValueError("extra_meta.residual_lora conflicts with live residual topology.")
+            if residual_topology is not None:
+                resolved_extra_meta["residual_lora"] = residual_topology
             if cat_runtime_state is not None:
                 existing_runtime_file = resolved_extra_meta.get("cat_runtime_state_file")
                 if existing_runtime_file not in (None, CAT_RUNTIME_STATE_FILENAME):
@@ -1793,6 +1808,19 @@ def load_v6_full_checkpoint_into_model(
         )
     if bool(meta.get("post_norm_head_linear", False)):
         ensure_post_norm_head_linear(model)
+    residual_topology = (meta.get("extra_meta") or {}).get("residual_lora")
+    if residual_topology is not None:
+        if not isinstance(residual_topology, dict) or residual_topology.get("version") != 1 or residual_topology.get("mode") not in ("additive", "replace"):
+            raise ValueError("Unsupported residual LoRA checkpoint topology or residual semantics.")
+        sites = residual_topology.get("sites")
+        if not isinstance(sites, dict) or set(sites) != {"attention", "mlp"}:
+            raise ValueError("Residual LoRA checkpoint must describe attention and mlp sites.")
+        install_residual_lora(model, **sites["attention"], mode=residual_topology["mode"],
+                              layer_indices=residual_topology["layer_indices"], site_configs=sites)
+        if get_residual_lora_topology(model) != residual_topology:
+            raise ValueError("Residual LoRA checkpoint topology does not match this model.")
+    elif get_residual_lora_topology(model) is not None:
+        raise ValueError("Cannot load a checkpoint without residual LoRA into a model that already has it.")
 
     validate_model_target_inventories(
         model,

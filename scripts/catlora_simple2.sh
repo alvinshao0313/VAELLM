@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PYTHONPATH=.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 export DISTILL_NCCL_TIMEOUT_SEC=10800
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=10800
 export PYTHONHASHSEED=31
@@ -12,9 +12,12 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
+# 可选残差 LoRA：默认 none；通过末尾 CLI 覆盖 --residual_lora_mode additive 启用；rank 必须 <= 8。
+# additive：skip=x+(alpha/r)*B(A(x))；replace：只保留低秩映射。
+# --residual_lora_lr 未设置时跟随 learning_rate；可追加该参数单独指定。
 torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --model_path "Qwen/Qwen3-8B" \
-  --output_dir "/root/data/ckpts/result/catlora/remaining_lora_mass" \
+  --output_dir "./result/catlora/remaining_lora_mass" \
   --compression_categories "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --target_layers all \
   --skip_layers "" \
@@ -41,7 +44,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --activation_calib_seed 31 \
   --activation_calib_device "" \
   --activation_calib_log_every 0 \
-  --codebook_bits "default=32,cat:down_proj=64" \
+  --codebook_bits "default=32" \
   --codebook_dim "default=32" \
   --residual_stages "default=2" \
   --base_ch "default=128" \
@@ -64,6 +67,8 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --commitment_loss_weight 0.25 \
   --entropy_loss_weight 0.01 \
   --normalize_weight \
+  --weight_rotation two_sided \
+  --weight_rotation_block_size 0 \
   --vae_decoder_checkpoint true \
   --new_quant \
   --log_every 100 \
@@ -71,7 +76,7 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --eval_blocks 256 \
   --skip_ppl_eval true \
   --eval_tasks "boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu" \
-  --channel_protect_mode channel \
+  --channel_protect_mode none \
   --channel_rank_metric channel_weight_actmean_abs \
   --channel_mlp_rank_metric none \
   --channel_mlp_fuse_weights "1,1,1" \
@@ -91,6 +96,10 @@ torchrun --standalone --nproc_per_node=4 tools/cat_train.py \
   --lora_rank "default=12" \
   --lora_alpha "default=24" \
   --lora_dropout "default=0.1" \
+  --residual_lora_mode none \
+  --residual_lora_rank 8 \
+  --residual_lora_alpha 16 \
+  --residual_lora_dropout 0 \
   --steps "default=5000" \
   --batch_size "default=8" \
   --learning_rate "default=1e-4" \

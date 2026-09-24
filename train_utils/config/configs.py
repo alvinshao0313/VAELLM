@@ -40,7 +40,7 @@ AFTER_CATEGORY_MODES = (
 DATASET_TASKS = ("lm", "sft")
 NORM_TRAIN_MODES = ("none", "final", "all")
 LM_HEAD_TRAIN_MODES = ("none", "linear", "lora", "full")
-DISTILL_FP32_COMPONENTS = ("lora", "decoder", "norm", "lm_head")
+DISTILL_FP32_COMPONENTS = ("lora", "decoder", "norm", "lm_head", "residual_lora")
 
 
 def parse_distill_fp32_components(raw) -> Tuple[str, ...]:
@@ -54,7 +54,7 @@ def parse_distill_fp32_components(raw) -> Tuple[str, ...]:
         return ()
     invalid = set(values) - set(DISTILL_FP32_COMPONENTS)
     if invalid:
-        raise ValueError(f"Invalid distill_fp32_components {sorted(invalid)}; choose lora,decoder,norm,lm_head or none alone.")
+        raise ValueError(f"Invalid distill_fp32_components {sorted(invalid)}; choose lora,decoder,norm,lm_head,residual_lora or none alone.")
     return tuple(name for name in DISTILL_FP32_COMPONENTS if name in values)
 
 
@@ -339,8 +339,28 @@ class AuxTrainableConfig:
     norm_lr: Optional[float] = None
     lm_head_train_mode: str = "none"
     lm_head_lr: Optional[float] = None
+    residual_lora_mode: str = "none"
+    residual_lora_rank: int = 8
+    residual_lora_alpha: float = 16.0
+    residual_lora_dropout: float = 0.0
+    residual_lora_lr: Optional[float] = None
 
     def validate(self) -> None:
+        self.residual_lora_mode = str(self.residual_lora_mode).strip().lower()
+        if self.residual_lora_mode not in ("none", "additive", "replace"):
+            raise ValueError("residual_lora_mode must be none, additive or replace.")
+        if not 1 <= int(self.residual_lora_rank) <= 8:
+            raise ValueError("residual_lora_rank must satisfy 1 <= rank <= 8.")
+        self.residual_lora_alpha = _require_finite(self.residual_lora_alpha, arg_name="residual_lora_alpha")
+        if self.residual_lora_alpha <= 0:
+            raise ValueError("residual_lora_alpha must be > 0.")
+        self.residual_lora_dropout = _require_finite(self.residual_lora_dropout, arg_name="residual_lora_dropout")
+        if not 0 <= self.residual_lora_dropout < 1:
+            raise ValueError("residual_lora_dropout must satisfy 0 <= dropout < 1.")
+        if self.residual_lora_lr is not None:
+            self.residual_lora_lr = _require_finite(self.residual_lora_lr, arg_name="residual_lora_lr")
+            if self.residual_lora_lr <= 0:
+                raise ValueError("residual_lora_lr must be > 0 when set.")
         norm_mode = str(self.norm_train_mode or "none").strip().lower()
         if norm_mode not in NORM_TRAIN_MODES:
             raise ValueError(f"norm_train_mode must be one of {NORM_TRAIN_MODES}, got {self.norm_train_mode!r}.")
@@ -533,6 +553,8 @@ class VAECoreConfig:
     zeta: float = 1.0
     inv_temperature: float = 100.0
     normalize_weight: bool = False
+    weight_rotation: str = "none"
+    weight_rotation_block_size: int = 32
     new_quant: bool = False
     transpose_modules: str = "v_proj,o_proj,gate_proj,up_proj,down_proj"
     intra_parallel: Tuple[int, int] = (1, 1)
@@ -564,6 +586,10 @@ class VAECoreConfig:
         self.intra_parallel = (int(parts[0]), int(parts[1]))
         if int(self.linear_group_size) < 1:
             raise ValueError("linear_group_size must be >= 1.")
+        if self.weight_rotation not in {"none", "two_sided"}:
+            raise ValueError("weight_rotation must be none or two_sided.")
+        if int(self.weight_rotation_block_size) < 0:
+            raise ValueError("weight_rotation_block_size must be >= 0 (0 means full dimension).")
 
 
 @dataclass
@@ -823,9 +849,9 @@ class CompressionTrainConfig:
 def validate_train_mode_aux(train_mode: str, aux: AuxTrainableConfig) -> None:
     mode = parse_train_mode(train_mode)
     aux.validate()
-    if mode == "none" and aux.norm_train_mode == "none" and aux.lm_head_train_mode == "none":
+    if mode == "none" and aux.norm_train_mode == "none" and aux.lm_head_train_mode == "none" and aux.residual_lora_mode == "none":
         raise ValueError(
-            "train_mode=none requires norm_train_mode != none or lm_head_train_mode != none."
+            "train_mode=none requires norm, lm_head, or residual_lora training to be enabled."
         )
 
 

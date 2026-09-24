@@ -275,6 +275,8 @@ def save_cat_v6_full_checkpoint(
             "decoder_lr": float(cfg.opt.resolved_decoder_lr()),
             "norm_lr": None if cfg.aux.norm_lr is None else float(cfg.aux.norm_lr),
             "lm_head_lr": None if cfg.aux.lm_head_lr is None else float(cfg.aux.lm_head_lr),
+            **({"residual_lora_lr": float(cfg.aux.residual_lora_lr if cfg.aux.residual_lora_lr is not None
+                                         else cfg.opt.learning_rate)} if cfg.aux.residual_lora_mode != "none" else {}),
         }
 
     stage_name = {

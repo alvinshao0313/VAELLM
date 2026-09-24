@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>混合位宽压缩 · 汇报</title>
+  <style>
+    :root {
+      --ink: #1a1f2b;
+      --muted: #5a6478;
+      --line: #d7d0c3;
+      --paper: #fffdf8;
+      --bg: #ebe6dc;
+      --accent: #2c5f52;
+      --accent-soft: #dce8e3;
+      --warn: #8b3d2f;
+      --title: #11151c;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; height: 100%;
+      background: var(--bg);
+      color: var(--ink);
+      font: 17px/1.45 "Source Han Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      overflow: hidden;
+    }
+    .deck { height: 100%; display: flex; flex-direction: column; }
+    .slide {
+      display: none;
+      flex: 1;
+      padding: 36px 48px 20px;
+      max-width: 1280px;
+      margin: 0 auto;
+      width: 100%;
+      overflow: auto;
+    }
+    .slide.active { display: block; }
+    h1 {
+      font-size: 28px;
+      line-height: 1.25;
+      margin: 0 0 6px;
+      color: var(--title);
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 14px;
+      margin: 0 0 18px;
+    }
+    h2 {
+      font-size: 16px;
+      margin: 0 0 8px;
+      color: var(--accent);
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .step {
+      display: grid;
+      grid-template-columns: 42px 150px 1fr;
+      gap: 12px;
+      align-items: stretch;
+      background: var(--paper);
+      border: 1px solid var(--line);
+    }
+    .num {
+      background: var(--ink);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 16px;
+    }
+    .name {
+      display: flex;
+      align-items: center;
+      padding: 10px 0 10px 4px;
+      font-weight: 700;
+      font-size: 15px;
+    }
+    .detail {
+      padding: 10px 14px 10px 0;
+      color: var(--muted);
+      font-size: 13.5px;
+    }
+    .detail b { color: var(--ink); font-weight: 650; }
+    .settings {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .card {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      padding: 10px 12px;
+      font-size: 13.5px;
+    }
+    .card strong { display: block; margin-bottom: 4px; font-size: 14px; color: var(--ink); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      background: var(--paper);
+      margin-top: 8px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 7px 8px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    thead th { background: #efe9dd; font-weight: 650; }
+    .up { color: var(--accent); font-weight: 650; }
+    .down { color: var(--warn); font-weight: 650; }
+    .note {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: #f3e4de;
+      border-left: 4px solid var(--warn);
+      font-size: 13.5px;
+    }
+    .cols {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+    .chip {
+      background: var(--accent-soft);
+      border: 1px solid #b7cfc6;
+      padding: 3px 8px;
+      font-size: 12.5px;
+    }
+    .nav {
+      height: 48px;
+      border-top: 1px solid var(--line);
+      background: var(--paper);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      flex-shrink: 0;
+    }
+    .nav button {
+      background: var(--ink);
+      color: #fff;
+      border: 0;
+      padding: 7px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .nav button:disabled { opacity: 0.35; cursor: default; }
+    .progress { flex: 1; text-align: center; color: var(--muted); font-size: 13px; }
+    .bar { height: 3px; background: #ddd6c8; margin-bottom: 4px; }
+    .fill { height: 3px; background: var(--accent); width: 50%; }
+    @media (max-width: 900px) {
+      .slide { padding: 20px; }
+      .step { grid-template-columns: 36px 1fr; }
+      .name { grid-column: 2; padding-bottom: 0; }
+      .detail { grid-column: 2; padding: 0 10px 10px 4px; }
+      .settings, .cols { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="deck">
+
+    <!-- 第 1 页：算法 -->
+    <section class="slide active" data-slide>
+      <h1>混合精度怎么做</h1>
+      <p class="sub">通义千问 3（80 亿）· 252 个线性层 · 平均比特预算 ≤ 2.0 · 本阶段无蒸馏恢复</p>
+
+      <div class="flow">
+        <div class="step">
+          <div class="num">1</div>
+          <div class="name">盘点目标层</div>
+          <div class="detail">扫描解码器投影层：36 层 × 7 类（q / k / v / o / gate / up / down）= <b>252</b> 个线性层。不压缩词嵌入、归一化层、语言模型头。</div>
+        </div>
+        <div class="step">
+          <div class="num">2</div>
+          <div class="name">训练候选池</div>
+          <div class="detail">每个「类别 × 比特档」训一个压缩编解码器（球形量化，残差 2 级，码本维 32，一万步，均方误差）。共 <b>7 × 5 = 35</b> 个任务，导出压缩态。</div>
+        </div>
+        <div class="step">
+          <div class="num">3</div>
+          <div class="name">均匀 2 比特基线</div>
+          <div class="detail">全部线性层选 <b>2.0 比特档</b>，作为后续代价与效果对比的参照学生。只存分配元数据，不另存完整模型。</div>
+        </div>
+        <div class="step">
+          <div class="num">4</div>
+          <div class="name">校准与教师缓存</div>
+          <div class="detail">校准集 <b>1000</b> 条，序列长度 <b>2048</b>。教师缓存每位置前 <b>K=256</b> 概率；KL 度量锁定为 teacher top-k。</div>
+        </div>
+        <div class="step">
+          <div class="num">5</div>
+          <div class="name">单层代价 ΔKL</div>
+          <div class="detail">在均匀 2 比特学生上每次只换一个线性层，算 <b>ΔKL = KL(换层后) − KL(均匀基线)</b>。得到 252 × 5 = <b>1260</b> 行代价表；基线档代价为 0。</div>
+        </div>
+        <div class="step">
+          <div class="num">6</div>
+          <div class="name">整数规划分配</div>
+          <div class="detail">目标：最小化 Σ ΔKL。约束：每层只选一档；参数量加权平均比特 ≤ 2.0。求解器要求证明全局最优。再组装模型并验证（下游分数不进入求解目标）。</div>
+        </div>
+      </div>
+
+      <div class="settings">
+        <div class="card">
+          <strong>候选比特档</strong>
+          1.0 / 1.5 / 2.0 / 2.5 / 3.0<br>
+          码本比特 16/24/32/40/48，维 32，残差 2<br>
+          另做一版：去掉 1.0 比特后再求解
+        </div>
+        <div class="card">
+          <strong>优化问题</strong>
+          最小化总 ΔKL<br>
+          每层 one-hot 选一档<br>
+          平均比特 ≤ 2.0
+        </div>
+        <div class="card">
+          <strong>验证指标</strong>
+          实际混合 KL、wiki-PPL<br>
+          8 个零样本任务<br>
+          boolq / rte / winogrande / arc_* / openbookqa / piqa / mmlu
+        </div>
+      </div>
+    </section>
+
+    <!-- 第 2 页：效果 -->
+    <section class="slide" data-slide>
+      <h1>混合精度是否有效？</h1>
+      <p class="sub">对照：均匀 2 比特基线（原始均匀精度）　对　两种混合分配。同一套代价表；「无 1 比特」只是求解时排除 1.0 档。</p>
+
+      <div class="cols">
+        <div>
+          <h2>下游与困惑度</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>指标</th>
+                <th>均匀 2 比特</th>
+                <th>混合含 1 比特<br>（平均 1.841）</th>
+                <th>混合无 1 比特<br>（平均 2.000）</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>校准 KL</td><td>8.264</td><td class="up">6.961</td><td class="up">7.358</td></tr>
+              <tr><td>wiki-PPL</td><td>10307</td><td class="down">447174</td><td class="down">30262</td></tr>
+              <tr><td>boolq</td><td>38.04</td><td>46.82</td><td>37.89</td></tr>
+              <tr><td>rte</td><td>45.13</td><td>46.57</td><td>52.35</td></tr>
+              <tr><td>winogrande</td><td>49.17</td><td>50.99</td><td>51.38</td></tr>
+              <tr><td>arc_easy</td><td>26.09</td><td>26.47</td><td>26.94</td></tr>
+              <tr><td>arc_challenge</td><td>23.72</td><td>25.17</td><td>23.89</td></tr>
+              <tr><td>openbookqa</td><td>28.20</td><td>24.80</td><td>26.00</td></tr>
+              <tr><td>piqa</td><td>51.31</td><td>48.26</td><td>51.41</td></tr>
+              <tr><td>mmlu</td><td>24.45</td><td>22.96</td><td>23.10</td></tr>
+              <tr>
+                <td><strong>8 任务均值</strong></td>
+                <td><strong>35.76</strong></td>
+                <td><strong>36.51</strong></td>
+                <td><strong>36.62</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div>
+          <h2>分配概况</h2>
+          <div class="card" style="margin-bottom:10px">
+            <strong>混合含 1 比特</strong>
+            平均 1.841 / 2.0，全局最优<br>
+            层数：1.0×84 · 1.5×49 · 2.0×30 · 2.5×51 · 3.0×38<br>
+            可加预测 KL = −42.8，实测 6.96（可加性失效）
+          </div>
+          <div class="card" style="margin-bottom:10px">
+            <strong>混合无 1 比特</strong>
+            平均 2.000 / 2.0，预算打满，全局最优<br>
+            层数：1.5×104 · 2.0×58 · 2.5×59 · 3.0×31<br>
+            可加预测 KL = −27.5，实测 7.36（仍失效，但 PPL 好很多）
+          </div>
+          <div class="chips">
+            <span class="chip">两边都无蒸馏</span>
+            <span class="chip">reload 误差 = 0</span>
+            <span class="chip">下游不进目标</span>
+          </div>
+
+          <div class="note">
+            <strong>结论：当前混合精度还不“有效”。</strong><br>
+            · 求解器目标（校准 KL）上混合略好于均匀基线。<br>
+            · 语言模型质量上：含 1 比特的 wiki-PPL 崩坏；去掉 1 比特后 PPL 仍差于均匀基线约 3 倍。<br>
+            · 下游 8 任务均值几乎贴着基线（约 36%），接近随机，不能支撑“混合优于均匀”。<br>
+            · 根因更像代价信号：单层 ΔKL 大量为负、可加预测与实测差一个数量级。
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="nav">
+    <button id="prevBtn" type="button">← 上一页</button>
+    <div class="progress">
+      <div class="bar"><div class="fill" id="bar"></div></div>
+      <div id="pageLabel">1 / 2</div>
+    </div>
+    <button id="nextBtn" type="button">下一页 →</button>
+  </div>
+
+  <script>
+    (function () {
+      const slides = Array.from(document.querySelectorAll("[data-slide]"));
+      let i = 0;
+      const prevBtn = document.getElementById("prevBtn");
+      const nextBtn = document.getElementById("nextBtn");
+      const pageLabel = document.getElementById("pageLabel");
+      const bar = document.getElementById("bar");
+      function show(n) {
+        i = Math.max(0, Math.min(slides.length - 1, n));
+        slides.forEach((s, k) => s.classList.toggle("active", k === i));
+        pageLabel.textContent = (i + 1) + " / " + slides.length;
+        bar.style.width = ((i + 1) / slides.length * 100) + "%";
+        prevBtn.disabled = i === 0;
+        nextBtn.disabled = i === slides.length - 1;
+        history.replaceState(null, "", "#" + (i + 1));
+      }
+      prevBtn.addEventListener("click", () => show(i - 1));
+      nextBtn.addEventListener("click", () => show(i + 1));
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") { e.preventDefault(); show(i + 1); }
+        else if (e.key === "ArrowLeft" || e.key === "PageUp") { e.preventDefault(); show(i - 1); }
+        else if (e.key === "Home") { e.preventDefault(); show(0); }
+        else if (e.key === "End") { e.preventDefault(); show(slides.length - 1); }
+      });
+      const hash = parseInt((location.hash || "").replace("#", ""), 10);
+      show(Number.isFinite(hash) && hash >= 1 ? hash - 1 : 0);
+    })();
+  </script>
+</body>
+</html>

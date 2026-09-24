@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from torch import nn
 
+from rotation.weight_preprocess import build_weight_rotation
 from litebsq.autoencoder import pack_decoders
 from litebsq.bitpack import (
     build_bitpack_u8_spec,
@@ -136,6 +137,7 @@ class VAELinear(nn.Module):
         protected_residual_stage_codebook_dims: Optional[Sequence[int]] = None,
         always_use_original: bool = False,
         protect_original_weight: bool = False,
+        weight_rotation_spec: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.in_features = int(in_features)
@@ -159,6 +161,9 @@ class VAELinear(nn.Module):
             raise ValueError(
                 f"compressed_out_features must be in [1, {self.out_features}], got {self.compressed_out_features}"
             )
+        self.weight_rotation = build_weight_rotation(
+            self.compressed_out_features, self.compressed_in_features, weight_rotation_spec,
+        )
         if self.parallel_parts < 1:
             raise ValueError(f"parallel_parts must be >= 1, got {self.parallel_parts}")
         if parallel_rows is None and parallel_cols is None:
@@ -2720,6 +2725,9 @@ class VAELinear(nn.Module):
         include_low_rank: bool = True,
         include_sparse_residual: bool = True,
     ) -> torch.Tensor:
+        if self.weight_rotation is not None:
+            # Restore before channel scatter, original-coordinate patches, and caching.
+            compressed_weight = self.weight_rotation(compressed_weight, inverse=True)
         full_weight = self._materialize_full_weight(
             compressed_weight,
             dtype=dtype,

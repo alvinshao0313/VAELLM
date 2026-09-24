@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from torch import nn
 
 from train_utils.cat_step_resume_v6 import (
+    build_cat_step_immutable_resume_contract,
     build_distill_dataset_identity,
     model_identity,
     prune_completed_cat_round_roots,
+    validate_cat_step_immutable_resume_contract,
 )
+
+from train_utils.config.configs import AuxTrainableConfig
 
 
 class _FakeDataset:
@@ -105,3 +111,78 @@ def test_completed_round_retention_preserves_unlimited_and_prunes_oldest(tmp_pat
     assert not (rounds / "0000_q_proj").exists()
     assert (rounds / "0001_k_proj").is_dir()
     assert (rounds / "0002_v_proj").is_dir()
+
+
+def _resume_contract_for_aux(aux):
+    stage = SimpleNamespace(
+        mode="remaining_lora",
+        config=SimpleNamespace(
+            data={},
+            loss={},
+            opt=SimpleNamespace(logging_steps=1, distill_fp32_components=()),
+            aux=aux,
+            runtime=SimpleNamespace(parallel_mode="dp", layer_device_map="auto"),
+        ),
+    )
+    return build_cat_step_immutable_resume_contract(
+        stage=stage,
+        trainer_args=SimpleNamespace(),
+        tokenizer=SimpleNamespace(name_or_path="tiny-tokenizer"),
+        round_base_checkpoint_id="tiny-round-base",
+        active_category="down_proj",
+        round_base_meta={},
+        lora_target_names=(),
+        decoder_target_names=(),
+        teacher_identity=None,
+        dataset_identity={},
+        lora_config=None,
+    )
+
+
+def test_disabled_residual_lora_keeps_legacy_cat_resume_contract():
+    legacy = _resume_contract_for_aux(
+        SimpleNamespace(norm_train_mode="none", norm_lr=None, lm_head_train_mode="none", lm_head_lr=None)
+    )
+    current = _resume_contract_for_aux(AuxTrainableConfig())
+    validate_cat_step_immutable_resume_contract(legacy, current)
+    assert current["aux"] == legacy["aux"]
+    inactive = _resume_contract_for_aux(
+        AuxTrainableConfig(
+            residual_lora_mode="none",
+            residual_lora_rank=4,
+            residual_lora_alpha=8,
+            residual_lora_dropout=0.1,
+            residual_lora_lr=3e-5,
+        )
+    )
+    validate_cat_step_immutable_resume_contract(legacy, inactive)
+
+
+def test_enabled_residual_lora_is_recorded_in_cat_resume_contract():
+    contract = _resume_contract_for_aux(
+        AuxTrainableConfig(residual_lora_mode="additive", residual_lora_lr=3e-5)
+    )
+    assert contract["aux"]["residual_lora_mode"] == "additive"
+    assert contract["aux"]["residual_lora_rank"] == 8
+    assert contract["aux"]["residual_lora_alpha"] == 16
+    assert contract["aux"]["residual_lora_dropout"] == 0
+    assert contract["aux"]["residual_lora_lr"] == 3e-5
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"residual_lora_mode": "none"},
+        {"residual_lora_mode": "replace"},
+        {"residual_lora_rank": 4},
+        {"residual_lora_alpha": 8},
+        {"residual_lora_dropout": 0.1},
+        {"residual_lora_lr": 7e-5},
+    ],
+)
+def test_cat_resume_rejects_residual_lora_contract_changes(change):
+    aux = AuxTrainableConfig(residual_lora_mode="additive", residual_lora_lr=3e-5)
+    saved = _resume_contract_for_aux(aux)
+    current = _resume_contract_for_aux(replace(aux, **change))
+    with pytest.raises(ValueError, match="immutable"):
+        validate_cat_step_immutable_resume_contract(saved, current)

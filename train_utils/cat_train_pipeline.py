@@ -57,6 +57,7 @@ from train_utils.config.targets import (
 from train_utils.lora_utils import resolve_distill_train_device
 from litebsq.vae_args import apply_autoencoder_arch_defaults
 from litebsq.misc import set_module_by_name
+from rotation.weight_preprocess import build_weight_rotation, rotation_spec
 from train_utils.cat_data_prep import (
     LinearPrepRef,
     build_outlier_channel_index_plan,
@@ -1179,6 +1180,7 @@ def _build_vae_linear_from_stage_payload(
     parallel_parts: int,
     bias,
     protected_channel_quant_format: str = "none",
+    weight_rotation_spec: Optional[Dict[str, Any]] = None,
 ):
     from litebsq.vae_linear import VAELinear
 
@@ -1227,6 +1229,7 @@ def _build_vae_linear_from_stage_payload(
         protected_output_qvalues=split_meta.protected_output_qvalues,
         protected_output_scales=split_meta.protected_output_scales,
         protected_channel_quant_format=str(protected_channel_quant_format),
+        weight_rotation_spec=weight_rotation_spec,
         always_use_original=False,
         protect_original_weight=False,
     )
@@ -1306,6 +1309,9 @@ def train_group_vae_payload(
     stage_codebook_dim = int(runtime_cfg.codebook_dim)
     stage_steps = int(runtime_cfg.steps)
     stage_recon_loss = str(runtime_cfg.recon_loss_type).strip().lower()
+    weight_rotation_mode = str(getattr(vae_args, "weight_rotation", "none"))
+    if weight_rotation_mode != "none" and stage_recon_loss != "mse":
+        raise ValueError("Local weight_rotation requires mse; original-axis channel loss weights are not valid.")
     stage_base_ch = int(runtime_cfg.base_ch)
     stage_num_res_blocks = int(runtime_cfg.num_res_blocks)
     stage_norm_type = str(runtime_cfg.norm_type).strip().lower()
@@ -1399,6 +1405,26 @@ def train_group_vae_payload(
         channel_plan=channel_plan if resolved_channel_mode == "channel" and channel_protection_enabled else None,
         apply_outlier_channel_removal=resolved_channel_mode == "channel",
     )
+    weight_rotation_specs = []
+    for entry_idx, entry in enumerate(prepared_entries):
+        spec = rotation_spec(
+            weight_rotation_mode, int(getattr(vae_args, "weight_rotation_block_size", 32)),
+            int(getattr(training_args, "seed", 0)), entry.ref.name,
+        )
+        weight_rotation_specs.append(spec)
+        if spec is not None:
+            prepared = entry.prepared_weight
+            transform = build_weight_rotation(
+                prepared.compressed_out_features, prepared.compressed_in_features, spec,
+            ).to(train_device)
+            with torch.no_grad():
+                rotated = transform(prepared.split_weight.to(device=train_device, dtype=torch.float32)).cpu()
+            prepared_entries[entry_idx] = replace(
+                entry, prepared_weight=replace(prepared, split_weight=rotated),
+            )
+            del transform
+    if weight_rotation_mode != "none":
+        log.info("[%s] local two-sided weight preprocessing: %s", group_tag, weight_rotation_specs)
     initial_split_weights_by_linear: Optional[List[torch.Tensor]] = None
     target_common_result = materialize_prepared_group_data(
         prepared_entries=prepared_entries,
@@ -1966,6 +1992,7 @@ def train_group_vae_payload(
         "all_stage_codebook_dims": all_stage_codebook_dims,
         "all_stage_split_metas": all_stage_split_metas,
         "protected_channel_quant_format": str(channel_quant),
+        "weight_rotation_specs": weight_rotation_specs,
     }
     del current_residual_weights, target_common_result
     torch.cuda.empty_cache()
@@ -1994,6 +2021,9 @@ def apply_group_vae_payload(
     all_stage_codebook_dims = payload["all_stage_codebook_dims"]
     all_stage_split_metas = payload["all_stage_split_metas"]
     protected_channel_quant_format = str(payload.get("protected_channel_quant_format", "none"))
+    weight_rotation_specs = payload.get("weight_rotation_specs", [None] * len(group_refs))
+    if len(weight_rotation_specs) != len(group_refs):
+        raise ValueError(f"[{group_tag}] weight_rotation_specs length does not match group_refs.")
 
     if (
         len(all_stage_bits) != residual_stages
@@ -2054,6 +2084,7 @@ def apply_group_vae_payload(
             parallel_parts=parts_per_linear,
             bias=old.bias,
             protected_channel_quant_format=protected_channel_quant_format,
+            weight_rotation_spec=weight_rotation_specs[i],
         ).to(convert_device)
         new_linear.to("cpu")
         set_module_by_name(model, r.name, new_linear)

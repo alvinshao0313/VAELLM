@@ -180,6 +180,17 @@ def build_cat_step_immutable_resume_contract(
         opt.pop("logging_steps", None)
         if not opt.get("distill_fp32_components"):
             opt.pop("distill_fp32_components", None)
+    aux = _jsonable(cfg.aux)
+    if aux.get("residual_lora_mode", "none") == "none":
+        # Disabled residual adapters do not change the historical resume contract.
+        for key in (
+            "residual_lora_mode",
+            "residual_lora_rank",
+            "residual_lora_alpha",
+            "residual_lora_dropout",
+            "residual_lora_lr",
+        ):
+            aux.pop(key, None)
     tokenizer_name, tokenizer_revision = tokenizer_identity(tokenizer)
     return {
         "version": 1,
@@ -200,7 +211,7 @@ def build_cat_step_immutable_resume_contract(
         "loss": _jsonable(cfg.loss),
         "optimization": opt,
         "lora": None if lora_config is None else _jsonable(dict(lora_config)),
-        "aux": _jsonable(cfg.aux),
+        "aux": aux,
         "runtime": _jsonable(cfg.runtime),
         "tokenizer": {
             "identity": str(tokenizer_name),

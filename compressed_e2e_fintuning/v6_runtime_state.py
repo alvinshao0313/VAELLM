@@ -26,6 +26,7 @@ _COMPONENT_BY_INVENTORY = {
     "decoder_parameters": "decoder",
     "norm_parameters": "norm",
     "lm_head_parameters": "lm_head",
+    "residual_lora_parameters": "residual_lora",
 }
 
 
@@ -218,7 +219,10 @@ def build_e2e_immutable_resume_contract(
         "loss": loss,
         "optimization": opt,
         "lora": _jsonable(cfg.lora),
-        "aux": _jsonable(cfg.aux),
+        "aux": {
+            key: value for key, value in _jsonable(cfg.aux).items()
+            if cfg.aux.residual_lora_mode != "none" or not key.startswith("residual_lora_")
+        },
         "runtime": runtime,
         "tokenizer": {
             "identity": str(tokenizer_name),

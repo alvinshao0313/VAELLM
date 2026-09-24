@@ -73,6 +73,7 @@ from train_utils.config.targets import (
 
 DELETED_CLI_FLAGS = frozenset(
     {
+        "--residual_lora_enabled",
         "--distill_temperature",
         "--distill_alpha",
         "--distill_loss_alpha",
@@ -499,6 +500,13 @@ def _add_lora_aux_args(parser: argparse.ArgumentParser, *, cat_overrides: bool) 
     parser.add_argument("--norm_lr", type=float, default=None)
     parser.add_argument("--lm_head_train_mode", type=str, default="none")
     parser.add_argument("--lm_head_lr", type=float, default=None)
+    parser.add_argument("--residual_lora_mode", choices=("none", "additive", "replace"), default="none",
+                        help="none: no residual training; additive: x + LoRA(x); replace: LoRA(x) without identity.")
+    parser.add_argument("--residual_lora_rank", type=int, default=8)
+    parser.add_argument("--residual_lora_alpha", type=float, default=16.0)
+    parser.add_argument("--residual_lora_dropout", type=float, default=0.0)
+    parser.add_argument("--residual_lora_lr", type=float, default=None,
+                        help="Residual LoRA learning rate; defaults to the main learning rate.")
 
 
 def _add_runtime_eval_args(parser: argparse.ArgumentParser) -> None:
@@ -625,6 +633,8 @@ def build_e2e_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--student_checkpoint_dir", type=str, required=True)
     parser.add_argument("--run_root_dir", type=str, default=".result/compressed_e2e_fintuning")
+    parser.add_argument("--stop_after_step", type=int, default=None,
+                        help="Pause after this absolute optimizer step is saved and evaluated; keep --steps unchanged for resume.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--teacher_model_path", type=str, default=None)
     parser.add_argument("--train_mode", type=parse_train_mode, default="decoder")
@@ -652,6 +662,10 @@ def build_cat_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_device", type=str, default="cuda")
     parser.add_argument("--deterministic", type=_bool_type("--deterministic"), default=False)
     parser.add_argument("--rot_llm", type=_bool_type("--rot_llm"), nargs="?", const=True, default=False)
+    parser.add_argument("--weight_rotation", choices=("none", "two_sided"), default="none",
+                        help="Local VAE weight preprocessing; preserves the original Linear coordinates.")
+    parser.add_argument("--weight_rotation_block_size", type=int, default=32,
+                        help="Hadamard block size; 0 uses each full unprotected dimension. No padding.")
     parser.add_argument("--convert", type=_bool_type("--convert"), nargs="?", const=True, default=False)
     parser.add_argument("--convert_device", type=str, default="cuda")
     parser.add_argument("--save_model", type=_bool_type("--save_model"), nargs="?", const=True, default=False)
@@ -738,6 +752,11 @@ def _build_aux_config(ns) -> AuxTrainableConfig:
         norm_lr=ns.norm_lr,
         lm_head_train_mode=ns.lm_head_train_mode,
         lm_head_lr=ns.lm_head_lr,
+        residual_lora_mode=ns.residual_lora_mode,
+        residual_lora_rank=ns.residual_lora_rank,
+        residual_lora_alpha=ns.residual_lora_alpha,
+        residual_lora_dropout=ns.residual_lora_dropout,
+        residual_lora_lr=ns.residual_lora_lr,
     )
     cfg.validate()
     return cfg
@@ -766,6 +785,7 @@ class E2ECLIConfig:
     bit_lr: str
     bit_weight_decay: float
     bit_round_steps: str
+    stop_after_step: Optional[int] = None
 
 
 @dataclass
@@ -885,6 +905,8 @@ class CatCLIConfig:
                 zeta=self.core_template.zeta,
                 inv_temperature=self.core_template.inv_temperature,
                 normalize_weight=self.core_template.normalize_weight,
+                weight_rotation=self.core_template.weight_rotation,
+                weight_rotation_block_size=self.core_template.weight_rotation_block_size,
                 new_quant=self.core_template.new_quant,
                 transpose_modules=self.core_template.transpose_modules,
                 intra_parallel=tuple(resolve_category_value(self.intra_parallel, category)),
@@ -1036,6 +1058,8 @@ def parse_e2e_cli(argv: Optional[Sequence[str]] = None) -> E2ECLIConfig:
             logging_steps=int(ns.logging_steps),
         )
         opt.validate()
+        if ns.stop_after_step is not None and not 0 < int(ns.stop_after_step) < int(opt.steps):
+            raise ValueError("stop_after_step must be > 0 and strictly less than steps.")
         lora = LoRAConfig(
             rank=int(ns.lora_rank),
             alpha=float(ns.lora_alpha),
@@ -1050,6 +1074,7 @@ def parse_e2e_cli(argv: Optional[Sequence[str]] = None) -> E2ECLIConfig:
         runtime = _build_runtime_config(ns)
         return E2ECLIConfig(
             student_checkpoint_dir=str(ns.student_checkpoint_dir),
+            stop_after_step=ns.stop_after_step,
             train_mode=str(ns.train_mode),
             data=data,
             loss=loss,
@@ -1229,12 +1254,21 @@ def parse_cat_cli(argv: Optional[Sequence[str]] = None) -> CatCLIConfig:
             zeta=float(ns.zeta),
             inv_temperature=float(ns.inv_temperature),
             normalize_weight=bool(ns.normalize_weight),
+            weight_rotation=str(ns.weight_rotation),
+            weight_rotation_block_size=int(ns.weight_rotation_block_size),
             new_quant=bool(ns.new_quant),
             transpose_modules=str(ns.transpose_modules),
             linear_group_size=int(ns.linear_group_size),
             allow_tail_group=bool(ns.allow_tail_group),
         )
         core_template.validate()
+
+        if core_template.weight_rotation != "none":
+            if bool(ns.rot_llm):
+                raise ValueError("--weight_rotation two_sided and --rot_llm are mutually exclusive.")
+            for category in categories:
+                if resolve_category_value(recon_loss_type, category) != "mse":
+                    raise ValueError("--weight_rotation two_sided requires recon_loss_type=mse for every category.")
 
         cfg = CatCLIConfig(
             model_path=str(ns.model_path),

@@ -163,6 +163,7 @@ def _selection_has_continuous(selection) -> bool:
             "lora_parameters",
             "norm_parameters",
             "lm_head_parameters",
+            "residual_lora_parameters",
         )
     )
 
@@ -178,7 +179,32 @@ def _resolved_learning_rates(cfg) -> dict:
             else float(cfg.opt.learning_rate)
         ),
         "weight_decay": float(cfg.opt.weight_decay),
+        **({"residual_lora_lr": float(cfg.aux.residual_lora_lr if cfg.aux.residual_lora_lr is not None
+                                     else cfg.opt.learning_rate)} if cfg.aux.residual_lora_mode != "none" else {}),
     }
+
+
+def _validate_stop_after_step(cfg, training_args) -> Optional[int]:
+    stop = getattr(cfg, "stop_after_step", None)
+    if stop is None:
+        return None
+    stop = int(stop)
+    if not 0 < stop < int(training_args.max_steps):
+        raise ValueError("stop_after_step must be > 0 and strictly less than steps.")
+    evaluation = cfg.runtime.evaluation
+    if not evaluation.eval_after_save or not str(evaluation.eval_tasks or "").strip():
+        raise ValueError("stop_after_step requires eval_after_save=true and non-empty eval_tasks.")
+    strategy = getattr(training_args.save_strategy, "value", training_args.save_strategy)
+    interval = training_args.save_steps
+    if str(strategy) != "steps" or float(interval) < 1 or not float(interval).is_integer():
+        raise ValueError("stop_after_step requires save_strategy=steps and an integer save_steps >= 1.")
+    if stop % int(interval):
+        raise ValueError("stop_after_step must be a save_steps boundary.")
+    if cfg.resume_from_checkpoint:
+        state = TrainerState.load_from_json(os.path.join(str(cfg.resume_from_checkpoint), "trainer_state.json"))
+        if stop <= int(state.global_step):
+            raise ValueError("stop_after_step must exceed the resumed checkpoint global_step.")
+    return stop
 
 
 def _validate_v6_step_training_args(training_args) -> None:
@@ -529,6 +555,7 @@ def _run_final_lm_eval(*, model, tokenizer, cfg, base_model_path: str, output_di
 
 def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
     log = get_logger("compressed_e2e_fintuning")
+    stop_after_step = _validate_stop_after_step(cfg, training_args)
     round_base_dir, round_base_meta, step_meta = _resolve_round_base(cfg)
     base_model_path = str(round_base_meta.get("base_model_path") or "").strip()
     if not base_model_path:
@@ -571,8 +598,9 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
         str(cfg.train_mode) == "none"
         and str(cfg.aux.norm_train_mode) == "none"
         and str(cfg.aux.lm_head_train_mode) == "none"
+        and cfg.aux.residual_lora_mode == "none"
     ):
-        raise ValueError("train_mode=none requires norm_train_mode or lm_head_train_mode to be enabled.")
+        raise ValueError("train_mode=none requires norm, lm_head, or residual_lora training to be enabled.")
     if train_sparse:
         _validate_sparse_trainer_modes(training_args)
 
@@ -734,6 +762,7 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
             run_output_dir=run_output_dir,
             log=log,
             parallel_mode=str(cfg.runtime.parallel_mode),
+            stop_after_step=stop_after_step,
         )
         callbacks.append(eval_after_save_callback)
 
@@ -773,6 +802,7 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
             decoder_lr=cfg.opt.decoder_lr,
             norm_lr=cfg.aux.norm_lr,
             lm_head_lr=cfg.aux.lm_head_lr,
+            residual_lora_lr=cfg.aux.residual_lora_lr,
         )
         attach_model_level_optimizer_contract(
             trainer,
@@ -841,6 +871,23 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
         )
         raise
 
+    if eval_after_save_callback is not None and eval_after_save_callback.stopped_checkpoint_dir is not None:
+        paused_checkpoint = eval_after_save_callback.stopped_checkpoint_dir
+        paused_step = int(trainer.state.global_step)
+        _cleanup_runtime(model, hook_handles=hook_handles,
+                         streaming_manager=streaming_manager, hif4_handles=hif4_handles)
+        log.info("E2E status=paused global_step=%d max_steps=%d; finalization skipped.",
+                 paused_step, int(training_args.max_steps))
+        return {
+            "status": "paused",
+            "run_output_dir": run_output_dir,
+            "resume_from_checkpoint": paused_checkpoint,
+            "round_base_checkpoint_id": str(round_base_meta["checkpoint_id"]),
+            "global_step": paused_step,
+            "saved_model_dir": None,
+            "stage_lm_eval_path": os.path.join(run_output_dir, "lm_eval", f"lm_eval_results_step_{paused_step}.json"),
+        }
+
     final_model = _unwrap_model_for_finalization(trainer)
     final_model.eval()
     if hasattr(trainer, "offload_teacher_to_cpu"):
@@ -892,11 +939,17 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
         distributed_guarded_all(lambda: _finalize_decoders(selected))
 
     compressed_proxy_names = [str(name) for name, _module in selected] if train_lora else []
+    deferred_dense_targets = (
+        ("lm_head",)
+        if str(cfg.aux.lm_head_train_mode).strip().lower() == "lora"
+        else ()
+    )
     if list(iter_named_peft_lora_layers(final_model)):
         final_model = distributed_guarded_all(
             lambda: finalize_model_level_lora(
                 final_model,
                 compressed_proxy_names=compressed_proxy_names or None,
+                defer_dense_targets=deferred_dense_targets,
             )
         )
 
@@ -934,12 +987,23 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
         barrier=False,
     )
 
+    deferred_lora_fused = False
+    if deferred_dense_targets and list(iter_named_peft_lora_layers(final_model)):
+        final_model = distributed_guarded_all(
+            lambda: finalize_model_level_lora(
+                final_model,
+                compressed_proxy_names=None,
+            )
+        )
+        deferred_lora_fused = True
+
     lm_head_fused = distributed_guarded_all(
         lambda: finalize_lm_head_linear_if_needed(
             final_model,
             lm_head_train_mode=str(cfg.aux.lm_head_train_mode),
         )
     )
+    lm_head_fused = bool(lm_head_fused or deferred_lora_fused)
 
     structural_probe_state = {}
 

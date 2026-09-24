@@ -121,6 +121,9 @@ def build_cat_cross_category_runtime_identity(
         for field in _VAE_IDENTITY_FIELDS
         if hasattr(vae_args, field)
     }
+    if str(getattr(vae_args, "weight_rotation", "none")) != "none":
+        vae_shared["weight_rotation"] = str(vae_args.weight_rotation)
+        vae_shared["weight_rotation_block_size"] = int(vae_args.weight_rotation_block_size)
     cat_shared = {
         field: _identity_value(getattr(cat_args, field))
         for field in _CAT_IDENTITY_FIELDS

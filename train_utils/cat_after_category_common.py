@@ -778,6 +778,7 @@ def _train_model_level_selection(
             ),
             norm_lr=cfg.aux.norm_lr,
             lm_head_lr=cfg.aux.lm_head_lr,
+            residual_lora_lr=cfg.aux.residual_lora_lr,
         ),
     )
 
@@ -954,6 +955,7 @@ def _run_canonical_current_family(
     aux_active = bool(
         str(cfg.aux.norm_train_mode) != "none"
         or str(cfg.aux.lm_head_train_mode) != "none"
+        or str(cfg.aux.residual_lora_mode) != "none"
     )
     if int(cfg.opt.steps) <= 0 or not (effective_train_lora or effective_train_decoder or aux_active):
         return CanonicalCurrentDecoderResult(
@@ -1309,6 +1311,7 @@ def _run_canonical_remaining_family(
     aux_active = bool(
         str(cfg.aux.norm_train_mode) != "none"
         or str(cfg.aux.lm_head_train_mode) != "none"
+        or str(cfg.aux.residual_lora_mode) != "none"
     )
     has_stage_trainables = bool(remaining_names or decoder_targets or aux_active)
     if not has_stage_trainables or int(cfg.opt.steps) <= 0:

@@ -246,6 +246,7 @@ class ModelLevelTrainableSelection:
     lora_parameters: Dict[str, nn.Parameter] = field(default_factory=dict)
     norm_parameters: Dict[str, nn.Parameter] = field(default_factory=dict)
     lm_head_parameters: Dict[str, nn.Parameter] = field(default_factory=dict)
+    residual_lora_parameters: Dict[str, nn.Parameter] = field(default_factory=dict)
     compressed_lora_targets: List[str] = field(default_factory=list)
     include_lm_head_lora: bool = False
     peft_model: Optional[nn.Module] = None
@@ -278,6 +279,7 @@ def assert_disjoint_component_inventories(
     lora_parameters: Dict[str, nn.Parameter],
     norm_parameters: Dict[str, nn.Parameter],
     lm_head_parameters: Dict[str, nn.Parameter],
+    residual_lora_parameters: Optional[Dict[str, nn.Parameter]] = None,
 ) -> None:
     """Hard error if the same Parameter id appears in more than one component inventory."""
     inventories = {
@@ -285,6 +287,7 @@ def assert_disjoint_component_inventories(
         "lora_parameters": lora_parameters,
         "norm_parameters": norm_parameters,
         "lm_head_parameters": lm_head_parameters,
+        "residual_lora_parameters": residual_lora_parameters or {},
     }
     owner: Dict[int, Tuple[str, str]] = {}
     for inv_name, params in inventories.items():
@@ -501,6 +504,19 @@ def build_model_level_trainable_selection(
             execution_mode=str(decoder_execution_mode),
         )
 
+    # Install and enable after PEFT, which freezes existing base-model parameters.
+    # Repeated CAT stages reuse the same residual sites and their learned weights.
+    residual_lora_parameters: Dict[str, nn.Parameter] = {}
+    if aux.residual_lora_mode != "none":
+        from e2e_common.residual_lora import (
+            install_residual_lora, enable_residual_lora, collect_residual_lora_parameters,
+        )
+        install_residual_lora(peft_model, rank=aux.residual_lora_rank,
+                              alpha=aux.residual_lora_alpha, dropout=aux.residual_lora_dropout,
+                              mode=aux.residual_lora_mode)
+        enable_residual_lora(peft_model)
+        residual_lora_parameters = collect_residual_lora_parameters(peft_model)
+
     norm_parameters, lm_head_non_lora = apply_aux_trainables(peft_model, aux)
     lora_parameters, lm_head_lora = classify_peft_lora_parameters(peft_model)
 
@@ -520,6 +536,7 @@ def build_model_level_trainable_selection(
         lora_parameters=lora_parameters,
         norm_parameters=norm_parameters,
         lm_head_parameters=lm_head_parameters,
+        residual_lora_parameters=residual_lora_parameters,
     )
 
     return ModelLevelTrainableSelection(
@@ -527,6 +544,7 @@ def build_model_level_trainable_selection(
         lora_parameters=lora_parameters,
         norm_parameters=norm_parameters,
         lm_head_parameters=lm_head_parameters,
+        residual_lora_parameters=residual_lora_parameters,
         compressed_lora_targets=[str(name) for name, _ in lora_compressed_modules],
         include_lm_head_lora=bool(include_lm_head_lora),
         peft_model=peft_model,

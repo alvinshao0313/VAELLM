@@ -53,4 +53,12 @@ python tools/migrate_checkpoint_v6.py \
 
 `--dry_run true` 只检查可迁移性，不写文件。specialized bitpack/candidate 工具保留自己的紧凑 artifact schema，但完整模型输入输出仍走 v6。
 
-详细参数见 [CAT 参数](docs/cat_train_args.md)、[checkpoint-distill](docs/catlora_distill_from_checkpoint.md) 和 [E2E](compressed_e2e_fintuning/README.md)。
+详细参数见 [CAT 参数](docs/guides/cat_training.md)、[checkpoint-distill](docs/guides/catlora_distill_from_checkpoint.md) 和 [E2E](compressed_e2e_fintuning/README.md)。
+
+## 项目文档
+
+使用指南、模块说明、经验、实验结果和历史材料统一从 [文档入口](docs/README.md) 查找。维护方式见 [文档管理规范](docs/MANAGEMENT.md)。
+
+## 经验与实验记录
+
+实验设计前先检索 [经验库](docs/experience/README.md)，阅读相关经验及来源，避免重复踩坑。经验、原始结果、历史方案分别维护；完整来源见 [目录](docs/experience/CATALOG.md)。

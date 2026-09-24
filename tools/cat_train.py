@@ -13,6 +13,7 @@ from train_utils.cat_train_pipeline import run_cat_train
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     cat_args, hf_args, training_args, vae_args = parse_cat_runtime_args(argv)
+    training_args.seed = int(cat_args.seed)
     run_cat_train(
         cat_args=cat_args,
         hf_args=hf_args,

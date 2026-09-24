@@ -17,6 +17,7 @@ _COMPONENT_BY_INVENTORY = {
     "decoder_parameters": "decoder",
     "norm_parameters": "norm",
     "lm_head_parameters": "lm_head",
+    "residual_lora_parameters": "residual_lora",
 }
 
 

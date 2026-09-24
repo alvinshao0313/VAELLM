@@ -371,6 +371,7 @@ class EvalAfterSaveCallback(TrainerCallback):
         run_output_dir: str,
         log,
         parallel_mode: str,
+        stop_after_step: Optional[int] = None,
     ):
         self.e2e_args = e2e_args
         self.tokenizer = tokenizer
@@ -380,6 +381,8 @@ class EvalAfterSaveCallback(TrainerCallback):
         self.parallel_mode = str(parallel_mode).strip().lower()
         self._last_eval_step: Optional[int] = None
         self._trainer = None
+        self.stop_after_step = stop_after_step
+        self.stopped_checkpoint_dir: Optional[str] = None
 
     def bind_trainer(self, trainer) -> None:
         self._trainer = trainer
@@ -495,4 +498,17 @@ class EvalAfterSaveCallback(TrainerCallback):
                     trainer.restore_teacher_device(previous_teacher_device)
                     if previous_teacher_device is not None and previous_teacher_device.type != "cpu":
                         self.log.info("Restored teacher to %s after eval-after-save.", previous_teacher_device)
+        checkpoint_dir = os.path.join(str(args.output_dir), f"checkpoint-{global_step}")
+        if trainer is not None:
+            # lm-eval resets Python/NumPy/Torch RNG. The checkpoint was written
+            # before evaluation; persist the state continuous training now uses.
+            trainer._save_rng_state(checkpoint_dir)
+            distill_distributed_barrier()
+        if self.stop_after_step == global_step:
+            if trainer is None:
+                raise RuntimeError("stop_after_step requires a bound Trainer to persist post-eval RNG.")
+            self.stopped_checkpoint_dir = checkpoint_dir
+            control.should_training_stop = True
+            self.log.info("Paused after saved/evaluated optimizer step %d; resume checkpoint: %s",
+                          global_step, checkpoint_dir)
         return control

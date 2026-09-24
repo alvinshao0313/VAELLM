@@ -114,7 +114,7 @@ def test_release_cat_trainer_training_state_breaks_callback_cycle_and_optimizer_
 def test_current_recovery_clears_decoded_cache_without_eval_or_save():
     model = _TinyCatModel()
     cfg = SimpleNamespace(
-        aux=SimpleNamespace(norm_train_mode="none", lm_head_train_mode="none", norm_lr=None, lm_head_lr=None),
+        aux=AuxTrainableConfig(),
         opt=SimpleNamespace(
             distill_fp32_components=(),
             steps=1,

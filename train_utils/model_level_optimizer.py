@@ -20,6 +20,7 @@ from train_utils.model_level_trainables import (
 logger = logging.getLogger(__name__)
 
 GROUP_LORA = "lora"
+GROUP_RESIDUAL_LORA = "residual_lora"
 GROUP_DECODER = "decoder"
 GROUP_NORM = "norm"
 GROUP_LM_HEAD = "lm_head"
@@ -27,13 +28,17 @@ GROUP_LM_HEAD = "lm_head"
 
 @dataclass(frozen=True)
 class ModelLevelOptimizerLRConfig:
-    """Resolved LR/WD contract for the four inventory components."""
+    """Resolved LR/WD contract for the labeled inventory components."""
 
     learning_rate: float
     weight_decay: float
     decoder_lr: Optional[float] = None
     norm_lr: Optional[float] = None
     lm_head_lr: Optional[float] = None
+    residual_lora_lr: Optional[float] = None
+
+    def resolved_residual_lora_lr(self) -> float:
+        return float(self.learning_rate if self.residual_lora_lr is None else self.residual_lora_lr)
 
     def resolved_decoder_lr(self) -> float:
         if self.decoder_lr is None:
@@ -73,6 +78,7 @@ def build_model_level_param_groups(
 
     Mapping (exact):
     - lora_parameters     -> lr=learning_rate, wd=weight_decay
+    - residual_lora_parameters -> lr=residual_lora_lr or learning_rate, wd=weight_decay
     - decoder_parameters  -> lr=decoder_lr or learning_rate, wd=0
     - norm_parameters      -> lr=norm_lr or learning_rate, wd=0
     - lm_head_parameters   -> lr=lm_head_lr or learning_rate, wd=0
@@ -82,6 +88,7 @@ def build_model_level_param_groups(
         lora_parameters=selection.lora_parameters,
         norm_parameters=selection.norm_parameters,
         lm_head_parameters=selection.lm_head_parameters,
+        residual_lora_parameters=selection.residual_lora_parameters,
     )
 
     for inv_name, inv in (
@@ -89,6 +96,7 @@ def build_model_level_param_groups(
         ("lora_parameters", selection.lora_parameters),
         ("norm_parameters", selection.norm_parameters),
         ("lm_head_parameters", selection.lm_head_parameters),
+        ("residual_lora_parameters", selection.residual_lora_parameters),
     ):
         _assert_all_requires_grad(inv, inventory_name=inv_name)
 
@@ -126,11 +134,13 @@ def build_model_level_param_groups(
     _append(GROUP_DECODER, selection.decoder_parameters, lr=decoder_lr, weight_decay=0.0)
     _append(GROUP_NORM, selection.norm_parameters, lr=norm_lr, weight_decay=0.0)
     _append(GROUP_LM_HEAD, selection.lm_head_parameters, lr=lm_head_lr, weight_decay=0.0)
+    _append(GROUP_RESIDUAL_LORA, selection.residual_lora_parameters,
+            lr=lr_config.resolved_residual_lora_lr(), weight_decay=main_wd)
 
     if not groups:
         raise RuntimeError(
             "Model-level optimizer requires at least one non-empty trainable inventory "
-            "(decoder/lora/norm/lm_head)."
+            "(decoder/lora/norm/lm_head/residual_lora)."
         )
 
     if model is not None:
@@ -190,6 +200,7 @@ def create_model_level_optimizer(
                 decoder_lr=None if decoder_lr is None else float(decoder_lr),
                 norm_lr=getattr(trainer, "norm_lr", None),
                 lm_head_lr=getattr(trainer, "lm_head_lr", None),
+                residual_lora_lr=getattr(trainer, "residual_lora_lr", None),
             )
 
     opt_model = getattr(trainer, "model_wrapped", None) or trainer.model
@@ -230,6 +241,7 @@ def selection_from_component_parameters(
     lora_parameters: Optional[Dict[str, nn.Parameter]] = None,
     norm_parameters: Optional[Dict[str, nn.Parameter]] = None,
     lm_head_parameters: Optional[Dict[str, nn.Parameter]] = None,
+    residual_lora_parameters: Optional[Dict[str, nn.Parameter]] = None,
 ) -> ModelLevelTrainableSelection:
     """Assemble a selection from already-labeled component maps (no name guessing)."""
     selection = ModelLevelTrainableSelection(
@@ -237,12 +249,14 @@ def selection_from_component_parameters(
         lora_parameters=dict(lora_parameters or {}),
         norm_parameters=dict(norm_parameters or {}),
         lm_head_parameters=dict(lm_head_parameters or {}),
+        residual_lora_parameters=dict(residual_lora_parameters or {}),
     )
     assert_disjoint_component_inventories(
         decoder_parameters=selection.decoder_parameters,
         lora_parameters=selection.lora_parameters,
         norm_parameters=selection.norm_parameters,
         lm_head_parameters=selection.lm_head_parameters,
+        residual_lora_parameters=selection.residual_lora_parameters,
     )
     return selection
 
@@ -261,12 +275,14 @@ def attach_model_level_optimizer_contract(
     trainer.decoder_lr = float(lr_config.resolved_decoder_lr()) if selection.decoder_parameters else None
     trainer.norm_lr = None if lr_config.norm_lr is None else float(lr_config.norm_lr)
     trainer.lm_head_lr = None if lr_config.lm_head_lr is None else float(lr_config.lm_head_lr)
+    trainer.residual_lora_lr = lr_config.resolved_residual_lora_lr() if selection.residual_lora_parameters else None
 
 
 __all__ = [
     "GROUP_DECODER",
     "GROUP_LM_HEAD",
     "GROUP_LORA",
+    "GROUP_RESIDUAL_LORA",
     "GROUP_NORM",
     "ModelLevelOptimizerLRConfig",
     "attach_model_level_optimizer_contract",
