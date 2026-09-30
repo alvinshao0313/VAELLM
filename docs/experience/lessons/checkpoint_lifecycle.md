@@ -35,6 +35,14 @@ Linear输出实验在导出第4个模块时触发误差门限，旧runner此前�
 
 阶段预算应独立于scheduler总steps。真实CPU Trainer含dropout/累积的连续与恢复参数、Adam、scheduler逐位一致；真实GPU非确定运行在暂停前也有差异，不能据此宣称GPU逐位等价。最终导出核切换问题已独立修复并通过同路径验收，见下节；阶段恢复通过本身不能替代导出验证。
 
+## 顺序搜索保留中途最佳，部署排名须独立重载（2026-09-30核查）
+
+**本配置实测支持**：0920 checkpoint、rank8、四卡DP搜索已有11组从1000或2500步续训至5000步，阶段退出码、run_meta和最终八任务原始指标相互印证；这些是实际续训完成证据，不是GPU逐位exact-resume对照。[配置、指标与来源](../records/e2e_0920/2026-09-24_rank8_search.md)
+
+**导出证据边界**：baseline `lr3e5/step1000`训练内均分66.564804%，真实导出后fresh process四卡strict重载为66.554029%，差−0.010775个百分点；只支持该checkpoint的导出重载有效，不外推所有候选或位级恢复一致性。
+
+**动作**：保留中途最佳训练checkpoint直至实际导出重载比较完成，5000步终点不能替代2500步权重。此次核查最高68.009998%来自`c05_pre_mlp_hidden_loss_weight_1/step2500`训练内评测，尚未fresh重载；`best_result.json`仍仅记录已重载的baseline。搜索最高分、当前已重载结果与最终交付排名必须分别报告，不能把文件名中的best当作整个搜索已完成。
+
 ## 结构转换与解码核切换分开验证（2026-09-24）
 
 **本配置实测支持，已通过真实导出及fresh strict重载，并在用户授权的隔离worktree落地。** 0910 Qwen3-8B的decoder+LoRA真实8步checkpoint：冻结decoder保持packed路径时logits逐元素相同，转换LoRA相对同路径也逐元素相同；仅由packed切到修复候选fused时，logits相对L2约0.00794。原core校验将结构转换和计算核切换合在一起，不能将这一报错直接解释为LoRA参数丢失。[同模型三阶段证据与边界](../records/e2e_0910/2026-09-24_rank8_search.md)

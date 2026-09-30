@@ -11,7 +11,7 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
-STUDENT_CKPT="${STUDENT_CKPT:-result/catlora/Qwen_Qwen3-8B_20260910_094022/final_model/}"
+STUDENT_CKPT="${STUDENT_CKPT:-/root/data/ckpts/result/catlora/remaining_lora_mass/Qwen_Qwen3-8B_20260920_095822/final_model}"
 PARALLEL_MODE="${PARALLEL_MODE:-dp}"   # dp | layer_mp
 
 export DISTILL_NCCL_TIMEOUT_SEC="${DISTILL_NCCL_TIMEOUT_SEC:-10800}"
@@ -43,26 +43,26 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
   # 原正式 recipe：decoder + Sparse Bit；不启用 backbone LoRA。
   torchrun --standalone --nproc_per_node=4 -m compressed_e2e_fintuning.main \
     --student_checkpoint_dir "${STUDENT_CKPT}" \
-    --run_root_dir ./result/compressed_e2e_fintuning/only_lora \
+    --run_root_dir /root/data/ckpts/result/compressed_e2e_fintuning/only_lora \
     --train_mode lora \
     --distill_fp32_components lora,lm_head,norm \
     --seed 0 \
     --data_seed 0 \
     --dataset_mix "edgerazor_ii_7m=0.341,edgerazor_ii_gen=0.067,edgerazor_tulu=0.028,edgerazor_am=0.064,vaellm_eval_task=0.500" \
-    --dataset_task sft \
+    --dataset_task lm \
     --dynamic_padding true \
     --model_max_length 1024 \
     --group_by_length true \
     --target_layers 0-35 \
     --target_modules all \
-    --loss_type kl_top_partial \
+    --loss_type kd_top_partial \
     --top_k 100 \
     --temperature 1.0 \
-    --alpha 0.5 \
+    --alpha 0.95 \
     --prompt_loss_weight 0.3 \
-    --hidden_loss_weight 0.0 \
-    --pre_mlp_hidden_loss_weight 0.0 \
-    --hidden_layer_weighting adaptive_top_3 \
+    --hidden_loss_weight 0.1 \
+    --pre_mlp_hidden_loss_weight 0.01 \
+    --hidden_layer_weighting linear_depth \
     --selective_student_topk false \
     --selective_student_topk_chunk_rows 32 \
     --steps 5000 \
@@ -86,7 +86,7 @@ if [[ "${PARALLEL_MODE}" == "dp" ]]; then
     --residual_lora_dropout 0 \
     --norm_train_mode all \
     --norm_lr 1e-4 \
-    --lm_head_train_mode lora \
+    --lm_head_train_mode linear \
     --lm_head_lr 1e-4 \
     --bit_active_ratio 0.03 \
     --bit_optimizer rms_sgd \
