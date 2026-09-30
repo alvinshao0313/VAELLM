@@ -55,11 +55,13 @@ def read_bank_hard_bits(
     return torch.stack(values).to(torch.bool)
 
 
-def scores_from_hard_bits(hard_bits: torch.Tensor) -> torch.Tensor:
+def scores_from_hard_bits(hard_bits: torch.Tensor, *, proxy_scale: float | None = None) -> torch.Tensor:
+    dtype = torch.float16 if proxy_scale is None else torch.float32
+    radius = 1.0 if proxy_scale is None else float(proxy_scale) / 2
     return torch.where(
         hard_bits.to(torch.bool),
-        torch.ones_like(hard_bits, dtype=torch.float16),
-        -torch.ones_like(hard_bits, dtype=torch.float16),
+        torch.full_like(hard_bits, radius, dtype=dtype),
+        -torch.full_like(hard_bits, radius, dtype=dtype),
     )
 
 
@@ -104,17 +106,24 @@ def dense_active_score_grad_reference(
     *,
     states: Sequence[AffineSamplerState],
     model_indices: Sequence[int],
+    proxy_scales: Sequence[float] | None = None,
 ) -> list[torch.Tensor]:
     if len(states) != len(model_indices):
         raise ValueError("states/model_indices length mismatch.")
+    scales = (1.0,) * len(states) if proxy_scales is None else tuple(float(v) for v in proxy_scales)
+    if len(scales) != len(states):
+        raise ValueError("proxy_scales/states length mismatch.")
+    dtype = torch.float16 if proxy_scales is None else torch.float32
     grads: list[torch.Tensor] = []
     grad_fp32 = grad_out.to(torch.float32)
     weight_fp32 = weight.to(torch.float32)
-    for state, model_idx in zip(states, model_indices):
+    for state, model_idx, scale in zip(states, model_indices, scales):
         per_model = grad_fp32[:, int(model_idx), :]
         rows = []
         for logical_idx in state.active_indices():
-            latent_idx = int(logical_idx) % int(state.n_bits // max(1, grad_out.shape[0]))
-            rows.append((per_model * weight_fp32[int(model_idx), :, latent_idx]).sum())
-        grads.append(torch.stack(rows).to(torch.float16))
+            logical_in = int(state.n_bits // max(1, grad_out.shape[0]))
+            block_idx = int(logical_idx) // logical_in
+            latent_idx = int(logical_idx) % logical_in
+            rows.append((per_model[block_idx] * weight_fp32[int(model_idx), :, latent_idx]).sum() / scale)
+        grads.append(torch.stack(rows).to(dtype))
     return grads

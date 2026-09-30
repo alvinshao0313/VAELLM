@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from train_utils.distill_precision import configure_distill_precision, prepare_model_export
+from train_utils.distill_precision import configure_distill_precision, mixed_precision_dtype, prepare_model_export
 
 import json
 import os
@@ -695,7 +695,13 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
             bit_lr=cfg.bit_lr,
             weight_decay=float(cfg.bit_weight_decay),
             round_steps=cfg.bit_round_steps,
+            proxy_coordinates=cfg.bit_proxy_coordinates,
         ).normalized()
+        calibration_dtype = None
+        if sparse_cfg.proxy_coordinates == "decoder_sensitivity":
+            calibration_dtype = mixed_precision_dtype(training_args)
+            if calibration_dtype is None:
+                calibration_dtype = model.get_input_embeddings().weight.dtype
         sparse_bit_manager = SparseBitTuningManager(
             root_model=model,
             targets=selected,
@@ -703,6 +709,7 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
             training_seed=int(training_args.seed),
             config=sparse_cfg,
             streaming=str(cfg.runtime.offload_mode) == "streaming",
+            calibration_dtype=calibration_dtype,
         )
 
     sparse_residual_prewarm = _prewarm_sparse_residual_cache(model, training_args, log=log)

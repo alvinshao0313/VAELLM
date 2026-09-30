@@ -16,6 +16,7 @@ class OptimizerChunkMeta:
     bank_specs: Tuple[BankSpec, ...]
     n_active: torch.Tensor
     score_offset: torch.Tensor
+    score_radius: torch.Tensor
 
     @property
     def num_banks(self) -> int:
@@ -51,8 +52,22 @@ class BitOptimizerManager:
                 bank_specs=ordered,
                 n_active=torch.tensor([int(s.n_active) for s in ordered], dtype=torch.int64, device=device),
                 score_offset=torch.tensor([int(s.score_start) for s in ordered], dtype=torch.int64, device=device),
+                score_radius=torch.ones(len(ordered), dtype=torch.float32, device=device),
             )
             self._state[int(chunk_id)] = _BitState()
+
+    @torch.no_grad()
+    def refresh_coordinate_scales(self) -> None:
+        """Refresh fixed bank radii after initial calibration or exact-state restore."""
+        for meta in self._chunk_meta.values():
+            radii = torch.tensor(
+                [self.module.score_radius(spec) for spec in meta.bank_specs],
+                dtype=torch.float32,
+                device=meta.score_radius.device,
+            )
+            if not bool((torch.isfinite(radii) & (radii > 0)).all()):
+                raise ValueError("Sparse Bit score radii must be finite and positive.")
+            meta.score_radius.copy_(radii)
 
     def bit_parameters(self) -> Iterable[nn.Parameter]:
         return self.module.bit_parameters()
@@ -72,9 +87,11 @@ class BitOptimizerManager:
                     f"Sparse Bit score chunk {chunk_id} has grad=None after a valid backward; "
                     "the bit-aware autograd path is disconnected or the target did not execute."
                 )
-            if score.grad.dtype != torch.float16:
+            expected_dtype = torch.float32 if self.module.proxy_coordinates == "decoder_sensitivity" else torch.float16
+            if score.dtype != expected_dtype or score.grad.dtype != expected_dtype:
                 raise RuntimeError(
-                    f"Sparse Bit score chunk {chunk_id} grad must be FP16, got {score.grad.dtype}."
+                    f"Sparse Bit score chunk {chunk_id} score/grad must be {expected_dtype}, "
+                    f"got {score.dtype}/{score.grad.dtype}."
                 )
             if score.grad.device != score.device:
                 raise RuntimeError(

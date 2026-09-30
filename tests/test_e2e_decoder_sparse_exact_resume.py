@@ -145,6 +145,7 @@ def _build_trainer(
     output_dir: Path,
     stop_at_two: bool,
     fp32_decoder: bool = False,
+    proxy_coordinates: str = "unit",
 ):
     device = torch.device("cuda:0")
     model = _load_round_base(round_base).to(device=device, dtype=torch.bfloat16)
@@ -173,8 +174,9 @@ def _build_trainer(
             enabled=True,
             active_ratio=0.5,
             optimizer="adam",
-            bit_lr=0.02,
-            round_steps=5,
+            bit_lr=2e-5 if proxy_coordinates == "decoder_sensitivity" else 0.02,
+            round_steps=3 if proxy_coordinates == "decoder_sensitivity" else 5,
+            proxy_coordinates=proxy_coordinates,
         ),
         streaming=False,
     )
@@ -195,7 +197,7 @@ def _build_trainer(
         seed=123,
         data_seed=123,
         dataloader_num_workers=0,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=2 if proxy_coordinates == "decoder_sensitivity" else 1,
         max_grad_norm=1.0,
         bf16=True,
     )
@@ -252,8 +254,13 @@ def _decoder_state(model: _TinyModel) -> dict:
     return {name: tensor.detach().cpu().clone() for name, tensor in decoder.state_dict().items()}
 
 
-@pytest.mark.parametrize("fp32_decoder", [False, True])
-def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp_path: Path, fp32_decoder: bool):
+@pytest.mark.parametrize(
+    ("fp32_decoder", "proxy_coordinates"),
+    [(False, "unit"), (True, "unit"), (True, "decoder_sensitivity")],
+)
+def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(
+    tmp_path: Path, fp32_decoder: bool, proxy_coordinates: str,
+):
     torch.manual_seed(77)
     round_base_model = _TinyModel()
     round_base = tmp_path / "round_base"
@@ -274,6 +281,7 @@ def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp
         output_dir=tmp_path / "continuous",
         stop_at_two=False,
         fp32_decoder=fp32_decoder,
+        proxy_coordinates=proxy_coordinates,
     )
     continuous.train()
     assert int(continuous.state.global_step) == 4
@@ -284,6 +292,7 @@ def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp
         output_dir=tmp_path / "interrupted",
         stop_at_two=True,
         fp32_decoder=fp32_decoder,
+        proxy_coordinates=proxy_coordinates,
     )
     interrupted.train()
     assert int(interrupted.state.global_step) == 2
@@ -300,6 +309,7 @@ def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp
         output_dir=tmp_path / "interrupted",
         stop_at_two=False,
         fp32_decoder=fp32_decoder,
+        proxy_coordinates=proxy_coordinates,
     )
     resumed.train(resume_from_checkpoint=str(step_dir))
     assert resumed._v6_exact_resume_loaded is True
@@ -319,13 +329,20 @@ def test_decoder_sparse_bit_interrupted_resume_matches_uninterrupted_exactly(tmp
     assert exact["stable_counter"] == continuous_manager.stable_counter
     assert exact["cumulative_flip_count"] == continuous_manager.cumulative_flip_count
     assert exact["had_flip"] == continuous_manager.had_flip
+    if proxy_coordinates == "decoder_sensitivity":
+        assert exact["version"] == 2
+        assert exact["coordinate_scales"] == _interrupted_manager.exact_state_dict()["coordinate_scales"]
+        assert all(score.dtype == torch.float32 for score in exact["score_chunks"])
+        assert exact["global_bit_round"] == 1
+        assert exact["bit_round_step"] == 1
     assert any(
         chunk["exp_avg"] is not None and chunk["exp_avg_sq"] is not None
         for chunk in exact["bit_optimizer"]["chunks"].values()
     )
 
 
-def test_sparse_bit_only_one_step_uses_no_continuous_optimizer(tmp_path: Path):
+@pytest.mark.parametrize("proxy_coordinates", ["unit", "decoder_sensitivity"])
+def test_sparse_bit_only_one_step_uses_no_continuous_optimizer(tmp_path: Path, proxy_coordinates: str):
     torch.manual_seed(91)
     round_base = tmp_path / "sparse_only_round_base"
     v6.save_v6_full_checkpoint(
@@ -369,8 +386,9 @@ def test_sparse_bit_only_one_step_uses_no_continuous_optimizer(tmp_path: Path):
             enabled=True,
             active_ratio=0.5,
             optimizer="adam",
-            bit_lr=0.02,
-            round_steps=5,
+            bit_lr=2e-5 if proxy_coordinates == "decoder_sensitivity" else 0.02,
+            round_steps=3 if proxy_coordinates == "decoder_sensitivity" else 5,
+            proxy_coordinates=proxy_coordinates,
         ),
         streaming=False,
     )

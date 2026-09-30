@@ -106,3 +106,52 @@ def test_bit_aware_forward_and_decoder_grads_match_existing_packed_path():
     assert torch.equal(bias_a.grad, bias_b.grad)
     expected = _expected_score_grad(upstream, weight_a.detach(), states, (0, 1))
     assert torch.equal(score.grad, expected)
+
+
+@pytest.mark.parametrize("train_decoder", [False, True])
+def test_sensitivity_gradient_matches_dense_ste_with_fp32_decoder_bf16_forward(train_decoder):
+    device = torch.device("cuda:0")
+    B, M, IN, H = 7, 2, 13, 19
+    torch.manual_seed(57)
+    bits = torch.randint(0, 2, (B, M, IN), dtype=torch.bool, device=device)
+    packed = pack_bool_bits(bits).contiguous()
+    weight = torch.randn(M, H, IN, device=device, dtype=torch.float32, requires_grad=train_decoder)
+    bias = torch.randn(M, H, device=device, dtype=torch.float32, requires_grad=train_decoder)
+    other_weight = weight.detach().clone().requires_grad_(train_decoder)
+    other_bias = bias.detach().clone().requires_grad_(train_decoder)
+    states = _states(B, IN)
+    model_indices = (1, 0)
+    scales = (0.002, 0.008)
+    meta = PackedBitRuntimeMeta.build(
+        states=states, model_indices=model_indices, score_offsets=(0, 11),
+        logical_in_dim=IN, device=device, proxy_scales=scales,
+    )
+    scores = torch.empty(20, device=device, dtype=torch.float32, requires_grad=True)
+    initialize_scores_from_packed(packed, scores, meta)
+    dense_scores = scores.detach().clone().requires_grad_(True)
+    codes = bits.float()
+    for state, model_idx, start, scale in zip(states, model_indices, (0, 11), scales):
+        indices = torch.tensor(state.active_indices(), device=device)
+        normalized = dense_scores[start:start + state.n_active] / scale + 0.5
+        hard = (dense_scores[start:start + state.n_active] >= 0).float()
+        ste = normalized + (hard - normalized).detach()
+        codes[indices // IN, model_idx, indices % IN] = ste
+    dense = torch.einsum("bmi,mhi->bmh", codes, weight.detach().to(torch.bfloat16).float())
+    upstream = torch.randn(B, M, H, device=device, dtype=torch.bfloat16)
+    dense.backward(upstream.float())
+    actual = bit_aware_packed_u8_linear(
+        packed, weight, bias, scores, meta, logical_in_dim=IN, activation_dtype=torch.bfloat16,
+    )
+    packed_reference = packed_u8_linear(
+        packed, other_weight, other_bias, logical_in_dim=IN, activation_dtype=torch.bfloat16,
+    )
+    assert torch.equal(actual, packed_reference)
+    actual.backward(upstream)
+    assert scores.grad.dtype == torch.float32
+    torch.testing.assert_close(scores.grad, dense_scores.grad, rtol=2e-6, atol=2e-5)
+    if train_decoder:
+        packed_reference.backward(upstream)
+        assert torch.equal(weight.grad, other_weight.grad)
+        assert torch.equal(bias.grad, other_bias.grad)
+    else:
+        assert weight.grad is None and bias.grad is None

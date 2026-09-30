@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -52,6 +53,7 @@ class SparseBitModuleBinding:
             model_indices=(0,),
             score_offsets=(0,),
             logical_in_dim=int(spec.latent_dim),
+            proxy_scales=self.manager.proxy_scales((spec,)),
             device=torch.device(device),
         )
 
@@ -83,6 +85,7 @@ class SparseBitModuleBinding:
             model_indices=model_indices,
             score_offsets=offsets,
             logical_in_dim=next(iter(latent_dims)),
+            proxy_scales=self.manager.proxy_scales(specs),
             device=torch.device(device),
         )
         return score, meta
@@ -181,6 +184,7 @@ class SparseBitTuningManager:
         training_seed: int,
         config: SparseBitTuningConfig,
         streaming: bool,
+        calibration_dtype: torch.dtype | None = None,
     ) -> None:
         self.root_model = root_model
         self.config = config.normalized()
@@ -188,6 +192,7 @@ class SparseBitTuningManager:
             raise ValueError("SparseBitTuningManager requires config.enabled=true.")
         self.training_seed = int(training_seed)
         self.streaming = bool(streaming)
+        self.calibration_dtype = calibration_dtype
         self._modules: Dict[str, nn.Module] = {}
         raw_specs: list[BankSpec] = []
         for module_path, module in targets:
@@ -243,7 +248,7 @@ class SparseBitTuningManager:
             raise ValueError("Sparse Bit target selection produced zero normal packed banks.")
         if hasattr(root_model, "sparse_bit_tuning"):
             raise RuntimeError("root model already has sparse_bit_tuning attribute.")
-        self.score_module = SparseBitTuningModule(raw_specs)
+        self.score_module = SparseBitTuningModule(raw_specs, proxy_coordinates=self.config.proxy_coordinates)
         root_model.add_module("sparse_bit_tuning", self.score_module)
         self._bank_specs: Tuple[BankSpec, ...] = self.score_module.bank_specs
         self._bank_by_identity: Dict[tuple[str, int, int], BankSpec] = {
@@ -318,10 +323,64 @@ class SparseBitTuningManager:
         self.bit_round_steps = int(resolved_round_steps)
         self.stable_steps = int(resolved_stable_steps)
 
+    @property
+    def coordinate_state_version(self) -> int:
+        return 2 if self.config.proxy_coordinates == "decoder_sensitivity" else 1
+
+    def proxy_scales(self, specs):
+        if self.config.proxy_coordinates == "unit":
+            return None
+        scales = self.score_module.coordinate_scales
+        if any(spec.canonical_key not in scales for spec in specs):
+            raise RuntimeError("Sparse Bit sensitivity coordinates must be initialized or restored first.")
+        return tuple(scales[spec.canonical_key] for spec in specs)
+
+    def _set_coordinate_scales(self, values: dict) -> None:
+        expected = {spec.canonical_key for spec in self._bank_specs}
+        if not isinstance(values, dict) or set(values) != expected:
+            raise ValueError("Sparse Bit coordinate scale bank set mismatch.")
+        scales = {key: float(value) for key, value in values.items()}
+        for key, scale in scales.items():
+            if not math.isfinite(scale) or scale <= 0:
+                raise ValueError(f"Invalid Sparse Bit coordinate scale for {key}: {scale}.")
+            bounds = torch.tensor([scale / 2, 1 / scale], dtype=torch.float32)
+            if not bool(torch.isfinite(bounds).all() and (bounds > 0).all()):
+                raise ValueError(f"Sparse Bit coordinate scale is not representable in FP32: {key}.")
+        self.score_module.coordinate_scales = scales
+        self.bit_optimizer.refresh_coordinate_scales()
+
+    def _initialize_coordinates(self) -> None:
+        if self.config.proxy_coordinates == "unit" or self.score_module.coordinate_scales:
+            return
+        from .coordinates import calibrate_bank_scale
+        self._set_coordinate_scales({
+            spec.canonical_key: calibrate_bank_scale(
+                self._modules[spec.module_path], spec, compute_dtype=self.calibration_dtype,
+            )
+            for spec in self._bank_specs
+        })
+
+    def _coordinate_metadata(self) -> dict:
+        if self.config.proxy_coordinates == "unit":
+            return {}
+        self.proxy_scales(self._bank_specs)
+        return {"proxy_coordinates": self.config.proxy_coordinates,
+                "coordinate_scales": dict(self.score_module.coordinate_scales)}
+
+    def _restore_coordinate_metadata(self, metadata: dict) -> None:
+        mode = str(metadata.get("proxy_coordinates", "unit"))
+        if mode != self.config.proxy_coordinates:
+            raise ValueError(f"Sparse Bit coordinate mode mismatch: checkpoint={mode} current={self.config.proxy_coordinates}.")
+        if mode == "decoder_sensitivity":
+            self._set_coordinate_scales(metadata.get("coordinate_scales"))
+        elif "coordinate_scales" in metadata:
+            raise ValueError("Unit Sparse Bit coordinates must not contain calibrated scales.")
+
     @torch.no_grad()
     def initialize_scores(self) -> None:
         if self._initialized_scores:
             return
+        self._initialize_coordinates()
         for binding in self.bindings.values():
             binding.initialize_scores()
         self.score_module.mark_initialized()
@@ -333,6 +392,7 @@ class SparseBitTuningManager:
             model_indices=(0,),
             score_offsets=(0,),
             logical_in_dim=int(spec.latent_dim),
+            proxy_scales=self.proxy_scales((spec,)),
             device=torch.device(device),
         )
 
@@ -540,7 +600,7 @@ class SparseBitTuningManager:
     def restore_coverage_metadata(self, metadata: dict) -> None:
         if str(metadata.get("format")) != "sparse_bit_tuning_coverage" or int(
             metadata.get("version", -1)
-        ) != 1:
+        ) != self.coordinate_state_version:
             raise ValueError(
                 f"unsupported Sparse Bit coverage format/version: "
                 f"{metadata.get('format')!r}/{metadata.get('version')!r}."
@@ -561,6 +621,7 @@ class SparseBitTuningManager:
             raise ValueError(
                 f"Sparse Bit target set mismatch: checkpoint={checkpoint_targets} current={expected_targets}."
             )
+        self._restore_coordinate_metadata(metadata)
         raw_banks = metadata.get("banks")
         if not isinstance(raw_banks, list):
             raise TypeError("Sparse Bit coverage metadata banks must be a list.")
@@ -603,7 +664,8 @@ class SparseBitTuningManager:
             raise RuntimeError("Sparse Bit exact checkpoint requires a configured schedule.")
         return {
             "format": "sparse_bit_tuning_exact_state",
-            "version": 1,
+            "version": self.coordinate_state_version,
+            **self._coordinate_metadata(),
             "training_seed": int(self.training_seed),
             "streaming": bool(self.streaming),
             "bit_active_ratio": float(self.config.active_ratio),
@@ -624,7 +686,7 @@ class SparseBitTuningManager:
             ],
             "packed_banks": self.checkpoint_packed_snapshot(),
             "score_chunks": [
-                score.detach().to(device="cpu", dtype=torch.float16).contiguous()
+                score.detach().to(device="cpu").contiguous()
                 for score in self.score_module.score_chunks
             ],
             "sampler_states": {
@@ -650,7 +712,7 @@ class SparseBitTuningManager:
             raise TypeError(f"Sparse Bit exact state must be dict, got {type(state_dict)}.")
         if str(state_dict.get("format")) != "sparse_bit_tuning_exact_state" or int(
             state_dict.get("version", -1)
-        ) != 1:
+        ) != self.coordinate_state_version:
             raise ValueError(
                 "unsupported Sparse Bit exact state format/version: "
                 f"{state_dict.get('format')!r}/{state_dict.get('version')!r}."
@@ -677,6 +739,7 @@ class SparseBitTuningManager:
                 f"Sparse Bit exact target mismatch: checkpoint={provided_targets} current={expected_targets}."
             )
 
+        self._restore_coordinate_metadata(state_dict)
         raw_banks = state_dict.get("banks")
         if not isinstance(raw_banks, list):
             raise TypeError("Sparse Bit exact state 'banks' must be a list.")
@@ -761,9 +824,9 @@ class SparseBitTuningManager:
                 f"current={len(self.score_module.score_chunks)}."
             )
         for chunk_id, (source, target) in enumerate(zip(raw_scores, self.score_module.score_chunks)):
-            if not torch.is_tensor(source) or source.dtype != torch.float16:
+            if not torch.is_tensor(source) or source.dtype != target.dtype:
                 raise TypeError(
-                    f"Sparse Bit exact score chunk {chunk_id} must be FP16 Tensor, "
+                    f"Sparse Bit exact score chunk {chunk_id} must be {target.dtype} Tensor, "
                     f"got {type(source)}/{getattr(source, 'dtype', None)}."
                 )
             if tuple(source.shape) != tuple(target.shape):
@@ -771,7 +834,7 @@ class SparseBitTuningManager:
                     f"Sparse Bit exact score chunk {chunk_id} shape mismatch: "
                     f"checkpoint={tuple(source.shape)} current={tuple(target.shape)}."
                 )
-            target.copy_(source.to(device=target.device, dtype=torch.float16))
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
             target.grad = None
 
         bit_round_steps = int(state_dict.get("bit_round_steps", 0))
@@ -811,7 +874,8 @@ class SparseBitTuningManager:
         states = self.pending_next_states if self.pending_next_states else self.sampler_states
         return {
             "format": "sparse_bit_tuning_coverage",
-            "version": 1,
+            "version": self.coordinate_state_version,
+            **self._coordinate_metadata(),
             "global_bit_round": int(self.global_bit_round),
             "training_seed": int(self.training_seed),
             "bit_active_ratio": float(self.config.active_ratio),

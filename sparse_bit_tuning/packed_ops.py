@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Sequence, Tuple
 
@@ -39,6 +40,9 @@ class PackedBitRuntimeMeta:
     secondary_inverse: Tensor
     model_idx: Tensor
     score_offset: Tensor
+    score_radius: Tensor
+    score_gradient_scale: Tensor
+    score_dtype: torch.dtype
 
     @property
     def num_banks(self) -> int:
@@ -65,6 +69,7 @@ class PackedBitRuntimeMeta:
         score_offsets: Sequence[int] | None,
         logical_in_dim: int,
         device: torch.device,
+        proxy_scales: Sequence[float] | None = None,
     ) -> "PackedBitRuntimeMeta":
         states_t = tuple(states)
         model_t = tuple(int(v) for v in model_indices)
@@ -86,6 +91,19 @@ class PackedBitRuntimeMeta:
             score_offsets_t = tuple(int(v) for v in score_offsets)
             if len(score_offsets_t) != len(states_t):
                 raise ValueError("score_offsets/states length mismatch.")
+        if proxy_scales is None:
+            radii = [1.0] * len(states_t)
+            gradient_scales = [1.0] * len(states_t)
+            score_dtype = torch.float16
+        else:
+            scales = tuple(float(value) for value in proxy_scales)
+            if len(scales) != len(states_t):
+                raise ValueError("proxy_scales/states length mismatch.")
+            if any(not math.isfinite(value) or value <= 0 for value in scales):
+                raise ValueError("proxy_scales must be finite and positive.")
+            radii = [value / 2 for value in scales]
+            gradient_scales = [1 / value for value in scales]
+            score_dtype = torch.float32
         metas = [state.subset_meta() for state in states_t]
         dev = torch.device(device)
 
@@ -109,6 +127,9 @@ class PackedBitRuntimeMeta:
             secondary_inverse=ints(meta.secondary_inverse for meta in metas),
             model_idx=ints(model_t),
             score_offset=ints(score_offsets_t),
+            score_radius=torch.tensor(radii, dtype=torch.float32, device=dev),
+            score_gradient_scale=torch.tensor(gradient_scales, dtype=torch.float32, device=dev),
+            score_dtype=score_dtype,
         )
 
 
@@ -121,8 +142,8 @@ def initialize_scores_from_packed(
         raise ValueError(
             f"packed/score/meta device mismatch: {packed.device}, {score_span.device}, {meta.device}."
         )
-    if score_span.dtype != torch.float16:
-        raise ValueError(f"score_span must be FP16, got {score_span.dtype}.")
+    if score_span.dtype != meta.score_dtype:
+        raise ValueError(f"score_span must be {meta.score_dtype}, got {score_span.dtype}.")
     if int(score_span.numel()) < max(
         offset + int(state.n_active) for offset, state in zip(meta.score_offsets_py, meta.states)
     ):
@@ -228,6 +249,7 @@ class _SparseBitPackedLinear(torch.autograd.Function):
         ctx.logical_in_dim = int(IN)
         ctx.weight_dtype = weight.dtype
         ctx.score_dtype = score_span.dtype
+        ctx.activation_dtype = activation_dtype
         return out
 
     @staticmethod
@@ -256,7 +278,10 @@ class _SparseBitPackedLinear(torch.autograd.Function):
                 for offset, state in zip(meta.score_offsets_py, meta.states)
             )
             grad_score = torch.empty((total,), device=grad_c.device, dtype=ctx.score_dtype)
-            launch_dscore(grad_c, weight, grad_score, meta)
+            # New coordinates differentiate the actual first-linear arithmetic,
+            # including its forward weight cast; preserve the existing unit path.
+            score_weight = weight.to(ctx.activation_dtype) if meta.score_dtype == torch.float32 else weight
+            launch_dscore(grad_c, score_weight, grad_score, meta)
         return grad_packed, grad_weight, grad_bias, grad_score, None, None, None
 
 
@@ -272,6 +297,8 @@ def bit_aware_packed_u8_linear(
 ) -> Tensor:
     if not torch.is_grad_enabled():
         raise RuntimeError("bit_aware_packed_u8_linear is training/autograd only.")
+    if score_span.dtype != meta.score_dtype:
+        raise ValueError(f"score_span must be {meta.score_dtype}, got {score_span.dtype}.")
     if not bool(score_span.requires_grad):
         raise RuntimeError("Sparse Bit score span must require gradients during training.")
     return _SparseBitPackedLinear.apply(

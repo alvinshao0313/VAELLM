@@ -69,3 +69,8 @@ causal KD曾存在一位错位问题：位置t的logits对应t+1目标。硬件�
 **分开改变权重，分开解释。** 固定hidden=.1，同一参照下pre-MLP=.01/0/.03分别为67.883982%/68.009998%/67.974884%。当前按观测分数保留hidden=.1、pre-MLP=0，但pre-MLP的0与.03仅差0.0351个百分点，尚不支持稳定优胜或所有正权重有害；两个权重各自的.03候选仅到2500步，不能将其短程排名推广到长程或其他配方。
 
 **CE/KD混合尚待本轮完成。** 继承pre-MLP=0后，KD alpha=.99在2500步为67.688203%，低于同预算alpha=.95的68.009998%；截至北京时间20:14，alpha=1纯KD仍运行，不能提前终判CE比例或纯KD优劣。以上均为训练内全量八任务0-shot分数，非最终导出重载成绩，也不能由小差距证明显著性。
+
+
+## Dense offload参数与实际显存边界（2026-09-30）
+
+**源码核查和当前函数数值测试支持。** `e2e_common/dense_loss.py`的dense路径忽略`teacher_output_chunk_tokens`，将完整teacher logits转回student设备并转FP32，因此配置`teacher_output_offload=cpu, chunk8`不代表loss以8token分块。teacher前向输出存CPU与损失阶段GPU峰值是不同条件；启用mass/CE等分支时按真实B4/seq1024/accum4短测验收，不能从参数名推断峰值。当前mass/CE3/CE5在FP32/BF16的独立公式和学生梯度对照通过；CE同样受prompt权重作用。此观察不表示chunk配置改变了损失公式，也不提供精度提升结论。[真实流程和证据](../records/e2e_0910/2026-09-30_focused_b16_search.md)

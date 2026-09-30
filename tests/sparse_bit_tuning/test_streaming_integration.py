@@ -57,7 +57,8 @@ class _Block(nn.Module):
         return self.vae(x)
 
 
-def test_streaming_prefetch_checkpoint_offload_and_delayed_transition():
+@pytest.mark.parametrize("proxy_coordinates", ["unit", "decoder_sensitivity"])
+def test_streaming_prefetch_checkpoint_offload_and_delayed_transition(proxy_coordinates):
     device = torch.device("cuda:0")
     block = _Block().to(dtype=torch.bfloat16)
     vae = block.vae
@@ -78,6 +79,7 @@ def test_streaming_prefetch_checkpoint_offload_and_delayed_transition():
         training_seed=91,
         config=SparseBitTuningConfig(
             enabled=True,
+            proxy_coordinates=proxy_coordinates,
             active_ratio=0.5,
             optimizer="rms_sgd",
             bit_lr=0.5,
@@ -87,6 +89,8 @@ def test_streaming_prefetch_checkpoint_offload_and_delayed_transition():
     )
     bit_manager.configure_schedule(total_optimizer_steps=2)
     bit_manager.initialize_scores()
+    scales = dict(bit_manager.score_module.coordinate_scales)
+    assert vae.get_stage_part_vq_storage(0, 0).device.type == "cpu"
 
     x = torch.randn(2, 4, dtype=torch.bfloat16, requires_grad=True)
     y = wrapped(x)
@@ -126,3 +130,4 @@ def test_streaming_prefetch_checkpoint_offload_and_delayed_transition():
     persistent = vae.get_stage_part_vq_storage(0, 0).detach().cpu().contiguous()
     assert torch.equal(persistent, old_hard)
     assert bit_manager.score_module.score_chunks[0].grad is not None
+    assert bit_manager.score_module.coordinate_scales == scales

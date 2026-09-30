@@ -71,7 +71,7 @@ class _TinyLM(nn.Module):
         return {"logits": self.lm_head(hidden), "hidden_states": (hidden,) if output_hidden_states else None}
 
 
-def _build():
+def _build(proxy_coordinates="unit"):
     torch.manual_seed(606)
     base = _TinyLM()
     layer = base.layer
@@ -100,9 +100,10 @@ def _build():
         training_seed=606,
         config=SparseBitTuningConfig(
             enabled=True,
+            proxy_coordinates=proxy_coordinates,
             active_ratio=0.5,
             optimizer="rms_sgd",
-            bit_lr=0.2,
+            bit_lr=0.2 if proxy_coordinates == "unit" else 2e-5,
             round_steps=3,
         ),
         streaming=False,
@@ -139,9 +140,10 @@ def _trainer(model, manager, aux, output_dir, max_steps, save_steps):
     )
 
 
-def test_full_lora_bit_real_trainer_adapter_sidecars_and_resume():
+@pytest.mark.parametrize("proxy_coordinates", ["unit", "decoder_sensitivity"])
+def test_full_lora_bit_real_trainer_adapter_sidecars_and_resume(proxy_coordinates):
     with tempfile.TemporaryDirectory() as tmp:
-        model0, layer0, aux0, manager0 = _build()
+        model0, layer0, aux0, manager0 = _build(proxy_coordinates)
         initial_bias = layer0.bias.detach().cpu().clone()
         trainer0 = _trainer(model0, manager0, aux0, tmp, max_steps=1, save_steps=1)
         out0 = trainer0.train()
@@ -154,7 +156,7 @@ def test_full_lora_bit_real_trainer_adapter_sidecars_and_resume():
         assert torch.equal(layer0.bias.detach().cpu(), initial_bias)
         assert not layer0.bias.requires_grad
 
-        model1, layer1, aux1, manager1 = _build()
+        model1, layer1, aux1, manager1 = _build(proxy_coordinates)
         trainer1 = _trainer(model1, manager1, aux1, tmp, max_steps=2, save_steps=99)
         out1 = trainer1.train(resume_from_checkpoint=ckpt)
         assert int(out1.global_step) == 2

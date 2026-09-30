@@ -96,3 +96,42 @@ def test_tail_allocation_non_multiple_of_four_bytes():
     torch.cuda.synchronize(device)
     assert torch.equal(actual, expected)
     assert int(flip.item()) == expected_flips
+
+
+@pytest.mark.parametrize("B,M,IN,scales", [(5, 2, 13, (0.002, 0.008)), (1, 1, 17, (0.004,))])
+def test_sensitivity_coordinates_init_set_preserve_inactive_bits_and_zero_tie(B, M, IN, scales):
+    device = torch.device("cuda:0")
+    torch.manual_seed(42)
+    original = pack_bool_bits(torch.randint(0, 2, (B, M, IN), device=device, dtype=torch.bool))
+    states = tuple(_state(f"m{i}", n_bits=B * IN, n_active=min(9, B * IN)) for i in range(M))
+    meta = PackedBitRuntimeMeta.build(
+        states=states, model_indices=tuple(range(M)), score_offsets=None,
+        logical_in_dim=IN, device=device, proxy_scales=scales,
+    )
+    scores = torch.empty(meta.total_active, device=device, dtype=torch.float32, requires_grad=True)
+    initialize_scores_from_packed(original, scores, meta)
+    expected_scores = torch.cat([
+        scores_from_hard_bits(
+            read_bank_hard_bits(original, state=state, model_idx=i, logical_in_dim=IN),
+            proxy_scale=scales[i],
+        ) for i, state in enumerate(states)
+    ])
+    assert torch.equal(scores, expected_scores)
+    actual = original.clone()
+    assert project_scores_to_packed(actual, scores, meta).item() == 0
+    assert torch.equal(actual, original)
+    with torch.no_grad():
+        scores[::2].neg_()
+        scores[1::3] = 0  # Sparse Bit keeps its existing zero-to-one tie rule.
+    expected = original.clone()
+    expected_flips = 0
+    for i, (state, start) in enumerate(zip(states, meta.score_offsets_py)):
+        expected, flips = apply_bank_scores_reference(
+            expected, state=state, scores=scores[start:start + state.n_active],
+            model_idx=i, logical_in_dim=IN,
+        )
+        expected_flips += flips
+    actual_flips = project_scores_to_packed(actual, scores, meta)
+    assert torch.equal(actual, expected)
+    assert actual_flips.item() == expected_flips
+    assert project_scores_to_packed(actual, scores, meta).item() == 0

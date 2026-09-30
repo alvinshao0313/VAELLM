@@ -6,6 +6,7 @@ from typing import Union
 
 
 _VALID_BIT_OPTIMIZERS = {"rms_sgd", "adam", "adamw"}
+_VALID_PROXY_COORDINATES = {"unit", "decoder_sensitivity"}
 _AUTO_BIT_LR = {
     "rms_sgd": 0.05,
     "adam": 0.02,
@@ -88,9 +89,21 @@ class SparseBitTuningConfig:
     bit_lr: Union[str, float] = "auto"
     weight_decay: float = 0.0
     round_steps: Union[str, int] = "auto"
+    proxy_coordinates: str = "unit"
 
     def normalized(self) -> "SparseBitTuningConfig":
         opt = normalize_bit_optimizer(self.optimizer)
+        coordinates = str(self.proxy_coordinates).strip().lower()
+        if coordinates not in _VALID_PROXY_COORDINATES:
+            raise ValueError(
+                f"bit_proxy_coordinates must be one of {sorted(_VALID_PROXY_COORDINATES)}, "
+                f"got {self.proxy_coordinates!r}."
+            )
+        if bool(self.enabled) and coordinates == "decoder_sensitivity" and str(self.bit_lr).strip().lower() == "auto":
+            raise ValueError(
+                "bit_proxy_coordinates=decoder_sensitivity requires an explicit positive bit_lr; "
+                "the unit-coordinate auto learning rates do not apply to sensitivity coordinates."
+            )
         ratio = float(self.active_ratio)
         if not (0.0 < ratio <= 1.0):
             raise ValueError(f"bit_active_ratio must satisfy 0 < ratio <= 1, got {ratio}.")
@@ -108,6 +121,7 @@ class SparseBitTuningConfig:
             bit_lr=self.bit_lr,
             weight_decay=wd,
             round_steps=self.round_steps,
+            proxy_coordinates=coordinates,
         )
 
     def resolved_lr(self) -> float:

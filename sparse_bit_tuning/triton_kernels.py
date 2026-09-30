@@ -57,6 +57,7 @@ if _TRITON_AVAILABLE:
         secondary_offset_ptr,
         model_idx_ptr,
         score_offset_ptr,
+        score_radius_ptr,
         B: tl.constexpr,
         M: tl.constexpr,
         IN: tl.constexpr,
@@ -95,7 +96,8 @@ if _TRITON_AVAILABLE:
         packed_offset = (block_idx * M + model_idx) * P + byte_idx
         packed = tl.load(packed_ptr + packed_offset, mask=mask, other=0).to(tl.int32)
         bit = (packed >> bit_offset) & 1
-        score = tl.where(bit != 0, 1.0, -1.0).to(tl.float16)
+        radius = tl.load(score_radius_ptr + bank).to(tl.float32)
+        score = tl.where(bit != 0, radius, -radius)
         tl.store(score_ptr + score_offset + q, score, mask=mask)
 
 
@@ -268,6 +270,7 @@ if _TRITON_AVAILABLE:
         secondary_offset_ptr,
         model_idx_ptr,
         score_offset_ptr,
+        score_gradient_scale_ptr,
         B,
         M,
         IN: tl.constexpr,
@@ -329,7 +332,8 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             ).to(tl.float32)
             acc += tl.sum(grad * weight, axis=1)
-        tl.store(out_ptr + score_offset + q, acc.to(tl.float16), mask=mask_q)
+        gradient_scale = tl.load(score_gradient_scale_ptr + bank).to(tl.float32)
+        tl.store(out_ptr + score_offset + q, acc * gradient_scale, mask=mask_q)
 
 
     @triton.jit
@@ -362,6 +366,7 @@ if _TRITON_AVAILABLE:
         flip_ptr,
         n_active_ptr,
         score_offset_ptr,
+        score_radius_ptr,
         LR: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -374,11 +379,12 @@ if _TRITON_AVAILABLE:
         score = tl.load(score_ptr + start + q, mask=mask, other=0.0).to(tl.float32)
         grad = tl.load(grad_ptr + start + q, mask=mask, other=0.0).to(tl.float32)
         rms = tl.load(rms_ptr + bank).to(tl.float32)
-        updated = tl.maximum(-1.0, tl.minimum(1.0, score - LR * grad / rms))
-        updated_fp16 = updated.to(tl.float16)
-        flipped = mask & ((score >= 0.0) != (updated_fp16 >= 0.0))
+        radius = tl.load(score_radius_ptr + bank).to(tl.float32)
+        updated = tl.maximum(-radius, tl.minimum(radius, score - LR * grad / rms))
+        updated_stored = updated.to(score_ptr.dtype.element_ty)
+        flipped = mask & ((score >= 0.0) != (updated_stored >= 0.0))
         tl.atomic_add(flip_ptr, tl.sum(flipped.to(tl.int32), axis=0))
-        tl.store(score_ptr + start + q, updated_fp16, mask=mask)
+        tl.store(score_ptr + start + q, updated_stored, mask=mask)
 
 
     @triton.jit
@@ -390,6 +396,7 @@ if _TRITON_AVAILABLE:
         flip_ptr,
         n_active_ptr,
         score_offset_ptr,
+        score_radius_ptr,
         LR: tl.constexpr,
         BETA1: tl.constexpr,
         BETA2: tl.constexpr,
@@ -418,13 +425,14 @@ if _TRITON_AVAILABLE:
         m_hat = m / BIAS1
         v_hat = v / BIAS2
         updated = score - LR * m_hat / (tl.sqrt(v_hat) + EPS)
-        updated = tl.maximum(-1.0, tl.minimum(1.0, updated))
-        updated_fp16 = updated.to(tl.float16)
-        flipped = mask & ((score >= 0.0) != (updated_fp16 >= 0.0))
+        radius = tl.load(score_radius_ptr + bank).to(tl.float32)
+        updated = tl.maximum(-radius, tl.minimum(radius, updated))
+        updated_stored = updated.to(score_ptr.dtype.element_ty)
+        flipped = mask & ((score >= 0.0) != (updated_stored >= 0.0))
         tl.atomic_add(flip_ptr, tl.sum(flipped.to(tl.int32), axis=0))
         tl.store(m_ptr + idx, m, mask=mask)
         tl.store(v_ptr + idx, v, mask=mask)
-        tl.store(score_ptr + idx, updated_fp16, mask=mask)
+        tl.store(score_ptr + idx, updated_stored, mask=mask)
 
 
 def _q_bank_grid(max_active: int, block: int, num_banks: int) -> tuple[int, int]:
@@ -468,6 +476,7 @@ def launch_init_scores(
         meta.secondary_offset,
         meta.model_idx,
         meta.score_offset,
+        meta.score_radius,
         B=int(packed.shape[0]),
         M=int(packed.shape[1]),
         IN=int(meta.logical_in_dim),
@@ -568,6 +577,7 @@ def launch_dscore(
         meta.secondary_offset,
         meta.model_idx,
         meta.score_offset,
+        meta.score_gradient_scale,
         int(grad_out.shape[0]),
         int(grad_out.shape[1]),
         int(meta.logical_in_dim),
@@ -616,6 +626,7 @@ def launch_rms_sgd_update(
         flip_counter,
         meta.n_active,
         meta.score_offset,
+        meta.score_radius,
         LR=float(lr),
         BLOCK=block,
         num_warps=4,
@@ -658,6 +669,7 @@ def launch_adam_update(
         flip_counter,
         meta.n_active,
         meta.score_offset,
+        meta.score_radius,
         LR=float(lr),
         BETA1=float(beta1),
         BETA2=float(beta2),

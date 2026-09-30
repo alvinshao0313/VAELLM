@@ -624,6 +624,11 @@ def _add_sparse_bit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bit_lr", type=str, default="auto")
     parser.add_argument("--bit_weight_decay", type=float, default=0.0)
     parser.add_argument("--bit_round_steps", type=str, default="auto")
+    parser.add_argument(
+        "--bit_proxy_coordinates", type=str, default="unit",
+        choices=("unit", "decoder_sensitivity"),
+        help="Sparse-bit score coordinates; decoder_sensitivity requires an explicit --bit_lr.",
+    )
 
 
 def build_e2e_parser() -> argparse.ArgumentParser:
@@ -786,6 +791,7 @@ class E2ECLIConfig:
     bit_weight_decay: float
     bit_round_steps: str
     stop_after_step: Optional[int] = None
+    bit_proxy_coordinates: str = "unit"
 
 
 @dataclass
@@ -1072,6 +1078,18 @@ def parse_e2e_cli(argv: Optional[Sequence[str]] = None) -> E2ECLIConfig:
         aux = _build_aux_config(ns)
         validate_train_mode_aux(ns.train_mode, aux)
         runtime = _build_runtime_config(ns)
+        if "sparse_bit" in str(ns.train_mode) and ns.bit_proxy_coordinates == "decoder_sensitivity":
+            from sparse_bit_tuning.config import SparseBitTuningConfig
+
+            SparseBitTuningConfig(
+                enabled=True,
+                active_ratio=float(ns.bit_active_ratio),
+                optimizer=str(ns.bit_optimizer),
+                bit_lr=ns.bit_lr,
+                weight_decay=float(ns.bit_weight_decay),
+                round_steps=ns.bit_round_steps,
+                proxy_coordinates=ns.bit_proxy_coordinates,
+            ).normalized()
         return E2ECLIConfig(
             student_checkpoint_dir=str(ns.student_checkpoint_dir),
             stop_after_step=ns.stop_after_step,
@@ -1095,6 +1113,7 @@ def parse_e2e_cli(argv: Optional[Sequence[str]] = None) -> E2ECLIConfig:
             bit_lr=str(ns.bit_lr),
             bit_weight_decay=float(ns.bit_weight_decay),
             bit_round_steps=str(ns.bit_round_steps),
+            bit_proxy_coordinates=str(ns.bit_proxy_coordinates),
         )
     except (ValueError, argparse.ArgumentTypeError) as exc:
         _error_from_exc(parser, exc)

@@ -63,3 +63,12 @@
 **本配置实测支持**：Qwen3-8B无旋转、单stage VAE初始化，敏感度码坐标、code+decoder联合优化、FP teacher前缀对齐、4096×2048校准、每层3968步，28层恢复后，同路径完整八任务均值由39.90%升至59.38%或59.10%。冻结状态与严格native重载均通过。[完整配置与原始结果](../records/experiments/liftquant_recovery/2026-09-24_full_layers_lr.md)
 
 **可复用结论与边界**：判断恢复是否有效应看同路径的初始化/成品全量下游对照；本次支持该整体流程的收益，不单独证明翻码的因果贡献。两档decoder LR只差约0.27个百分点且仅单seed，不据此认定稳定排名；未达到69%，未与官方LiftQuant同条件对比，不能声称超过官方。此前短测只验证链路的边界仍然有效。
+
+
+## 迁移到 Sparse Bit 时同时处理坐标、轮次与恢复（2026-09-30）
+
+**问题与证据**：原 Sparse Bit 用 ±1 score 和0.02/0.05默认LR，本来能翻码，不能沿用旧逐层恢复0/1代理冻结的判断。新增敏感度模式在真实packed计算、三种优化器、换轮/offload、Trainer精确续训检查中通过；固定小矩阵在2e-5下第9步翻码且目标MSE下降，原坐标12步不变。[实现、验证及边界](../records/experiments/liftquant_recovery/2026-09-30_sparse_bit_coordinates.md)
+
+**可复用做法**：迁移时一起实现 p=s(b−0.5)、链式梯度1/s、与原训练器一致的限幅、FP32代理和固定尺度保存恢复。每轮重选active集合不等于可以重算s；精确续训须用初始保存值，不能用已更新decoder替代。新坐标要求显式LR，每轮更新步数仍决定阈值可达性。AMP计算dtype与decoder参数dtype分开处理，抽样校准不得消耗训练RNG或改变offload驻留。
+
+**范围**：标定使用初始单bank完整decoder的eval输出；grouped抽取产生的正常低精度差异不要求逐位相同。新模式复用敏感度公式，保留Sparse Bit采样和优化器规则，不是复制完整LiftQuant训练法。小矩阵收益只证实机制，不构成Sparse Bit大模型下游提升证据；原unit默认及旧断点语义保留。

@@ -54,7 +54,8 @@ def _layer():
     )
 
 
-def _manager(*, streaming=False, round_steps=5, seed=17, optimizer="rms_sgd"):
+def _manager(*, streaming=False, round_steps=5, seed=17, optimizer="rms_sgd",
+             proxy_coordinates="unit", initialize=True):
     device = torch.device("cuda:0")
     layer = _layer().to(device=device, dtype=torch.bfloat16)
     layer.enable_sparse_bit_decode_graph(parallel_stage_decode=False)
@@ -67,6 +68,7 @@ def _manager(*, streaming=False, round_steps=5, seed=17, optimizer="rms_sgd"):
         training_seed=seed,
         config=SparseBitTuningConfig(
             enabled=True,
+            proxy_coordinates=proxy_coordinates,
             active_ratio=0.5,
             optimizer=str(optimizer),
             bit_lr=2.0,
@@ -75,7 +77,8 @@ def _manager(*, streaming=False, round_steps=5, seed=17, optimizer="rms_sgd"):
         streaming=streaming,
     )
     manager.configure_schedule(total_optimizer_steps=20)
-    manager.initialize_scores()
+    if initialize:
+        manager.initialize_scores()
     return root, layer, manager
 
 
@@ -248,3 +251,70 @@ def test_exact_sidecar_file_round_trip_uses_exact_restore_api():
         _root1, _layer1, manager1 = _manager(streaming=False, round_steps=5, seed=47, optimizer="adam")
         restore_exact_sidecar(tmp, manager1)
         _assert_tensor_tree_equal(expected, manager1.exact_state_dict())
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_sensitivity_coordinates_survive_exact_and_coverage_resume(tmp_path, streaming):
+    root, layer, manager = _manager(
+        streaming=streaming, round_steps=1, seed=53, optimizer="adam",
+        proxy_coordinates="decoder_sensitivity",
+    )
+    scales = dict(manager.score_module.coordinate_scales)
+    for score in manager.score_module.score_chunks:
+        assert score.dtype == torch.float32
+        score.grad = torch.sign(score.detach())
+    telemetry = manager.optimizer_step()
+    assert telemetry.step_flip_count > 0
+    assert telemetry.round_ended
+    assert manager.score_module.coordinate_scales == scales
+    exact = manager.exact_state_dict()
+    assert exact["version"] == 2
+    assert exact["coordinate_scales"] == scales
+    save_exact_sidecar(str(tmp_path), manager)
+
+    _root2, layer2, manager2 = _manager(
+        streaming=streaming, round_steps=1, seed=53, optimizer="adam",
+        proxy_coordinates="decoder_sensitivity", initialize=False,
+    )
+    # A resumed decoder may have changed; its initial coordinate scale must not.
+    with torch.no_grad():
+        for parameter in layer2.get_stage_part_decoder(0, 0).parameters():
+            parameter.mul_(3)
+    restore_exact_sidecar(str(tmp_path), manager2)
+    manager2.initialize_scores()
+    _assert_tensor_tree_equal(exact, manager2.exact_state_dict())
+
+    snapshot, coverage = manager.checkpoint_packed_snapshot(), manager.coverage_metadata()
+    _root3, _layer3, manager3 = _manager(
+        streaming=streaming, round_steps=1, seed=53, optimizer="adam",
+        proxy_coordinates="decoder_sensitivity", initialize=False,
+    )
+    manager3.restore_checkpoint_packed(snapshot)
+    manager3.restore_coverage_metadata(coverage)
+    manager3.initialize_scores()
+    assert manager3.score_module.coordinate_scales == scales
+    for spec in manager3.bank_specs:
+        scores = manager3.score_module.score_view(spec)
+        assert torch.equal(scores.abs(), torch.full_like(scores, scales[spec.canonical_key] / 2))
+    for key, packed in manager3.checkpoint_packed_snapshot().items():
+        assert torch.equal(packed, snapshot[key])
+
+    manager.final_commit()
+    manager.detach_runtime()
+    assert not hasattr(root, "sparse_bit_tuning")
+    assert not any("coordinate" in key or "score" in key for key in root.state_dict())
+    assert layer.get_stage_part_vq_storage(0, 0).dtype == torch.uint8
+
+
+def test_sensitivity_resume_rejects_missing_or_invalid_scales():
+    import copy
+    _, _, manager = _manager(proxy_coordinates="decoder_sensitivity")
+    state = manager.exact_state_dict()
+    for scales in ({}, {key: float("nan") for key in state["coordinate_scales"]}):
+        damaged = copy.deepcopy(state)
+        damaged["coordinate_scales"] = scales
+        with pytest.raises(ValueError, match="scale"):
+            manager.load_exact_state_dict(damaged)
+    _, _, unit_manager = _manager()
+    with pytest.raises(ValueError, match="format/version"):
+        unit_manager.load_exact_state_dict(state)

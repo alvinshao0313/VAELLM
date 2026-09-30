@@ -28,6 +28,30 @@ python -m compressed_e2e_fintuning.main \
 
 `--target_layers` 接受 `all`、范围或显式层号；`--target_modules` 接受 `all` 或完整 projection 名集合。两者共同限定训练目标，普通未压缩 Linear 不会被当作 VAELinear decoder 目标。
 
+## Sparse Bit 敏感度代理坐标
+
+`--bit_proxy_coordinates` 默认 `unit`，保持原来的 FP16 `±1` score、零阈值，以及 `bit_lr=auto` 对应的 RMS-SGD `0.05`、Adam/AdamW `0.02`。原模式本来就可以翻码；新选项是按 decoder 敏感度调整训练坐标，并非修复原模式不能翻码。
+
+在已配置的数据、损失及运行命令中，可以显式加入：
+
+```bash
+--train_mode decoder_sparse_bit \
+--bit_proxy_coordinates decoder_sensitivity \
+--bit_lr 2e-5
+```
+
+同样支持 `sparse_bit`、`lora_sparse_bit` 和 `decoder_lora_sparse_bit`。这里的 `2e-5` 仅为机制验证的起点，不是推荐最优学习率或正式实验配置；新模式要求显式正数 `--bit_lr`，拒绝 `auto`，因为原坐标的默认步长不能直接沿用。`bit_active_ratio`、`bit_round_steps` 和优化器选择保持原含义，每轮更新预算仍会影响是否发生翻码。
+
+每个编码 bank（一个 module/stage/part）在训练开始时均匀选取最多 256 行，逐个翻转全部 latent bit，使用完整 decoder 的 eval 输出测量权重变化 RMS，得到固定尺度 `s`。该测量与 LiftQuant 恢复共用 `litebsq.bit_sensitivity.measure_scale`。代理值采用 FP32 `p=s×(b−0.5)`，初始翻转距离为 `s/2`，前向仍使用硬 `0/1` bit，STE 梯度按 `1/s` 缩放，优化后将 `p` 限制在 `[-s/2,s/2]`。`s` 在整个训练期间固定，换轮不重算。Sparse Bit 保留原有稀疏采样、换轮、优化器和坐标限幅流程，不能把它视为完整复现 LiftQuant 的训练方法。
+
+E2E 入口根据 AMP 精度确定校准计算 dtype；没有 AMP 时使用输入 embedding dtype，并遵守模块已设置的 decoder 计算精度。直接调用 `SparseBitTuningManager`、且 decoder 参数与输入计算 dtype 不同时，应显式传入 `calibration_dtype`，避免按参数 dtype 校准。
+
+相比 `unit`，FP32 score 和梯度各多 2 字节，每个 active bit 合计多 4 字节；Adam/AdamW 动量原本就是 FP32，不因此增加。另有每 bank 固定尺度和少量运行元数据。未激活 bit 仍保持 packed 存储。
+
+坐标模式进入参数快照；启用敏感度坐标的 Sparse Bit 训练也将其写入严格恢复契约。训练步断点保存 FP32 score、固定 `s`、采样及优化器状态，exact-resume 使用保存的 `s`，不按已更新的 decoder 重算。不能在同一个训练步断点中切换坐标模式或学习率；如需调整，应从完整阶段/最终模型开启新实验。`unit` 及非 Sparse Bit 模式的原恢复契约保持不变。
+
+最终导出前将代理提交为原生 packed bits，并移除 score 和尺度；模型仍只保留原有 packed 编码、decoder 及所选训练组件，不增加此功能的推理开销。该机制可帮助编码跨过阈值，但是否提高下游精度需要实际实验验证。
+
 ## 数据与 loss
 
 数据通过 `--dataset_mix` 或 `--train_file` 输入，`--dataset_task` 为 `sft` 或 `lm`。`--model_max_length` 是截断上限，`--dynamic_padding true` 按 micro-batch 动态 padding。

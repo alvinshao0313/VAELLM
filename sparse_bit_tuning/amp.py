@@ -24,7 +24,8 @@ class SparseBitGradScaler(torch.amp.GradScaler):
     """GradScaler that permits FP16 grads only for marked Sparse-Bit score groups.
 
     PyTorch 2.6's public ``unscale_`` rejects FP16 gradients unconditionally.
-    Sparse Bit scores are intentionally FP16, so we split optimizer groups and call
+    Unit-coordinate scores are FP16 and sensitivity-coordinate scores are FP32.
+    We split optimizer groups and call
     the same PyTorch unscale implementation with ``allow_fp16=True`` only for the
     explicitly marked score groups.  Main parameter groups preserve stock behavior.
     """
@@ -128,12 +129,12 @@ class SparseBitGradScaler(torch.amp.GradScaler):
             for param in group["params"]:
                 if param.grad is None:
                     raise RuntimeError(
-                        "Sparse Bit FP16 score parameter has grad=None during GradScaler unscale; "
+                        "Sparse Bit score parameter has grad=None during GradScaler unscale; "
                         "the bit-aware autograd path is disconnected or the target did not execute."
                     )
-                if param.grad.dtype != torch.float16:
+                if param.dtype not in (torch.float16, torch.float32) or param.grad.dtype != param.dtype:
                     raise RuntimeError(
-                        f"Sparse Bit score grad must remain FP16, got {param.grad.dtype}."
+                        f"Sparse Bit score/grad must share FP16 or FP32 dtype, got {param.dtype}/{param.grad.dtype}."
                     )
         optimizer_state["found_inf_per_device"] = self._merge_found_inf(main_found, bit_found)
         optimizer_state["stage"] = OptState.UNSCALED

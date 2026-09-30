@@ -254,6 +254,11 @@ def build_e2e_immutable_resume_contract(
             "bit_lr": str(cfg.bit_lr),
             "weight_decay": float(cfg.bit_weight_decay),
             "round_steps": str(cfg.bit_round_steps),
+            **(
+                {"proxy_coordinates": str(cfg.bit_proxy_coordinates)}
+                if "sparse_bit" in str(cfg.train_mode) and cfg.bit_proxy_coordinates != "unit"
+                else {}
+            ),
         },
         "teacher_identity": None if teacher_identity is None else _jsonable(dict(teacher_identity)),
     }

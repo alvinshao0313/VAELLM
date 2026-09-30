@@ -84,10 +84,11 @@ def layout_bank_specs(
     specs: Sequence[BankSpec],
     *,
     target_chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
+    score_dtype: torch.dtype = torch.float16,
 ) -> Tuple[List[BankSpec], List[ScoreChunkSpec]]:
     if not specs:
         return [], []
-    target_elems = max(1, int(target_chunk_bytes) // torch.tensor([], dtype=torch.float16).element_size())
+    target_elems = max(1, int(target_chunk_bytes) // torch.tensor([], dtype=score_dtype).element_size())
     laid_out: List[BankSpec] = []
     chunk_specs: List[ScoreChunkSpec] = []
     chunk_id = -1
@@ -147,16 +148,24 @@ def layout_bank_specs(
 
 
 class SparseBitTuningModule(nn.Module):
-    """Owns fixed-shape FP16 score Parameters; optimizer/sampler state lives elsewhere."""
+    """Owns fixed-shape score Parameters and fixed per-bank coordinate scales."""
 
     def __init__(
         self,
         bank_specs: Sequence[BankSpec],
         *,
         target_chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
+        proxy_coordinates: str = "unit",
     ) -> None:
         super().__init__()
-        laid_out, chunks = layout_bank_specs(bank_specs, target_chunk_bytes=target_chunk_bytes)
+        if proxy_coordinates not in {"unit", "decoder_sensitivity"}:
+            raise ValueError(f"Unknown sparse-bit proxy coordinates: {proxy_coordinates!r}.")
+        self.proxy_coordinates = proxy_coordinates
+        self.coordinate_scales: Dict[str, float] = {}
+        score_dtype = torch.float32 if proxy_coordinates == "decoder_sensitivity" else torch.float16
+        laid_out, chunks = layout_bank_specs(
+            bank_specs, target_chunk_bytes=target_chunk_bytes, score_dtype=score_dtype,
+        )
         if not laid_out:
             raise ValueError("SparseBitTuningModule requires at least one bank.")
         self._bank_specs: Tuple[BankSpec, ...] = tuple(laid_out)
@@ -168,7 +177,7 @@ class SparseBitTuningModule(nn.Module):
                 nn.Parameter(
                     torch.empty(
                         (int(chunk.numel),),
-                        dtype=torch.float16,
+                        dtype=score_dtype,
                         device=torch.device(chunk.device),
                     ),
                     requires_grad=True,
@@ -217,6 +226,14 @@ class SparseBitTuningModule(nn.Module):
         if end - start != expected:
             raise RuntimeError(f"module {module_path!r} sparse-bit banks are not contiguous.")
         return self.score_chunks[next(iter(chunk_ids))][start:end], ordered
+
+    def score_radius(self, bank: BankSpec | str) -> float:
+        if self.proxy_coordinates == "unit":
+            return 1.0
+        key = bank if isinstance(bank, str) else bank.canonical_key
+        if key not in self.coordinate_scales:
+            raise RuntimeError(f"Sparse Bit coordinate scale is not initialized: {key}.")
+        return self.coordinate_scales[key] / 2.0
 
     def bit_parameters(self) -> Iterable[nn.Parameter]:
         return iter(self.score_chunks)

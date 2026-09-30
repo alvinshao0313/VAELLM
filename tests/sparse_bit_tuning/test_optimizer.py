@@ -8,7 +8,7 @@ from sparse_bit_tuning.optimizer import BitOptimizerManager, SparseBitCompositeO
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _module(device="cuda:0"):
+def _module(device="cuda:0", proxy_coordinates="unit"):
     specs = [
         BankSpec(
             canonical_key="m0|stage=0|part=0",
@@ -31,7 +31,7 @@ def _module(device="cuda:0"):
             device=torch.device(device),
         ),
     ]
-    return SparseBitTuningModule(specs, target_chunk_bytes=1024)
+    return SparseBitTuningModule(specs, target_chunk_bytes=1024, proxy_coordinates=proxy_coordinates)
 
 
 def _set_score_and_grad(module, score_values, grad_values):
@@ -132,3 +132,64 @@ def test_composite_keeps_bit_state_out_of_torch_optimizer_state():
         for state in composite.state.values()
         for v in (state.values() if isinstance(state, dict) else [])
     )
+
+
+@pytest.mark.parametrize("optimizer,weight_decay", [("rms_sgd", 0.0), ("adam", 0.0), ("adamw", 0.1)])
+def test_sensitivity_optimizer_matches_coordinate_reference_over_multiple_steps(optimizer, weight_decay):
+    module = _module(proxy_coordinates="decoder_sensitivity")
+    module.coordinate_scales.update({spec.canonical_key: scale for spec, scale in zip(module.bank_specs, (0.002, 0.008))})
+    score = module.score_chunks[0]
+    assert score.dtype == torch.float32
+    initial = torch.tensor([0.001, -0.001, 0.00001, -0.00001, 0.004, -0.004, 0.0], device=score.device)
+    with torch.no_grad():
+        score.copy_(initial)
+    cfg = SparseBitTuningConfig(
+        enabled=True, optimizer=optimizer, bit_lr=2e-5, weight_decay=weight_decay,
+        proxy_coordinates="decoder_sensitivity",
+    )
+    manager = BitOptimizerManager(module, cfg)
+    manager.refresh_coordinate_scales()
+    expected = initial.clone()
+    m = torch.zeros_like(expected)
+    v = torch.zeros_like(expected)
+    radii = torch.tensor([0.001] * 4 + [0.004] * 3, device=score.device)
+    for step in range(1, 5):
+        grad = torch.tensor([500.0, -500.0, 1000.0, -1000.0, -250.0, 250.0, 400.0], device=score.device)
+        grad = grad * (1 if step < 3 else -0.25)
+        score.grad = grad.clone()
+        old = expected.clone()
+        if optimizer == "rms_sgd":
+            update = torch.empty_like(grad)
+            for start, end in ((0, 4), (4, 7)):
+                update[start:end] = grad[start:end] / torch.sqrt(grad[start:end].square().mean() + 1e-8)
+        else:
+            m = 0.9 * m + 0.1 * grad
+            v = 0.999 * v + 0.001 * grad.square()
+            update = (m / (1 - 0.9 ** step)) / (torch.sqrt(v / (1 - 0.999 ** step)) + 1e-8)
+        base = expected * (1 - 2e-5 * weight_decay) if optimizer == "adamw" else expected
+        expected = torch.maximum(-radii, torch.minimum(radii, base - 2e-5 * update))
+        counters = manager.step_scores(optimizer_step_in_round=step)
+        torch.testing.assert_close(score.detach(), expected, rtol=2e-6, atol=2e-10)
+        assert sum(counter.item() for counter in counters) == ((old >= 0) != (expected >= 0)).sum().item()
+    if optimizer != "rms_sgd":
+        actual_m, actual_v = list(manager.state_tensors())
+        torch.testing.assert_close(actual_m, m, rtol=2e-6, atol=1e-5)
+        torch.testing.assert_close(actual_v, v, rtol=2e-6, atol=1e-5)
+    manager.reset_round_state()
+    assert all(torch.count_nonzero(tensor).item() == 0 for tensor in manager.state_tensors())
+
+
+def test_fp32_sensitivity_scores_unscale_with_sparse_amp():
+    from sparse_bit_tuning.amp import SparseBitGradScaler
+
+    score = torch.nn.Parameter(torch.tensor([0.001, -0.001], device="cuda:0", dtype=torch.float32))
+    optimizer = torch.optim.SGD(
+        [{"params": [score], "lr": 0.0, "_sparse_bit_score_group": True}], lr=0.0,
+    )
+    scaler = SparseBitGradScaler("cuda", init_scale=128.0)
+    # Accumulated scaled gradients must retain FP32 before the sparse optimizer step.
+    scaler.scale(score.sum() * 2).backward()
+    scaler.scale(score.sum() * 3).backward()
+    scaler.unscale_(optimizer)
+    assert score.grad.dtype == torch.float32
+    assert torch.equal(score.grad, torch.full_like(score, 5.0))

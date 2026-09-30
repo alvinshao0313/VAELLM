@@ -78,3 +78,91 @@ def test_ratio_validation():
     for value in [0.0, -0.1, 1.1]:
         with pytest.raises(ValueError):
             SparseBitTuningConfig(enabled=True, active_ratio=value).normalized()
+
+
+@pytest.mark.parametrize("optimizer", ["rms_sgd", "adam", "adamw"])
+def test_sensitivity_coordinates_require_explicit_positive_bit_lr(optimizer):
+    with pytest.raises(ValueError, match="requires an explicit positive bit_lr"):
+        SparseBitTuningConfig(
+            enabled=True, optimizer=optimizer, proxy_coordinates="decoder_sensitivity",
+        ).normalized()
+    for invalid in ("0", "-1", "nan", "inf", "invalid"):
+        with pytest.raises(ValueError, match="bit_lr"):
+            SparseBitTuningConfig(
+                enabled=True, optimizer=optimizer, bit_lr=invalid,
+                proxy_coordinates="decoder_sensitivity",
+            ).normalized()
+    cfg = SparseBitTuningConfig(
+        enabled=True, optimizer=optimizer, bit_lr="2e-5", proxy_coordinates="decoder_sensitivity",
+    ).normalized()
+    assert cfg.proxy_coordinates == "decoder_sensitivity"
+    assert cfg.resolved_lr() == pytest.approx(2e-5)
+    unit = SparseBitTuningConfig(enabled=True, optimizer=optimizer).normalized()
+    assert unit.proxy_coordinates == "unit"
+    assert unit.resolved_lr() == resolve_bit_lr("auto", optimizer=optimizer)
+
+
+def test_proxy_coordinates_validation_and_disabled_config():
+    with pytest.raises(ValueError, match="bit_proxy_coordinates"):
+        SparseBitTuningConfig(proxy_coordinates="unknown").normalized()
+    disabled = SparseBitTuningConfig(enabled=False, proxy_coordinates="decoder_sensitivity").normalized()
+    assert disabled.bit_lr == "auto"
+
+
+def _proxy_cli(*extra):
+    from train_utils.config.cli import parse_e2e_cli
+
+    return parse_e2e_cli([
+        "--student_checkpoint_dir", "/tmp/unused", "--dataset_mix", "openorca",
+        "--train_mode", "decoder_sparse_bit", *extra,
+    ])
+
+
+def test_proxy_coordinates_cli_rejects_auto_before_model_loading():
+    with pytest.raises(SystemExit):
+        _proxy_cli("--bit_proxy_coordinates", "decoder_sensitivity")
+    cfg = _proxy_cli("--bit_proxy_coordinates", "decoder_sensitivity", "--bit_lr", "2e-5")
+    assert cfg.bit_proxy_coordinates == "decoder_sensitivity"
+    assert cfg.bit_lr == "2e-5"
+    assert not cfg.remaining_argv
+    with pytest.raises(SystemExit):
+        _proxy_cli("--bit_proxy_coordinates", "unknown")
+
+
+def test_proxy_coordinates_exact_resume_contract_preserves_unit_and_rejects_mode_switch():
+    from types import SimpleNamespace
+
+    from compressed_e2e_fintuning.v6_runtime_state import (
+        build_e2e_immutable_resume_contract,
+        validate_e2e_immutable_resume_contract,
+    )
+
+    def contract(cfg):
+        return build_e2e_immutable_resume_contract(
+            cfg=cfg, training_args=SimpleNamespace(),
+            tokenizer=SimpleNamespace(name_or_path="same-tokenizer"), input_checkpoint_id="same-base",
+            resolved_target_layers=[0], resolved_target_modules=["q_proj"], teacher_identity=None,
+        )
+
+    unit = contract(_proxy_cli("--bit_lr", "2e-5"))
+    explicit_unit = contract(_proxy_cli("--bit_lr", "2e-5", "--bit_proxy_coordinates", "unit"))
+    assert unit == explicit_unit
+    assert unit["sparse_bit"] == {
+        "active_ratio": 0.01, "optimizer": "rms_sgd", "bit_lr": "2e-5",
+        "weight_decay": 0.0, "round_steps": "auto",
+    }
+    sensitivity = contract(_proxy_cli("--bit_lr", "2e-5", "--bit_proxy_coordinates", "decoder_sensitivity"))
+    assert sensitivity["sparse_bit"] == {**unit["sparse_bit"], "proxy_coordinates": "decoder_sensitivity"}
+    assert {k: v for k, v in sensitivity.items() if k != "sparse_bit"} == {
+        k: v for k, v in unit.items() if k != "sparse_bit"
+    }
+    validate_e2e_immutable_resume_contract(unit, explicit_unit)
+    validate_e2e_immutable_resume_contract(sensitivity, sensitivity)
+    for before, after in ((unit, sensitivity), (sensitivity, unit)):
+        with pytest.raises(ValueError, match="immutable contract mismatch"):
+            validate_e2e_immutable_resume_contract(before, after)
+
+    disabled = contract(_proxy_cli("--train_mode", "lora"))
+    unused_sensitivity = contract(_proxy_cli("--train_mode", "lora", "--bit_proxy_coordinates", "decoder_sensitivity"))
+    assert disabled == unused_sensitivity
+    assert "proxy_coordinates" not in disabled["sparse_bit"]
