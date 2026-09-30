@@ -2,7 +2,9 @@
 
 ## 当前状态
 
-**修正训练数据后的J/K/L/M已启动并正常推进，GPU4–7各一组；69+仍未达成。** 2026-09-24 10:31 UTC验收J/K/M至少20次、L至少30次optimizer更新。四组均从原0910开始，rank8、B4acc1、同5000步调度，400步保存评估后自动暂停；旧E/G/H/I已全部正常结束。新文件修复2490条RTE空题干/反标签，MMLU改用官方auxiliary_train，去除旧LongBench尾部；任务数据内容已修正并实际接入，训练ChatML与评估裸题模板仍有差异。四格配置及运行标识见下方“新数据”段落。旧数据探索分支A/B/E/G/H/I不再安排续训，权重已清理，仅保留最小证据；原始0910不变。
+2026-09-24 23:37（北京时间）后续：[七天自动搜索](2026-09-24_seven_day_search.md)。下方旧九候选启动状态保留为历史，最新七天运行标识见后续记录。
+
+**固定数据的长程超参搜索已于2026-09-24 11:33:25 UTC后台启动并接管GPU4–7；69+仍未达成。** 控制器wrapper3641607，四个既有实际训练进程已接入，9个候选按400→1000→2000→5000筛选。最佳已保留K400为65.6146%。本次固定修正后的v2数据、task0.5原混合比例与ChatML；取消的数据/模板对照已撤回并清理。数据冻结仅属于本次实验，不写入AGENTS.md。控制器状态、当前配置、最佳权重索引见结果根fixed_data_search/summary.json与best_metrics.json；本次交付后停止人工/代理主动监控，由远程脚本自行接续。
 
 目标保持：初始 `result/catlora/Qwen_Qwen3-8B_20260910_094022/final_model`，id `01457bf3-ef22-49e8-847f-dc721287c2d6`；rank≤8；原八任务全量0-shot均分≥69。没有声称目标已实现，也不保证有限搜索得到全局最优。69须以实际保存模型的同口径全量成绩确认，区分单次达标与稳定收益。
 
@@ -294,6 +296,51 @@ CPU实际Qwen3 tokenizer revision b968826d9c46dd6066d109eabc6255188de91218：RTE
 
 本轮后续清理G trainer_state、J/M短测trainer_state、重复表/启动日志及已用完的数据生成和状态检查临时文件，实际释放845799424 bytes，生命周期与短测证据已归并核心日志。加上前述A/B/E/H/I清理，两次共2255339520 bytes（约2.100GiB）；不是共享磁盘总量变化。G800权重没有具体续训/复评用途，已删除；完整指标与配置受保护。原始0910、新版训练数据/官方Parquet输入正在被后续工作使用，保留。Windows官方Parquet传输副本47,518,592 bytes的删除被自动审批审查拒绝，仅返回“blocked by policy”，暂保留，未绕过或冒称已清理。
 
+## J/K/L/M的400步完成结果（2026-09-24）
+
+独立只读核实四组`lm_eval_results_step_400.json`及200步对应文件、核心日志与wrapper退出记录：原八任务齐全且有限、指标键按既定协议，num_fewshot=0、limit=None，64个子任务共24742有效样本，effective=original、n_shot全0。四组均完成saved/evaluated pause、wrapper exit0，核查时checkpoint400存在。以下事实只认证当前400步终点，不表示5000步轨迹已完成或69+达成。
+
+| 配置 | 200步均分 % | 400步均分 % | 400−200 pp | 400−初始0910 pp | 400−旧B400 pp |
+|---|---:|---:|---:|---:|---:|
+| J：task0.5、LR1e-4、纯KD | 65.28540244067685 | 65.404405410506 | +0.11900297 | +0.02780144 | -0.54252303 |
+| K：普通LoRA LR3e-4 | 64.99758264463291 | 65.61459093822081 | +0.61700829 | +0.23798696 | -0.33233750 |
+| L：task权重0.8 | 64.96636248046835 | 64.982715182728 | +0.01635270 | -0.39388879 | -0.96421326 |
+| M：0.1CE+0.9KD | 65.08536328328961 | 65.31884429325547 | +0.23348101 | -0.05775968 | -0.62808415 |
+
+初始值65.37660397423905%、旧B400值65.94692844283674%，均分均由原始八项未舍入值等权计算。旧B的数据版本、B32、warmup150及样本曝光与本轮B4/warmup20不同，表中差值仅是同口径评估成绩参照，不能把它当作单因素数据改动收益。J与旧E400的65.63160883838877%比较为-0.22720343pp，虽训练配置更接近，仍是RTE修复/MMLU替换/旧尾部移除的版本整体对照。
+
+400步分项如下（单位%）：
+
+| 任务 | J | K | L | M |
+|---|---:|---:|---:|---:|
+| boolq | 81.71253823 | 82.50764526 | 82.53822630 | 81.65137615 |
+| rte | 71.84115523 | 70.03610108 | 68.23104693 | 68.95306859 |
+| winogrande | 67.00868193 | 67.40331492 | 66.77190213 | 67.40331492 |
+| arc_easy | 76.09427609 | 76.93602694 | 76.43097643 | 76.55723906 |
+| arc_challenge | 48.97610922 | 49.23208191 | 49.23208191 | 49.23208191 |
+| openbookqa | 39.20000000 | 40.00000000 | 38.40000000 | 39.80000000 |
+| piqa | 76.06093580 | 76.65941240 | 76.11534276 | 76.60500544 |
+| mmlu | 62.34154679 | 62.14214499 | 62.14214499 | 62.34866828 |
+
+200→400变化中，K的六项上升、ARC-Challenge下降0.3413pp，其他主要上涨为RTE+1.8051、winogrande+1.2628、openbookqa+1.2pp，MMLU仅+0.1068pp；这支持它作为本轮优先增加有限预算的候选，而非已接近69。J的上涨主要由RTE+1.0830与winogrande+0.4736抵消其他下降。L仅+0.01635pp且仍低初始0.39389pp，没有显示提高整个task比例的收益。M较J均分低0.08556pp，但RTE低2.88809pp，其余七项平均反而高0.31480pp；不能根据微小总差宣布CE整体无效，也不能临时排除RTE改变主指标。
+
+**已确定续训与权重用途：** J/L/M本轮不续训，只保留原始指标、有效配置、核心日志与复现入口；主任务已删除J/L/M的`trainer_state`；四组wrapper的START/FORMAL_EXIT生命周期记录先并入各自核心日志，再删除四份launch.log；各200/400重复summary.md也已删除。保留配置、核心日志、原始JSON与复现入口；本次实际释放846770176 allocated bytes（846648020 logical bytes），不计他人或共享磁盘变化。J的最小证据继续作为N/O/P包装与采样对照；这些新对照从0910开始，不依赖J权重。M分项信号保留在记录，不据此将CE整体判为无效。
+
+K保留唯一`task_v2_b4_kl_lr3e4/Qwen_Qwen3-8B_20260924_102952/trainer_state/checkpoint-400`，具体用途已安排为N/O/P/Q这一轮后在GPU5按同一数据/目标函数/优化器/调度/评估间隔配置续至800，验证200→400的回升能否持续。主任务已新增续训入口`run_task_v2_b4_kl_lr3e4_stage800.sh`，SHA256为`92b8ec831afb1a7651b00da48863451dddd629e308424277d4ee3bc63fffd4ca`，GPU5、同一数据与5000步调度、resume400→stop800。该续训尚未启动，拟N/O/P/Q之后接续；保留是为这一明确任务，不是“以后可能有用”。K400比旧B400低0.33233750pp，但数据、batch、预热和样本曝光不同，仍不能作单因素归因，也不据此承诺K800会达69。
+
+本轮修正了实际数据内容，但**采样与模板尚未同评估目标全面对齐**：task仍按行数混合、ARC覆盖较少；ChatML与裸题评估不同，MMLU auxiliary_train缺subject，不能杜撰description。结果不支持“正确数据必然提高均分”，也不能推断数据修复无价值或模板/均衡抽样一定有效。后续对照应保持已安排的独立变量，而非因400步未达69同时改变多处。
+
+原始结果根为`/home/shaoyuantian/program/VAELLM/result/compressed_e2e_fintuning/e2e_0910_search_20260924/`。J/K/L/M实际子目录分别为`task_v2_b4_kl`、`task_v2_b4_kl_lr3e4`、`task_v2_b4_task80`、`task_v2_b4_ce10`下的`Qwen_Qwen3-8B_20260924_102952`；各自`lm_eval/lm_eval_results_step_400.json`为完整分项主源，`normalized_e2e_runtime_args.json`与`compressed_e2e_fintuning.log`保留实际配置/过程。四份复现脚本沿用上文已验证入口。
+
+| 配置 | wrapper退出UTC / code | Trainer真实runtime，含评估 | wrapper全程 |
+|---|---|---:|---:|
+| J | 11:00:15 / 0 | 1765.976秒 | 1830秒 |
+| K | 10:59:54 / 0 | 1745.0636秒 | 1809秒 |
+| L | 10:58:23 / 0 | 1655.2077秒 | 1718秒 |
+| M | 10:59:33 / 0 | 1724.9131秒 | 1788秒 |
+
+四个wrapper均从10:29:45 UTC开始，耗时是对应单卡实际阶段成本，不采用HF按max_steps计算的summary吞吐。本段核查只读评估与运行证据，另据主任务已执行的清理结果补录上述释放量及保留用途；K续训和下一轮实际启动状态由主任务后续补录。
+
 ## J/K/L/M的200步中间结果（2026-09-24 10:46:58 UTC）
 
 主任务已从四份原始JSON核实完整八任务、0-shot、limit=None、24742有效样本，未改变评估口径；这是200步检查点，四组仍按原定400步终点执行，不能写为最终实验已完成。本节复用该次核验，不另行轮询。
@@ -439,7 +486,7 @@ E/F200步收尾：F全部trainer_state、两份重复指标表、两份旧启动
 
 最终导航检查：269 documents + 206 aliases，canonical=270，relative_markdown_paths=1084，errors=0，exit0；检查临时日志归并后删除4096 bytes，本轮清理总计2255372288 bytes。
 
-## 下一轮task裸续写编码准备（2026-09-24，尚未接入正式训练）
+## 已取消的task裸续写与均衡抽样准备（2026-09-24历史过程）
 
 在不修改当前J/K/L/M依赖的前提下，新增独立模块worktree train_utils/task_continuation.py，SHA256 617a62736a50097560ee83e1aaa3776d162a13aebf0769456609c690fdf99c7a。它严格接受两条user/assistant消息，保留题面和答案原空白，按照lm-eval0.4.8的causal pair边界分词，不添加ChatML包装、BOS或EOS；右截断到最大长度，没有可预测答案则跳过。本轮只准备编码函数，尚未注册dataset alias、修改canonical路由或用于GPU训练。
 
@@ -469,3 +516,72 @@ N/O/P其他四源保持.341/.067/.028/.064；O/P每任务全局样本权重.0625
 本轮CPU统计、编码验证及拆分数据的一次性脚本/临时日志和已归档重复JSON在证据归并后自动清理，实际释放98304 bytes；唯一结果JSON、模块、by_task数据及manifest保留用于上述具体下一轮工作。
 
 本轮导航index/check通过（errors=0、exit0）；检查临时日志归并后另清理4096 bytes，CPU准备收尾合计102400 bytes。
+
+
+## 本次实验的数据冻结与超参数比较（用户于2026-09-24明确）
+
+**仅本次实验的约束。** 保持已修正的v2实际数据源及现有K数据配置，不再自行改变数据组成、抽样比例或输入模板。固定mix为`edgerazor_ii_7m=0.341,edgerazor_ii_gen=0.067,edgerazor_tulu=0.028,edgerazor_am=0.064,vaellm_task_train_v2=0.5`，任务内按原文件行分布，保留ChatML。此约束不是项目长期规范，不修改AGENTS.md。
+
+此前N/O/P/Q的均衡采样、纯任务与裸续写是代理新增的比较，并非数据源修复必需；用户纠正后已对这四个本轮进程发送SIGTERM，wrapper3611318/3611319/3611320/3611321及worker3611330/3611333/3611331/3611332均退出。没有有效全量成绩，不对该方向作效果判断。撤回17个新增alias、plain路由、独立encoder及对应新增测试，仅保留修正后的v2 alias；原ChatML路由与原测试逐字节恢复HEAD，data.py恢复SHA098fe413d1478f5db04db81d37694cbe2f22a40866f6a77ef68ca1d4bb82320c，distill_data.py为0cf457f21b966c788b0d07bde9086703455f3941320162d32fa7e6ff46d455bb。相关准备段仅是历史，不能当当前执行计划。
+
+保留K原配置与数据作为对照，另外三组均从原0910开始、rank8/alpha16/B4acc1/seq1024，5000步cosine调度、warmup20、保存/完整评测每200步、停400。每组仅改变表中一个训练参数，norm/head LR均保持1e-4，不引入eval_limit。K续到800只增加训练预算，不能将K800和新组400当等预算排名；新组先比较既有K400。
+
+| GPU | 配置 | 相对K的唯一变化 | 入口 |
+|---|---|---|---|
+| 4 | R task_v2_b4_lr6e4 | 普通LoRA LR3e-4→6e-4 | run_task_v2_b4_lr6e4.sh |
+| 5 | K续训 | step400→800，数据与超参数不变 | run_task_v2_b4_kl_lr3e4_stage800.sh |
+| 6 | S task_v2_b4_prompt1 | prompt_loss_weight0.3→1.0 | run_task_v2_b4_prompt1.sh |
+| 7 | T task_v2_b4_dropout0 | lora_dropout0.1→0 | run_task_v2_b4_dropout0.sh |
+
+参考既有loss语义与短程经验：prompt1仍是token加权归约，不是改变task样本比例；dropout0检验小预算下正则影响；K已记录梯度范数0.25819–1.22043低于clip1.5，支持探索更高LoRA LR，但不是6e-4稳定性的既有证据。R先运行24步真实短测，保留warmup20以覆盖峰值LR更新；其余复用既有v2真实更新/保存/评测与exact-resume证据，不修改运行代码。shell及标量参数差分已确认数据mix完全相同，三个fresh只与K相差run_root及指定单参数。
+
+新入口SHA256：R 6cf13ba03936ca3d96fa2644ca32dd3f520317cf4382c2aa8b074f1ef46c0a34；S b937da173d2b9d86fae723cef443c6a524740bf377c61ce8820bef890ae46fb1；T 68361df1fb429bca3d9ddcb975a0fa8f9a6cd63c8aad5dceacd9aa6fd148a712。K续训入口SHA92b8ec831afb1a7651b00da48863451dddd629e308424277d4ee3bc63fffd4ca。均位于隔离worktree experiments/e2e_0910_search。
+
+
+### 可脱离本机运行的长程搜索（用户追加要求）
+
+本次采用远程Python控制脚本`experiments/e2e_0910_search/run_fixed_data_search.py`及唯一配置`fixed_data_search_plan.json`，固定上述v2数据与评测口径。候选为K基准及8个单变量组：R LR6e-4、S prompt1、T dropout0、U LR1.5e-4、V prompt0.1、W topK1000、X temperature2、Y alpha0.9的kd_top_partial。Y为0.1CE+0.9KD，CE同样参与prompt0.3加权；X同时改变分布温度与T²尺度，不能只解释为更软的监督。
+
+预定阶梯：400步取4，1000步取2，2000步取1，最后至5000步；每200步完整评测，所有阶段保持5000步总调度。400阶段统一使用对应400指标，K额外已跑到800的预算单列；如K晋级，从已有800接到1000，不重复训练。总预算约11000–11400更新、55–57次全量评估，按既有速度估计剩余13–14 GPU小时、墙钟约7–8小时；后段收缩至2卡/1卡，估计并非承诺。达到>=69的有效保存点后停止新增派发、已在跑的自然完成，保留实际最佳状态；预算用完仍未达标则明确budget_exhausted，不声明全局最优或任务完成。
+
+当前先验验证：R实际24步短测跨过warmup20，峰值LR0.0006，24步loss/grad均有限，最大已记录grad1.47699213；651可变张量有限、253 LoRA B非零、651 Adam组step24且moment有限，保存与limit1评测/恢复成功、exit0。X温度2在实际A800、BF16、2×8×151936 logits上比较正式dense/offloaded teacher路径，loss同为0.02390030398964882、梯度最大差0，有限且非零；这是局部损失/反向验证，不是完整模型收益。其余复用对应v2、K1000、CE10与exact-resume证据。9种配置全部通过当前真实CLI解析。
+
+长程状态写在结果根`fixed_data_search/`。K400最佳权重已先复制到该目录best_checkpoint并将round_base_ref重定位到同一个0910绝对路径，以免活动K的save_total_limit1轮转删除该实物；原base id不变，分数65.61459093822081与rawJSON一致。脚本仍在完成CPU校验/独立代码审阅，尚未宣称控制器已启动；当前四路训练是独立nohup，启动标识见后续验收。
+
+取消组task_v2_plain：START 2026-09-24T11:13:52Z pid=3611318 script=experiments/e2e_0910_search/run_task_v2_plain.sh；FORMAL_EXIT 2026-09-24T11:14:49Z code=143；无保存checkpoint或全量指标。
+
+取消组task_v2_balanced_chat：START 2026-09-24T11:13:52Z pid=3611319 script=experiments/e2e_0910_search/run_task_v2_balanced_chat.sh；FORMAL_EXIT 2026-09-24T11:14:49Z code=143；无保存checkpoint或全量指标。
+
+取消组task_v2_balanced_plain：START 2026-09-24T11:13:52Z pid=3611320 script=experiments/e2e_0910_search/run_task_v2_balanced_plain.sh；FORMAL_EXIT 2026-09-24T11:14:49Z code=143；无保存checkpoint或全量指标。
+
+取消组task_v2_balanced_plain_only：START 2026-09-24T11:13:52Z pid=3611321 script=experiments/e2e_0910_search/run_task_v2_balanced_plain_only.sh；FORMAL_EXIT 2026-09-24T11:14:49Z code=143；无保存checkpoint或全量指标。
+
+本次有限衔接GPU4：MATMUL iterations=486580 elapsed_seconds=290.694295 shape=4096x4096 dtype=float16 finite=True sample=2.0；RELEASED。
+
+本次有限衔接GPU5：MATMUL iterations=946275 elapsed_seconds=561.046221 shape=4096x4096 dtype=float16 finite=True sample=2.0；RELEASED。
+
+本次有限衔接GPU6：MATMUL iterations=952751 elapsed_seconds=560.885489 shape=4096x4096 dtype=float16 finite=True sample=2.0；RELEASED。
+
+本次有限衔接GPU7：MATMUL iterations=494003 elapsed_seconds=290.948539 shape=4096x4096 dtype=float16 finite=True sample=2.0；RELEASED。
+
+取消的裸续写真实短测两组均4步exit0，651可变张量有限、253 LoRA B非零、651 Adam step4、scheduler4、RNG四项存在，八任务limit1齐全；仅机制通过，无效果结论。CPU唯一证据仍保留task_continuation_cpu_validation.json（包含该历史模块与集成结果），代码/派生分任务数据/取消的入口已撤回。
+
+本次取消方向与已完成短测收尾释放allocated=1037217792 bytes、logical=1037066670 bytes；初始0910、原始v2单文件、活动K/R/S/T及已保护最佳checkpoint未删除。
+
+
+### 长程控制器启动验收（2026-09-24 11:33 UTC）
+
+生产--check由root再次执行并PASS：9配置、4个实际worker命令/GPU/normalized契约、同一0910与seed checkpoint均核验。控制器源码SHA256 39222420d10613dc474315cb4f14117317261811b675dee5dbf12a8786fa0dbb；计划SHA256 20e61723800034b3a1a6e2441c3ecc7db7ac9e527f0c4ded04aa2b9d10937fb6。独立代码审阅发现并修复同阶段比较/精确全量样本/中途达标停派/故障前有效候选保留/终态模型与指标对应问题；CPU重放使用实际K400 raw与metadata，没有伪造训练成功。新的后台控制器已进入run主循环并输出四条adopted，summary.status=running、active=4、trials=9。
+
+实际命令：在bitvae和隔离worktree内以nohup调用`python -u experiments/e2e_0910_search/run_fixed_data_search.py --plan experiments/e2e_0910_search/fixed_data_search_plan.json`，stdin关闭、stdout/stderr写fixed_data_search/controller.log，wrapper3641607；实际控制器子进程：`3641610 python -u experiments/e2e_0910_search/run_fixed_data_search.py --plan experiments/e2e_0910_search/fixed_data_search_plan.json`。wrapper结束写SEARCH_EXIT。
+
+- GPU5 K_base：wrapper3619141 / worker3619154，当前阶段终点800，run_dir=/home/shaoyuantian/program/VAELLM/result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_kl_lr3e4/Qwen_Qwen3-8B_20260924_102952。
+- GPU4 R_lr6e4：wrapper3631160 / worker3631163，当前阶段终点400，run_dir=/home/shaoyuantian/program/VAELLM/result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_lr6e4/Qwen_Qwen3-8B_20260924_112559。
+- GPU6 S_prompt1：wrapper3619142 / worker3619153，当前阶段终点400，run_dir=/home/shaoyuantian/program/VAELLM/result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_prompt1/Qwen_Qwen3-8B_20260924_111835。
+- GPU7 T_dropout0：wrapper3619143 / worker3619152，当前阶段终点400，run_dir=/home/shaoyuantian/program/VAELLM/result/compressed_e2e_fintuning/e2e_0910_search_20260924/task_v2_b4_dropout0/Qwen_Qwen3-8B_20260924_111835。
+
+K/S/T已验证实际更新推进，R启动验收：`2026-09-24 11:32:02,909 - compressed_e2e_fintuning - INFO - E2E train: step=200 loss=0.2953 distill_loss=0.43282434344291687 learning_rate=0.0005980893688468733 grad_norm=0.6825549602508545 epoch=0.04`。脚本无自动重试；达到阈值不再派新任务，失败不会冒报完成，结束不追加占卡。只有下一阶段确实使用的卡在等待阶段衔接时才允许有限helper。末段无需4卡则释放不再使用的卡。
+
+唯一最佳指标写best_metrics.json：中间训练checkpoint与最终final_model分别绑定实际评分；终态最佳只保留成品，不冒用final指标给训练态。故障前的有效优秀点若需保留则明确recoverable_failed_job，不视为该任务成功。控制器完成这轮预算不等于证明69可达或全局最优。
+
+验证边界：真实R24峰值LR、已有exact-resume/保存评测、T2损失反向与CPU控制逻辑已验证；当前只确认接管和实际推进，尚未等到此控制器的首个400阶段结束或后续晋级，也未声称长程已完成。用户明确不希望等待，交付后由远程脚本继续，代理停止主动监控。

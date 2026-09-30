@@ -1,6 +1,6 @@
 # 全层恢复的两组 decoder 学习率对照（2026-09-24）
 
-运行状态：GPU0于2026-09-24 17:25（北京时间）从17层完成边界再次恢复，已通过正式身份校验并进入真实GPU教师前缀回放；回放后从block25首步续训。GPU1原实验继续运行。两次SIGINT来源仍未知，已加入信号来源记录；结论状态：证据不足，不扩大既定两组配置。
+运行状态：两组均于2026-09-24完成全部28层恢复和完整八任务评测，退出码0；2026-09-30核实。GPU0组59.3750%、GPU1组59.1009%，同路径初始化基线39.9029%。结果已验证，不扩大实验。
 
 ## 问题与依据
 
@@ -93,3 +93,35 @@
 
 
 本轮收尾：原9层boundary的全部413状态、9层输入输出样例及指标已由17层boundary完整同值覆盖；新进程只引用17层boundary，正式严格载入已通过。删除原9层boundary（1,013,668,112字节）、原始/resume01两份不被恢复入口读取的重复calibration_ids（各67,110,084字节）、已归并的两个失败退出码散文件（各2字节），合计1,147,888,284字节（约1.07GiB）。旧resume01脚本已注明被02替代，其已清理边界不再是当前恢复入口。核心日志、失败run.json、原指标、实际配置/源码身份仍保留；17层边界、原始数据、初始模型、当前源码副本和resume02输出受保护。信号探针临时日志另清理261字节，总计本轮清理1,147,888,545字节。文档index/check已通过（1079个相对路径、errors=0）。
+
+## 最终结果（2026-09-24完成，2026-09-30核实）
+
+两组均完成28层、每层3968步、共111104次有效优化更新；冻结状态SHA不变，完整native保存及严格重载通过，28层保存样例max_abs均0。GPU1于北京时间2026-09-24 19:42:12完成，GPU0于23:05:03完成，run.json均completed/exit_code=0，评测summary均PASS。最后恢复运行的信号日志为空，未再记录指定中断；此前两次SIGINT来源仍未知，不能据此声称查明根因。
+
+评测为同一packed BF16驻留路径、0-shot、batch1、无样本截断，八任务等权平均，MMLU沿用原group汇总。初始模型为本次重新评测，未混用历史fused基线。
+
+| 任务 | 初始化 | decoder LR 1.25e-5 | decoder LR 6.25e-6 |
+| --- | ---: | ---: | ---: |
+| boolq | 49.4495 | 82.1407 | 81.8043 |
+| rte | 48.7365 | 71.1191 | 68.9531 |
+| winogrande | 52.4073 | 61.7206 | 62.5888 |
+| arc_easy | 35.5219 | 65.1936 | 65.3620 |
+| arc_challenge | 24.1468 | 41.2116 | 40.5290 |
+| openbookqa | 27.8000 | 34.0000 | 34.6000 |
+| piqa | 58.2155 | 70.3482 | 70.7291 |
+| mmlu | 22.9454 | 49.2665 | 48.2410 |
+| 八任务等权均值 | 39.9029 | 59.3750 | 59.1009 |
+
+两组分别较初始化增加19.4722、19.1980个百分点；高decoder LR组高0.2741个百分点。支持本次VAE初始化后的联合code/decoder逐层恢复有明显下游收益；单seed两组不足证明学习率稳定优胜，未达到69%目标，也没有同条件官方LiftQuant基线，不能声称超过官方方法。
+
+原始结果：正式根目录`decoder_1p25e5_resume_02/evaluation/A.json`为初始基线，两组各自`evaluation/B.json`为成品。原run.json、训练/评测summary、freeze_check及逐层指标为验收证据。对应经验已更新；本次只读验收与归档，没有新增训练或评测。
+
+本轮收尾盘点：两组最终模型选为本次A/B交付成品保留，初始模型、原始指标、核心日志及隔离源码保留。完整训练/导出/评测均已成功，无具体续训任务；以下无活动文件持有者的中间边界与可再生校准副本已不需要，按持续授权清理：
+
+- `/home/shaoyuantian/program/VAELLM/.result/liftquant_recovery/full_layers_lr_20260924_01/decoder_1p25e5_resume_01/recovery/latest_boundary.pt`：1952972384字节。
+- `/home/shaoyuantian/program/VAELLM/.result/liftquant_recovery/full_layers_lr_20260924_01/decoder_1p25e5_resume_02/recovery/latest_boundary.pt`：3244301968字节。
+- `/home/shaoyuantian/program/VAELLM/.result/liftquant_recovery/full_layers_lr_20260924_01/decoder_6p25e6/recovery/latest_boundary.pt`：3244290384字节。
+- `/home/shaoyuantian/program/VAELLM/.result/liftquant_recovery/full_layers_lr_20260924_01/decoder_1p25e5_resume_02/recovery/calibration_ids.pt`：67110084字节。
+- `/home/shaoyuantian/program/VAELLM/.result/liftquant_recovery/full_layers_lr_20260924_01/decoder_6p25e6/recovery/calibration_ids.pt`：67110084字节。
+
+实际释放8575784904字节（7.99GiB）；两份交付成品及全部原始评测结果仍保留。历史resume入口依赖的中间边界已结束用途，不再作为当前入口。

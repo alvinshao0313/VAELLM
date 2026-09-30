@@ -57,4 +57,4 @@ grep -RniE '编码|STE|翻码|proxy' docs/experience/lessons
 - [LiftQuant编码恢复经验](lessons/liftquant_recovery.md)：最新状态、证据和限制见正文。
 - [硬码翻转贡献对照](records/experiments/liftquant_recovery/BIT_CONTRIBUTION_20260923.md)：最新状态、证据和限制见正文。
 
-- [0910 checkpoint 端到端 rank8 搜索](records/e2e_0910/2026-09-24_rank8_search.md)：分阶段筛选方案、运行状态与晋级结果见正文。
+- [0910 checkpoint 端到端 rank8 搜索](records/e2e_0910/2026-09-24_rank8_search.md)；[七天固定数据自动搜索](records/e2e_0910/2026-09-24_seven_day_search.md)：运行标识、预算、验证和结果入口见各正文。
