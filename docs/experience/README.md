@@ -58,4 +58,4 @@ grep -RniE '编码|STE|翻码|proxy' docs/experience/lessons
 - [硬码翻转贡献对照](records/experiments/liftquant_recovery/BIT_CONTRIBUTION_20260923.md)：最新状态、证据和限制见正文。
 
 - [0910 checkpoint 端到端 rank8 搜索](records/e2e_0910/2026-09-24_rank8_search.md)；[七天固定数据自动搜索](records/e2e_0910/2026-09-24_seven_day_search.md)：运行标识、预算、验证和结果入口见各正文。
-- [0920 checkpoint 的 rank8 DP 顺序搜索](records/e2e_0920/2026-09-24_rank8_search.md)：独立参数组学习率、辅助损失对照、中途最佳及导出重载的阶段性证据；初始模型与0910专题不同。
+- [0920 checkpoint 的 rank8 DP 顺序搜索](records/e2e_0920/2026-09-24_rank8_search.md)：独立参数组学习率、辅助损失对照、中途最佳及最终导出重载结果；初始模型与0910专题不同。
