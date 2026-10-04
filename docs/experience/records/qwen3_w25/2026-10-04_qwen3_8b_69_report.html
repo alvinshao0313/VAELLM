@@ -1,0 +1,1051 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="Qwen3-8B 69.313%结果、压缩模块设置、2.457bpw账本与正负实验对照"><title>Qwen3 8B 压缩达到69的技术汇报</title><style>
+:root{color-scheme:light;--ink:#172a3a;--muted:#516171;--line:#d8e1e8;--accent:#0a6376;--wash:#edf4f6}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;color:var(--ink);background:#f3f6f8;font:16px/1.85 "Noto Sans CJK SC","Microsoft YaHei","PingFang SC",sans-serif}
+a{color:#08677c;text-underline-offset:3px;overflow-wrap:anywhere}header{background:#123746;color:#fff;padding:26px 36px}header small{letter-spacing:.08em;color:#d9e8ec}.layout{display:grid;grid-template-columns:255px minmax(0,1fr);max-width:1510px;margin:auto;gap:26px;padding:28px}
+nav{position:sticky;top:18px;align-self:start;max-height:94vh;overflow-y:auto;font-size:13px;padding:16px 12px;border:1px solid var(--line);border-radius:10px;background:white}nav b{display:block;margin:0 10px 12px}nav a{display:block;text-decoration:none;padding:5px 10px;line-height:1.55;border-radius:5px}nav a:hover{background:var(--wash)}nav .level-2{font-weight:700;margin-top:7px}nav .level-3{padding-left:22px;color:var(--muted)}main{min-width:0;background:white;border:1px solid var(--line);border-radius:10px;padding:36px 44px}
+h1{font-size:29px;line-height:1.5;margin:0 0 28px;letter-spacing:-.02em}h2{font-size:24px;margin:50px 0 18px;padding-top:12px;border-top:2px solid #a3bec7;scroll-margin-top:20px}h3{font-size:19px;color:#134f60;margin:30px 0 12px;scroll-margin-top:20px}p{margin:16px 0}strong{font-weight:700}code{font-family:"Cascadia Code","DejaVu Sans Mono",monospace;font-size:.86em;background:#f0f4f6;padding:2px 4px;border-radius:3px;overflow-wrap:anywhere}pre{padding:18px 20px;background:#eef3f6;border-left:4px solid #5c8795;overflow:auto;line-height:1.7;font-size:13px;border-radius:3px;white-space:pre-wrap;overflow-wrap:anywhere}pre code{padding:0;background:none;font-size:inherit}.table-scroll{overflow-x:auto;margin:22px 0}table{border-collapse:collapse;width:100%;font-size:13.2px;line-height:1.75;table-layout:auto}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top;overflow-wrap:anywhere}th{background:#e8f0f3;text-align:left;font-weight:700;color:#143e4c}tbody tr:nth-child(even){background:#f9fbfc}td code{font-size:.94em}td:last-child a{white-space:normal}li{margin:9px 0}footer{color:var(--muted);font-size:12px;border-top:1px solid var(--line);margin-top:40px;padding-top:18px}.tools{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;margin-top:8px}.tools a{color:#e9f5f8}.print-button{background:transparent;color:#e9f5f8;border:1px solid #9ebdc7;padding:3px 12px;border-radius:4px;font:inherit;cursor:pointer}
+@media(max-width:1100px){.layout{grid-template-columns:1fr;padding:16px}nav{position:static;max-height:250px}main{padding:26px}}
+@media(max-width:650px){body{font-size:15px}header{padding:22px}.layout{padding:10px;gap:12px}main{padding:20px 16px}h1{font-size:25px}h2{font-size:21px}table{min-width:650px;font-size:12px}}
+@page{size:A4;margin:17mm 14mm}
+@media print{html{scroll-behavior:auto}body{background:white;font-size:10pt;line-height:1.7}header,nav,.tools{display:none}.layout{display:block;padding:0;max-width:none}main{border:0;padding:0;border-radius:0}h1{font-size:21pt}h2{font-size:16pt;margin-top:25pt;break-after:avoid}h3{font-size:12pt;break-after:avoid}p{orphans:3;widows:3}table{min-width:0;width:100%;font-size:8.3pt;line-height:1.55}th,td{padding:5px 6px}thead{display:table-header-group}tr{break-inside:avoid}.table-scroll{overflow:visible}pre{font-size:8.5pt;break-inside:avoid}a{color:inherit;text-decoration:none}footer{font-size:8pt}}
+</style></head><body><header><small>VAELLM · Qwen3-8B · 2026-10-04</small><div class="tools"><a href="2026-10-04_qwen3_8b_69_report.md">可编辑正文</a><button class="print-button" onclick="window.print()">打印或另存为 PDF</button></div></header><div class="layout"><nav aria-label="材料目录"><b>阅读目录</b><a class="level-2" href="#section-1">已达成的结果和评测定义</a><a class="level-3" href="#section-2">八任务结果</a><a class="level-3" href="#section-3">实际评测条件</a><a class="level-3" href="#section-4">结果的证明范围</a><a class="level-2" href="#section-5">模型结构和需要压缩的对象</a><a class="level-2" href="#section-6">压缩模块怎样表示权重</a><a class="level-3" href="#section-7">用二进制编码和小网络保存一组权重</a><a class="level-3" href="#section-8">重要输入通道保护和权重旋转</a><a class="level-2" href="#section-9">从原模型到达标模型的训练过程</a><a class="level-3" href="#section-10">第一阶段 逐类别压缩并在每类后恢复</a><a class="level-3" href="#section-11">第二阶段 全模型 decoder 恢复并选取不同类别</a><a class="level-3" href="#section-12">第三阶段 提取注意力恢复和第一层 down 的互补结果</a><a class="level-3" href="#section-13">第四阶段 从新起点训练第一层 down 并在1200步达标</a><a class="level-2" href="#section-14">损失函数和码位更新的含义</a><a class="level-2" href="#section-15">平均位宽的完整计算</a><a class="level-3" href="#section-16">主编码码率和实际平均位宽不同</a><a class="level-3" href="#section-17">从单个矩阵推导六项开销</a><a class="level-3" href="#section-18">达标成品的实际账本</a><a class="level-3" href="#section-19">scale 旋转与标准化是否漏算</a><a class="level-3" href="#section-20">完整模型到底多大</a><a class="level-2" href="#section-21">有效果和没有效果的对照实验</a><a class="level-3" href="#section-22">纯 CAT 压缩：结构、码率、保护通道和重构目标</a><a class="level-3" href="#section-23">局部重构与离散码优化：局部误差下降是否兑现为任务收益</a><a class="level-3" href="#section-24">模型级训练：覆盖率、训练强度、辅助模块与成品组合</a><a class="level-3" href="#section-25">局部模型级短测：容量、输入格式和答案监督</a><a class="level-3" href="#section-26">早期旧核结果：保留探索证据，不与修核后的细微增益混排</a><a class="level-2" href="#section-27">可直接用于口头汇报的说明</a><a class="level-2" href="#section-28">复现和证据索引</a></nav><main><h1>Qwen3 8B 极低比特压缩达到八任务均分 69 的方案与实验证据</h1><p>只想了解改了什么和最快复现步骤，可先读<a href="2026-10-04_qwen3_8b_69_quickstart.md">简版说明</a>或<a href="2026-10-04_qwen3_8b_69_quickstart.html">简版HTML</a>。</p>
+<p>本材料面向第一次接触 VAELLM 项目的读者，说明模型压缩了什么、每个模块怎样设置、如何训练恢复精度、平均位宽如何计算，以及哪些尝试确实改善了指标、哪些在已测条件下没有改善。整理日期为 2026-10-04，讨论范围是已完成的原“投影权重平均位宽不超过 2.5 bit、八任务均分达到 69%”目标。</p>
+<p><strong>已验证的交付结果为：Qwen3-8B 在完整八任务、0-shot 评测下，均分 69.3129801840%，被压缩投影权重的实际存储为 2.4569887908 bit/weight，成品无外置 LoRA。</strong> 模型来自最后一轮训练的第 1200 步。该轮后来完成 2000 步，但 1600 和 2000 步的结果都更低，因此交付的是独立保留的第 1200 步模型。</p>
+<p>这里的 69% 是八项指标的等权平均，不是每项都达到 69%，也不是 MMLU 达到 69%。2.457 bit 的分母是 252 个目标投影的原始权重数，embedding、lm_head 和模型归一化参数需要另算。最终成品经历了逐类别压缩与恢复、模型级蒸馏、类别组合，以及第一层 down_proj 的局部联合训练；不能把该成绩表述成纯权重量化的结果。</p>
+<p>阅读时可先看结果表、模块配置、位宽账本和有效路线，再按需查看全部对照与复现证据。正文中的“百分点”表示两个百分数直接相减，例如 69.313% 比 67.805% 高 1.508 个百分点。</p>
+<h2 id="section-1">已达成的结果和评测定义</h2>
+<h3 id="section-2">八任务结果</h3>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>任务及主要考察内容</th>
+<th>指标</th>
+<th>分区</th>
+<th style="text-align:right">题数</th>
+<th style="text-align:right">得分 %</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BoolQ 阅读问答</td>
+<td><code>acc,none</code></td>
+<td>validation</td>
+<td style="text-align:right">3,270</td>
+<td style="text-align:right">83.9755351682</td>
+</tr>
+<tr>
+<td>RTE 文本蕴含</td>
+<td><code>acc,none</code></td>
+<td>validation</td>
+<td style="text-align:right">277</td>
+<td style="text-align:right">82.6714801444</td>
+</tr>
+<tr>
+<td>Winogrande 代词与常识推理</td>
+<td><code>acc,none</code></td>
+<td>validation</td>
+<td style="text-align:right">1,267</td>
+<td style="text-align:right">70.7182320442</td>
+</tr>
+<tr>
+<td>ARC Easy 科学选择题</td>
+<td><code>acc_norm,none</code></td>
+<td>test</td>
+<td style="text-align:right">2,376</td>
+<td style="text-align:right">81.7340067340</td>
+</tr>
+<tr>
+<td>ARC Challenge 较难科学选择题</td>
+<td><code>acc_norm,none</code></td>
+<td>test</td>
+<td style="text-align:right">1,172</td>
+<td style="text-align:right">55.8873720137</td>
+</tr>
+<tr>
+<td>OpenBookQA 开卷常识科学问答</td>
+<td><code>acc_norm,none</code></td>
+<td>test</td>
+<td style="text-align:right">500</td>
+<td style="text-align:right">40.8000000000</td>
+</tr>
+<tr>
+<td>PIQA 物理常识</td>
+<td><code>acc_norm,none</code></td>
+<td>validation</td>
+<td style="text-align:right">1,838</td>
+<td style="text-align:right">77.6931447225</td>
+</tr>
+<tr>
+<td>MMLU 57学科知识与推理</td>
+<td><code>acc,none</code></td>
+<td>test</td>
+<td style="text-align:right">14,042</td>
+<td style="text-align:right">61.0240706452</td>
+</tr>
+<tr>
+<td><strong>八项等权平均</strong></td>
+<td>固定上述指标</td>
+<td>全量</td>
+<td style="text-align:right"><strong>24,742</strong></td>
+<td style="text-align:right"><strong>69.3129801840</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>原始结果来自 <a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/acceptance.json">1200 步完整验收</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/mmlu.json">MMLU 原始输出</a>和<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/seven.json">其余七任务原始输出</a>。数值计算使用未舍入的原始浮点值，表内小数只为阅读显示。</p>
+<pre><code class="language-text">八任务均分 = 100 × (BoolQ + RTE + Winogrande + ARC-E
+                    + ARC-C + OpenBookQA + PIQA + MMLU) / 8
+           = 69.31298018402366%
+
+MMLU = 57 个学科正确数之和 / 57 个学科题数之和
+     = 8569 / 14042 = 61.02407064520724%
+</code></pre>
+<p>MMLU 先按各学科题数加权合成一项，然后与另外七项等权平均。不能对 64 个叶任务直接等权平均，也不能把全部 24742 题混在一起算成这个“八任务均分”。例如 RTE 只有 277 题，MMLU 有 14042 题，但二者在最终均分中各占八分之一。</p>
+<p>本轮原始HF模型的历史参考均分为 <strong>70.2471223406%</strong>，当前成品低 <strong>0.9341421565个百分点</strong>。但MMLU由72.9169633955%降至61.0240706452%，低11.8928927503个百分点；RTE则由77.9783393502%升至82.6714801444%。均分接近不代表各项能力都接近。历史HF评估采用四卡、auto batch、整模型BF16 cast，其结果文件缺少完整configs/versions/nsamples，因此这里只作历史参考，不能把所有差异严格归因于量化。见<a href="../../../../result/qwen3_8b_w25_20260930/teacher/lm_eval/lm_eval_results_teacher_reference.json">原HF八任务结果</a>和<a href="../w25_transfer/2026-10-04_mmlu65_llama31.md">基线边界说明</a>。</p>
+<h3 id="section-3">实际评测条件</h3>
+<p>使用本机 <code>lm-eval 0.4.8</code>，全部任务为 0-shot、无 <code>limit</code>，总计 24742 题。评测采用标准题目及候选答案的因果语言模型似然，不套聊天模板，不运行思考链生成。<code>acc</code> 按候选答案似然判断；本机版本的 <code>acc_norm</code> 将候选的对数似然按候选字符串字符数归一化后判断。它们是不同指标，表中固定采用的指标不能随候选更换。</p>
+<p>实际 batch 为 MMLU 64、其余任务 32。使用 fast tokenizer，类名为 <code>Qwen2TokenizerFast</code>；模型通过 v6 strict 路径独立加载，按 group size 8 将全部 252 个投影预热为 BF16 解码缓存。未启用 HiFloat4 激活量化。这些 batch 数是独立评测进程的实测值，不是训练脚本里 <code>eval_batch_size=auto</code> 的字面值。</p>
+<p>该成品跳过了 PPL 评测，因此没有本成品的困惑度结论，也没有由此次验收证明的长上下文、生成质量或吞吐提升。后续 MMLU≥65%、均分≥69.5% 及 LongBench 是另一个阶段，见<a href="../w25_transfer/2026-10-04_mmlu65_llama31.md">新阶段记录</a>。</p>
+<h3 id="section-4">结果的证明范围</h3>
+<p>“独立验收”指从保存的成品重新加载并完整运行评测，同时核对模型身份和存储；不是新采集了一份从未参与方案选择的隐藏测试集。本轮多次使用这八项指标筛选配置与保存点，训练数据也包含这些任务的训练分区。因此这是一项面向既定任务的压缩恢复结果，不能泛化为完全不接触任务的通用量化成绩。</p>
+<p>已核对训练采用七任务 train 和 MMLU auxiliary_train，排除了对应的评测 validation/test 分区；这项分区审计不等价于全互联网预训练语料去污染证明。现有材料主要为固定种子的单次运行，没有多种子误差条或统计显著性检验。小幅领先宜表述为“本次实测更高”。</p>
+<h2 id="section-5">模型结构和需要压缩的对象</h2>
+<p>原模型为本地 <code>/home/star/models/Qwen/Qwen3-8B</code>，对应 <code>Qwen/Qwen3-8B</code> 固定 revision <code>b968826d9c46dd6066d109eabc6255188de91218</code>。五个 safetensors 分片已在实验输入准备时校验官方权重哈希，证据见<a href="../../../../result/qwen3_8b_w25_20260930/model_source.json">模型来源</a>。</p>
+<p>模型有 36 个 Transformer 层，隐藏维度 4096，MLP 中间维度 12288，32 个 query heads 和 8 个 key/value heads。每层有七个主要线性投影，共 36×7=252 个压缩目标。输入输出矩阵的形状以下表的“输出维度×输入维度”为准。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>类别</th>
+<th>单矩阵形状</th>
+<th style="text-align:right">36层原始权重数</th>
+<th style="text-align:right">主码bit</th>
+<th style="text-align:right">INT8保护输入列</th>
+<th style="text-align:right">实际类别bpw</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>q_proj</code></td>
+<td>4096×4096</td>
+<td style="text-align:right">603,979,776</td>
+<td style="text-align:right">2</td>
+<td style="text-align:right">64</td>
+<td style="text-align:right">2.114349365</td>
+</tr>
+<tr>
+<td><code>k_proj</code></td>
+<td>1024×4096</td>
+<td style="text-align:right">150,994,944</td>
+<td style="text-align:right">2</td>
+<td style="text-align:right">64</td>
+<td style="text-align:right">2.170288086</td>
+</tr>
+<tr>
+<td><code>v_proj</code></td>
+<td>1024×4096</td>
+<td style="text-align:right">150,994,944</td>
+<td style="text-align:right">2</td>
+<td style="text-align:right">64</td>
+<td style="text-align:right">2.170288086</td>
+</tr>
+<tr>
+<td><code>o_proj</code></td>
+<td>4096×4096</td>
+<td style="text-align:right">603,979,776</td>
+<td style="text-align:right">3</td>
+<td style="text-align:right">64</td>
+<td style="text-align:right">3.102630615</td>
+</tr>
+<tr>
+<td><code>gate_proj</code></td>
+<td>12288×4096</td>
+<td style="text-align:right">1,811,939,328</td>
+<td style="text-align:right">2</td>
+<td style="text-align:right">64</td>
+<td style="text-align:right">2.101918538</td>
+</tr>
+<tr>
+<td><code>up_proj</code></td>
+<td>12288×4096</td>
+<td style="text-align:right">1,811,939,328</td>
+<td style="text-align:right">2</td>
+<td style="text-align:right">64</td>
+<td style="text-align:right">2.101918538</td>
+</tr>
+<tr>
+<td><code>down_proj</code></td>
+<td>4096×12288</td>
+<td style="text-align:right">1,811,939,328</td>
+<td style="text-align:right">3</td>
+<td style="text-align:right">256</td>
+<td style="text-align:right">3.113911947</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>252个投影</strong></td>
+<td style="text-align:right"><strong>6,945,767,424</strong></td>
+<td style="text-align:right">按权重数加权</td>
+<td style="text-align:right">共117,964,800个保护权重</td>
+<td style="text-align:right"><strong>2.456988791</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>注意力的 q/k/v 将输入转换成 query、key、value；o 将注意力输出映射回隐藏空间。MLP 的 gate/up 将隐藏表示扩展，经过门控后由 down 投影回 4096 维。down 的输入维度较大，因此本方案给它更多保护通道。</p>
+<p>embedding 将词编号转换成向量，lm_head 将最后的向量转换成词表分数。这两大矩阵保留 BF16，模型内原有的 RMSNorm 等参数也保留。压缩范围不包括 KV cache 或激活值量化。</p>
+<p>本材料中的BF16是16位浮点数，FP32是32位浮点数，INT8是8位整数；bit/weight（简称bpw）表示每个原始权重平均需要多少存储位。一个byte等于8 bit，GiB按2的30次方字节计算，GB按10的9次方字节计算。参数保存精度、训练计算精度、运行时缓存精度可以不同。</p>
+<h2 id="section-6">压缩模块怎样表示权重</h2>
+<h3 id="section-7">用二进制编码和小网络保存一组权重</h3>
+<p>CAT 是本项目的逐类别压缩流程。每次选一类投影，例如所有层的 q_proj，为各矩阵分别训练权重自编码器。训练时将一组权重输入 encoder，得到二进制编码，再由一个小 decoder 重建这组权重；部署时只保存打包编码和 decoder，encoder 不进入成品。</p>
+<p>这里代码中虽然使用 VAE 命名，当前配置的核心是 BSQ 二值球面量化和权重重构。本文不会把模型级教师蒸馏的 KL 损失误称为传统高斯 VAE 的潜变量 KL 正则。</p>
+<p>关键变量的含义如下。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>达标成品</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D，即 <code>codebook_dim</code></td>
+<td>一个向量中要重建的权重个数</td>
+<td>所有类别 32</td>
+</tr>
+<tr>
+<td>K，即 <code>codebook_bits</code></td>
+<td>每个向量、每个残差 stage 的二进制位数</td>
+<td>普通类别 32；o/down 为 48</td>
+</tr>
+<tr>
+<td>S，即 <code>residual_stages</code></td>
+<td>逐次拟合残差的级数</td>
+<td>所有类别 2</td>
+</tr>
+<tr>
+<td>H，即 <code>base_ch</code></td>
+<td>小 decoder 的隐藏宽度</td>
+<td>128</td>
+</tr>
+<tr>
+<td>R，即 <code>num_res_blocks</code></td>
+<td>decoder 内部额外残差块数</td>
+<td>0</td>
+</tr>
+<tr>
+<td>decoder 类型</td>
+<td><code>symmetric</code>，采用对应自编码器结构</td>
+<td>K→128→32</td>
+</tr>
+<tr>
+<td>归一化与激活</td>
+<td>decoder 内部 LayerNorm 和 Swish</td>
+<td>全部相同</td>
+</tr>
+<tr>
+<td>成品 decoder 精度</td>
+<td>实际落盘的数据类型</td>
+<td>BF16，每参数 16 bit</td>
+</tr>
+</tbody>
+</table></div>
+<p>单个 stage 的 decoder 执行 <code>Linear(K,128) → LayerNorm(128) → Swish → Linear(128,32)</code>。两 stage 各有独立参数；所有层、所有投影也各有独立参数。<code>linear_group_size=36</code> 表示把 36 个独立自编码器放在一个训练组内并行计算，不表示 36 层共享一个 decoder。</p>
+<p>两级残差重构可简写为：第一级拟合向量 v，第二级拟合 <code>v−第一级输出</code>，最终相加。每个 32 维向量使用两组 K 位，所以主编码名义码率为 <code>S×K/D</code>。K=32 时为 2 bit/weight，K=48 时为 3 bit/weight。这里不是每个标量直接在 4 个或 8 个固定数值中选一个，而是一个 32 维向量联合用二进制串和小网络表示；也不保存一个具有 2^K 项的显式巨大查找表。</p>
+<p>BSQ 训练使用连续潜变量、符号量化和直通梯度；部署把符号转换成 0/1，并按 8 位打包到 uint8。BSQ 的归一化符号尺度在部署 decoder 第一层中融合，因此后续代码读取的 0/1 与训练时的正负符号表示对应。</p>
+<h3 id="section-8">重要输入通道保护和权重旋转</h3>
+<p>保护通道指对每个矩阵选出少量重要输入列，不让它们进入极低比特主编码，而用 INT8 保存。本成品每层每类独立选通道，普通投影保护 64 个输入通道，down 保护 256 个；它们分别为 D 的 2 倍和 8 倍。</p>
+<p>排序指标是 <code>channel_weight_actmean_abs</code>：输入列j的分数为 <code>mean(|x_j|) × sqrt(sum_i W_ij²)</code>，同时考虑激活平均绝对值和该列权重的L2范数。激活统计来自 Alpaca 连续打包的512个块，每块256 token，总计131072 token，seed31；不是512篇各自截断的独立文档。采用 <code>channel_scope=layer</code>、<code>channel_axis=input</code>、<code>channel_mlp_rank_metric=none</code>，不做跨 MLP 的联合通道排序；<code>channel_refresh_after_category=false</code>，类别间不重新刷新保护统计。</p>
+<p>保护数据包含 INT8 权重、BF16 scale 和 int64 原输入通道索引；这些全部计入位宽。存储容器可能显示 uint8，但数值语义为有符号 INT8。该方案没有另外保存一份逐通道 zero-point 张量。</p>
+<p>非保护部分使用 block size 32 的双侧 Hadamard 权重旋转，并保存两侧随机正负符号。旋转用于改变权重表示坐标，降低极端分布对编码的压力；反向变换恢复到线性层原始坐标。Hadamard 矩阵由规则生成，不完整保存稠密旋转矩阵。这里借用了旋转这一思路，不能称为完整复现其他论文的整套算法。</p>
+<p>权重归一化、通道抽取、转置和旋转的实际顺序及元数据处理见后面的位宽细节；最终推理重建时会恢复相应结构。达标方案沿用 block32，并没有采用其他纯 CAT 对照中得分更高的 D16/block64 结构。</p>
+<h2 id="section-9">从原模型到达标模型的训练过程</h2>
+<h3 id="section-10">第一阶段 逐类别压缩并在每类后恢复</h3>
+<p>类别顺序固定为 <code>q_proj → k_proj → v_proj → o_proj → gate_proj → up_proj → down_proj</code>。每类覆盖 36 层，每个残差 stage 重构训练 10000 步，采用每个独立自编码器8192个权重向量的batch、AdamW、学习率0.003、weight decay0、线性学习率衰减、无warmup，seed/data_seed为31。36个模型分组时输入约为<code>[8192,36,32]</code>，不能把8192理解为36层合计的向量数。</p>
+<p>重构损失采用 MSE。<code>l1_weight=1</code> 是历史参数名，不意味着本次使用 L1 重构；另有 <code>lfq_weight=2.5</code>、commitment 权重 0.25、entropy 权重 0.01，<code>gamma0=gamma=zeta=1</code>、<code>inv_temperature=100</code>。这些约束用于训练二进制表示，不是最终八任务评价函数。</p>
+<p>按本次36模型组的实现，实际标量目标可写为 <code>36×[MSE+2.5×(0.25×commitment+0.01/100×(H_sample−H_batch))]</code>。commitment约束连续表示接近硬符号，熵项兼顾单样本确定性与整个batch的编码利用率。日志中的<code>train/commitment_loss</code>包含这部分完整辅助项，不能只按名称把它理解成纯commitment。这里涉及的BSQ潜变量归一化，与权重残差标准化、decoder LayerNorm、保护INT8 scale各有用途，不是同一个scale。</p>
+<p>每压缩完一类，运行 500 步模型级蒸馏恢复：已经压缩的前缀类别训练 decoder，尚未压缩的 dense 类别训练临时 LoRA。临时 LoRA 为 rank12、alpha24、dropout0.1，学习率 1e-4；decoder 学习率 1e-5。随后将 LoRA 融入尚未压缩的 dense 权重，再继续压缩下一类别。因此“成品无外置 LoRA”与“训练中曾使用 LoRA”同时成立。最后 down 压缩完已无剩余 dense 类别，仍执行前缀 decoder 恢复。</p>
+<p>LoRA是一种用两个较小的低秩矩阵表示权重修正量的方法。rank12限制修正的中间维度，alpha控制缩放；融合是把该修正量直接加回原权重。此处它用于压缩过程的临时补偿，之后权重还会进入压缩，不意味着成品额外保存rank12分支。蒸馏中的教师始终是原模型，学生是正在压缩恢复的模型。</p>
+<p>该阶段每类恢复 batch4、累积1、最大长度1024、SFT、BF16计算、FP32可训练 decoder/LoRA、AdamW、cosine、warmup1%、梯度裁剪1.5。损失为教师 Top100 mass-KL，温度1，prompt权重0.3，不加 hidden 或 pre-MLP hidden 辅助损失。七类各500步，合计3500步模型级恢复；它与自编码器的“每stage10000步”是两个不同的训练循环。</p>
+<p>训练数据按样本来源抽样：<code>ii_7M 34.1% + ii_gen 6.7% + tulu 2.8% + am 6.4% + 任务数据50%</code>。这是抽源概率，不是 token 数或梯度贡献比例。该阶段固定64/32复评得到 <strong>66.5762388504%</strong>，见<a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_s500/eval_batch64_32/acceptance.json">原始验收</a>。历史16/16评测曾得66.54992965%，不能把换batch后的差值算成训练收益。</p>
+<p>完整配置见<a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_s500/home_star_models_Qwen_Qwen3-8B_20261001_143107/normalized_cat_runtime_args.json">实际 CAT 解析配置</a>；<a href="../../../../scripts/cat_w25_remaining.sh">CAT 脚本</a>为可读入口。应读取 <code>resolved_category_runtime</code> 的最终类别值，不能将配置模板里的默认 K/D/S 当作实际类别参数。</p>
+<h3 id="section-11">第二阶段 全模型 decoder 恢复并选取不同类别</h3>
+<p>从上面的同一成品分别训练两条 2000 步 decoder-only 分支，硬编码保持不变，其他模型权重冻结。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>分支</th>
+<th>损失和数据</th>
+<th style="text-align:right">末步完整均分</th>
+<th>对最终模型的作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CE10</td>
+<td>0.1×CE + 0.9×mass-KL；task50；prompt0.3</td>
+<td style="text-align:right">66.44208228%</td>
+<td>提供 MLP 三类 decoder</td>
+</tr>
+<tr>
+<td>CE50</td>
+<td>0.5×CE + 0.5×mass-KL；task100；prompt0</td>
+<td style="text-align:right">66.89468320%</td>
+<td>提供 attention 四类 decoder</td>
+</tr>
+<tr>
+<td>两分支类别组合</td>
+<td>144个attention取CE50，108个MLP取CE10</td>
+<td style="text-align:right">67.13033275%</td>
+<td>后续多组对照的共同起点</td>
+</tr>
+</tbody>
+</table></div>
+<p>两条训练均为 LR1e-5、batch4、累积1、max1024、seed0、2000步cosine/warmup20，Top100/T1，FP32训练decoder、BF16计算与导出。CE50 相对 CE10 同时改变损失混合、任务数据比例和 prompt 监督，不能将全部差值归因于 CE 系数。组合是把匹配结构的实际类别权重移植到一个模型，并非推理时做多模型投票或集成。</p>
+<p>证据：<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_remaining_prefix_ce10_lr1e5/step_2000/acceptance.json">CE10</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_remaining_prefix_ce50_task100_resp_lr1e5/step_2000/acceptance.json">CE50</a>、<a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">组合结果</a>及<a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/final_model/assembly_report.json">类别来源审计</a>。</p>
+<h3 id="section-12">第三阶段 提取注意力恢复和第一层 down 的互补结果</h3>
+<p>从67.13033275%的共同起点并行产生两条来源。</p>
+<p>其一进行全模型 decoder-only 恢复：task50、纯mass-KL、prompt0.3，2000步，所有硬码冻结。整模型终点为67.03170248%，低于起点；但只取其144个attention投影、保留起点MLP，组合得67.64180413%。这说明“整模型训练分支没有净增益”不等于其中所有类别都无用。</p>
+<p>其二在固定1024条训练样本、32条留出样本上，对第0层（第一层）<code>down_proj</code> 做256步 decoder 与硬码联合更新，ChatML格式、CE50、prompt0、batch4，使用2000步cosine调度的前256步。该局部成品得67.23828170%；同数据同预算、仅训练decoder的控制为66.98004898%。局部联合在这个配对实验中高0.25823272个百分点，是一项直接正向对照。</p>
+<p>最后以局部联合模型为base，将全模型decoder-only分支的attention四类移入，得到 <strong>67.8045225821%</strong>。它保留了CE10来源的MLP，并叠加第一层down的实际局部更新；成为最后一轮的固定初始模型。</p>
+<p>证据：<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits00_s2000/step_2000/acceptance.json">decoder-only终点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/assembled_mlpbest_bits00_s2000_attn/eval/acceptance.json">attention组合</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_ce50_chatml_joint_s256/full8/eval/acceptance.json">局部联合</a>、<a href="../../../../result/qwen3_8b_w25_20260930/assembled_ce50_chatml_joint_bits00_s2000_attn/eval/acceptance.json">最终起点组合</a>及<a href="../../../../result/qwen3_8b_w25_20260930/assembled_ce50_chatml_joint_bits00_s2000_attn/final_model/assembly_report.json">组合来源审计</a>。<code>bits00</code>目录虽保留一部分未启用的bit配置字段，实际<code>train_mode=decoder</code>，冻结审计确认504个码库完全不变，不能按参数默认值误写成5%码位训练。</p>
+<h3 id="section-13">第四阶段 从新起点训练第一层 down 并在1200步达标</h3>
+<p>最终一轮从67.80452258%起点重新初始化优化器与码位敏感度坐标，采用原生全量任务数据流。它是新的训练，不是前面固定1024条样本实验的精确续训。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>设置</th>
+<th>实际值及含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>更新范围</td>
+<td>仅 <code>model.layers.0.mlp.down_proj</code></td>
+</tr>
+<tr>
+<td>训练模式</td>
+<td><code>decoder_sparse_bit</code>，同时训练小decoder和二进制编码</td>
+</tr>
+<tr>
+<td>decoder参数</td>
+<td>6个合并stage张量，共21312个元素；训练FP32，落盘BF16</td>
+</tr>
+<tr>
+<td>硬码范围</td>
+<td>此投影两stage全部147849216位；<code>bit_active_ratio=1</code>只相对该投影</td>
+</tr>
+<tr>
+<td>其余冻结项</td>
+<td>3415个持久张量，包括其余251投影；另502个码库保持原样</td>
+</tr>
+<tr>
+<td>外置LoRA、norm、lm_head</td>
+<td>均不训练，不添加外置分支</td>
+</tr>
+<tr>
+<td>教师</td>
+<td>固定原始Qwen3-8B，教师参数不更新</td>
+</tr>
+<tr>
+<td>数据</td>
+<td><code>vaellm_eval_task=1</code>，176597行修复版任务训练数据</td>
+</tr>
+<tr>
+<td>输入与监督</td>
+<td>SFT聊天格式；最大1024；动态padding；prompt权重0</td>
+</tr>
+<tr>
+<td>loss</td>
+<td><code>kd_top_mass</code>，alpha0.5，即0.5×响应CE + 0.5×响应mass-KL</td>
+</tr>
+<tr>
+<td>TopK和温度</td>
+<td>教师Top100，T=1；其余词表概率合并为一个尾部桶</td>
+</tr>
+<tr>
+<td>batch与累积</td>
+<td>batch4、gradient accumulation1，实际单卡训练</td>
+</tr>
+<tr>
+<td>decoder优化器</td>
+<td>AdamW，LR1e-5，betas0.9/0.999，eps1e-8，weight decay0</td>
+</tr>
+<tr>
+<td>decoder调度</td>
+<td>2000步cosine，warmup1%即20步，max grad norm1.5</td>
+</tr>
+<tr>
+<td>码位优化器</td>
+<td>Adam，LR4e-5，weight decay0</td>
+</tr>
+<tr>
+<td>码位坐标</td>
+<td><code>decoder_sensitivity</code>，FP32 score；每码库由单比特扰动校准固定尺度</td>
+</tr>
+<tr>
+<td>码位轮次</td>
+<td>最长512步一轮，沿既有stable10换轮规则提交硬码并重置连续状态</td>
+</tr>
+<tr>
+<td>随机种子</td>
+<td>seed0，data_seed0；未启用全流程严格确定性模式</td>
+</tr>
+<tr>
+<td>数值和资源</td>
+<td>BF16前向，FP32可训练decoder/score；gradient checkpointing；训练GPU0、独立导出评测GPU1</td>
+</tr>
+<tr>
+<td>teacher offload</td>
+<td>model和output均none，保留在GPU；不是以chunk8实现本损失分块</td>
+</tr>
+<tr>
+<td>保存与验收</td>
+<td>每400步独立导出、strict重载、完整八任务；原生训练断点轮转保留1份</td>
+</tr>
+<tr>
+<td>交付点</td>
+<td>原2000步调度中的第1200步，不是一个总预算1200步的新调度</td>
+</tr>
+</tbody>
+</table></div>
+<p>这里的 response 包括模板生成的空think、结束符等受监督token，不是只训练一个语义答案字母。<code>prompt_loss_weight=0</code> 不代表只保留答案内容mask。任务文件的 SHA256 为 <code>894a04aea907efebd8b0f52f040c5635750bb30dfb64d9c34e30a97421a155a1</code>，MMLU auxiliary_train为99842行，占任务文件约56.54%；训练采样行数比例不等于有效token或梯度占比。</p>
+<p>总预算2000步时，batch4×2000=8000条序列曝光；第1200步对应4800条序列曝光。不能把日志里的epoch=1理解为遍历了176597行一整遍，也不能将曝光数当作去重后的题目覆盖数。懒加载数据路径还会处理截断和无响应样本，配置声明的长度分组等字段需与数据加载后的运行行为区别。</p>
+<p>具体而言，虽然配置请求<code>group_by_length=true</code>，实际进入<code>LazySinglePresetIterable</code>后运行入口将它禁用。因此该轮实际为懒加载SFT流、动态padding、无连续packing，<code>group_by_length=false</code>。这与前面通道校准使用packed blocks是不同的数据处理路径。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th style="text-align:right">最后一轮步数</th>
+<th style="text-align:right">完整八任务均分 %</th>
+<th style="text-align:right">MMLU %</th>
+<th>原始验收</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">400</td>
+<td style="text-align:right">68.6782502172</td>
+<td style="text-align:right">60.6039025780</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_0400/acceptance.json">step400</a></td>
+</tr>
+<tr>
+<td style="text-align:right">800</td>
+<td style="text-align:right">68.6654551188</td>
+<td style="text-align:right">60.5540521293</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_0800/acceptance.json">step800</a></td>
+</tr>
+<tr>
+<td style="text-align:right">1200</td>
+<td style="text-align:right">69.3129801840</td>
+<td style="text-align:right">61.0240706452</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/acceptance.json">step1200</a></td>
+</tr>
+<tr>
+<td style="text-align:right">1600</td>
+<td style="text-align:right">68.7017817045</td>
+<td style="text-align:right">60.4116222760</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1600/acceptance.json">step1600</a></td>
+</tr>
+<tr>
+<td style="text-align:right">2000</td>
+<td style="text-align:right">68.5889796351</td>
+<td style="text-align:right">60.4970801880</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_2000/acceptance.json">step2000</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>达标点相对该轮起点提高 <strong>1.5084576019个百分点</strong>，八项都高于该起点。但没有同起点、同原生数据流、同1200步预算的decoder-only控制，因此不能把1.508个百分点全部归因于码位学习、512步换轮或训练时长中的任意单项。</p>
+<p>该点21,312个decoder FP32元素均有变化，其中19,069个变化在BF16导出后仍存在。相对本轮起点，stage0净改变168278位、stage1净改变14516349位，总计14684627位；这是端点XOR，不是整个训练期间累计翻转次数。独立审计确认其余冻结状态保持不变，成品全部3423个持久张量与保存/重新加载结果一致。</p>
+<p>完整配置和运行状态见<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/launch.json">最终训练launch</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/home_star_models_Qwen_Qwen3-8B_20261004_061859/normalized_e2e_runtime_args.json">实际解析配置</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/audit.json">1200步导出审计</a>。</p>
+<h2 id="section-14">损失函数和码位更新的含义</h2>
+<p>教师蒸馏要求压缩模型在同样输入上尽量接近原模型的下一个token分布。CE则要求压缩模型给训练答案较高概率。最后一轮把二者结合：</p>
+<p>代码中的<code>alpha</code>是KL项权重，通式为<code>L=(1−alpha)×CE+alpha×KL_mass</code>。因此CE10设alpha0.9，CE50设alpha0.5；它与临时LoRA的alpha24是不同参数。</p>
+<pre><code class="language-text">L = 0.5 × CE(response) + 0.5 × KL_mass(response)
+
+KL_mass = Σ[top100] p_teacher(i) log[p_teacher(i)/p_student(i)]
+          + p_teacher(other) log[p_teacher(other)/p_student(other)]
+</code></pre>
+<p>Top100按教师分布选取，保留它们相对于完整词表的概率质量；剩余词的总质量合成一个桶。它与只对Top100重新归一化后计算KL不同。prompt和padding不参与最后一轮的有效损失，response token在整个micro-batch内按有效token数归一化，不是先对每道题求均值再平均。系数0.5也不表示CE和KL贡献了相同大小的梯度。实现见<a href="../../../../train_utils/distill_loss_core.py">模型级损失</a>。</p>
+<p>离散0/1不能直接像普通浮点参数一样微分，训练为每个位维护连续score，用score的正负决定硬码，反向使用直通估计获得更新方向；推理仍保存并使用打包硬码。<code>decoder_sensitivity</code>通过抽取码向量、逐位翻转并测量decoder输出变化，给每个码库确定一个训练坐标尺度。它不增加成品参数，score和Adam状态不属于部署模型。实现见<a href="../../../../litebsq/bit_sensitivity.py">敏感度校准</a>、<a href="../../../../sparse_bit_tuning/coordinates.py">训练坐标</a>和<a href="../../../../sparse_bit_tuning/manager.py">码位管理</a>。</p>
+<p>换轮会将当前硬码提交到持久存储，并重新建立连续score与优化器状态；512是本轮配置的最大轮长，不能简单当成“每512步重新压缩模型”。第1200步审计记录为round2、轮内step176，与两次完整512步边界相符。</p>
+<h2 id="section-15">平均位宽的完整计算</h2>
+<h3 id="section-16">主编码码率和实际平均位宽不同</h3>
+<p>主码“2 bit或3 bit”只描述未保护权重的编码量。真正部署还要保存decoder、保护列和辅助张量。最终验收按这些张量的实际存储字节计数，再除以全部原始目标投影权重数。</p>
+<pre><code class="language-text">原始投影参数数N
+= 36 × (4096×4096 + 1024×4096 + 1024×4096 + 4096×4096
+        + 12288×4096 + 12288×4096 + 4096×12288)
+= 6,945,767,424
+
+平均位宽 = 252个投影的全部必要部署存储bit之和 / N
+</code></pre>
+<p>保护权重仍属于原始权重，不能从分母剔除；各矩阵按原始参数量加权，不能对七类模块的位宽直接算简单平均。MLP矩阵比k/v大得多，其位宽对模型平均的影响也更大。</p>
+<h3 id="section-17">从单个矩阵推导六项开销</h3>
+<p>设矩阵输出维度O、输入维度I，保护C个输入列，向量长D、码长K、stage数S、decoder隐藏宽H。本成品D=32、S=2、H=128。</p>
+<pre><code class="language-text">主码bit          = O×(I−C)×S×K/D
+decoder bit      = 16×S×[H×(K+D+3)+D]
+INT8保护权重bit  = 8×O×C
+INT64通道索引bit = 64×C
+BF16保护scalebit = 16×C
+INT8旋转符号bit  = 8×[O+(I−C)]
+
+该矩阵bpw = 上述六项之和 / (O×I)
+</code></pre>
+<p>decoder参数公式包括第一线性层 <code>KH+H</code>、LayerNorm的<code>2H</code>、第二线性层<code>HD+D</code>。K32时每stage8608参数；K48时每stage10656参数。所有504个stage decoder共4633344参数，即74133504 bit。成品把每个投影的两个stage按相同字段并行存储，共1512个decoder张量；张量合并不代表stage共享参数。</p>
+<p>以一层down_proj为例：O4096、I12288、C256，非保护权重49283072个。六项分别为147849216、340992、8388608、16384、4096、129024 bit，总计156728320 bit；除以原50331648个权重，得到 <strong>3.1139119466 bpw</strong>。down单类超过2.5 bit与全体加权平均低于2.5 bit并不矛盾。</p>
+<h3 id="section-18">达标成品的实际账本</h3>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>存储项</th>
+<th style="text-align:right">实际bit数</th>
+<th style="text-align:right">实际字节数</th>
+<th style="text-align:right">对平均bpw的贡献</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>两stage packed主编码</td>
+<td style="text-align:right">16,024,338,432</td>
+<td style="text-align:right">2,003,042,304</td>
+<td style="text-align:right">2.307065217391</td>
+</tr>
+<tr>
+<td>BF16 decoder含其LayerNorm与偏置</td>
+<td style="text-align:right">74,133,504</td>
+<td style="text-align:right">9,266,688</td>
+<td style="text-align:right">0.010673191236</td>
+</tr>
+<tr>
+<td>INT8保护权重</td>
+<td style="text-align:right">943,718,400</td>
+<td style="text-align:right">117,964,800</td>
+<td style="text-align:right">0.135869565217</td>
+</tr>
+<tr>
+<td>int64保护通道索引</td>
+<td style="text-align:right">1,474,560</td>
+<td style="text-align:right">184,320</td>
+<td style="text-align:right">0.000212296196</td>
+</tr>
+<tr>
+<td>BF16保护scale</td>
+<td style="text-align:right">368,640</td>
+<td style="text-align:right">46,080</td>
+<td style="text-align:right">0.000053074049</td>
+</tr>
+<tr>
+<td>int8旋转符号</td>
+<td style="text-align:right">21,639,168</td>
+<td style="text-align:right">2,704,896</td>
+<td style="text-align:right">0.003115446671</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td style="text-align:right"><strong>17,065,672,704</strong></td>
+<td style="text-align:right"><strong>2,133,209,088</strong></td>
+<td style="text-align:right"><strong>2.456988790761</strong></td>
+</tr>
+</tbody>
+</table></div>
+<pre><code class="language-text">实际投影位宽 = 17,065,672,704 / 6,945,767,424
+             = 2.4569887907608696 bit/weight
+距2.5 bit上限尚有约0.0430112092 bit/weight
+</code></pre>
+<p>该结果来自已保存checkpoint的张量存储审计，不是仅凭架构预估。有效码位与uint8打包后的物理位数相同，padding为0；LoRA存储为0，没有额外稀疏残差或原始dense投影副本。审计没有未分类投影字段，也没有存储别名导致的重复计数。K32和K48均可被8整除，所以这份模型没有末字节填充开销。</p>
+<h3 id="section-19">scale 旋转与标准化是否漏算</h3>
+<p>实际处理顺序为：在原始坐标选保护输入列并抽出 → 对剩余矩阵做双侧block32 Hadamard → 按类别转置并切成32维向量 → 逐stage标准化及残差重构。转置类别是q/v/o/down；k/gate/up不转置。转置改变向量里相邻权重的分组方向，不改变保护的输入轴。</p>
+<p>每个stage对该投影当前残差整体计算均值μ和<code>σ=max(std,1e-6)</code>，并训练<code>(残差−μ)/σ</code>。部署时将σ和μ融合进decoder最后线性层；符号到0/1的尺度融合进第一线性层。因此主码不另存逐向量scale或zero-point，它们的相应数值作用已经由decoder参数体现。</p>
+<p>INT8保护列则确实单独保存scale：每输入列<code>scale=BF16(max(abs(该列))/127)</code>，全零列使用1；按该scale舍入并裁剪后保存INT8值，zero-point隐式为0。保护scale及原通道索引已在账本中单列。随机旋转符号虽只有±1两个值，当前实现实际使用int8，每个占8 bit，也已按实际开销计入。</p>
+<p>推理时两个stage解码结果相加，重排并撤销转置、逆旋转，再把INT8保护列放回原索引位置。实现依据见<a href="../../../../litebsq/protected_channel_quant.py">保护通道量化</a>、<a href="../../../../train_utils/cat_train_pipeline.py">CAT训练流程</a>、<a href="../../../../rotation/weight_preprocess.py">权重旋转</a>和<a href="../../../../litebsq/vae_linear.py">VAELinear重建</a>。</p>
+<h3 id="section-20">完整模型到底多大</h3>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>存储部分</th>
+<th style="text-align:right">实际张量字节数</th>
+<th>是否进入2.5 bit验收</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全部252个压缩投影及附加张量</td>
+<td style="text-align:right">2,133,209,088</td>
+<td>是</td>
+</tr>
+<tr>
+<td>BF16 embedding与lm_head</td>
+<td style="text-align:right">2,489,319,424</td>
+<td>否，另列</td>
+</tr>
+<tr>
+<td>BF16模型归一化参数</td>
+<td style="text-align:right">616,448</td>
+<td>否，另列</td>
+</tr>
+<tr>
+<td>完整模型张量合计</td>
+<td style="text-align:right"><strong>4,623,144,960</strong></td>
+<td>完整模型口径</td>
+</tr>
+<tr>
+<td><code>pytorch_model.bin</code> 文件长度</td>
+<td style="text-align:right"><strong>4,624,558,885</strong></td>
+<td>加上序列化封装后的文件长度</td>
+</tr>
+</tbody>
+</table></div>
+<p>embedding与lm_head不共享权重，两者各为151936×4096。完整张量大小约 <strong>4.305639 GiB</strong>；模型bin比张量多1413925字节序列化开销。这个文件长度还不包含旁边的tokenizer/config/metadata等文件，也不等于文件系统实际分配的块数。</p>
+<p>如果另行采用“完整模型tensor总bit / 原模型全部8190735360个参数”，可推导得到 <strong>4.5154870783 bpw</strong>。这是补充说明的全模型口径，不能与2.456989的投影口径混用。相对相同参数的BF16 tensor payload，投影约压缩6.512倍，完整模型约3.543倍；这些是存储比，不是实测速度比。</p>
+<p>评测把压缩权重解码为BF16缓存再计算，激活也没有变成2 bit。因此不能说这是W2A2计算，更不能由文件大小推断运行显存或推理加速。训练还要容纳教师、encoder或连续score、梯度和优化器状态，它们不计入部署文件，却确实消耗训练资源。</p>
+<h2 id="section-21">有效果和没有效果的对照实验</h2>
+<p>这些实验回答的是“在什么条件下有用”，而不是给某类算法永久贴上有效或无效的标签。下表的分数均指八任务等权平均准确率，单位为百分数；变化量使用<strong>百分点</strong>，例如 63%→64% 是提高 1 个百分点。展示值保留六位小数，计算和验收使用原始未舍入值。除明确标注为历史结果、局部诊断或未完成观察外，表中结果均来自完整 24,742 题的独立成品评估，没有用训练损失或少量题目代替完整指标。</p>
+<p>为便于阅读，先说明本节缩写。<code>D</code> 是每个被编码权重向量的维度，<code>K</code> 是每个向量、每个残差阶段的编码位数，<code>S</code> 是残差阶段数，因此名义主码位宽为 <code>S×K/D</code>；<code>H</code> 是小型权重解码器的隐藏宽度。这里的 <strong>decoder</strong> 是重建压缩权重的小网络，不是整个语言模型的 Transformer 解码层。<code>q/k/v/o</code> 是注意力的四类投影，<code>gate/up/down</code> 是前馈网络（MLP）的三类投影；<code>L0</code> 是编号从 0 开始的第一个 Transformer 层。MSE 是均方误差，KL 是学生与教师输出分布的差异，CE 是对真实答案的交叉熵，KD 指知识蒸馏。<strong>MSE/KL 更低只说明相应训练目标改善，不能直接换算成八任务准确率更高。</strong></p>
+<h3 id="section-22">纯 CAT 压缩：结构、码率、保护通道和重构目标</h3>
+<p>这一组不做模型级蒸馏，也不训练外置 LoRA。除表中注明的变化外，使用种子 31、每阶段 10,000 次更新、权重向量批量 8,192、初始学习率 0.003 并线性衰减，默认用 MSE 加二值球面量化（BSQ）辅助损失。保护通道的默认校准量是 Alpaca 训练文本连续打包的 <code>512×256=131,072</code> 个 token，<strong>不是 512 篇分别截断的文档</strong>。表中“单独重训某类”均把其他类别从既有完整模型原样保留后再全量评估；单独重训也可能改变类别随机数流，因此不能把所有差值当作严格单变量因果。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>比较方案</th>
+<th>明确对照与实际八任务均分 %</th>
+<th>实验证明了什么、没有证明什么</th>
+<th>原始证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>旋转块从 32 扩到 64</strong>：保持全 D32、两阶段、相同码率和 INT8 保护</td>
+<td>block32 <strong>61.330141</strong> → block64 <strong>62.572956</strong>，提高 <strong>1.242815</strong> 个百分点</td>
+<td>这是保持其他主要参数不变的正向对照；BoolQ、RTE、MMLU 改善，ARC 两项下降，不能称全部能力改善</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block32_o3_down3/eval_fixed_decoder/acceptance.json">block32 对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block64_o3_down3/eval/acceptance.json">block64</a></td>
+</tr>
+<tr>
+<td><strong>增加普通输入保护</strong>：block32 下 default64/down256 → default96/down320</td>
+<td><strong>61.330141 → 62.316672</strong>；实际位宽升至 <strong>2.497845</strong></td>
+<td>在这一纯压缩配置中有收益；接近 2.5bit 预算上限，不能认为多保护必然更好，也不能把这一增量直接加到蒸馏成品上</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block32_o3_down3/eval_fixed_decoder/acceptance.json">对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block32_p96_d320/eval/acceptance.json">增加保护</a></td>
+</tr>
+<tr>
+<td><strong>缩小编码向量</strong>：D32/S2 → 全 D16/S2，K 同比例缩小、保持各类名义主码位宽</td>
+<td>D32/block32 <strong>61.330141</strong> → D16/block32 <strong>63.061908</strong></td>
+<td>该候选整体更好，但改变了网络形状、向量数量和相应随机数流；不能归结为一个连续数值参数的小调整</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block32_o3_down3/eval_fixed_decoder/acceptance.json">D32</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_s2_block32_o3_down3/eval/acceptance.json">D16</a></td>
+</tr>
+<tr>
+<td><strong>仅 o/down 使用 D16，其余保持 D32</strong>，继续比较旋转范围</td>
+<td>全 block32 <strong>62.727348</strong>；其余类 block64、o/down 仍 block32 <strong>63.171271</strong>；统一 block64 <strong>63.699392</strong></td>
+<td>最后一种组合更好，后两者相差 <strong>+0.528121</strong> 个百分点；必须实际组装并全评，不能把各类别单独收益相加预测</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_block32/eval/acceptance.json">全 block32</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_block64/eval/acceptance.json">混合旋转</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64/eval/acceptance.json">统一 block64</a></td>
+</tr>
+<tr>
+<td><strong>继续增大旋转块并重新分配保护</strong>：block128、default128/o0/down128；再尝试只取该来源的 q/k/v</td>
+<td>完整候选 <strong>63.023897</strong>；只替换 q/k/v <strong>63.642317</strong>；对照为统一 block64 的 <strong>63.699392</strong></td>
+<td>两种候选均未超过对照。完整 block128 方案同时改变保护分配，不能把全部差异归因于旋转块大小</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block128_p128_o0_d128/eval/acceptance.json">完整 block128</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_block64_qkv128/eval/acceptance.json">q/k/v 组合</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64/eval/acceptance.json">对照</a></td>
+</tr>
+<tr>
+<td><strong>两阶段改四阶段</strong>：全 D32，单阶段 K 减半、总主码率不变，每阶段仍训练 10,000 步</td>
+<td>同 D32/block64 两阶段 <strong>62.572956</strong> → 四阶段 <strong>62.623346</strong>，仅 <strong>+0.050390</strong> 个百分点</td>
+<td>总更新数从 20,000 增至 40,000，且分组训练改变部分随机数流；没有显示与成本相称的明确优势，也低于 D16 混合结构的 63.699392，不能称严格等预算对照</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block64_o3_down3/eval/acceptance.json">两阶段</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_s4_d32_block64_o3_down3/eval/acceptance.json">四阶段</a></td>
+</tr>
+<tr>
+<td><strong>增大小型 decoder 容量</strong>：D16 o/down、block64 基础上，H128/无残块 → H256/无残块，或 H128/一个残块</td>
+<td>对照 <strong>63.699392</strong>；H256 <strong>62.915843</strong>；一个残块 <strong>63.336715</strong></td>
+<td>更宽或更深在本次纯压缩配方中都未改善；不否定其他初始化、预算或蒸馏条件下的容量收益</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64/eval/acceptance.json">对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_h256/eval/acceptance.json">H256</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_r1/eval/acceptance.json">一个残块</a></td>
+</tr>
+<tr>
+<td><strong>down 两阶段改单阶段</strong>：D16/K24/S2 → D16/K48/S1，保持 down 主码 3bit</td>
+<td>原完整混合结构 <strong>63.699392</strong> → 单阶段 down <strong>61.957493</strong></td>
+<td>八项均下降；单阶段几何及独立类别训练发生变化，不能由此否定所有单阶段量化器</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64/eval/acceptance.json">两阶段来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_s1/eval/acceptance.json">单阶段 down</a></td>
+</tr>
+<tr>
+<td><strong>down 的学习率、训练预算和参数精度</strong>：三个独立匹配对照</td>
+<td>独立 down 基线 LR0.003、10K/阶段、BF16 为 <strong>63.807576</strong>；LR0.001 <strong>63.400774</strong>；30K/阶段 <strong>62.980616</strong>；FP32 训练/保存 <strong>63.571597</strong></td>
+<td>三种改动均未超过相应共同基线。30K 从新初始化开始且改变学习率衰减时域；FP32 保存不等于全 FP32 推理，不能把较低训练损失当更高精度</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">共同基线</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr1e3/eval/acceptance.json">低学习率</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_s2_s30000/eval/acceptance.json">更长训练</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_fp32/eval/acceptance.json">FP32</a></td>
+</tr>
+<tr>
+<td><strong>提高 q 或 gate 码率</strong>：q 2→2.5bit；另以 o 3→2bit 换取 gate 2→2.5bit</td>
+<td>q 候选 <strong>63.215634</strong>，低于其来源 <strong>63.699392</strong>；gate/o 重配 <strong>62.739137</strong>，低于独立 down 基线 <strong>63.807576</strong></td>
+<td>两种具体预算分配均未改善。q 的编码维度和随机数流变化；gate/o 同时改变两类，不能据此说 gate 精度不重要</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_q25/eval/acceptance.json">q 候选</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64/eval/acceptance.json">q 的对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_gate25_o2/eval/acceptance.json">gate/o 候选</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">gate/o 的对照</a></td>
+</tr>
+<tr>
+<td><strong>更激进的码率重分配</strong>：attention1.5/gate2.5/up2/down3.5bit，并重配保护数</td>
+<td>对照 <strong>63.807576</strong> → 候选 <strong>52.805960</strong>，实际 <strong>2.496501bit</strong></td>
+<td>八项均下降，是该多变量组合的负结果；不能拆成“attention1.5bit 单独造成全部损失”</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block32_attn15_gate25_down35/eval/acceptance.json">候选</a></td>
+</tr>
+<tr>
+<td><strong>MLP 联合保护通道</strong>：对齐 gate/up 输出与 down 输入，320 通道；另试完整旋转加 1,280 通道</td>
+<td>对照 <strong>63.807576</strong>；320 通道 <strong>51.821911</strong>；完整旋转/1,280 通道 <strong>43.139391</strong></td>
+<td>两种配方八项均下降。改变的是跨模块保护方案，第二种还改旋转，不能把结果推广为所有通道保护无效</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_mlp_aligned320/eval/acceptance.json">320 通道</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_full_mlp_aligned1280_gate_d32/eval/acceptance.json">1,280 通道</a></td>
+</tr>
+<tr>
+<td><strong>gate 保护轴</strong>：保护 64 个输入列，或 192 个输出行，每层保护权重数同为 786,432</td>
+<td>独立 input64 <strong>64.276003</strong>；output192 <strong>58.888110</strong>，后者低 <strong>5.387893</strong> 个百分点</td>
+<td>输入保护在此匹配试验更好；输出方案替换而非叠加原输入保护。input64 相对旧 gate 的提升还伴随独立类别随机数流，不能包装成新增算法收益</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_input64/eval/acceptance.json">输入保护</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_output192/eval/acceptance.json">输出保护</a></td>
+</tr>
+<tr>
+<td><strong>改变权重向量分组方向</strong>：down 不转置；gate 增加转置</td>
+<td>down <strong>63.807576 → 64.143885</strong>；gate <strong>64.276003 → 63.649939</strong></td>
+<td>down 观察到 <strong>+0.336309</strong> 个百分点，gate 反降 <strong>0.626064</strong>；方向选择的结论不能跨类别套用</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">down 对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_notranspose/eval/acceptance.json">down 候选</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_input64/eval/acceptance.json">gate 对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_transpose/eval/acceptance.json">gate 候选</a></td>
+</tr>
+<tr>
+<td><strong>把单独较好的 gate 和 down 组装在一起</strong></td>
+<td>gate 成品 <strong>64.276003</strong>、down 成品 <strong>64.143885</strong>；组合 <strong>64.080859</strong></td>
+<td>组合低于两个来源，证明“各类别各自更好”不能保证组合收益相加</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_input64/eval/acceptance.json">gate 来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_notranspose/eval/acceptance.json">down 来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/assembled_gate_input64_down_notranspose/eval/acceptance.json">组合</a></td>
+</tr>
+<tr>
+<td><strong>仅 down 的旋转块从 64 扩到 256</strong></td>
+<td>纯 CAT 最佳来源 <strong>64.276003 → 63.333701</strong></td>
+<td>低 <strong>0.942302</strong> 个百分点，虽然 MMLU 多答对 59 题，其他任务损失抵消了它；不是所有块大小越大越好</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_input64/eval/acceptance.json">对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_block256_925b/eval/acceptance.json">block256</a></td>
+</tr>
+<tr>
+<td><strong>增加或更换 down 保护校准数据</strong>：Alpaca token 数增至四倍，或改用任务训练数据</td>
+<td>原校准 <strong>63.807576</strong>；四倍 Alpaca <strong>63.198215</strong>；任务数据 <strong>62.974840</strong></td>
+<td>更多数据或更贴近任务的数据未改善这套通道选择配置；任务数据也改变文本包装，不能单独归因内容分布</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_calib_alpaca2048/eval/acceptance.json">四倍 Alpaca</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_calib_task512/eval/acceptance.json">任务数据</a></td>
+</tr>
+<tr>
+<td><strong>更多 down 保护，或逐类别刷新保护统计</strong></td>
+<td>down256→640：<strong>63.807576 → 63.662485</strong>；每类后刷新下一类统计：<strong>62.572956 → 60.670442</strong></td>
+<td>两项不同的匹配试验均未改善。刷新真实完成六次，但只刷新下一类的保护排名，不是所有后续层或重构损失统计</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">down 对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_protect640/eval/acceptance.json">保护640</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block64_o3_down3/eval/acceptance.json">刷新对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_block64_refresh/eval/acceptance.json">刷新候选</a></td>
+</tr>
+<tr>
+<td><strong>减弱 BSQ 辅助项</strong>：down 的总系数 2.5→1；gate 的逐样本熵系数 gamma0 1→0</td>
+<td>down <strong>63.807576 → 63.212693</strong>；gate <strong>64.276003 → 63.254861</strong></td>
+<td>两项均未改善。总系数同时缩放承诺损失和熵项；移除一个正损失项会自然降低日志数值，不能据此称训练更有效</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">down 对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_lfq1/eval/acceptance.json">总系数1</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_input64/eval/acceptance.json">gate 对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d32_gate_gamma0/eval/acceptance.json">gamma0=0</a></td>
+</tr>
+<tr>
+<td><strong>MLP 改用加权重构损失</strong>：按目标权重绝对值与激活最大值加权的 WA-MSE；按激活平方均值加权的 AMSE</td>
+<td>旋转 MSE 来源 <strong>63.807576</strong>；无旋转 WA-MSE <strong>59.855265</strong>；无旋转 AMSE <strong>61.764005</strong></td>
+<td>两者未超过来源。与来源相比同时移除了 MLP 旋转并独立重训；AMSE 还把重构系数设为 6.77、BSQ 系数保持 2.5。不能把全部差值归给损失名称</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_odown_allblock64_down_lr3e3/eval/acceptance.json">来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_mlp_wa_mse_no_rotation/eval/acceptance.json">WA-MSE</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_mlp_amse_no_rotation/eval/acceptance.json">AMSE</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>这些纯压缩探索得到的最好完整分数是 <strong>64.276003%</strong>。它说明压缩结构选择确有影响，也说明本轮 69% 的突破还需要后续模型级恢复；不能把纯 CAT 最佳配置与最终达标配置混为一谈。</p>
+<h3 id="section-23">局部重构与离散码优化：局部误差下降是否兑现为任务收益</h3>
+<p>“局部”指训练目标只观察一个 Linear 或一个 Transformer block 的输出误差，通常输入来自原始教师模型，或按层固定学生前缀；它没有直接优化最后的语言模型预测。下面几组完整评估尤其适合解释为什么不能只看重构损失。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>方案与预算</th>
+<th>局部优化证据</th>
+<th>完整八任务对照 % 与结论</th>
+<th>原始证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>固定编码、逐 Linear 优化 decoder：32 训练文档、32 留出文档、长度256、192步、LR1.25e-5</td>
+<td>252/252 投影的留出输出 MSE 都下降</td>
+<td>旧 full-rotation/down3 来源 <strong>41.087902 → 43.154144</strong>，提高 <strong>2.066242</strong> 个百分点；早期确有恢复作用，但仍远离目标，且属于下述旧核历史条件</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_down3/acceptance.json">来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/local_decoder_full/acceptance.json">完整结果</a>、<a href="../../../../result/qwen3_8b_w25_20260930/local_decoder_full/finalize.json">保存与来源审计</a></td>
+</tr>
+<tr>
+<td>36 层顺序 block 恢复、只更新 decoder：64 文档、长度256、每块64或192步、LR1.25e-5</td>
+<td>64步全部36块训练及留出 MSE 下降；192步35/36块留出改善</td>
+<td>同旧核无旋转保护来源 <strong>60.849497</strong>；64步 <strong>53.135017</strong>，192步 <strong>53.862196</strong>，均明显更差。更多局部拟合没有解决全模型表现</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_o3_down3/acceptance.json">来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/sequential_no_rotation_n64_s64/acceptance.json">64步</a>、<a href="../../../../result/qwen3_8b_w25_20260930/sequential_no_rotation_n64_s192/acceptance.json">192步</a>、<a href="../../../../result/qwen3_8b_w25_20260930/sequential_no_rotation_n64_s192/run/local_metrics_summary.json">局部指标</a></td>
+</tr>
+<tr>
+<td>固定 decoder、逐 Linear 只学硬码：512训练+64留出文档、128步；attention 与 MLP 使用各自已筛选的代理学习率和换轮间隔</td>
+<td>239/252 投影留出 MSE 改善，最终有 737,758,178 个码位不同于起点</td>
+<td>同旧核来源 <strong>60.849497 → 58.104607</strong>；真实翻码和局部误差改善都发生了，但八任务没有净收益</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_o3_down3/acceptance.json">来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/local_bits_protected_full/acceptance.json">完整结果</a>、<a href="../../../../result/qwen3_8b_w25_20260930/local_bits_protected_full/local_metrics_summary.json">局部指标</a></td>
+</tr>
+<tr>
+<td>每 block 联合更新 decoder 和码：512训练+64留出、128步，36块分别拟合教师输入与输出</td>
+<td>36/36块训练及留出误差都改善，留出误差比例按块平均约0.5583</td>
+<td><strong>修核后同条件重评</strong>：来源 <strong>60.918675 → 47.782767</strong>，八项全降。这组证据直接反驳“所有局部误差下降就一定改善全模型”的推断</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_o3_down3/eval_fixed_decoder/acceptance.json">修核后来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/joint_no_rotation_n512_s128/eval_fixed_decoder/acceptance.json">联合结果</a>、<a href="../../../../result/qwen3_8b_w25_20260930/joint_no_rotation_n512_s128/local_metrics_summary.json">局部指标</a></td>
+</tr>
+<tr>
+<td>BlockLDLQ 有限邻域误差反馈：纯 CAT 64.143885 来源、全部36个 down、512训练+64留出；比较反馈关/开</td>
+<td>每个 D16 向量在两阶段码中最多翻1bit，共49个候选；两臂36/36层留出 MSE 都改善，开启反馈的每层误差还都优于关闭反馈</td>
+<td>来源 <strong>64.143885</strong>；关反馈 <strong>63.839728</strong>；开反馈 <strong>63.839097</strong>。两者都低于来源，反馈改善局部误差却没有提高均分。这只是本项目一次49邻域原型，不是完整 QuIP# 复现</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_d16_down_notranspose/eval/acceptance.json">来源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/block_ldlq_l27/run/pilot.json">单层机制报告</a>、<a href="../../../../result/qwen3_8b_w25_20260930/block_ldlq_down36/feedback_off_eval_allocator/acceptance.json">关反馈</a>、<a href="../../../../result/qwen3_8b_w25_20260930/block_ldlq_down36/feedback_on_eval_allocator/acceptance.json">开反馈</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>另有 <strong>完整输入 Gram 矩阵</strong>试验，把直接输入输出误差改写为 <code>G=XᵀX</code>、<code>L=〈EG,E〉/(N×输出维度)</code>，保留 INT8 保护误差与其他列的交叉项。实际验证得到 FP64 Gram 与直接输入计算的代理梯度相对误差最大约 <code>3.96×10⁻⁷</code>，所测局部前后向计算约快 4–6 倍。这是等价计算和局部性能证据，<strong>没有接入正式优化器，也没有对应八任务新成品，不能列为精度成功或失败方案</strong>。<a href="../../../../result/qwen3_8b_w25_20260930/validation_full_linear_gram/run/validation.json">真实 Gram 验证</a></p>
+<h3 id="section-24">模型级训练：覆盖率、训练强度、辅助模块与成品组合</h3>
+<p>这一组让梯度经过完整语言模型，以输出分布或真实答案为目标。“0%/1%/5%/100%”是每轮允许学习的硬码覆盖率，不是改变部署位宽；decoder 仍可同时训练。默认模型级配置为批量4、最大长度1024、decoder 学习率1e-5、2000步、每400步完整评估；码位使用 Adam、LR4e-5。除注明 CE 配方外，目标是纯 KL-top-mass，保留教师前100个 token 及剩余概率质量，任务训练样本比例50%，prompt 损失权重0.3。不同起点单独列出，不能跨起点只按最终分数判断某个参数好坏。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>比较方案</th>
+<th>明确对照与实际八任务均分 %</th>
+<th>结论和限制</th>
+<th>原始证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>全模型码位覆盖率</strong>：从同一61.330141纯压缩源训练2000步，换轮上限128步</td>
+<td>仅decoder <strong>66.058674</strong>；1% <strong>66.091906</strong>；5% <strong>66.177421</strong>；100% <strong>65.652864</strong></td>
+<td>匹配实际评测批量64/32后，1%/5%仅比0%高 <strong>0.033232/0.118747</strong> 个百分点；100%没有更好。单种子小差不证明稳定优势；100%还采用四卡层并行并经历中断恢复，不是全链逐位相同控制</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr1e5/eval_final/acceptance.json">0%</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_bits_block32_r128_lr4e5/eval_final/acceptance.json">1%</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_bits_block32_a005_r128_lr4e5/eval_final_batch64_32/acceptance.json">5%匹配批量</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_bits_block32_a100_mp4_r128_lr4e5/step_2000/acceptance.json">100%</a></td>
+</tr>
+<tr>
+<td><strong>提高 decoder 或码位学习率</strong>：同源800步比较</td>
+<td>decoder1e-5 <strong>65.521023</strong> → decoder3e-5 <strong>63.162383</strong>；1%码位LR4e-5 <strong>64.900273</strong> → 1.6e-4 <strong>62.920039</strong></td>
+<td>更大的更新在这一中期预算都更差，更多翻码不是质量证据；此行只比较同800步独立验收，不把未独立重载的原生终点混入</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr1e5/step_0800/acceptance.json">decoder低LR</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr3e5/step_0800/acceptance.json">decoder高LR</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_bits_block32_r128_lr4e5/step_0800/acceptance.json">码低LR</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_bits_block32_r128_lr1p6e4/step_0800/acceptance.json">码高LR</a></td>
+</tr>
+<tr>
+<td><strong>任务训练样本比例50%→80%</strong>：其余沿用纯KL，同1200步、实际64/32评测</td>
+<td><strong>66.103213 → 65.201260</strong>，低 <strong>0.901952</strong> 个百分点</td>
+<td>本匹配点不支持简单提高任务样本比例。终点也未出现预期提升，但部分终点评估使用16/16，不能拿异批量小差作单变量结论</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr1e5/step_1200/acceptance.json">50%</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_block32_task80_lr1e5/step_1200/acceptance.json">80%</a></td>
+</tr>
+<tr>
+<td><strong>更好的纯 CAT 几何，是否一定带来更好的逐类别恢复</strong>：保持每类500步恢复</td>
+<td>原 D32/block32 <strong>66.576239</strong>；增加保护 <strong>66.379439</strong>；D16 o/down+block64 <strong>66.086325</strong>；MLP码率2.5bit组合 <strong>66.367454</strong></td>
+<td>这三种几何在完整恢复后都未超过原配方。纯压缩阶段的排序没有稳定迁移，不能把纯CAT增量直接叠到蒸馏结果上</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_s500/eval_batch64_32/acceptance.json">原配方</a>、<a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_p96_d320_s500/eval/acceptance.json">增加保护</a>、<a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_allblock64_d16_odown_s500/eval/acceptance.json">D16/block64</a>、<a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_mlp25_d224_s500/eval/acceptance.json">MLP2.5</a></td>
+</tr>
+<tr>
+<td><strong>在66.576239成品上继续训练所有decoder</strong>：2000步比较损失配方</td>
+<td>原纯KL <strong>66.161795</strong>；CE10 <strong>66.442082</strong>；CE50/task100/仅response <strong>66.894683</strong></td>
+<td>纯KL追加和CE10没有超过起点；CE50组合有 <strong>+0.318444</strong> 个百分点，但MMLU下降。CE50同时改变真实标签权重、数据混合及prompt权重，不能把提升全归给CE系数</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_s500/eval_batch64_32/acceptance.json">共同起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_remaining_prefix_lr1e5/step_2000/acceptance.json">纯KL</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_remaining_prefix_ce10_lr1e5/step_2000/acceptance.json">CE10</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_remaining_prefix_ce50_task100_resp_lr1e5/step_2000/acceptance.json">CE50组合</a></td>
+</tr>
+<tr>
+<td><strong>增加隐藏状态匹配损失</strong>：共同“最后down压缩后、恢复前”起点，同800步调度，系数0与0.1</td>
+<td>400步 <strong>65.861132 / 65.528234</strong>；800步 <strong>66.434409 / 66.429109</strong>，顺序均为0/0.1</td>
+<td>中期增加隐藏损失较差，末点近乎相同；没有显示收益，不能将它与其他起点或旧500步终点直接比较</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_pre_down_kd_hidden0_s800/step_0400/acceptance.json">无隐藏损失400</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_pre_down_kd_hidden01_s800/step_0400/acceptance.json">0.1系数400</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_pre_down_kd_hidden0_s800/step_0800/acceptance.json">无隐藏损失800</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_pre_down_kd_hidden01_s800/step_0800/acceptance.json">0.1系数800</a></td>
+</tr>
+<tr>
+<td><strong>在67.130333组合成品上做0%/5%匹配控制</strong>：同纯KL、全decoder、2000步</td>
+<td>0%终点 <strong>67.031702</strong>；5%终点 <strong>66.666924</strong>；1200步却是0% <strong>66.230751</strong>、5% <strong>66.393397</strong></td>
+<td>终点5%低 <strong>0.364778</strong> 个百分点，两个终点都低于起点；中途排序会反转，不能说码位学习始终有害或始终有效</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits00_s2000/step_2000/acceptance.json">0%2000</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits05_s2000/step_2000/acceptance.json">5%2000</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits00_s2000/step_1200/acceptance.json">0%1200</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits05_s2000/step_1200/acceptance.json">5%1200</a></td>
+</tr>
+<tr>
+<td><strong>可融合的额外线性 head</strong>：共同67.130333起点，保持decoder配方，增加4096×4096线性变换、LR3e-5，训练后融合回原输出head</td>
+<td>同2000步仅decoder <strong>67.031702</strong>；加linear head <strong>66.570503</strong></td>
+<td>五个400间隔评估点均低于对应控制，终点低 <strong>0.461199</strong> 个百分点。部署无新支路，但本配方没有质量收益</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits00_s2000/step_2000/acceptance.json">控制</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_headlinear_s2000/step_2000/acceptance.json">linear head</a></td>
+</tr>
+<tr>
+<td><strong>训练归一化层 norm</strong>：逐类别恢复中训练全部norm，或在67.130333成品上只训练最终norm，norm LR1e-4</td>
+<td>全norm：<strong>66.576239 → 65.122167</strong>；最终norm：同2000步控制 <strong>67.031702</strong>、候选 <strong>66.825916</strong></td>
+<td>两种具体配置都未提高终点；最终norm首400相对控制曾略高，后四点较低。不能泛化为所有norm子集或学习率都无效</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_s500/eval_batch64_32/acceptance.json">逐类别控制</a>、<a href="../../../../result/qwen3_8b_w25_20260930/remaining_prefix_block32_normall_s500/eval/acceptance.json">全norm</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits00_s2000/step_2000/acceptance.json">最终norm控制</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_finalnorm_s2000/step_2000/acceptance.json">最终norm</a></td>
+</tr>
+<tr>
+<td><strong>从整体不优的训练成品中保留有益类别</strong>：67.130333来源，取其2000步decoder训练后的attention或MLP</td>
+<td>整模型终点 <strong>67.031702</strong>；只取attention <strong>67.641804</strong>；只取MLP <strong>66.425104</strong></td>
+<td>类别作用相互抵消；attention组合的正结果支持选择性保留，MLP互补对照是直接反证，不能只展示成功组合</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">共同起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits00_s2000/step_2000/acceptance.json">整模型</a>、<a href="../../../../result/qwen3_8b_w25_20260930/assembled_mlpbest_bits00_s2000_attn/eval/acceptance.json">只取attention</a>、<a href="../../../../result/qwen3_8b_w25_20260930/assembled_mlpbest_bits00_s2000_mlp/eval/acceptance.json">只取MLP</a></td>
+</tr>
+<tr>
+<td><strong>两个已观察到正收益的更新是否可直接相加</strong>：在67.804523组合上恢复旧o类别；再叠加新L0训练400步的down</td>
+<td>仅恢复o <strong>68.014221</strong>；保持原o的L0训练400步 <strong>68.678250</strong>；两者组合 <strong>68.502530</strong></td>
+<td>o恢复单独有益，但与后续down联合后低于68.678250；收益存在相互作用，必须每个组合独立完整验证</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/assembled_ce50_chatml_joint_bits00_s2000_attn/eval/acceptance.json">组合起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/assembled_best_combo_restore_o552/eval/acceptance.json">仅恢复o</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_0400/acceptance.json">L0训练400</a>、<a href="../../../../result/qwen3_8b_w25_20260930/assembled_best_o552_down0_joint_s400/eval/acceptance.json">两者组合</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>关于更长训练与尚未完成的方向，必须保留观察截止边界。以下均是<strong>截至本汇报取证时已有的完整评估点，不是整个预定预算的最终结论</strong>：</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>候选及当前观察范围</th>
+<th>已完成的完整八任务结果 %</th>
+<th>可以说到哪里</th>
+<th>证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>67.130333起点的CE50/task100/response-only，预定8000步；已观察至2400步</td>
+<td>400/800/1200/1600/2000/2400分别为 <strong>60.386479 / 60.701178 / 60.942741 / 61.790441 / 58.488360 / 62.292224</strong>；同起点2000总预算终点为 <strong>66.588728</strong></td>
+<td>已观察点均低于起点；8000总预算使用warmup80和不同cosine时域，不是旧2000成品精确续训，不能宣称8000最终失败或把差异只归因步数</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_ce50_s8000/step_0400/acceptance.json">400</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_ce50_s8000/step_0800/acceptance.json">800</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_ce50_s8000/step_1200/acceptance.json">1200</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_ce50_s8000/step_1600/acceptance.json">1600</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_ce50_s8000/step_2000/acceptance.json">2000</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_ce50_s8000/step_2400/acceptance.json">2400</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_ce50_s2000/step_2000/acceptance.json">2000总预算对照</a></td>
+</tr>
+<tr>
+<td>decoder LR降至3e-6，预定2000步；已观察至800步</td>
+<td>400 <strong>66.990213</strong>；800 <strong>67.154478</strong>，后者略高于起点 <strong>67.130333</strong></td>
+<td>不能继续写“全部点均低于起点”；小幅正差尚不足以证明整个预算获胜</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_decoder_lr3e6_s2000/step_0400/acceptance.json">400</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_decoder_lr3e6_s2000/step_0800/acceptance.json">800</a></td>
+</tr>
+<tr>
+<td>直接训练原始完整lm_head，LR3e-5；已观察首400步</td>
+<td>候选 <strong>65.518530</strong>，同400步仅decoder控制 <strong>65.670493</strong></td>
+<td>首点没有净收益；不能据此宣判全部head训练预算无效，也不能与已完成的可融合linear-head混称同一试验</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_headfull_s2000/step_0400/acceptance.json">full-head</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_mlpbest_bits00_s2000/step_0400/acceptance.json">控制</a></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="section-25">局部模型级短测：容量、输入格式和答案监督</h3>
+<p>以下短测只限制<strong>训练预算</strong>，每份末态仍做了完整八任务评估。共同起点是 <strong>67.130333%</strong> 的组合成品；旧混合数据短测使用归档的1,024个训练序列和32个留出序列，后面的格式配对实验则从任务训练数据重新选择共同的1,024+32条，不能把两批不同数据直接当作单变量对照。所有“联合”均只指 L0 down 的六个decoder张量及该层两库的147,849,216个码位，<strong>不是全模型全部码位</strong>。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>比较方案</th>
+<th>实际结果与明确控制 %</th>
+<th>有效证据与限制</th>
+<th>原始证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>L0 down只学码位，换轮上限128与512步</strong>：同旧混合数据、256步、decoder冻结</td>
+<td>起点 <strong>67.130333</strong>；128换轮 <strong>66.668241</strong>；512换轮 <strong>66.294366</strong></td>
+<td>512换轮留出KL更低（0.348838对0.351088），完整任务反低 <strong>0.373875</strong> 个百分点；这批留出KL没有正确预测任务排序</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/kl_round_codes_r128_s256/eval/acceptance.json">128换轮</a>、<a href="../../../../result/qwen3_8b_w25_20260930/kl_round_codes_r512_s256/eval/acceptance.json">512换轮</a></td>
+</tr>
+<tr>
+<td><strong>同L0 down只学decoder，或decoder与码联合</strong>：旧混合数据、纯KL/prompt0.3、256步</td>
+<td>只decoder <strong>66.993562</strong>；联合 <strong>66.595799</strong>；起点 <strong>67.130333</strong></td>
+<td>联合比只decoder低 <strong>0.397763</strong> 个百分点，虽然联合留出KL更低；不能因联合优于只学码的一种端点就称已获整体收益</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/kl_joint_decoder_s256/full8/eval/acceptance.json">只decoder</a>、<a href="../../../../result/qwen3_8b_w25_20260930/kl_joint_joint_s256/full8/eval/acceptance.json">联合</a></td>
+</tr>
+<tr>
+<td><strong>只加宽L0 gate/down的decoder，H128→H256</strong>：复制隐藏表示、输出初始化为旧权重与零两半，256步，硬码冻结</td>
+<td>H128 <strong>66.960678</strong>；H256 <strong>66.965082</strong>；两者均低于起点 <strong>67.130333</strong></td>
+<td>H256只高 <strong>0.004404</strong> 个百分点，未显示明确任务收益；其留出KL更好仍未兑现。此初始化同时改变优化几何，不能把差值完全归给容量</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/decoder_width_h128_full8/eval/acceptance.json">H128</a>、<a href="../../../../result/qwen3_8b_w25_20260930/decoder_width_h256_full8/eval/acceptance.json">H256</a></td>
+</tr>
+<tr>
+<td><strong>输入格式×联合码学习，纯KL</strong>：同任务1,024+32条、256步，ChatML或“user+ASCII空格+answer”</td>
+<td>ChatML：只decoder <strong>66.872534</strong>、联合 <strong>66.651818</strong>；裸格式：只decoder <strong>66.949853</strong>、联合 <strong>66.831926</strong></td>
+<td>裸格式相对略好，但四臂均低于 <strong>67.130333</strong> 起点，两种格式内联合均低于只decoder；不能说去掉模板已经解决问题</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/decoder_ce50_ce10_mlp/eval/acceptance.json">起点</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_recovery_chatml_decoder_s256/full8/eval/acceptance.json">ChatML只decoder</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_recovery_chatml_joint_s256/full8/eval/acceptance.json">ChatML联合</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_recovery_bare_space_decoder_s256/full8/eval/acceptance.json">裸格式只decoder</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_recovery_bare_space_joint_s256/full8/eval/acceptance.json">裸格式联合</a></td>
+</tr>
+<tr>
+<td><strong>同一格式配对，换成CE50/仅response</strong>：原任务1,024+32条和256步不变</td>
+<td>ChatML：只decoder <strong>66.980049</strong>、联合 <strong>67.238282</strong>，差 <strong>+0.258233</strong>；裸格式：只decoder <strong>67.046582</strong>、联合 <strong>66.917193</strong>，差 <strong>−0.129388</strong></td>
+<td>ChatML条件下联合学习转为正向，并略超起点，是继续验证该路线的证据；裸格式仍无净收益。相对上行同时改变CE和prompt权重，不能拆成CE单因素，MMLU与OBQA也未同时改善</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/format_ce50_chatml_decoder_s256/full8/eval/acceptance.json">ChatML控制</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_ce50_chatml_joint_s256/full8/eval/acceptance.json">ChatML联合</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_ce50_bare_space_decoder_s256/full8/eval/acceptance.json">裸格式控制</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_ce50_bare_space_joint_s256/full8/eval/acceptance.json">裸格式联合</a></td>
+</tr>
+<tr>
+<td><strong>监督区域只保留语义答案</strong>：CE50 ChatML，保持输入/顺序不变，训练label从11,911个response token缩至4,743个答案token</td>
+<td>只decoder <strong>67.047415</strong>，比其response控制 <strong>66.980049</strong> 高 <strong>0.067366</strong>；联合 <strong>67.106735</strong>，比其response控制 <strong>67.238282</strong> 低 <strong>0.131547</strong></td>
+<td>简单删除包装token的监督没有改善联合路线，两份答案-only端点都未超过共同起点；不能只展示其中一个小正差</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/format_ce50_chatml_decoder_s256/full8/eval/acceptance.json">只decoder控制</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_answer_chatml_decoder_s256/full8/eval/acceptance.json">只decoder答案监督</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_ce50_chatml_joint_s256/full8/eval/acceptance.json">联合控制</a>、<a href="../../../../result/qwen3_8b_w25_20260930/format_answer_chatml_joint_s256/full8/eval/acceptance.json">联合答案监督</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>格式实验前还有一项只观察教师的机制证据：在相同14条题目与答案内容上，从ChatML改为“题目+空格+答案”，答案总负对数似然平均由 <strong>28.536976降到4.222149</strong>，14/14条都下降。这说明教师对“直接接答案”还是“继续解释”的偏好受输入形式影响，<strong>不等于教师生成正确率提高，更不是压缩模型八任务提升</strong>。去包装和新增分隔空格同时变化，答案token数也从26变27；未加空格的分支有9/14条边界不合法，在训练前取消，不能列作失败算法。<a href="../../../../result/qwen3_8b_w25_20260930/teacher_format_probe/interpretation.json">教师格式观测</a></p>
+<p>另一次教师加载对照发现，把整个教师额外转成BF16会使RoPE频率buffer也变成BF16；保留其原FP32精度后数值有变化，但“直接答案标签概率低、教师倾向解释续写”的主要现象仍存在。因此不能把格式问题全部归因于这一加载差异。<a href="../../../../result/qwen3_8b_w25_20260930/teacher_loading_ab/interpretation.json">教师加载对照</a></p>
+<h3 id="section-26">早期旧核结果：保留探索证据，不与修核后的细微增益混排</h3>
+<p><strong>以下采用修复前的decoder计算核，仅用于说明早期探索过程。后来确认并修复了归一化、激活及部分梯度/参数转换计算；关键底座已用新核复评，而这些早期退役分支未全部复评。因此，不能把下表与上面新核结果的差全部解释成算法或参数收益。</strong></p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>早期方案</th>
+<th>当时完整八任务对照 %</th>
+<th>当时能支持的有限结论</th>
+<th>保留证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无保护、完整旋转，全2bit→仅down增至3bit</td>
+<td><strong>39.190928 → 41.087902</strong></td>
+<td>增加down码率有小幅恢复，但远不足以达标</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_w2/acceptance.json">全2bit</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_down3/acceptance.json">down3bit</a></td>
+</tr>
+<tr>
+<td>上述down3结构，decoder改H256/一个残块；再比较FP32参数训练与保存</td>
+<td>原H128 <strong>41.087902</strong>；H256/BF16 <strong>39.427755</strong>；H256/FP32 <strong>37.782805</strong></td>
+<td>这套大decoder配方未优于原结构；不能泛称增加容量或FP32都无效</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_down3/acceptance.json">对照</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_decoder256/acceptance.json">H256/BF16</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_decoder256_fp32/acceptance.json">H256/FP32</a></td>
+</tr>
+<tr>
+<td>D16单阶段、FP32，20,000步</td>
+<td><strong>36.506214</strong>，低于down3两阶段基线 <strong>41.087902</strong></td>
+<td>虽总更新次数相同，但向量维度、阶段结构、网络和计算量不同，不能说单stage是唯一原因</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_single16/acceptance.json">单阶段</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_down3/acceptance.json">两阶段基线</a></td>
+</tr>
+<tr>
+<td>完整旋转下保护o512/down1280；另改无旋转及default64/down256保护</td>
+<td>完整旋转保护 <strong>42.096833</strong>；无旋转、o/down3bit和普通保护 <strong>60.849497</strong></td>
+<td>后者明显更好，但同时改变旋转、保护分配与o码率，不能把全部提升归给某一种措施</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_protect_o512_down1280/acceptance.json">完整旋转保护</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_o3_down3/acceptance.json">无旋转普通保护</a></td>
+</tr>
+<tr>
+<td>无旋转普通保护底座上，q/o码率互换、增加保护、FP32三个后续对照</td>
+<td>原 <strong>60.849497</strong>；q3/o2 <strong>60.465492</strong>；default96/down288保护 <strong>60.896449</strong>；FP32 <strong>61.179242</strong></td>
+<td>q/o互换未改善；增加保护只出现很小正差，FP32也仅为这套旧核条件下的观测，不能迁移为新几何结论</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_o3_down3/acceptance.json">原源</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_q3_o2/acceptance.json">q/o互换</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_protect96/acceptance.json">增加保护</a>、<a href="../../../../result/qwen3_8b_w25_20260930/reconstruction_no_rotation_o3_down3_fp32/acceptance.json">FP32</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>还有三类证据不应归入“已证明有效/无效”的表格：</p>
+<ul>
+<li><strong>只做结构迁移、未开始训练的候选。</strong> 恒等初始化加入一个decoder残块后，完整基线为67.139093%，原源67.130333%；这一极小差值发生在未训练状态，属于推理数值路径差异，不是学习收益。其2000步训练候选在目标达到后取消，不能列为训练失败。<a href="../../../../result/qwen3_8b_w25_20260930/decoder_r1_identity/eval/acceptance.json">迁移基线</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_r1_identity_s2000/launch.json">取消记录</a></li>
+<li><strong>有训练过程或原生评测，但未完成同级独立验收。</strong> 早期H256、decoder LR1e-5分支因持续训练失稳，经批准停止；后续LR1e-6训练2000步的原生完整评估为63.819886%，但没有保存成品的独立strict重载验收。可作为过程证据，不能与独立验收表混排作精细结论。<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_h256_lr1e5/stop_record.json">停止证据</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_decoder_h256_lr1e6/home_star_models_Qwen_Qwen3-8B_20261001_182154/lm_eval/lm_eval_results_final.json">低LR原生评估</a></li>
+<li><strong>不满足本目标前提的历史分数。</strong> D16逐类别恢复中间曾出现69.323140%，但该点仍有未压缩dense投影；它不属于252投影全部压缩的69%成品。旧训练数据也曾有RTE题干为空且答案映射颠倒的问题，不能把旧数据上的CE负结果移用到本次已修复的176,597行数据。最终达标使用修复版数据，训练与评估集合按既定来源分离。<a href="../../../../result/qwen3_8b_w25_20260930/down_category_transition_d16_prefix/diagnostic_summary.json">中间状态诊断</a>、<a href="../../../../result/qwen3_8b_w25_20260930/data/task_manifest.json">当前数据来源与校验</a></li>
+</ul>
+<h2 id="section-27">可直接用于口头汇报的说明</h2>
+<p>我们的目标是在Qwen3-8B的主要Transformer投影上，把实际权重存储控制在平均2.5 bit以内，同时让固定八项下游任务平均分超过69%。最终达到的是69.313%，投影存储2.457 bit，完整模型权重文件约4.625 GB。</p>
+<p>压缩表示有三部分：大多数权重以两级二进制向量编码保存，小型BF16 decoder负责重建；少量重要输入通道保留INT8；再保存恢复旋转所需的符号和索引等辅助信息。q/k/v/gate/up主编码是2 bit，o/down是3 bit，但我们报告的2.457已经计入decoder和保护开销。</p>
+<p>精度恢复经历了多级训练。先按七类逐次压缩，每次用教师蒸馏更新已压缩decoder，并临时补偿尚未压缩的dense层；临时LoRA会融合，不留在成品里。再从不同损失配方中组合较好的attention与MLP类别。最后从67.805%的组合模型出发，只训练第一层down的decoder和二进制码，在1200步达到69.313%。</p>
+<p>比较实验说明，增加位宽、加宽decoder、延长训练或训练更多码位都不保证提升。有些改动改善了局部重构误差，却降低了完整下游均分；有些整模型分支略退步，但取其中attention类别反而有价值。因此本次结论依赖实际保存模型的完整评测，而不是只看训练loss。69.313%是这条组合路线的实测成绩；各部分独立贡献仍有尚未完成的严格消融，尤其不能把最后1.508个百分点全部说成码位翻转的单独贡献。</p>
+<h2 id="section-28">复现和证据索引</h2>
+<p>交付模型为 <a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/final_model">step1200 final_model</a>，UUID <code>f927ffda-dd5b-4d00-b63a-5e839a182d70</code>。它包含全部部署张量，加载不需要已清理的祖先压缩权重。当前项目v6 loader仍先从原HF目录构建和加载原模型，再覆盖压缩状态，因此需要可用的原HF权重目录、配置/tokenizer及CUDA/FlashAttention2环境；不能把压缩目录当作普通dense HF权重直接解释。成品文件的存储大小与当前loader的这些外部运行依赖应分开理解。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>需要核对的内容</th>
+<th>权威证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原任务完整历史与结论边界</td>
+<td><a href="2026-09-30_goal.md">原69%实验记录</a></td>
+</tr>
+<tr>
+<td>原始模型revision及分片哈希</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/model_source.json">model_source.json</a></td>
+</tr>
+<tr>
+<td>数据行数、哈希、分区来源</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/data/task_manifest.json">task_manifest.json</a></td>
+</tr>
+<tr>
+<td>最终实际CLI、来源、代码文件哈希和退出结果</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/launch.json">launch.json</a></td>
+</tr>
+<tr>
+<td>各模块结构和实际成品字段</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/final_model/checkpoint_meta.json">checkpoint_meta.json</a></td>
+</tr>
+<tr>
+<td>均分、任务指标、样本数、位宽分项</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/acceptance.json">acceptance.json</a></td>
+</tr>
+<tr>
+<td>导出、冻结、硬码和保存重载一致性</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/audit.json">audit.json</a></td>
+</tr>
+<tr>
+<td>原始八任务输出</td>
+<td><a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/mmlu.json">mmlu.json</a>、<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/seven.json">seven.json</a></td>
+</tr>
+<tr>
+<td>位宽统计实现</td>
+<td><a href="../../../../train_utils/checkpoint_bpw.py">checkpoint_bpw.py</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>运行环境记录为Python3.11.16、PyTorch2.6.0+cu124、transformers4.51.0、datasets3.6.0、lm-eval0.4.8，使用<code>bitvae</code>和A800 80GB GPU。代码起点为<code>95c1dd9</code>，实际实验包含未提交修改，各次运行以launch中的文件哈希为版本依据，不能把起点commit当作最终全部代码身份。</p>
+<p>交付权重SHA256为<code>abcf27f6bfe6c57724027df32b141cb43a306af2762beb25f78f7258c8134266</code>；完整验收SHA256为<code>22af432db1a90c751a5a184debdc084fa17fd59abb78f1c573af2574381d1786</code>。本文复核已有原始结果和代码，没有重新训练或重新跑GPU评测。</p>
+<p>历史探索中已退役的权重和优化器状态有些已按项目清理规则删除，但对应原始评测、配置、metadata和关键审计仍保留。本文中的链接优先指向这些持久证据；原模型、数据和当前交付成品的保留用途与探索中间态不同。</p>
+<footer>本文是已完成69%阶段的实验汇报快照。正文可离线阅读；原始证据链接对应VAELLM仓库中的相对路径。阅读版由同目录Markdown正文生成。</footer></main></div></body></html>

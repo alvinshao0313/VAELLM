@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -168,6 +170,24 @@ def _write_jsonl_record(handle, record: Dict[str, object]) -> None:
     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+@contextmanager
+def _atomic_jsonl_writer(output_path: Path):
+    # Interrupted downloads must not look complete to --skip_existing.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=output_path.parent,
+        prefix=output_path.name + ".", suffix=".partial", delete=False,
+    ) as handle:
+        partial_path = Path(handle.name)
+        try:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            partial_path.unlink(missing_ok=True)
+            raise
+    partial_path.replace(output_path)
+
+
 def _report_saved(path: Path, count: int) -> None:
     size_mb = path.stat().st_size / 1024 / 1024
     print(f"Saved {count} samples -> {path} ({size_mb:.1f} MB)")
@@ -180,7 +200,7 @@ def generate_ii_7M_instruct(*, output_dir: Path, max_samples: Optional[int]) -> 
     print(f"Loading {_INFINITY_REPO} (7M) ...")
     dataset = _load_infinity_dataset("7M")
     count = 0
-    with output_path.open("w", encoding="utf-8") as handle:
+    with _atomic_jsonl_writer(output_path) as handle:
         for example in tqdm(dataset, desc="ii_7M_instruct"):
             messages = _convert_infinity_conversations(example.get("conversations"))
             if messages is None:
@@ -200,7 +220,7 @@ def generate_ii_gen_instruct(*, output_dir: Path, max_samples: Optional[int]) ->
     print(f"Loading {_INFINITY_REPO} (Gen) ...")
     dataset = _load_infinity_dataset("Gen")
     count = 0
-    with output_path.open("w", encoding="utf-8") as handle:
+    with _atomic_jsonl_writer(output_path) as handle:
         for example in tqdm(dataset, desc="ii_gen_1.4M_instruct"):
             messages = _convert_infinity_conversations(example.get("conversations"))
             if messages is None:
@@ -220,7 +240,7 @@ def generate_tulu_instruct(*, output_dir: Path, max_samples: Optional[int]) -> i
     print("Loading allenai/tulu-v3.1-mix-preview-4096-OLMoE ...")
     dataset = _load_hf_dataset("allenai/tulu-v3.1-mix-preview-4096-OLMoE")
     count = 0
-    with output_path.open("w", encoding="utf-8") as handle:
+    with _atomic_jsonl_writer(output_path) as handle:
         for example in tqdm(dataset, desc="tulu_0.6M_instruct"):
             messages = example.get("messages")
             if not isinstance(messages, list):
@@ -240,7 +260,7 @@ def generate_am_instruct(*, output_dir: Path, max_samples: Optional[int]) -> int
     output_path = output_dir / "am_1.4M_instruct.jsonl"
     count = 0
     skipped = 0
-    with output_path.open("w", encoding="utf-8") as handle:
+    with _atomic_jsonl_writer(output_path) as handle:
         for filename in _AM_FILES:
             print(f"Downloading {_AM_REPO}/{filename} ...")
             download_kwargs = {"repo_type": "dataset"}

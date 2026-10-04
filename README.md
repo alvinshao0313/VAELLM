@@ -6,14 +6,16 @@
 - 已压缩模型的端到端恢复训练：`python -m compressed_e2e_fintuning.main`
 - 已完成 VAE 压缩后的逐类别恢复：`tools/cat_distill_from_vae_checkpoint.py`
 
-三条链路共享 `train_utils.config` 的数据、loss、目标范围和运行时配置。模型级 loss 仅支持 `sft`、`kl`、`kl_top`、`kd`、`kd_top`；top-k 必须通过独立的 `--top_k` 指定。
+三条链路共享 `train_utils.config` 的数据、loss、目标范围和运行时配置。模型级 loss 支持 `sft`、`kl`、`kl_top`、`kl_top_partial`、`kl_top_mass`、`kl_top_mse`、`kd`、`kd_top`、`kd_top_partial`、`kd_top_mass`；top-k 通过独立的 `--top_k` 指定。完整校验以 `train_utils/config/configs.py` 的 `LOSS_TYPES` 为准。
 
 ## 推荐流程
 
 ```bash
 bash scripts/catlora_simple2.sh
 bash compressed_e2e_fintuning/scripts/e2e_decoder.sh
-python tools/cat_eval.py --checkpoint_dir .result/example/final_model
+python tools/cat_eval.py --checkpoint_dir .result/example/final_model \
+  --eval_lm_eval --tasks boolq,rte,winogrande,arc_easy,arc_challenge,openbookqa,piqa,mmlu \
+  --num_fewshot 0 --output_json .result/example/eval.json
 ```
 
 CAT online 支持六种 `--after_category_mode`：

@@ -463,27 +463,28 @@ def launch_init_scores(
     max_active = int(meta.max_active)
     block = 256
     grid = _q_bank_grid(max_active, block, int(meta.num_banks))
-    _init_scores_kernel[grid](
-        packed,
-        score_span,
-        meta.n_bits,
-        meta.n_active,
-        meta.cursor,
-        meta.stride,
-        meta.offset,
-        meta.remaining,
-        meta.secondary_stride,
-        meta.secondary_offset,
-        meta.model_idx,
-        meta.score_offset,
-        meta.score_radius,
-        B=int(packed.shape[0]),
-        M=int(packed.shape[1]),
-        IN=int(meta.logical_in_dim),
-        P=int(packed.shape[2]),
-        BLOCK_Q=block,
-        num_warps=4,
-    )
+    with torch.cuda.device(packed.device):
+        _init_scores_kernel[grid](
+            packed,
+            score_span,
+            meta.n_bits,
+            meta.n_active,
+            meta.cursor,
+            meta.stride,
+            meta.offset,
+            meta.remaining,
+            meta.secondary_stride,
+            meta.secondary_offset,
+            meta.model_idx,
+            meta.score_offset,
+            meta.score_radius,
+            B=int(packed.shape[0]),
+            M=int(packed.shape[1]),
+            IN=int(meta.logical_in_dim),
+            P=int(packed.shape[2]),
+            BLOCK_Q=block,
+            num_warps=4,
+        )
 
 
 def launch_set_scores(
@@ -502,31 +503,8 @@ def launch_set_scores(
         flip_counter.zero_()
     block = 256
     grid = _q_bank_grid(int(meta.max_active), block, int(meta.num_banks))
-    _set_scores_full_words_kernel[grid](
-        packed,
-        score_span,
-        flip_counter,
-        meta.n_bits,
-        meta.n_active,
-        meta.cursor,
-        meta.stride,
-        meta.offset,
-        meta.remaining,
-        meta.secondary_stride,
-        meta.secondary_offset,
-        meta.model_idx,
-        meta.score_offset,
-        int(packed.numel()),
-        B=int(packed.shape[0]),
-        M=int(packed.shape[1]),
-        IN=int(meta.logical_in_dim),
-        P=int(packed.shape[2]),
-        BLOCK_Q=block,
-        num_warps=4,
-    )
-    tail = int(packed.numel()) % 4
-    if tail:
-        _tail_bytes_kernel[(tail,)](
+    with torch.cuda.device(packed.device):
+        _set_scores_full_words_kernel[grid](
             packed,
             score_span,
             flip_counter,
@@ -535,21 +513,46 @@ def launch_set_scores(
             meta.cursor,
             meta.stride,
             meta.offset,
-            meta.inverse,
             meta.remaining,
             meta.secondary_stride,
             meta.secondary_offset,
-            meta.secondary_inverse,
             meta.model_idx,
             meta.score_offset,
-            PACKED_NUMEL=int(packed.numel()),
+            int(packed.numel()),
             B=int(packed.shape[0]),
             M=int(packed.shape[1]),
             IN=int(meta.logical_in_dim),
             P=int(packed.shape[2]),
-            NUM_BANKS=int(meta.num_banks),
-            num_warps=1,
+            BLOCK_Q=block,
+            num_warps=4,
         )
+    tail = int(packed.numel()) % 4
+    if tail:
+        with torch.cuda.device(packed.device):
+            _tail_bytes_kernel[(tail,)](
+                packed,
+                score_span,
+                flip_counter,
+                meta.n_bits,
+                meta.n_active,
+                meta.cursor,
+                meta.stride,
+                meta.offset,
+                meta.inverse,
+                meta.remaining,
+                meta.secondary_stride,
+                meta.secondary_offset,
+                meta.secondary_inverse,
+                meta.model_idx,
+                meta.score_offset,
+                PACKED_NUMEL=int(packed.numel()),
+                B=int(packed.shape[0]),
+                M=int(packed.shape[1]),
+                IN=int(meta.logical_in_dim),
+                P=int(packed.shape[2]),
+                NUM_BANKS=int(meta.num_banks),
+                num_warps=1,
+            )
     return flip_counter
 
 
@@ -563,35 +566,36 @@ def launch_dscore(
     block_q = 32
     block_h = 128
     grid = _q_bank_grid(int(meta.max_active), block_q, int(meta.num_banks))
-    _dscore_kernel[grid](
-        grad_out,
-        weight,
-        score_grad,
-        meta.n_bits,
-        meta.n_active,
-        meta.cursor,
-        meta.stride,
-        meta.offset,
-        meta.remaining,
-        meta.secondary_stride,
-        meta.secondary_offset,
-        meta.model_idx,
-        meta.score_offset,
-        meta.score_gradient_scale,
-        int(grad_out.shape[0]),
-        int(grad_out.shape[1]),
-        int(meta.logical_in_dim),
-        int(grad_out.shape[2]),
-        grad_out.stride(0),
-        grad_out.stride(1),
-        grad_out.stride(2),
-        weight.stride(0),
-        weight.stride(1),
-        weight.stride(2),
-        BLOCK_Q=block_q,
-        BLOCK_H=block_h,
-        num_warps=4,
-    )
+    with torch.cuda.device(grad_out.device):
+        _dscore_kernel[grid](
+            grad_out,
+            weight,
+            score_grad,
+            meta.n_bits,
+            meta.n_active,
+            meta.cursor,
+            meta.stride,
+            meta.offset,
+            meta.remaining,
+            meta.secondary_stride,
+            meta.secondary_offset,
+            meta.model_idx,
+            meta.score_offset,
+            meta.score_gradient_scale,
+            int(grad_out.shape[0]),
+            int(grad_out.shape[1]),
+            int(meta.logical_in_dim),
+            int(grad_out.shape[2]),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_out.stride(2),
+            weight.stride(0),
+            weight.stride(1),
+            weight.stride(2),
+            BLOCK_Q=block_q,
+            BLOCK_H=block_h,
+            num_warps=4,
+        )
 
 
 def launch_rms_sgd_update(
@@ -609,28 +613,30 @@ def launch_rms_sgd_update(
     else:
         flip_counter.zero_()
     rms = torch.empty((int(meta.num_banks),), device=score.device, dtype=torch.float32)
-    _rms_by_bank_kernel[(int(meta.num_banks),)](
-        grad,
-        rms,
-        meta.n_active,
-        meta.score_offset,
-        EPS=float(eps),
-        BLOCK=1024,
-        num_warps=8,
-    )
+    with torch.cuda.device(score.device):
+        _rms_by_bank_kernel[(int(meta.num_banks),)](
+            grad,
+            rms,
+            meta.n_active,
+            meta.score_offset,
+            EPS=float(eps),
+            BLOCK=1024,
+            num_warps=8,
+        )
     block = 256
-    _rms_sgd_update_kernel[_q_bank_grid(int(meta.max_active), block, int(meta.num_banks))](
-        score,
-        grad,
-        rms,
-        flip_counter,
-        meta.n_active,
-        meta.score_offset,
-        meta.score_radius,
-        LR=float(lr),
-        BLOCK=block,
-        num_warps=4,
-    )
+    with torch.cuda.device(score.device):
+        _rms_sgd_update_kernel[_q_bank_grid(int(meta.max_active), block, int(meta.num_banks))](
+            score,
+            grad,
+            rms,
+            flip_counter,
+            meta.n_active,
+            meta.score_offset,
+            meta.score_radius,
+            LR=float(lr),
+            BLOCK=block,
+            num_warps=4,
+        )
     return flip_counter
 
 
@@ -661,24 +667,25 @@ def launch_adam_update(
     bias1 = 1.0 - float(beta1) ** t
     bias2 = 1.0 - float(beta2) ** t
     block = 256
-    _adam_update_kernel[_q_bank_grid(int(meta.max_active), block, int(meta.num_banks))](
-        score,
-        grad,
-        exp_avg,
-        exp_avg_sq,
-        flip_counter,
-        meta.n_active,
-        meta.score_offset,
-        meta.score_radius,
-        LR=float(lr),
-        BETA1=float(beta1),
-        BETA2=float(beta2),
-        EPS=float(eps),
-        BIAS1=float(bias1),
-        BIAS2=float(bias2),
-        WEIGHT_DECAY=float(weight_decay),
-        USE_ADAMW=bool(adamw),
-        BLOCK=block,
-        num_warps=4,
-    )
+    with torch.cuda.device(score.device):
+        _adam_update_kernel[_q_bank_grid(int(meta.max_active), block, int(meta.num_banks))](
+            score,
+            grad,
+            exp_avg,
+            exp_avg_sq,
+            flip_counter,
+            meta.n_active,
+            meta.score_offset,
+            meta.score_radius,
+            LR=float(lr),
+            BETA1=float(beta1),
+            BETA2=float(beta2),
+            EPS=float(eps),
+            BIAS1=float(bias1),
+            BIAS2=float(bias2),
+            WEIGHT_DECAY=float(weight_decay),
+            USE_ADAMW=bool(adamw),
+            BLOCK=block,
+            num_warps=4,
+        )
     return flip_counter

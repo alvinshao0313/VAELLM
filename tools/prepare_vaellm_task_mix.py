@@ -20,6 +20,7 @@ from jinja2 import Template
 from tqdm import tqdm
 
 from e2e_common.data import record_to_mcqa_example
+from tools.prepare_edgerazor_distill_jsonl import _atomic_jsonl_writer
 
 def _hellaswag_preprocess(text: str) -> str:
     text = text.strip()
@@ -252,7 +253,7 @@ def _write_task_jsonl(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stats: Dict[str, int] = {}
 
-    with output_path.open("w", encoding="utf-8") as handle:
+    with _atomic_jsonl_writer(output_path) as handle:
         for task_name, config in KEEP_TASK_CONFIGS.items():
             count = 0
             iterator = _iter_task_config_records(

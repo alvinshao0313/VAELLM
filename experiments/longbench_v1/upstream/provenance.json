@@ -1,0 +1,31 @@
+{
+  "repository": "https://github.com/THUDM/LongBench",
+  "commit": "2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+  "license": "MIT",
+  "files": {
+    "metrics.py": {
+      "upstream_path": "LongBench/metrics.py",
+      "url": "https://raw.githubusercontent.com/THUDM/LongBench/2e00731f8d0bff23dc4325161044d0ed8af94c1e/LongBench/metrics.py",
+      "sha256": "e22e2a2662e0f7e683137fa3541f64edb6a801e9138d16d2f3459a6ab9941323",
+      "bytes": 5190
+    },
+    "dataset2prompt.json": {
+      "upstream_path": "LongBench/config/dataset2prompt.json",
+      "url": "https://raw.githubusercontent.com/THUDM/LongBench/2e00731f8d0bff23dc4325161044d0ed8af94c1e/LongBench/config/dataset2prompt.json",
+      "sha256": "56d22ad4f382169c2b8a11ff4c982a4a1bea096c8152b0f0b85b64686b157c30",
+      "bytes": 5437
+    },
+    "dataset2maxlen.json": {
+      "upstream_path": "LongBench/config/dataset2maxlen.json",
+      "url": "https://raw.githubusercontent.com/THUDM/LongBench/2e00731f8d0bff23dc4325161044d0ed8af94c1e/LongBench/config/dataset2maxlen.json",
+      "sha256": "72966b3c0933e214591637fb085798c5e687ebff4ddaab5d99bbc31120532022",
+      "bytes": 459
+    },
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/THUDM/LongBench/2e00731f8d0bff23dc4325161044d0ed8af94c1e/LICENSE",
+      "sha256": "bf7f05f274d65931bdf14f060b6855f1c359b8424eb74fd3091d25de89d700c3",
+      "bytes": 1075
+    }
+  }
+}

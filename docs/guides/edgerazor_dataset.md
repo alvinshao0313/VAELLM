@@ -11,7 +11,7 @@ CAT 与 compressed E2E 统一通过 common data config 使用 EdgeRazor 数据�
 
 先运行 `bash scripts/prepare_vaellm_edgerazor_data.sh` 准备本地数据。alias、采样权重、tokenization 与 cache key 都由 shared data layer 处理；CAT 和 E2E 不各自维护第二套数据语义。
 
-模型级 loss 仅支持 `sft`、`kl`、`kl_top`、`kd`、`kd_top`。推荐脚本使用 `kl_top` 和独立 `--top_k 100`，teacher 输出通过 `--teacher_output_offload cpu` 暂存。
+模型级 loss 的当前列表见 [项目概览](../../README.md)。`catlora_simple2.sh` 使用 `kl_top_mass`，`e2e_decoder.sh` 的 DP 分支使用 `kd_top_partial`，两者用独立 `--top_k 100`；teacher 输出通过 `--teacher_output_offload cpu` 暂存。
 
 正式入口：
 

@@ -2,7 +2,7 @@
 
 ## 当前架构
 
-CAT online 与 checkpoint-distill 共用 `train_utils.cat_after_category_common`：同一套目标 inventory、数据、五种模型级 loss、plain full-space LoRA、decoder finalize 和 v6 exact-resume 逻辑。
+CAT online 与 checkpoint-distill 共用 `train_utils.cat_after_category_common`：同一套目标 inventory、数据、模型级 loss、plain full-space LoRA、decoder finalize 和 v6 exact-resume 逻辑。
 
 在线 CAT 有六种 `after_category_mode`；checkpoint-distill 只允许 current-family 三种。两条入口必须显式声明调用来源，不再根据目标数量或模型拓扑猜测。
 
@@ -57,7 +57,9 @@ python tools/cat_train.py \
 | `remaining_lora_current_decoder` | remaining LoRA + 当前类别 decoder |
 | `remaining_lora_prefix_decoder` | remaining LoRA + 已完成前缀 decoder |
 
-非 `none` 模式必须提供数据源。模型级 loss 仅支持 `sft`、`kl`、`kl_top`、`kd`、`kd_top`；K 使用独立 `--top_k`。
+非 `none` 模式必须提供数据源。模型级 loss 的当前列表见 [项目概览](../../README.md)，包括脚本采用的 `kl_top_mass`；K 使用独立 `--top_k`。
+
+[cat_w25_remaining.sh](../../scripts/cat_w25_remaining.sh) 是本轮无部署 LoRA 分支的在线候选入口：从原模型逐类压缩，未压缩 dense 的 rank12 LoRA 在每类后融合，同时更新已压缩前缀的 decoder；最后一类仍更新 decoder。它不能直接以全部压缩后的 checkpoint 重放 remaining-family。具体配方及验证状态见 [本轮记录](../experience/records/qwen3_w25/2026-09-30_goal.md)。
 
 ## v6 保存
 

@@ -158,3 +158,9 @@ def test_runtime_v6_tiny_decoder_smoke_runs_to_atomic_final_model(tmp_path: Path
     assert meta["runtime_audit"]["structural_finalization_forward_parity"]["max_abs"] >= 0.0
     assert meta["runtime_audit"]["runtime_cleanup_forward_parity"]["max_abs"] >= 0.0
     assert meta["runtime_audit"]["finalization_forward_parity"]["max_abs"] >= 0.0
+
+    audit = meta["runtime_audit"]["decoder_compute_path_difference"]
+    assert audit["source_path"] == "training_decode"
+    assert audit["reference_path"] == "deployment_decode"
+    assert audit["max_abs"] >= 0.0
+    assert audit["relative_l2"] >= 0.0

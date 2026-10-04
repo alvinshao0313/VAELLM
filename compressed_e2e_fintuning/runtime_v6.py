@@ -482,12 +482,12 @@ def _assert_final_runtime_clean(model: nn.Module) -> None:
             raise RuntimeError(f"{name}: trainable_decode survived finalization.")
 
 
-def run(cfg, hf_args, training_args) -> Dict[str, object]:
+def run(cfg, hf_args, training_args, *, extra_callbacks=()) -> Dict[str, object]:
     # Lazy import avoids a module cycle: orchestration consumes the runtime
     # primitives above, while this remains the single public E2E v6 entrypoint.
     from compressed_e2e_fintuning.runtime_v6_pipeline import run_pipeline
 
-    return run_pipeline(cfg, hf_args, training_args)
+    return run_pipeline(cfg, hf_args, training_args, extra_callbacks=extra_callbacks)
 
 
 __all__ = ["run"]

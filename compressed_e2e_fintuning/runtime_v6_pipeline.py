@@ -13,7 +13,7 @@ from torch import nn
 from transformers.trainer_callback import TrainerState
 
 from compressed_e2e_fintuning.device_map import apply_boundary_device_map, apply_layer_device_map
-from compressed_e2e_fintuning.mid_eval import EvalAfterSaveCallback
+from compressed_e2e_fintuning.mid_eval import EvalAfterSaveCallback, temporary_inference_decode_mode
 from compressed_e2e_fintuning.offload import (
     unwrap_streaming_offload_layers,
     wrap_model_layers_for_streaming_offload,
@@ -553,7 +553,7 @@ def _run_final_lm_eval(*, model, tokenizer, cfg, base_model_path: str, output_di
     )
 
 
-def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
+def run_pipeline(cfg, hf_args, training_args, *, extra_callbacks=()) -> Dict[str, object]:
     log = get_logger("compressed_e2e_fintuning")
     stop_after_step = _validate_stop_after_step(cfg, training_args)
     round_base_dir, round_base_meta, step_meta = _resolve_round_base(cfg)
@@ -760,6 +760,7 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
 
     eval_args = _build_eval_args(cfg)
     callbacks = [E2ETrainerLogCallback(logger=log)]
+    callbacks.extend(extra_callbacks)
     eval_after_save_callback = None
     if bool(eval_args.eval_after_save):
         eval_after_save_callback = EvalAfterSaveCallback(
@@ -935,6 +936,29 @@ def run_pipeline(cfg, hf_args, training_args) -> Dict[str, object]:
     def _capture_initial_finalization_probe():
         probe_inputs = _build_finalization_probe_inputs(tokenizer)
         probe_before, probe_dtype = _run_finalization_probe(final_model, probe_inputs)
+        if train_decoder or train_sparse:
+            # Structural parity compares the same deployment decode path on both
+            # sides; packed-to-fused rounding is a separate numerical diagnostic.
+            with temporary_inference_decode_mode(final_model, cache_decoded_weight=True):
+                deployment_probe, deployment_dtype = _run_finalization_probe(final_model, probe_inputs)
+            if deployment_dtype != probe_dtype:
+                raise RuntimeError(
+                    "Deployment decode probe output dtype changed: "
+                    f"before={probe_dtype} after={deployment_dtype}."
+                )
+            difference = deployment_probe - probe_before
+            checkpoint_context["runtime_audit"]["decoder_compute_path_difference"] = {
+                "source_path": "training_decode",
+                "reference_path": "deployment_decode",
+                "output_dtype": str(probe_dtype),
+                "max_abs": float(difference.abs().max()),
+                "relative_l2": float(difference.norm() / probe_before.norm().clamp_min(1e-12)),
+            }
+            log.info(
+                "Training-to-deployment decoder numerical difference (not structural parity): %s",
+                checkpoint_context["runtime_audit"]["decoder_compute_path_difference"],
+            )
+            probe_before = deployment_probe
         probe_state["inputs"] = probe_inputs
         probe_state["before"] = probe_before
         probe_state["dtype"] = probe_dtype

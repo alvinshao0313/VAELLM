@@ -1,0 +1,312 @@
+--- a/experiments/w25_eval/subset_state.py
++++ b/experiments/w25_eval/subset_state.py
+@@ -1,4 +1,4 @@
+-"""Architecture boundaries for the existing H128/H256 R0 two-stage down recipe.
++"""Architecture boundaries for the existing H128/H256 R0 two-stage recipe.
+ 
+ The live Qwen boundary cannot be edited while its callbacks are running. Numeric
+ restore/audit helpers remain shared; only model inventory and recipe checks live here.
+@@ -17,7 +17,7 @@
+ from experiments.w25_eval.model_inventory import model_inventory
+ from litebsq.vae_linear import VAELinear
+ from train_utils.checkpoint_v6 import load_v6_training_step_meta, resolve_training_step_round_base_ref
+-from train_utils.config.targets import parse_target_layers, resolve_target_layers
++from train_utils.config.targets import parse_target_layers, parse_target_modules, resolve_target_layers
+ from train_utils.utils import extract_layer_idx
+ 
+ 
+@@ -33,15 +33,33 @@
+     return resolve_target_layers(parsed, num_layers=architecture['num_hidden_layers'])
+ 
+ 
++def selected_modules(target_modules, architecture):
++    available = tuple(dict.fromkeys(name.rsplit('.', 1)[-1]
++                                   for name in architecture['projection_shapes']))
++    if isinstance(target_modules, str):
++        requested = parse_target_modules(target_modules)
++    else:
++        _require(isinstance(target_modules, (tuple, list)) and bool(target_modules)
++                 and all(isinstance(module, str) for module in target_modules),
++                 'Selected modules must be a nonempty collection of projection suffixes.')
++        requested = tuple(target_modules)
++        _require(len(set(requested)) == len(requested), 'Duplicate selected module suffixes.')
++    modules = available if requested == 'all' else tuple(requested)
++    _require(bool(modules) and set(modules) <= set(available),
++             f'Unknown projection suffixes: {sorted(set(modules) - set(available))}.')
++    # Native runtime stores suffixes in model traversal order, not CLI order.
++    return tuple(module for module in available if module in modules)
++
++
+ def selected_names(target_layers, target_modules, architecture):
+     layers = selected_layers(target_layers, architecture)
+-    modules = (target_modules,) if isinstance(target_modules, str) else tuple(target_modules)
+-    _require(modules == ('down_proj',), 'Subset export supports down_proj only.')
++    modules = selected_modules(target_modules, architecture)
+     names = tuple(name for name in architecture['projection_shapes']
+-                  if name.endswith('.down_proj') and extract_layer_idx(name) in layers)
+-    _require(len(names) == len(layers)
+-             and {extract_layer_idx(name) for name in names} == set(layers),
+-             'Selected down projections are absent or ambiguous in the real architecture.')
++                  if name.rsplit('.', 1)[-1] in modules and extract_layer_idx(name) in layers)
++    pairs = {(extract_layer_idx(name), name.rsplit('.', 1)[-1]) for name in names}
++    expected = {(layer, module) for layer in layers for module in modules}
++    _require(len(names) == len(expected) and pairs == expected,
++             'Selected projections are absent or ambiguous in the real architecture.')
+     return names
+ 
+ 
+@@ -106,8 +124,9 @@
+     """
+     contract = meta["immutable_resume_contract"]
+     cfg, training = snapshot["canonical_config"], snapshot["training_args"]
+-    _require(meta["train_mode"] == contract["train_mode"] == "decoder_sparse_bit",
+-             "Subset export requires native decoder_sparse_bit training.")
++    _require(meta["train_mode"] in ("decoder", "decoder_sparse_bit")
++             and meta["train_mode"] == contract["train_mode"],
++             "Subset export requires matching native decoder or decoder_sparse_bit training.")
+     _require(meta["lora_config"] is None and contract["lora"] is None, "LoRA is outside this export topology.")
+     for key in ("norm_train_mode", "lm_head_train_mode"):
+         _require(meta[key] == contract["aux"][key] == "none", f"Expected {key}=none.")
+@@ -118,16 +137,22 @@
+     _require(contract["distributed"]["world_size"] == 1, "This recipe uses single-process training/export.")
+     _require(contract["precision"]["bf16"] and not contract["precision"]["fp16"], "BF16 compute/export is required.")
+     _require(contract["optimization"].get("distill_fp32_components") == ["decoder"], "Expected FP32 decoder parameters only.")
+-    _require(contract["sparse_bit"].get("proxy_coordinates") == "decoder_sensitivity"
+-             and contract["sparse_bit"]["active_ratio"] == 1.0,
+-             "Subset export requires all bits and decoder_sensitivity coordinates.")
++    if meta["train_mode"] == "decoder_sparse_bit":
++        _require(contract["sparse_bit"].get("proxy_coordinates") == "decoder_sensitivity"
++                 and contract["sparse_bit"]["active_ratio"] == 1.0,
++                 "Joint subset export requires all bits and decoder_sensitivity coordinates.")
++    else:
++        _require("proxy_coordinates" not in contract["sparse_bit"],
++                 "Decoder-only native contracts must not claim active bit coordinates.")
+     _require(type(state["global_step"]) is int and 0 < state["global_step"] <= state["max_steps"], "Invalid selected optimizer step.")
+     _require(state["max_steps"] == training["max_steps"] == contract["optimization"]["steps"], "Original total steps disagree; do not edit them to export.")
+     selected_names(meta["target_layers"], meta["target_modules"], architecture)
+-    _require(meta["target_layers"] == contract["target_layers"] == cfg["target_layers"],
+-             "Subset target layers disagree across metadata, contract and snapshot.")
+-    _require(meta["target_modules"] == contract["target_modules"] == cfg["target_modules"],
+-             "Subset target modules disagree across metadata, contract and snapshot.")
++    _require(meta["target_layers"] == contract["target_layers"]
++             == list(selected_layers(cfg["target_layers"], architecture)),
++             "Resolved target layers disagree across metadata, contract and snapshot.")
++    _require(meta["target_modules"] == contract["target_modules"]
++             == list(selected_modules(cfg["target_modules"], architecture)),
++             "Resolved target modules disagree across metadata, contract and snapshot.")
+     _require(training["seed"] == contract["data"]["seed"], "Snapshot training seed disagrees.")
+ 
+     # The normalized snapshot precedes dataset construction, which resolves the
+@@ -159,6 +184,16 @@
+     return contract
+ 
+ 
++def validate_sparse_sidecar(checkpoint, train_mode):
++    sparse = Path(checkpoint) / 'sparse_bit_tuning'
++    if train_mode == 'decoder_sparse_bit':
++        _require((sparse / 'exact_state.pt').is_file(), 'Missing exact SparseBit sidecar.')
++    elif train_mode == 'decoder':
++        _require(not sparse.exists(), 'Decoder-only checkpoint unexpectedly contains SparseBit state.')
++    else:
++        raise ValueError('Unsupported subset training mode.')
++
++
+ def inspect_step(checkpoint):
+     checkpoint = Path(checkpoint).resolve()
+     meta = load_v6_training_step_meta(str(checkpoint))
+@@ -176,5 +211,5 @@
+              'The selected training step does not cover the complete actual architecture.')
+     _require(set(selected_names(meta['target_layers'], meta['target_modules'], architecture)) <= architecture['projection_shapes'].keys(),
+              'Selected layers are absent from this architecture.')
+-    _require((checkpoint / 'sparse_bit_tuning/exact_state.pt').is_file(), 'Missing exact SparseBit sidecar.')
++    validate_sparse_sidecar(checkpoint, meta['train_mode'])
+     return meta, state, snapshot, Path(source), base_meta, architecture
+--- a/experiments/w25_eval/subset_export.py
++++ b/experiments/w25_eval/subset_export.py
+@@ -19,7 +19,7 @@
+ from experiments.qwen3_w25.assemble_categories import _require
+ from experiments.qwen3_w25.e2e_subset_export import CODE_FILES as QWEN_CODE_FILES, _sha256
+ from experiments.qwen3_w25.export_e2e_selected import restore_decoder_state
+-from experiments.w25_eval.subset_state import checkpoint_inventory, inspect_step, persistent_inventory, selected_layers, selected_names
++from experiments.w25_eval.subset_state import checkpoint_inventory, inspect_step, persistent_inventory, selected_layers, selected_modules, selected_names
+ 
+ REPO = Path(__file__).resolve().parents[2]
+ CODE_FILES = QWEN_CODE_FILES + (
+@@ -73,7 +73,7 @@
+     _require(loaded_meta["checkpoint_id"] == meta["round_base_checkpoint_id"], "Loaded round-base UUID changed.")
+     inventory, _banks = persistent_inventory(model, architecture)
+     selected = collect_e2e_compressed_targets(model, target_layers=selected_layers(meta["target_layers"], architecture),
+-                                             target_modules=("down_proj",), num_layers=architecture["num_hidden_layers"])
++                                             target_modules=selected_modules(meta["target_modules"], architecture), num_layers=architecture["num_hidden_layers"])
+     names = selected_names(meta["target_layers"], meta["target_modules"], architecture)
+     _require(tuple(name for name, _ in selected) == names and set(names) <= inventory.keys(),
+              "Selected runtime topology disagrees with the authorized subset.")
+@@ -81,7 +81,8 @@
+              "Subset recipe requires six persistent decoder tensors and two code banks per projection.")
+     audit.update(selected_targets=list(names), selected_projection_count=len(names),
+                  deployed_projection_count=len(inventory), selected_decoder_tensor_count=6 * len(names),
+-                 selected_code_bank_count=2 * len(names))
++                 selected_projection_code_bank_count=2 * len(names),
++                 selected_code_bank_count=2 * len(names) if meta["train_mode"] == "decoder_sparse_bit" else 0)
+     audit["restored_decoder_tensors"] = restore_decoder_state(model, selected, checkpoint=checkpoint, snapshot=snapshot)
+     _require(audit["restored_decoder_tensors"] == 6 * len(names), "Mutable state escaped selected decoders.")
+     tokenizer = _build_v6_tokenizer(str(base_meta["base_model_path"]), SimpleNamespace(**snapshot["hf_args"]))
+@@ -90,6 +91,9 @@
+     if meta["train_mode"] == "decoder_sparse_bit":
+         audit["sparse_bit_restore"] = restore_packed_bits_cpu(
+             selected, checkpoint=checkpoint, contract=contract)
++    else:
++        audit["sparse_bit_restore"] = None
++        audit["code_state_reference"] = "unchanged_original_round_base"
+     model.eval().to(device)
+     probe_inputs = _build_finalization_probe_inputs(tokenizer)
+     training_probe, dtype = _run_finalization_probe(model, probe_inputs)
+--- a/experiments/w25_eval/subset_audit.py
++++ b/experiments/w25_eval/subset_audit.py
+@@ -1,4 +1,4 @@
+-"""Audit the selected native down recipe against the real Qwen/Llama inventory.
++"""Audit the selected native projection recipe against the real Qwen/Llama inventory.
+ 
+ Only the old live Qwen audit's architecture boundary is isolated here. Its pure
+ state/packed-code/BF16 projection and storage comparisons are imported unchanged.
+@@ -16,7 +16,33 @@
+ from experiments.qwen3_w25.assemble_categories import _assert_state_equal, _load_state, _require
+ from experiments.qwen3_w25.audit_e2e_decoder import _inference_spec, _validate_export_storage
+ from experiments.qwen3_w25.e2e_subset_audit import audit_subset_state
+-from experiments.w25_eval.subset_state import checkpoint_inventory, inspect_step, persistent_inventory, selected_layers, selected_names
++from experiments.w25_eval.subset_state import checkpoint_inventory, inspect_step, persistent_inventory, selected_layers, selected_modules, selected_names
++
++
++def audit_subset_training_state(original, actual, inventory, banks, *, names,
++                                mutable, packed_snapshot, train_mode):
++    """Reuse the numeric subset audit, with original codes as the decoder-only reference."""
++    _require(train_mode in ('decoder', 'decoder_sparse_bit'), 'Unsupported subset training mode.')
++    sparse = train_mode == 'decoder_sparse_bit'
++    selected_codes = {key for name in names for key, _ in banks[name]}
++    if not sparse:
++        _require(packed_snapshot is None, 'Decoder-only audit must not supply a mutable-code snapshot.')
++        packed_snapshot = {key: original[key] for key in selected_codes}
++    report = audit_subset_state(original, actual, inventory, banks, selected_names=names,
++                               training_decoder_state=mutable, packed_snapshot=packed_snapshot)
++    report['train_mode'] = train_mode
++    report['selected_projection_code_bank_count'] = len(selected_codes)
++    if not sparse:
++        _require(report['changed_code_bits'] == 0, 'Decoder-only export changed hard codes.')
++        # The reused audit compares the disjoint frozen complement and these two
++        # banks against their original bytes, so all non-decoder tensors are covered.
++        report['frozen_tensors_compared'] += len(selected_codes)
++        report['frozen_code_bank_count'] = report['code_bank_count']
++        report['selected_code_bank_count'] = 0
++        report['selected_codes_match_current_snapshot_exactly'] = None
++        report['selected_codes_match_frozen_source_exactly'] = True
++        report['code_state_reference'] = 'unchanged_original_round_base'
++    return report
+ 
+ 
+ def audit_e2e_subset(source_dir, checkpoint_dir, output, *, training_checkpoint_dir):
+@@ -50,7 +76,9 @@
+                  "Final reused an input checkpoint UUID.")
+         _require(Path(source_meta["base_model_path"]).resolve() == Path(final_meta["base_model_path"]).resolve(),
+                  "Final references another base model.")
+-        _require(final_meta["train_mode"] == "decoder_sparse_bit" and final_meta["norm_train_mode"] == "none"
++        _require(final_meta["train_mode"] == step_meta["train_mode"]
++                 and final_meta["train_mode"] in ("decoder", "decoder_sparse_bit")
++                 and final_meta["norm_train_mode"] == "none"
+                  and final_meta["lm_head_train_mode"] == "none" and final_meta["lora_config"] is None
+                  and not final_meta.get("post_norm_head_linear"), "Unexpected final trainable branch.")
+         _require({item["name"]: _inference_spec(item) for item in source_meta["converted_modules"]}
+@@ -65,7 +93,7 @@
+         inventory, banks = persistent_inventory(model, architecture)
+         report["source_reloaded_tensors_compared"] = _assert_state_equal(model.state_dict(), original, "Source strict load")
+         selected = collect_e2e_compressed_targets(model, target_layers=selected_layers(step_meta["target_layers"], architecture),
+-            target_modules=("down_proj",), num_layers=architecture["num_hidden_layers"])
++            target_modules=selected_modules(step_meta["target_modules"], architecture), num_layers=architecture["num_hidden_layers"])
+         _require({name for name, _ in selected} == set(names), "Actual selected modules disagree with metadata.")
+         mutable, manifest = load_v6_training_model_state(str(training), map_location="cpu")
+         expected = {key for name in names for key in inventory[name]}
+@@ -73,14 +101,18 @@
+                  and {row["name"]: row["component_class"] for row in manifest} == {key: "decoder" for key in expected}
+                  and set(mutable) == expected, "Continuous mutable state is not exactly the selected decoder subset.")
+         # Reuse the genuine current-sampler/sign/radius check; do not restore an optimizer or recalibrate scales.
+-        bit_restore = restore_packed_bits_cpu(selected, checkpoint=training, contract=step_meta["immutable_resume_contract"])
+-        model_state = model.state_dict()
+-        packed = {key: model_state[key].detach().clone() for name in names for key, _ in banks[name]}
+-        del model_state, selected, model
++        sparse = step_meta["train_mode"] == "decoder_sparse_bit"
++        bit_restore, packed = None, None
++        if sparse:
++            bit_restore = restore_packed_bits_cpu(selected, checkpoint=training, contract=step_meta["immutable_resume_contract"])
++            model_state = model.state_dict()
++            packed = {key: model_state[key].detach().clone() for name in names for key, _ in banks[name]}
++            del model_state
++        del selected, model
+         gc.collect()
+-        report.update(audit_subset_state(original, actual, inventory, banks, selected_names=names,
+-            training_decoder_state=mutable, packed_snapshot=packed))
+-        _require(report["frozen_tensors_compared"] == len(original) - 8 * len(names)
++        report.update(audit_subset_training_state(original, actual, inventory, banks, names=names,
++            mutable=mutable, packed_snapshot=packed, train_mode=step_meta["train_mode"]))
++        _require(report["frozen_tensors_compared"] == len(original) - (8 if sparse else 6) * len(names)
+                  and report["code_bank_count"] == 2 * len(inventory) and report["decoder_tensor_count"] == 6 * len(inventory),
+                  "Incomplete frozen/full-model inventory.")
+         _validate_export_storage(source_budget, final_budget, report)
+@@ -94,7 +126,7 @@
+         report.update(status="verified", source_checkpoint_id=source_meta["checkpoint_id"],
+             checkpoint_id=final_meta["checkpoint_id"], selected_checkpoint_id=step_meta["checkpoint_id"],
+             selected_global_step=step_state["global_step"], selected_training_state_sha256=_sha256(training / "training_model_state.pt"),
+-            selected_exact_sidecar_sha256=_sha256(training / "sparse_bit_tuning/exact_state.pt"),
++            selected_exact_sidecar_sha256=_sha256(training / "sparse_bit_tuning/exact_state.pt") if sparse else None,
+             sparse_bit_restore=bit_restore, source_bit_budget=source_budget, bit_budget=final_budget,
+             projection_count=len(inventory), serialized_tensors_compared=len(actual), reloaded_tensors_compared=compared,
+             fresh_strict_reload_state_exact=True, rank_zero=True, native_decoder_dtype="torch.bfloat16",
+--- a/experiments/w25_eval/train_subset_400.py
++++ b/experiments/w25_eval/train_subset_400.py
+@@ -1,4 +1,4 @@
+-"""Run a model-adaptive down subset for 400 steps of the native 2000-step schedule."""
++"""Run a model-adaptive projection subset for 400 steps of the native 2000-step schedule."""
+ 
+ from __future__ import annotations
+ 
+@@ -20,11 +20,13 @@
+     architecture = model_inventory(source_meta["base_model_path"])
+     validate_recipe(source_meta, architecture)
+     selected_names(cfg.target_layers, cfg.target_modules, architecture)
+-    if (cfg.train_mode != "decoder_sparse_bit" or cfg.aux.norm_train_mode != "none"
++    if (cfg.train_mode not in ("decoder", "decoder_sparse_bit") or cfg.aux.norm_train_mode != "none"
+             or cfg.aux.lm_head_train_mode != "none" or cfg.aux.residual_lora_mode != "none"
+-            or tuple(cfg.opt.distill_fp32_components) != ("decoder",)
+-            or cfg.bit_active_ratio != 1 or cfg.bit_proxy_coordinates != "decoder_sensitivity"):
+-        raise ValueError("Require selected FP32 decoders + all sensitivity-coordinate bits, frozen norm/head, no LoRA.")
++            or tuple(cfg.opt.distill_fp32_components) != ("decoder",)):
++        raise ValueError("Require selected FP32 decoders, frozen norm/head, no LoRA.")
++    if cfg.train_mode == "decoder_sparse_bit" and (
++            cfg.bit_active_ratio != 1 or cfg.bit_proxy_coordinates != "decoder_sensitivity"):
++        raise ValueError("Joint training requires all sensitivity-coordinate bits.")
+     if cfg.runtime.parallel_mode != "dp" or cfg.runtime.offload_mode != "none" or cfg.runtime.distill_hif4_act:
+         raise ValueError("This comparison uses native single-process DP without offload or HiFloat4.")
+     if cfg.runtime.evaluation.eval_after_save or str(cfg.runtime.evaluation.eval_tasks or "").strip():
+--- a/tests/test_w25_subset.py
++++ b/tests/test_w25_subset.py
+@@ -1,4 +1,5 @@
+ """CPU inventory checks; no Llama compressed checkpoint or GPU save is claimed."""
++import argparse
+ import ast
+ from copy import deepcopy
+ import json
+@@ -145,8 +146,14 @@
+     for layers in ([], [-1], [36], [0, 0], [True], [1.0]):
+         with pytest.raises(ValueError):
+             selected_names(layers, ['down_proj'], architecture)
+-    with pytest.raises(ValueError, match='down_proj'):
+-        selected_names([16], ['gate_proj'], architecture)
++    assert selected_names([16], ['gate_proj'], architecture) == ('model.layers.16.mlp.gate_proj',)
++    mlp = selected_names('all', ['down_proj', 'gate_proj', 'up_proj'], architecture)
++    assert len(mlp) == 108
++    assert mlp[:3] == tuple(f'model.layers.0.mlp.{module}' for module in ('gate_proj', 'up_proj', 'down_proj'))
++    assert len(selected_names('all', 'all', architecture)) == 252
++    for modules in ([], ['missing_proj'], ['down_proj', 'down_proj'], ['down_proj,up_proj'], ['all'], 'down', '*'):
++        with pytest.raises((ValueError, argparse.ArgumentTypeError)):
++            selected_names([16], modules, architecture)
+     llama = model_inventory(LLAMA)
+     assert len(selected_names('16-19', ['down_proj'], llama)) == 4
+     with pytest.raises(ValueError):

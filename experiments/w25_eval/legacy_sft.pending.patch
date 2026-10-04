@@ -1,0 +1,76 @@
+--- a/e2e_common/data.py
++++ b/e2e_common/data.py
+@@ -8,12 +8,6 @@
+ from datasets import Dataset, DatasetDict, concatenate_datasets, interleave_datasets, load_dataset
+ from transformers import AutoTokenizer
+ from transformers.trainer_utils import IntervalStrategy
+-
+-from e2e_common.chat_template_utils import (
+-    infer_assistant_response_template,
+-    infer_user_instruction_template,
+-    render_messages,
+-)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -715,50 +709,24 @@
+     *,
+     block_size: int,
+ ) -> Tuple[List[int], List[int], List[int]]:
+-    messages = _normalize_edgerazor_messages(record)
+-    if messages is None:
++    # Reuse canonical message boundaries without changing this legacy packer's
++    # list return, extra terminal EOS, or reject-overlength contract.
++    from train_utils.distill_data import _encode_native_messages, _labels_from_mask
++
++    encoded = _encode_native_messages(record, tokenizer, text_format="edgerazor_messages")
++    if encoded is None:
+         raise ValueError("edgerazor_messages SFT record is missing a valid messages field.")
+-
+-    try:
+-        from trl.trainer.utils import DataCollatorForCompletionOnlyLM
+-    except ImportError as exc:
+-        raise ImportError("未安装 trl。edgerazor_messages SFT 需要 DataCollatorForCompletionOnlyLM。") from exc
+-
+-    full_text = render_messages(messages, tokenizer, add_generation_prompt=False)
+-    encoded = tokenizer(
+-        full_text,
+-        add_special_tokens=False,
+-        return_attention_mask=False,
+-        return_token_type_ids=False,
+-    )
+-    input_ids = [int(token_id) for token_id in encoded.get("input_ids", [])]
++    input_ids, response_mask = encoded
++    labels = _labels_from_mask(input_ids, response_mask, task="sft")
+     attention_mask = [1] * len(input_ids)
+-    collator = DataCollatorForCompletionOnlyLM(
+-        infer_assistant_response_template(tokenizer),
+-        instruction_template=infer_user_instruction_template(tokenizer),
+-        tokenizer=tokenizer,
+-        mlm=False,
+-    )
+-    batch = collator(
+-        [
+-            {
+-                "input_ids": list(input_ids),
+-                "attention_mask": list(attention_mask),
+-            }
+-        ]
+-    )
+-    labels = [int(value) for value in batch["labels"][0].tolist()]
+-    has_trainable_token = any(int(value) != -100 for value in labels)
++    if not any(value != -100 for value in labels):
++        raise ValueError("edgerazor_messages SFT sample has no trainable response tokens.")
+ 
+     eos_token_id = getattr(tokenizer, "eos_token_id", None)
+     if eos_token_id is not None:
+         input_ids.append(int(eos_token_id))
+         labels.append(int(eos_token_id))
+         attention_mask.append(1)
+-        has_trainable_token = True
+-
+-    if not has_trainable_token:
+-        raise ValueError("edgerazor_messages SFT sample has no trainable response tokens.")
+     if len(input_ids) > int(block_size):
+         raise ValueError(
+             f"edgerazor_messages SFT sample length {len(input_ids)} exceeds --model_max_length={int(block_size)}. "

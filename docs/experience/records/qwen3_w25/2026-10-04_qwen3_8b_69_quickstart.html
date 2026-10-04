@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Qwen3 8B 达到69的简版说明与最快复现路径</title><style>
+:root{color-scheme:light;--ink:#172a3a;--muted:#516171;--line:#d8e1e8;--accent:#0a6376;--wash:#edf4f6}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;color:var(--ink);background:#f3f6f8;font:16px/1.85 "Noto Sans CJK SC","Microsoft YaHei","PingFang SC",sans-serif}
+a{color:#08677c;text-underline-offset:3px;overflow-wrap:anywhere}header{background:#123746;color:#fff;padding:26px 36px}header small{letter-spacing:.08em;color:#d9e8ec}.layout{display:grid;grid-template-columns:255px minmax(0,1fr);max-width:1510px;margin:auto;gap:26px;padding:28px}
+nav{position:sticky;top:18px;align-self:start;max-height:94vh;overflow-y:auto;font-size:13px;padding:16px 12px;border:1px solid var(--line);border-radius:10px;background:white}nav b{display:block;margin:0 10px 12px}nav a{display:block;text-decoration:none;padding:5px 10px;line-height:1.55;border-radius:5px}nav a:hover{background:var(--wash)}nav .level-2{font-weight:700;margin-top:7px}nav .level-3{padding-left:22px;color:var(--muted)}main{min-width:0;background:white;border:1px solid var(--line);border-radius:10px;padding:36px 44px}
+h1{font-size:29px;line-height:1.5;margin:0 0 28px;letter-spacing:-.02em}h2{font-size:24px;margin:50px 0 18px;padding-top:12px;border-top:2px solid #a3bec7;scroll-margin-top:20px}h3{font-size:19px;color:#134f60;margin:30px 0 12px;scroll-margin-top:20px}p{margin:16px 0}strong{font-weight:700}code{font-family:"Cascadia Code","DejaVu Sans Mono",monospace;font-size:.86em;background:#f0f4f6;padding:2px 4px;border-radius:3px;overflow-wrap:anywhere}pre{padding:18px 20px;background:#eef3f6;border-left:4px solid #5c8795;overflow:auto;line-height:1.7;font-size:13px;border-radius:3px;white-space:pre-wrap;overflow-wrap:anywhere}pre code{padding:0;background:none;font-size:inherit}.table-scroll{overflow-x:auto;margin:22px 0}table{border-collapse:collapse;width:100%;font-size:13.2px;line-height:1.75;table-layout:auto}th,td{border:1px solid var(--line);padding:10px 12px;vertical-align:top;overflow-wrap:anywhere}th{background:#e8f0f3;text-align:left;font-weight:700;color:#143e4c}tbody tr:nth-child(even){background:#f9fbfc}td code{font-size:.94em}td:last-child a{white-space:normal}li{margin:9px 0}footer{color:var(--muted);font-size:12px;border-top:1px solid var(--line);margin-top:40px;padding-top:18px}.tools{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;margin-top:8px}.tools a{color:#e9f5f8}.print-button{background:transparent;color:#e9f5f8;border:1px solid #9ebdc7;padding:3px 12px;border-radius:4px;font:inherit;cursor:pointer}
+@media(max-width:1100px){.layout{grid-template-columns:1fr;padding:16px}nav{position:static;max-height:250px}main{padding:26px}}
+@media(max-width:650px){body{font-size:15px}header{padding:22px}.layout{padding:10px;gap:12px}main{padding:20px 16px}h1{font-size:25px}h2{font-size:21px}table{min-width:650px;font-size:12px}}
+@page{size:A4;margin:17mm 14mm}
+@media print{html{scroll-behavior:auto}body{background:white;font-size:10pt;line-height:1.7}header,nav,.tools{display:none}.layout{display:block;padding:0;max-width:none}main{border:0;padding:0;border-radius:0}h1{font-size:21pt}h2{font-size:16pt;margin-top:25pt;break-after:avoid}h3{font-size:12pt;break-after:avoid}p{orphans:3;widows:3}table{min-width:0;width:100%;font-size:8.3pt;line-height:1.55}th,td{padding:5px 6px}thead{display:table-header-group}tr{break-inside:avoid}.table-scroll{overflow:visible}pre{font-size:8.5pt;break-inside:avoid}a{color:inherit;text-decoration:none}footer{font-size:8pt}}
+</style></head><body><header><small>VAELLM · Qwen3-8B · 简版复现说明</small><div class="tools"><a href="2026-10-04_qwen3_8b_69_quickstart.md">可编辑正文</a><a href="2026-10-04_qwen3_8b_69_report.html">详细汇报</a><button class="print-button" onclick="window.print()">打印或另存为 PDF</button></div></header><div class="layout"><nav aria-label="阅读目录"><b>简版目录</b><a class="level-2" href="#section-1">相对原框架究竟改了什么</a><a class="level-2" href="#section-2">真正有效的训练路线</a><a class="level-2" href="#section-3">最快复现选哪条路径</a><a class="level-2" href="#section-4">可直接使用的命令</a><a class="level-2" href="#section-5">必须保留的输入和复现边界</a></nav><main><h1>Qwen3 8B 达到69的简版说明与最快复现路径</h1>
+<p><strong>从原始 BF16 模型开始完整复现：</strong>使用<a href="../../../guides/qwen3_8b_69_reproduction.md">一键复现脚本与配套文档</a>。本页下方的快捷命令则使用已保留的压缩成品或末轮起点。</p>
+<p><strong>不是只调超参数。</strong> 达标方案沿用原框架的压缩与蒸馏算法，做了必要的计算实现修复，并增加模型组装、局部训练和独立导出工具。最终结果为八任务均分 <strong>69.312980%</strong>，投影权重存储 <strong>2.456989 bit/weight</strong>，成品无外置LoRA。</p>
+<h2 id="section-1">相对原框架究竟改了什么</h2>
+<p>这里以本轮代码起点<code>95c1dd9</code>为比较基准，不能只检出这个commit再套参数就视为完整复现。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>类型</th>
+<th>本轮做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已有机制的参数选择</td>
+<td>q/k/v/gate/up主码2bit，o/down主码3bit；D32、两stage、decoder H128/无残块；双侧block32旋转；普通输入INT8保护64通道、down保护256通道。CAT、旋转、保护、decoder蒸馏、SparseBit和敏感度坐标原本已有。</td>
+</tr>
+<tr>
+<td>实现修复</td>
+<td>修正融合decoder的LayerNorm/SiLU、低精度舍入及相关梯度/参数转换行为，使训练、导出、推理对应同一设计；评测缓存显式使用BF16计算精度。这是代码修复，不能靠改学习率代替。</td>
+</tr>
+<tr>
+<td>新增训练和组装流程</td>
+<td>从不同训练分支抽取attention/MLP类别组合；使用实验入口只联合训练第一层down的decoder和码位；按保存点独立导出、重载、评测。核心损失和码位更新规则仍复用原框架。</td>
+</tr>
+<tr>
+<td>新增结果核验</td>
+<td>保存完整八任务原始结果，固定fast tokenizer、0-shot、全量题目和64/32评测batch；按实际张量统计位宽，核查冻结权重和导出结果。</td>
+</tr>
+</tbody>
+</table></div>
+<p>探索期间还修过多GPU设备上下文，但最后达标训练本身是单卡，不能把这项修复单独说成精度来源。D16、H256、更深decoder、四stage、BlockLDLQ、额外head/norm等探索<strong>没有进入该达标成品</strong>。<a href="../../lessons/checkpoint_lifecycle.md">计算核修复依据</a> · <a href="2026-10-04_qwen3_8b_69_report.md">详细方案与实验</a></p>
+<h2 id="section-2">真正有效的训练路线</h2>
+<ol>
+<li><strong>原HF模型逐类别压缩与恢复 → 66.5762%。</strong> 每类压缩后训练已有压缩层decoder，尚未压缩层用临时rank12 LoRA补偿并融合；成品不留LoRA分支。</li>
+<li><strong>不同蒸馏分支按类别组装 → 67.8045%。</strong> 包含CE50 attention与CE10 MLP组合、后续attention恢复及第一层down局部联合更新。不是一条从头到尾只改学习率的训练。</li>
+<li><strong>从67.8045%成品重新训练第一层down → 第1200步69.313%。</strong> 只更新该投影decoder和两组硬码；task100、0.5CE+0.5mass-KL、prompt权重0、batch4、长度1024、decoder LR1e-5、码位Adam LR4e-5、换轮上限512、seed0，其余层冻结。</li>
+</ol>
+<p>最后一轮采用<strong>2000步cosine调度、warmup20</strong>，每400步独立全评；1200步是最佳保存点，2000步只有68.589%。<strong>不要把<code>--steps</code>改成1200来声称复现原轨迹</strong>，这会改变学习率曲线。</p>
+<h2 id="section-3">最快复现选哪条路径</h2>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>目的</th>
+<th>最短路径</th>
+<th>资源与时间依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>验证69.313%的成绩</td>
+<td>直接加载已保留的step1200成品，重跑完整八任务与位宽汇总</td>
+<td>1张空闲A800 80GB；历史导出、审计、全评合计约8.7分钟，仅复评未另行测时</td>
+</tr>
+<tr>
+<td>重做最后一轮训练</td>
+<td>从已保留的67.8045%成品启动相同2000步任务，检查独立step1200</td>
+<td>2张不同的空闲A800，1张训练、1张导出评测；历史到1200验收约52分钟，整轮约79分钟</td>
+</tr>
+<tr>
+<td>从原HF完整重训</td>
+<td>重做上面全部三阶段及其分支组装</td>
+<td>不是最快路径；历史祖先权重部分已清理，不能假设只跑一次CAT就达标</td>
+</tr>
+</tbody>
+</table></div>
+<p>时间是该服务器的历史记录，不是性能保证。这里只准备复现入口，<strong>本次没有启动训练或评测</strong>。</p>
+<h2 id="section-4">可直接使用的命令</h2>
+<p>使用当前服务器工作区和<code>bitvae</code>。还需要原HF目录<code>/home/star/models/Qwen/Qwen3-8B</code>、本地评测数据缓存；训练另需任务JSONL。下面两条路径二选一，GPU编号仅作示例，执行前替换为实际空闲卡。</p>
+<pre><code class="language-bash">cd /home/star/VAELLM
+source /home/star/miniconda3/etc/profile.d/conda.sh
+conda activate bitvae
+which python
+python -V
+</code></pre>
+<p><strong>最快验证成绩：</strong></p>
+<pre><code class="language-bash">RUN_DIR=&quot;result/qwen3_8b_w25_20260930/reproduce_eval_$(date +%Y%m%d_%H%M%S)&quot;
+(
+  set -o noclobber
+  CUDA_VISIBLE_DEVICES=0 nohup bash scripts/reproduce_qwen3_w25_69_eval.sh &quot;$RUN_DIR&quot; &gt; &quot;$RUN_DIR.log&quot; 2&gt;&amp;1 &lt; /dev/null
+) &amp;
+</code></pre>
+<p><a href="../../../../scripts/reproduce_qwen3_w25_69_eval.sh">复评脚本</a>依次执行MMLU batch64、其余七任务batch32，再生成<code>$RUN_DIR/acceptance.json</code>；日志为<code>$RUN_DIR.log</code>，退出码为<code>$RUN_DIR/run.exit</code>。无样本上限。汇总使用原指标和位宽口径，不靠手工四舍五入判断。</p>
+<p><strong>最快重做训练：</strong></p>
+<pre><code class="language-bash">RUN_DIR=&quot;result/qwen3_8b_w25_20260930/reproduce_train_$(date +%Y%m%d_%H%M%S)&quot;
+(
+  set -o noclobber
+  CUDA_VISIBLE_DEVICES=0 nohup bash scripts/reproduce_qwen3_w25_69_train.sh &quot;$RUN_DIR&quot; 1 &gt; &quot;$RUN_DIR.log&quot; 2&gt;&amp;1 &lt; /dev/null
+) &amp;
+</code></pre>
+<p><a href="../../../../scripts/reproduce_qwen3_w25_69_train.sh">训练脚本</a>已把原始实际命令写全；第一个参数是全新输出目录，第二个是独立导出评测卡号。示例为GPU0训练、GPU1导出。结果看<code>$RUN_DIR/step_1200/acceptance.json</code>，该点导出不会随原生训练断点轮转删除。脚本保持完整2000步预算；不能把旧分数当作新运行已成功的证据。</p>
+<p>两个脚本都会拒绝复用已存在的输出目录。脚本只负责运行既有入口，没有引入新的训练算法、调度器或自动重试。</p>
+<h2 id="section-5">必须保留的输入和复现边界</h2>
+<ul>
+<li><strong>直接复评模型：</strong> <a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/final_model">step1200 final_model</a>，UUID <code>f927ffda-dd5b-4d00-b63a-5e839a182d70</code>。</li>
+<li><strong>最后一轮训练起点：</strong> <a href="../../../../result/qwen3_8b_w25_20260930/assembled_ce50_chatml_joint_bits00_s2000_attn/final_model">67.8045% final_model</a>，UUID <code>1facb463-1832-4f10-8165-0a4b47ef7cf5</code>。两份权重本次核对均存在。</li>
+<li><strong>真实配置与版本：</strong> <a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/launch.json">原始launch</a>。本次核对其固定的66份源码SHA256，均与当前文件一致；复现脚本由其中实际argv和<a href="../../../../result/qwen3_8b_w25_20260930/e2e_best_combo_down0_joint_s2000/step_1200/step_export.json">原评测命令</a>整理，仅调整输出位置及由调用者指定GPU。</li>
+<li><strong>正确解读结果：</strong> 2.457bit只针对252个投影，含embedding/head等的完整模型张量约4.31GiB；69.313%是八任务均分，MMLU为61.024%。原训练未启用完全确定性模式，新训练的精确末位及最佳步数不作保证。</li>
+</ul>
+<p>本次只做脚本语法、原始命令参数对应和文档链接检查，复用已有运行证据；未重新跑GPU。需要展开原理、位宽计算或成功与失败对照时，查看<a href="2026-10-04_qwen3_8b_69_report.md">详细汇报</a>。</p>
+<footer>复现命令仅准备，尚未执行。原始指标和配置的相对链接对应VAELLM服务器工作区。</footer></main></div></body></html>

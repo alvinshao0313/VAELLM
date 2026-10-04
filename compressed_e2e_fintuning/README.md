@@ -69,10 +69,12 @@ Top-K 的 K 用 `--top_k`：`kl_top` 在教师 Top-K 集合内重新归一化；
 
 `compressed_e2e_fintuning/scripts/e2e_decoder.sh` 只保留 shell 级 `dp`/`layer_mp` 分支：
 
-- `dp`：`train_mode=decoder_sparse_bit`，`kl_top`，K=100。
+- `dp`：当前实际默认是`train_mode=lora`、`kd_top_partial`、K=100，并训练norm和linear lm_head；脚本中的“decoder + Sparse Bit”注释不代表当前参数。
 - `layer_mp`：`train_mode=decoder_lora`，`kl_top`，K=1000。
 
 `scripts/compressed_e2e_simple.sh` 是单入口示例。旧 `e2e_stage1_pretrain.sh`、`e2e_stage2_instruct.sh` 已删除。
+
+[Qwen3 ≤2.5bit 的无外置LoRA蒸馏入口](../scripts/e2e_w25_vae.sh)显式选择`train_mode=decoder`，冻结norm/head，关闭residual LoRA，使用FP32 decoder参数/BF16计算，最终导出BF16；运行配置与验证状态见[本轮记录](../docs/experience/records/qwen3_w25/2026-09-30_goal.md)。调用者先激活bitvae并设置`CUDA_VISIBLE_DEVICES`，路径可用`STUDENT_CKPT`、`RUN_ROOT_DIR`覆盖。无需传`--lora_rank 0`：当前公共配置要求rank为正数，但decoder模式不创建LoRA，成品应独立审计实际分支和位宽。
 
 ## 保存与续训
 
@@ -82,6 +84,27 @@ Top-K 的 K 用 `--top_k`：`kl_top` 在教师 Top-K 集合内重新归一化；
 
 晋级时从保留的 `trainer_state/checkpoint-200` 设置 `--resume_from_checkpoint`，将停止点提高（如 `--stop_after_step 400`），或去掉停止点继续到终局。总 `steps`、学习率调度、数据/损失、batch/累积、卡数/并行模式和评测保存间隔等 exact-resume 条件必须保持不变；停止点必须大于断点步数。阶段停止参数自身不进入数学恢复契约。用于已安排晋级的断点保留，淘汰候选按项目规范清理。
 
+Qwen3本轮另提供限定`decoder`/`decoder_sparse_bit`的[中间步导出入口](../experiments/qwen3_w25/export_e2e_selected.py)，适用于全252投影、无外置LoRA、norm/head冻结、单进程DP或`layer_mp`、FP32 decoder参数/BF16计算。它读取原run中的已提交checkpoint并保留原总steps；SparseBit通过CPU mmap读取exact sidecar，核对采样、固定敏感度尺度及score符号后恢复其中已物化的packed bits，不构造训练optimizer、不把完整score搬回GPU、不重标定或重放更新，然后导出新的BF16 v6成品：
+
+```bash
+python -m experiments.qwen3_w25.export_e2e_selected \
+  --checkpoint_dir <run>/trainer_state/checkpoint-400 \
+  --output_dir <new_selected_step400> --device cuda:0
+```
+
+中间训练回调采用packed解码，成品使用部署解码，分数不能直接等同。导出后须运行`experiments/qwen3_w25/audit_e2e_decoder.py`和完整八任务评测。原`e2e_w25_vae.sh`保留五个计划保存点，由独立命令导出评测，主入口终点仍执行配置的任务；当前实测状态以[本轮记录](../docs/experience/records/qwen3_w25/2026-09-30_goal.md)为准。
+
+全码位对照使用[独立导出训练入口](../experiments/qwen3_w25/train_with_step_exports.py)及`scripts/e2e_w25_full_bits.sh`：调用者激活bitvae，设置训练`CUDA_VISIBLE_DEVICES=0,1,2,4`，另将GPU7留给`--export_cuda_visible_devices 7`。每400步（含2000步）同步等待独立导出、冻结状态审计、fresh strict八任务全量评测和位宽验收完成后再继续训练。`step_XXXX/`保留阶段日志、退出码、成品和验收结果；`save_total_limit=1`只保留最新可续训checkpoint，独立评测结束前不会进入下一次保存轮转。正式入口没有样本上限，`--eval_tasks ''`仅关闭主入口终点重复评测。该入口已通过25项CPU检查、5项真实双卡检查，以及Qwen3-8B的四卡100%码位4步/save2验证：两次独立导出、冻结状态审计、limited GPU评测和评测后回训完成，末步独立与原生导出的3423个持久张量逐元素及字节一致。短测不代表完整任务精度；正式入口仍固定每400步全量八任务，结果与资源实测见本轮记录。
+
+
+Qwen3-8B 的既有 head/norm 方法另有两个隔离训练入口，均联合训练 decoder、冻结全部硬码、不创建外置 LoRA。它们使用单进程单训练卡 DP，并由 `--export_cuda_visible_devices` 指定独立导出卡；设置 `--save_steps 400 --save_total_limit 1 --eval_after_save false --eval_tasks ''` 后，每400步依次完成原生部署转换、冻结/存储审计和固定 MMLU64/seven32 完整八任务，再恢复训练。调用者激活 bitvae、设置训练 `CUDA_VISIBLE_DEVICES`，其余数据/损失/训练参数沿用正式入口。
+
+| 独立训练入口 | 组件设置 | 部署与审计 |
+| --- | --- | --- |
+| [train_aux_with_step_exports.py](../experiments/qwen3_w25/train_aux_with_step_exports.py) | `train_mode=decoder`、`norm_train_mode=none`、`lm_head_train_mode=linear`、`distill_fp32_components=decoder,lm_head` | 训练的4096×4096映射按原生路径融合进原 head；[export](../experiments/qwen3_w25/e2e_aux_export.py) 与 [audit](../experiments/qwen3_w25/e2e_aux_audit.py) 核实没有额外分支、head形状/dtype/字节数不变。 |
+| [train_norm_with_step_exports.py](../experiments/qwen3_w25/train_norm_with_step_exports.py) | `train_mode=decoder`、`norm_train_mode=final`、`lm_head_train_mode=none`、`distill_fp32_components=decoder,norm` | 只更新原 `model.norm.weight`；[export](../experiments/qwen3_w25/e2e_norm_export.py) 与 [audit](../experiments/qwen3_w25/e2e_norm_audit.py) 对照所选训练断点，分别记录FP32真实更新与BF16导出存活量，严格冻结其余norm/head/码位。 |
+
+两条路径均已通过真实8B、B4/1024、4步/save2的两次导出、诊断评测、回训和原生final验证。诊断题量不代表精度，正式入口没有样本上限；具体对照参数与完整评测状态见[本轮记录](../docs/experience/records/qwen3_w25/2026-09-30_goal.md)。单独调用 norm 审计还需 `--training_checkpoint_dir` 指向原保存步，以验证最终norm确为该FP32状态的原生BF16投射。
 
 ## 按组件保留 FP32 训练参数
 

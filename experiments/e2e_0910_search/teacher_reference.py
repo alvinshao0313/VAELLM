@@ -15,6 +15,7 @@ from train_utils.lora_utils import ensure_distill_process_group_initialized, get
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--model_path", default="Qwen/Qwen3-8B")
     cli = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("teacher_reference")
@@ -22,7 +23,7 @@ def main():
     set_e2e_seed(0)
     ensure_distill_process_group_initialized()
     try:
-        model_path = "Qwen/Qwen3-8B"
+        model_path = cli.model_path
         device = get_distill_local_device(fallback="cuda")
         tokenizer = build_tokenizer(model_path)
         model = load_frozen_base_reference_model_distributed_from_hf_args(

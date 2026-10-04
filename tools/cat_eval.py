@@ -213,6 +213,7 @@ def _prepare_model_for_eval(
 
     logger.info("[warmup] Moving model to %s ...", device)
     model.to(device)
+    activation_dtype = model.get_input_embeddings().weight.dtype
 
     from e2e_common.proxy_trainables import iter_named_vae_module_refs
     from litebsq.vae_linear import NamedVAELinearTarget, prime_named_vae_linear_cache
@@ -224,6 +225,7 @@ def _prepare_model_for_eval(
     ]
     stats = prime_named_vae_linear_cache(
         named_targets,
+        dtype=activation_dtype,
         group_size=int(prewarm_group_size),
         compute_device=device,
         logger=logger,
@@ -232,6 +234,7 @@ def _prepare_model_for_eval(
     result = {
         **stats,
         "device": device,
+        "prewarm_dtype": str(activation_dtype),
         "prewarm_group_size": int(prewarm_group_size),
         "duration_sec": duration_sec,
     }
@@ -253,9 +256,12 @@ def _build_compact_eval_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     evals = summary.get("evals", {}) if isinstance(summary.get("evals"), dict) else {}
     compact: Dict[str, Any] = {
         "checkpoint_dir": summary.get("checkpoint_dir"),
+        "checkpoint_id": summary.get("checkpoint_id"),
         "base_model_path": summary.get("base_model_path"),
         "checkpoint_loader": summary.get("checkpoint_loader"),
         "adapter_dir": summary.get("adapter_dir"),
+        "tokenizer_class": summary.get("tokenizer_class"),
+        "tokenizer_is_fast": summary.get("tokenizer_is_fast"),
         "evals": {},
     }
 
@@ -366,6 +372,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lm_batch_size", type=str, default="auto", help="Batch size for lm_eval.")
     parser.add_argument("--lm_limit", type=int, default=None, help="Optional lm_eval sample limit.")
     parser.add_argument(
+        "--tokenizer_use_fast",
+        type=lambda v: _parse_bool_like(v, arg_name="--tokenizer_use_fast"),
+        default=False,
+        help="Use the fast tokenizer for lm_eval; enable to match the E2E teacher reference.",
+    )
+    parser.add_argument(
         "--mmlu_debug_samples",
         type=int,
         default=0,
@@ -381,6 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--eval_log_dir", type=str, default="./eval_log", help="Directory to store evaluation logs.")
+    parser.add_argument("--output_json", type=str, default=None, help="Save the complete evaluation result, including raw task metrics, to this JSON path.")
     return parser
 
 
@@ -514,11 +527,17 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     summary: Dict[str, Any] = {
         "checkpoint_dir": ckpt_dir,
+        "checkpoint_id": meta["checkpoint_id"],
         "base_model_path": base_model_path,
         "checkpoint_loader": checkpoint_loader,
         "adapter_dir": adapter_dir,
+        "strict_load": bool(args.strict),
+        "eval_hif4_act": bool(args.eval_hif4_act),
         "evals": {},
     }
+    if args.eval_ppl or args.eval_lm_eval:
+        # Likelihood evaluation consumes logits without reusing KV states.
+        model.config.use_cache = False
     prepared_eval_devices: Dict[str, Dict[str, Any]] = {}
 
     if args.eval_linear_mse:
@@ -589,10 +608,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         summary["evals"].setdefault("cache_warmup", warmup_result)
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
-            use_fast=False,
+            use_fast=bool(args.tokenizer_use_fast),
             trust_remote_code=True,
             token=args.access_token,
         )
+        summary["tokenizer_class"] = type(tokenizer).__name__
+        summary["tokenizer_is_fast"] = bool(tokenizer.is_fast)
         lm_args = _build_lm_eval_args(args, tokenizer_name=tokenizer_name, eval_run_ts=_eval_run_ts)
         with applied_hif4_act(
             model,
@@ -606,6 +627,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         if summary_table:
             logger.info("[lm_eval] Summary table:\n%s", summary_table)
         summary["evals"]["lm_eval"] = lm_result
+
+    if args.output_json:
+        output_path = os.path.abspath(args.output_json)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2, default=str)
+            handle.write("\n")
+        logger.info("Saved complete evaluation result: %s", output_path)
 
     compact_summary = _build_compact_eval_summary(summary)
     logger.info("Evaluation summary:\n%s", json.dumps(compact_summary, ensure_ascii=False, indent=2))

@@ -1,12 +1,13 @@
 # VAELLM 文档入口
 
-文档主源：`iaaccn74:/home/shaoyuantian/program/VAELLM/`。先读项目规则，再按任务选一两个主题；无需加载整个目录。
+文档主源：`star:/home/star/VAELLM/`（2026-09-30 新服务器）；旧记录中的 iaaccn74 路径仅作历史来源。先读项目规则，再按任务选主题。
 
 | 要做什么 | 从这里开始 |
 | --- | --- |
 | 协作规则与代码习惯 | [项目规范](../AGENTS.md) |
 | 了解正式训练链路 | [项目概览](../README.md) |
 | CAT 压缩与恢复 | [CAT 架构和参数](guides/cat_training.md)、[checkpoint 逐类别恢复](guides/catlora_distill_from_checkpoint.md) |
+| 从 BF16 复现 Qwen3 8B 的 69% 压缩成品 | [一键脚本与完整操作说明](guides/qwen3_8b_69_reproduction.md) |
 | E2E 微调 | [E2E 模块说明](../compressed_e2e_fintuning/README.md) |
 | 添加残差保护或残差 LoRA | [base checkpoint residual](guides/cat_residual_from_base.md)、[残差 LoRA 配置](guides/residual_lora.md) |
 | 准备训练数据 | [EdgeRazor 接入](guides/edgerazor_dataset.md) |

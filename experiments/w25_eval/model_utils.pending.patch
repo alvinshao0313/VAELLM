@@ -1,0 +1,94 @@
+--- a/rotation/model_utils.py
++++ b/rotation/model_utils.py
+@@ -170,18 +170,25 @@
+     return model
+ 
+ 
++def get_model_config(model_name, hf_token=None):
++    return transformers.AutoConfig.from_pretrained(
++        model_name, token=hf_token, trust_remote_code=False
++    )
++
++
+ def get_model(
+     model_name, hf_token=None
+ ):
+-    if "llama" in model_name.lower():
++    config = get_model_config(model_name, hf_token)
++    if config.model_type == "llama":
+         return get_llama(model_name, hf_token)
+-    elif "mistral" in model_name.lower():
++    elif config.model_type == "mistral":
+         return get_mistral(model_name, hf_token)
+-    elif "Qwen2" in model_name:
++    elif config.model_type == "qwen2":
+         return get_qwen2(model_name, hf_token)
+-    elif "Qwen3" in model_name:
++    elif config.model_type == "qwen3":
+         return get_qwen3(model_name, hf_token)
+-    elif "opt" in model_name:
++    elif config.model_type == "opt":
+         return get_opt(model_name)
+     return get_auto_causal_lm(model_name, hf_token)
+ 
+--- a/train_utils/base_reference.py
++++ b/train_utils/base_reference.py
+@@ -37,12 +37,7 @@
+ 
+ 
+ def _load_reference_config(model_path: str, access_token: Optional[str]):
+-    from transformers import AutoConfig
+-
+-    kwargs = {"trust_remote_code": False}
+-    if access_token:
+-        kwargs["token"] = access_token
+-    return AutoConfig.from_pretrained(model_path, **kwargs)
++    return model_utils.get_model_config(model_path, access_token)
+ 
+ 
+ def _resolve_reference_dtype(config, requested_dtype: Optional[torch.dtype]) -> Optional[torch.dtype]:
+@@ -58,21 +53,16 @@
+     return None
+ 
+ 
+-def _reference_attn_implementation(model_path: str) -> Optional[str]:
+-    if "llama" in model_path.lower():
++def _reference_attn_implementation(config) -> Optional[str]:
++    if config.model_type == "llama":
+         return "sdpa"
+-    if "Qwen3" in model_path:
++    if config.model_type == "qwen3":
+         return "flash_attention_2"
+     return None
+ 
+ 
+-def _reference_seqlen(model_path: str, config) -> int:
+-    if (
+-        "llama" in model_path.lower()
+-        or "mistral" in model_path.lower()
+-        or "Qwen2" in model_path
+-        or "Qwen3" in model_path
+-    ):
++def _reference_seqlen(config) -> int:
++    if config.model_type in ("llama", "mistral", "qwen2", "qwen3"):
+         return 2048
+     max_pos = getattr(config, "max_position_embeddings", None)
+     return int(max_pos) if isinstance(max_pos, int) and max_pos > 0 else 2048
+@@ -92,7 +82,7 @@
+         "trust_remote_code": False,
+         "torch_dtype": dtype,
+     }
+-    attn_implementation = _reference_attn_implementation(model_path)
++    attn_implementation = _reference_attn_implementation(config)
+     if attn_implementation:
+         model_kwargs["attn_implementation"] = attn_implementation
+     with init_empty_weights(include_buffers=True):
+@@ -100,7 +90,7 @@
+     model.to(dtype=dtype)
+     model.to_empty(device=device)
+     model.tie_weights()
+-    model.seqlen = _reference_seqlen(model_path, config)
++    model.seqlen = _reference_seqlen(config)
+     return model
+ 
+ 

@@ -1,9 +1,8 @@
 """Fused multi-stage symmetric decoder (LayerNorm + swish) with Triton forward.
 
-Inference and training share the same fused forward. For bf16/fp16 inputs,
-matmuls use Tensor Cores (fp32 accumulate, then cast to the input dtype like
-F.linear) and LayerNorm/swish follow the same bf16/fp16 rounding as a serial
-PyTorch chain. Backward uses batched GEMM across stages (one-shot).
+Inference and training share the same fused forward. Half inputs follow the
+packed first linear and native Decoder LayerNorm/SiLU/last-linear sequence.
+Backward uses batched GEMMs and native LayerNorm/SiLU derivatives.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.nn import functional as F
 
 try:
     import triton
@@ -25,30 +25,32 @@ except ImportError:  # pragma: no cover
     _TRITON_AVAILABLE = False
 
 
-def _swish(x: Tensor) -> Tensor:
-    return x * torch.sigmoid(x)
+def _canonical_norm_silu(h: Tensor, ln_w: Tensor, ln_b: Tensor, *, eps: float) -> Tensor:
+    # Parallel Normalize integrates affine for one model, but rounds the
+    # non-affine normalization before its separate affine ops for multiple models.
+    if int(h.shape[1]) == 1:
+        normalized = F.layer_norm(h, (h.shape[-1],), ln_w[0].to(h.dtype), ln_b[0].to(h.dtype), eps)
+    else:
+        normalized = F.layer_norm(h, (h.shape[-1],), None, None, eps).to(h.dtype)
+        normalized = normalized * ln_w.to(h.dtype).unsqueeze(0) + ln_b.to(h.dtype).unsqueeze(0)
+    return F.silu(normalized)
 
 
 def reference_multistage_symmetric_decode(
-    x: Tensor,
-    w_in: Tensor,
-    b_in: Tensor,
-    ln_w: Tensor,
-    ln_b: Tensor,
-    w_out: Tensor,
-    b_out: Tensor,
-    *,
-    eps: float = 1e-5,
+    x: Tensor, w_in: Tensor, b_in: Tensor, ln_w: Tensor, ln_b: Tensor,
+    w_out: Tensor, b_out: Tensor, *, eps: float = 1e-5,
 ) -> Tensor:
-    """Pure PyTorch reference: x[B,S,In] -> y[B,Out]."""
-    h = torch.einsum("bsi,shi->bsh", x, w_in) + b_in.unsqueeze(0)
-    mean = h.mean(dim=-1, keepdim=True)
-    var = ((h - mean) ** 2).mean(dim=-1, keepdim=True)
-    h_hat = (h - mean) * torch.rsqrt(var + eps)
-    h_n = h_hat * ln_w.unsqueeze(0) + ln_b.unsqueeze(0)
-    h_a = _swish(h_n)
-    y = torch.einsum("bsh,soh->bso", h_a, w_out) + b_out.unsqueeze(0)
-    return y.sum(dim=1)
+    """Reference for packed-first-linear followed by the actual Decoder ops."""
+    dtype = x.dtype
+    with torch.autocast(x.device.type, enabled=False):
+        h = (torch.einsum("bsi,shi->bsh", x.float(), w_in.to(dtype).float())
+             + b_in.float().unsqueeze(0)).to(dtype)
+        h_a = _canonical_norm_silu(h, ln_w, ln_b, eps=eps)
+        if int(x.shape[1]) == 1:
+            y = F.linear(h_a[:, 0], w_out[0].to(dtype), b_out[0].to(dtype)).unsqueeze(1)
+        else:
+            y = torch.einsum("bsh,soh->bso", h_a, w_out.to(dtype)) + b_out.to(dtype).unsqueeze(0)
+        return y.sum(dim=1)
 
 
 def _next_pow2(n: int) -> int:
@@ -73,7 +75,7 @@ if _TRITON_AVAILABLE:
         h_pre_ptr,
         h_act_ptr,
         B,
-        S,
+        S: tl.constexpr,
         IN,
         H,
         OUT,
@@ -168,66 +170,50 @@ if _TRITON_AVAILABLE:
                 y_s = tl.dot(h_a, tl.trans(w_out)) + b_out_f[None, :]
                 acc += y_s
             else:
-                # Half-precision path matching serial F.linear + bf16/fp16 LN/swish:
-                # gemm fp32-acc -> cast to element dtype; LN reductions fp32->cast;
-                # elementwise (including var squares) stay in element dtype.
-                h = tl.dot(x, tl.trans(w_in), out_dtype=tl.float32) + b_in.to(tl.float32)[None, :]
-                if MM_KIND == 1:
-                    h = h.to(tl.bfloat16)
-                else:
-                    h = h.to(tl.float16)
+
+                element_dtype: tl.constexpr = tl.bfloat16 if MM_KIND == 1 else tl.float16
+                w_in = w_in.to(element_dtype)
+                # Packed first linear retains FP32 bias until the output cast.
+                h = (tl.dot(x, tl.trans(w_in), out_dtype=tl.float32)
+                     + b_in.to(tl.float32)[None, :]).to(element_dtype)
 
                 if SAVE_AUX:
                     tl.store(
                         h_pre_ptr + offs_m[:, None] * stride_h_b + s * stride_h_s + offs_h[None, :],
-                        h.to(tl.float32),
-                        mask=mask_m[:, None] & mask_h[None, :],
+                        h.to(tl.float32), mask=mask_m[:, None] & mask_h[None, :],
                     )
 
-                mean = (tl.sum(h.to(tl.float32), axis=1) / H)
-                if MM_KIND == 1:
-                    mean = mean.to(tl.bfloat16)
+                # Native LayerNorm accumulates mean/variance in FP32.
+                h_f = h.to(tl.float32)
+                mean = tl.sum(tl.where(mask_h[None, :], h_f, 0.0), axis=1) / H
+                centered = tl.where(mask_h[None, :], h_f - mean[:, None], 0.0)
+                var = tl.sum(centered * centered, axis=1) / H
+                normalized = centered * tl.rsqrt(var + eps)[:, None]
+                if S == 1:
+                    h_n = (normalized * ln_w.to(tl.float32)[None, :]
+                           + ln_b.to(tl.float32)[None, :]).to(element_dtype)
                 else:
-                    mean = mean.to(tl.float16)
-                centered = h - mean[:, None]
-                # Zero masked lanes in element dtype before squaring.
-                centered = tl.where(mask_h[None, :], centered, centered * 0)
-                sq = centered * centered
-                sq_f = tl.where(mask_h[None, :], sq.to(tl.float32), 0.0)
-                var = tl.sum(sq_f, axis=1) / H
-                # Match PyTorch: (var + eps) rounds to element dtype before rsqrt.
-                if MM_KIND == 1:
-                    var = var.to(tl.bfloat16)
-                    var_eps = (var.to(tl.float32) + eps).to(tl.bfloat16)
-                    rstd = (1.0 / tl.sqrt(var_eps.to(tl.float32))).to(tl.bfloat16)
-                else:
-                    var = var.to(tl.float16)
-                    var_eps = (var.to(tl.float32) + eps).to(tl.float16)
-                    rstd = (1.0 / tl.sqrt(var_eps.to(tl.float32))).to(tl.float16)
-                h_hat = centered * rstd[:, None]
-                h_n = h_hat * ln_w[None, :] + ln_b[None, :]
-                sig = (1.0 / (1.0 + tl.exp(-h_n.to(tl.float32))))
-                if MM_KIND == 1:
-                    sig = sig.to(tl.bfloat16)
-                else:
-                    sig = sig.to(tl.float16)
-                h_a = h_n * sig
+                    norm_half = normalized.to(element_dtype)
+                    affine = (norm_half.to(tl.float32) * ln_w.to(tl.float32)[None, :]).to(element_dtype)
+                    h_n = (affine.to(tl.float32) + ln_b.to(tl.float32)[None, :]).to(element_dtype)
+                # F.silu performs the scalar function in FP32 and rounds once.
+                h_n_f = h_n.to(tl.float32)
+                h_a = (h_n_f / (1.0 + tl.exp(-h_n_f))).to(element_dtype)
 
                 if SAVE_AUX:
                     tl.store(
                         h_act_ptr + offs_m[:, None] * stride_h_b + s * stride_h_s + offs_h[None, :],
-                        h_a.to(tl.float32),
-                        mask=mask_m[:, None] & mask_h[None, :],
+                        h_a.to(tl.float32), mask=mask_m[:, None] & mask_h[None, :],
                     )
 
-                y_s = tl.dot(h_a, tl.trans(w_out), out_dtype=tl.float32) + b_out.to(tl.float32)[None, :]
-                if MM_KIND == 1:
-                    y_s = y_s.to(tl.bfloat16)
-                    # Match serial stage sum in bf16: acc = acc + y_s
-                    acc = (acc.to(tl.bfloat16) + y_s).to(tl.float32)
+                y_acc = tl.dot(h_a, tl.trans(w_out), out_dtype=tl.float32)
+                if S == 1:
+                    y_s = (y_acc + b_out.to(tl.float32)[None, :]).to(element_dtype)
                 else:
-                    y_s = y_s.to(tl.float16)
-                    acc = (acc.to(tl.float16) + y_s).to(tl.float32)
+                    y_matmul = y_acc.to(element_dtype)
+                    y_s = (y_matmul.to(tl.float32) + b_out.to(tl.float32)[None, :]).to(element_dtype)
+                # torch.sum accumulates half inputs in FP32 and casts once.
+                acc += y_s.to(tl.float32)
 
         tl.store(
             y_ptr + offs_m[:, None] * OUT + offs_out[None, :],
@@ -246,7 +232,7 @@ if _TRITON_AVAILABLE:
         b_out_ptr,
         y_ptr,
         B,
-        S,
+        S: tl.constexpr,
         IN,
         H,
         OUT,
@@ -330,44 +316,38 @@ if _TRITON_AVAILABLE:
                 y_s = tl.dot(h_a, tl.trans(w_out)) + b_out.to(tl.float32)[None, :]
                 acc += y_s
             else:
-                h = tl.dot(x, tl.trans(w_in), out_dtype=tl.float32) + b_in.to(tl.float32)[None, :]
-                if MM_KIND == 1:
-                    h = h.to(tl.bfloat16)
+
+                element_dtype: tl.constexpr = tl.bfloat16 if MM_KIND == 1 else tl.float16
+                w_in = w_in.to(element_dtype)
+                # Packed first linear retains FP32 bias until the output cast.
+                h = (tl.dot(x, tl.trans(w_in), out_dtype=tl.float32)
+                     + b_in.to(tl.float32)[None, :]).to(element_dtype)
+
+                # Native LayerNorm accumulates mean/variance in FP32.
+                h_f = h.to(tl.float32)
+                mean = tl.sum(tl.where(mask_h[None, :], h_f, 0.0), axis=1) / H
+                centered = tl.where(mask_h[None, :], h_f - mean[:, None], 0.0)
+                var = tl.sum(centered * centered, axis=1) / H
+                normalized = centered * tl.rsqrt(var + eps)[:, None]
+                if S == 1:
+                    h_n = (normalized * ln_w.to(tl.float32)[None, :]
+                           + ln_b.to(tl.float32)[None, :]).to(element_dtype)
                 else:
-                    h = h.to(tl.float16)
-                mean = tl.sum(h.to(tl.float32), axis=1) / H
-                if MM_KIND == 1:
-                    mean = mean.to(tl.bfloat16)
+                    norm_half = normalized.to(element_dtype)
+                    affine = (norm_half.to(tl.float32) * ln_w.to(tl.float32)[None, :]).to(element_dtype)
+                    h_n = (affine.to(tl.float32) + ln_b.to(tl.float32)[None, :]).to(element_dtype)
+                # F.silu performs the scalar function in FP32 and rounds once.
+                h_n_f = h_n.to(tl.float32)
+                h_a = (h_n_f / (1.0 + tl.exp(-h_n_f))).to(element_dtype)
+
+                y_acc = tl.dot(h_a, tl.trans(w_out), out_dtype=tl.float32)
+                if S == 1:
+                    y_s = (y_acc + b_out.to(tl.float32)[None, :]).to(element_dtype)
                 else:
-                    mean = mean.to(tl.float16)
-                centered = h - mean[:, None]
-                centered = tl.where(mask_h[None, :], centered, centered * 0)
-                sq = centered * centered
-                sq_f = tl.where(mask_h[None, :], sq.to(tl.float32), 0.0)
-                var = tl.sum(sq_f, axis=1) / H
-                if MM_KIND == 1:
-                    var = var.to(tl.bfloat16)
-                    var_eps = (var.to(tl.float32) + eps).to(tl.bfloat16)
-                    rstd = (1.0 / tl.sqrt(var_eps.to(tl.float32))).to(tl.bfloat16)
-                else:
-                    var = var.to(tl.float16)
-                    var_eps = (var.to(tl.float32) + eps).to(tl.float16)
-                    rstd = (1.0 / tl.sqrt(var_eps.to(tl.float32))).to(tl.float16)
-                h_hat = centered * rstd[:, None]
-                h_n = h_hat * ln_w[None, :] + ln_b[None, :]
-                sig = 1.0 / (1.0 + tl.exp(-h_n.to(tl.float32)))
-                if MM_KIND == 1:
-                    sig = sig.to(tl.bfloat16)
-                else:
-                    sig = sig.to(tl.float16)
-                h_a = h_n * sig
-                y_s = tl.dot(h_a, tl.trans(w_out), out_dtype=tl.float32) + b_out.to(tl.float32)[None, :]
-                if MM_KIND == 1:
-                    y_s = y_s.to(tl.bfloat16)
-                    acc = (acc.to(tl.bfloat16) + y_s).to(tl.float32)
-                else:
-                    y_s = y_s.to(tl.float16)
-                    acc = (acc.to(tl.float16) + y_s).to(tl.float32)
+                    y_matmul = y_acc.to(element_dtype)
+                    y_s = (y_matmul.to(tl.float32) + b_out.to(tl.float32)[None, :]).to(element_dtype)
+                # torch.sum accumulates half inputs in FP32 and casts once.
+                acc += y_s.to(tl.float32)
 
         tl.store(
             y_base + offs_m[:, None] * OUT + offs_out[None, :],
@@ -401,7 +381,7 @@ def _fused_forward_triton(
     if tuple(w_out.shape) != (S, OUT, H):
         raise ValueError(f"w_out shape {tuple(w_out.shape)} != {(S, OUT, H)}")
 
-    if x.dtype != w_in.dtype or x.dtype != w_out.dtype:
+    if w_in.dtype not in (x.dtype, torch.float32) or x.dtype != w_out.dtype:
         raise ValueError(
             f"fused decode matmul dtypes must match: x={x.dtype}, w_in={w_in.dtype}, w_out={w_out.dtype}"
         )
@@ -413,7 +393,7 @@ def _fused_forward_triton(
         mm_kind = 0
 
     x_c = x.contiguous()
-    w_in_c = w_in.contiguous()
+    w_in_c = w_in.to(dtype=x.dtype).contiguous()
     b_in_c = b_in.contiguous()
     ln_w_c = ln_w.contiguous()
     ln_b_c = ln_b.contiguous()
@@ -441,36 +421,37 @@ def _fused_forward_triton(
     # Tile many rows per program so stage weights are reused.
     BLOCK_M = 32 if save_aux else 128
     grid = (triton.cdiv(B, BLOCK_M),)
-    _fused_fwd_kernel[grid](
-        x_c,
-        w_in_c,
-        b_in_c,
-        ln_w_c,
-        ln_b_c,
-        w_out_c,
-        b_out_c,
-        y,
-        h_pre,
-        h_act,
-        B,
-        S,
-        IN,
-        H,
-        OUT,
-        x_c.stride(0),
-        x_c.stride(1),
-        w_in_c.stride(0),
-        w_out_c.stride(0),
-        stride_h_b,
-        stride_h_s,
-        float(eps),
-        SAVE_AUX=save_aux,
-        MM_KIND=mm_kind,
-        BLOCK_M=BLOCK_M,
-        BLOCK_IN=BLOCK_IN,
-        BLOCK_H=BLOCK_H,
-        BLOCK_OUT=BLOCK_OUT,
-    )
+    with torch.cuda.device(x.device):
+        _fused_fwd_kernel[grid](
+            x_c,
+            w_in_c,
+            b_in_c,
+            ln_w_c,
+            ln_b_c,
+            w_out_c,
+            b_out_c,
+            y,
+            h_pre,
+            h_act,
+            B,
+            S,
+            IN,
+            H,
+            OUT,
+            x_c.stride(0),
+            x_c.stride(1),
+            w_in_c.stride(0),
+            w_out_c.stride(0),
+            stride_h_b,
+            stride_h_s,
+            float(eps),
+            SAVE_AUX=save_aux,
+            MM_KIND=mm_kind,
+            BLOCK_M=BLOCK_M,
+            BLOCK_IN=BLOCK_IN,
+            BLOCK_H=BLOCK_H,
+            BLOCK_OUT=BLOCK_OUT,
+        )
     y_out = y.to(dtype=x.dtype)
     if save_aux:
         return y_out, h_pre.to(dtype=x.dtype), h_act.to(dtype=x.dtype)
@@ -492,9 +473,9 @@ def _fused_backward_batched(
 ) -> Tuple[Optional[Tensor], Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """One-shot batched backward across stages. dy: [B, Out].
 
-    For bf16/fp16 inputs, LN/swish reverse uses the same element-dtype rounding
-    chain as the Triton forward (mean/var/rsqrt/sigmoid cast back to input dtype).
-    Matmul gradients still accumulate in fp32 then cast to the parameter dtype.
+    LN/SiLU derivatives use the native operators matching Decoder.forward.
+    First-linear gradients retain FP32 accumulation when its storage is FP32;
+    later linears retain their low-precision compute-gradient contract.
     """
     B, S, H = h_act.shape
     OUT = int(dy.shape[-1])
@@ -522,25 +503,16 @@ def _fused_backward_batched(
         g_b_out = dy_f.sum(dim=0).unsqueeze(0).expand(S, -1).contiguous().to(dtype=dtype)
         dh_act = torch.einsum("bo,soh->bsh", dy_f, w_out_e.float()).to(dtype=dtype)
 
-        # Match Triton half forward LN/swish dtype chain.
-        mean = (h_pre_e.float().mean(dim=-1, keepdim=True)).to(dtype=dtype)
-        centered = h_pre_e - mean
-        var = ((centered * centered).float().mean(dim=-1, keepdim=True)).to(dtype=dtype)
-        var_eps = (var.float() + float(eps)).to(dtype=dtype)
-        rstd = (torch.rsqrt(var_eps.float())).to(dtype=dtype)
-        h_hat = centered * rstd
-        h_n = h_hat * ln_w_e.unsqueeze(0) + ln_b_e.unsqueeze(0)
-        sig = torch.sigmoid(h_n.float()).to(dtype=dtype)
-        dh_n = dh_act * (sig + h_n * sig * (1.0 - sig))
+        with torch.enable_grad(), torch.autocast(dy.device.type, enabled=False):
+            h_leaf = h_pre_e.detach().requires_grad_(True)
+            ln_w_leaf = ln_w_e.detach().requires_grad_(True)
+            ln_b_leaf = ln_b_e.detach().requires_grad_(True)
+            h_act_ref = _canonical_norm_silu(h_leaf, ln_w_leaf, ln_b_leaf, eps=eps)
+            dh_pre, dln_w, dln_b = torch.autograd.grad(
+                h_act_ref, (h_leaf, ln_w_leaf, ln_b_leaf), dh_act, create_graph=False,
+            )
 
-        dln_w = (dh_n * h_hat).sum(dim=0)
-        dln_b = dh_n.sum(dim=0)
-        dh_hat = dh_n * ln_w_e.unsqueeze(0)
-        sum_dh = dh_hat.sum(dim=-1, keepdim=True)
-        sum_dh_hat = (dh_hat * h_hat).sum(dim=-1, keepdim=True)
-        dh_pre = (dh_hat - (sum_dh + h_hat * sum_dh_hat) / H) * rstd
-
-        g_w_in = torch.empty((S, H, IN), device=dy.device, dtype=dtype)
+        g_w_in = torch.empty((S, H, IN), device=dy.device, dtype=w_in.dtype)
         gx = torch.empty((B, S, IN), device=dy.device, dtype=dtype) if x.requires_grad else None
         dh_pre_f = dh_pre.float()
         x_f = x_e.float()
@@ -548,13 +520,13 @@ def _fused_backward_batched(
             g_w_in[stage_idx] = torch.matmul(
                 dh_pre_f[:, stage_idx, :].transpose(0, 1),
                 x_f[:, stage_idx, :],
-            ).to(dtype=dtype)
+            ).to(dtype=w_in.dtype)
             if gx is not None:
                 gx[:, stage_idx, :] = torch.matmul(
                     dh_pre_f[:, stage_idx, :],
                     w_in_e[stage_idx].float(),
                 ).to(dtype=dtype)
-        g_b_in = dh_pre_f.sum(dim=0).to(dtype=dtype)
+        g_b_in = dh_pre_f.sum(dim=0)
         return gx, g_w_in, g_b_in, dln_w, dln_b, g_w_out, g_b_out
 
     g_w_out = (
@@ -613,6 +585,7 @@ class FusedMultistageSymmetricDecode(torch.autograd.Function):
         )
         ctx.eps = float(eps)
         ctx.need_grad = need_grad
+        ctx.input_dtypes = tuple(t.dtype for t in (x, w_in, b_in, ln_w, ln_b, w_out, b_out))
 
         if x.device.type == "cuda" and _TRITON_AVAILABLE:
             if need_grad:
@@ -628,12 +601,10 @@ class FusedMultistageSymmetricDecode(torch.autograd.Function):
                 x, w_in, b_in, ln_w, ln_b, w_out, b_out, eps=float(eps)
             )
             if need_grad:
-                h_pre = torch.einsum("bsi,shi->bsh", x, w_in) + b_in.unsqueeze(0)
-                mean = h_pre.mean(dim=-1, keepdim=True)
-                var = ((h_pre - mean) ** 2).mean(dim=-1, keepdim=True)
-                h_hat = (h_pre - mean) * torch.rsqrt(var + float(eps))
-                h_n = h_hat * ln_w.unsqueeze(0) + ln_b.unsqueeze(0)
-                h_act = _swish(h_n)
+                with torch.autocast(x.device.type, enabled=False):
+                    h_pre = (torch.einsum("bsi,shi->bsh", x.float(), w_in.to(x.dtype).float())
+                             + b_in.float().unsqueeze(0)).to(x.dtype)
+                    h_act = _canonical_norm_silu(h_pre, ln_w, ln_b, eps=float(eps))
 
         if need_grad:
             ctx.save_for_backward(x, w_in, b_in, ln_w, ln_b, w_out, b_out, h_pre, h_act)
@@ -647,21 +618,24 @@ class FusedMultistageSymmetricDecode(torch.autograd.Function):
             return (None,) * 9
         x, w_in, b_in, ln_w, ln_b, w_out, b_out, h_pre, h_act = ctx.saved_tensors
         eps = float(ctx.eps)
-        gx, g_w_in, g_b_in, g_ln_w, g_ln_b, g_w_out, g_b_out = _fused_backward_batched(
-            dy.contiguous(),
-            x,
-            w_in,
-            ln_w,
-            ln_b,
-            w_out,
-            h_pre,
-            h_act,
-            eps=eps,
-            input_dtype=x.dtype,
-        )
+        with torch.autocast(dy.device.type, enabled=False):
+            gx, g_w_in, g_b_in, g_ln_w, g_ln_b, g_w_out, g_b_out = _fused_backward_batched(
+                dy.contiguous(),
+                x,
+                w_in,
+                ln_w,
+                ln_b,
+                w_out,
+                h_pre,
+                h_act,
+                eps=eps,
+                input_dtype=x.dtype,
+            )
         if not x.requires_grad:
             gx = None
-        return gx, g_w_in, g_b_in, g_ln_w, g_ln_b, g_w_out, g_b_out, None, None
+        gradients = (gx, g_w_in, g_b_in, g_ln_w, g_ln_b, g_w_out, g_b_out)
+        return (*(None if grad is None else grad.to(dtype=dtype)
+                  for grad, dtype in zip(gradients, ctx.input_dtypes)), None, None)
 
 
 def fused_multistage_symmetric_decode(
@@ -738,8 +712,8 @@ def fused_decode_packed_symmetric_decoder(
     eps: float = 1e-5,
 ) -> Tensor:
     w_in, b_in, ln_w, ln_b, w_out, b_out = (
-        weight.to(dtype=grouped_vq.dtype)
-        for weight in extract_packed_symmetric_stage_weights(decoder)
+        weight if index in (0, 1) else weight.to(dtype=grouped_vq.dtype)
+        for index, weight in enumerate(extract_packed_symmetric_stage_weights(decoder))
     )
     return fused_multistage_symmetric_decode(
         grouped_vq, w_in, b_in, ln_w, ln_b, w_out, b_out, eps=eps
@@ -776,7 +750,7 @@ def _fused_forward_triton_batched_layers(
         mm_kind = 0
 
     x_c = x.contiguous()
-    w_in_c = w_in.contiguous()
+    w_in_c = w_in.to(dtype=x.dtype).contiguous()
     b_in_c = b_in.contiguous()
     ln_w_c = ln_w.contiguous()
     ln_b_c = ln_b.contiguous()
@@ -791,39 +765,40 @@ def _fused_forward_triton_batched_layers(
         raise ValueError(f"fused decode dims too large: IN={IN} H={H} OUT={OUT}")
     BLOCK_M = 128
     grid = (triton.cdiv(B, BLOCK_M), L)
-    _fused_fwd_kernel_layered[grid](
-        x_c,
-        w_in_c,
-        b_in_c,
-        ln_w_c,
-        ln_b_c,
-        w_out_c,
-        b_out_c,
-        y,
-        B,
-        S,
-        IN,
-        H,
-        OUT,
-        x_c.stride(0),
-        x_c.stride(1),
-        x_c.stride(2),
-        w_in_c.stride(0),
-        w_in_c.stride(1),
-        w_out_c.stride(0),
-        w_out_c.stride(1),
-        b_in_c.stride(0),
-        ln_w_c.stride(0),
-        ln_b_c.stride(0),
-        b_out_c.stride(0),
-        y.stride(0),
-        float(eps),
-        MM_KIND=mm_kind,
-        BLOCK_M=BLOCK_M,
-        BLOCK_IN=BLOCK_IN,
-        BLOCK_H=BLOCK_H,
-        BLOCK_OUT=BLOCK_OUT,
-    )
+    with torch.cuda.device(x.device):
+        _fused_fwd_kernel_layered[grid](
+            x_c,
+            w_in_c,
+            b_in_c,
+            ln_w_c,
+            ln_b_c,
+            w_out_c,
+            b_out_c,
+            y,
+            B,
+            S,
+            IN,
+            H,
+            OUT,
+            x_c.stride(0),
+            x_c.stride(1),
+            x_c.stride(2),
+            w_in_c.stride(0),
+            w_in_c.stride(1),
+            w_out_c.stride(0),
+            w_out_c.stride(1),
+            b_in_c.stride(0),
+            ln_w_c.stride(0),
+            ln_b_c.stride(0),
+            b_out_c.stride(0),
+            y.stride(0),
+            float(eps),
+            MM_KIND=mm_kind,
+            BLOCK_M=BLOCK_M,
+            BLOCK_IN=BLOCK_IN,
+            BLOCK_H=BLOCK_H,
+            BLOCK_OUT=BLOCK_OUT,
+        )
     return y.to(dtype=x.dtype)
 
 
@@ -857,7 +832,8 @@ def fused_decode_batched_same_shape_decoders(
             ]
 
     weight_packs = [
-        tuple(weight.to(dtype=vq.dtype) for weight in extract_packed_symmetric_stage_weights(decoder))
+        tuple(weight if index in (0, 1) else weight.to(dtype=vq.dtype)
+              for index, weight in enumerate(extract_packed_symmetric_stage_weights(decoder)))
         for decoder, vq in zip(decoders, grouped_vqs)
     ]
     first_vq = grouped_vqs[0]

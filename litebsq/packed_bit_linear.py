@@ -286,32 +286,33 @@ def _packed_u8_linear_forward(
     block_h = 32
     mm_kind = _resolve_mm_kind(activation_dtype)
     grid = (triton.cdiv(B, block_b), M, triton.cdiv(H, block_h))
-    _packed_u8_linear_fwd_kernel[grid](
-        packed_c,
-        weight,
-        bias,
-        out,
-        B,
-        M,
-        IN,
-        H,
-        packed_c.stride(0),
-        packed_c.stride(1),
-        packed_c.stride(2),
-        weight.stride(0),
-        weight.stride(1),
-        weight.stride(2),
-        bias.stride(0),
-        bias.stride(1),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        MM_KIND=mm_kind,
-        BLOCK_B=block_b,
-        BLOCK_K=block_k,
-        BLOCK_H=block_h,
-        num_warps=4,
-    )
+    with torch.cuda.device(packed.device):
+        _packed_u8_linear_fwd_kernel[grid](
+            packed_c,
+            weight,
+            bias,
+            out,
+            B,
+            M,
+            IN,
+            H,
+            packed_c.stride(0),
+            packed_c.stride(1),
+            packed_c.stride(2),
+            weight.stride(0),
+            weight.stride(1),
+            weight.stride(2),
+            bias.stride(0),
+            bias.stride(1),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            MM_KIND=mm_kind,
+            BLOCK_B=block_b,
+            BLOCK_K=block_k,
+            BLOCK_H=block_h,
+            num_warps=4,
+        )
     return out, packed_c, B, M, IN, H
 
 
@@ -361,32 +362,33 @@ class _PackedU8Linear(torch.autograd.Function):
         )
         mm_kind = _resolve_mm_kind(grad_c.dtype)
         grid = (reduction_splits, M, triton.cdiv(H, block_h) * n_i_tiles)
-        _packed_u8_linear_dw_kernel[grid](
-            packed,
-            grad_c,
-            partial,
-            B,
-            M,
-            IN,
-            H,
-            rows_per_split,
-            packed.stride(0),
-            packed.stride(1),
-            packed.stride(2),
-            grad_c.stride(0),
-            grad_c.stride(1),
-            grad_c.stride(2),
-            partial.stride(0),
-            partial.stride(1),
-            partial.stride(2),
-            partial.stride(3),
-            MM_KIND=mm_kind,
-            BLOCK_B=block_b,
-            BLOCK_IN=block_in,
-            BLOCK_H=block_h,
-            N_I_TILES=n_i_tiles,
-            num_warps=4,
-        )
+        with torch.cuda.device(grad_c.device):
+            _packed_u8_linear_dw_kernel[grid](
+                packed,
+                grad_c,
+                partial,
+                B,
+                M,
+                IN,
+                H,
+                rows_per_split,
+                packed.stride(0),
+                packed.stride(1),
+                packed.stride(2),
+                grad_c.stride(0),
+                grad_c.stride(1),
+                grad_c.stride(2),
+                partial.stride(0),
+                partial.stride(1),
+                partial.stride(2),
+                partial.stride(3),
+                MM_KIND=mm_kind,
+                BLOCK_B=block_b,
+                BLOCK_IN=block_in,
+                BLOCK_H=block_h,
+                N_I_TILES=n_i_tiles,
+                num_warps=4,
+            )
         grad_weight = partial.sum(dim=0, dtype=torch.float32).to(dtype=ctx.weight_dtype)
         grad_bias = grad_c.sum(dim=0, dtype=torch.float32).to(dtype=ctx.weight_dtype)
         return None, grad_weight, grad_bias, None, None

@@ -192,32 +192,33 @@ def _compute_decoder_weight_bias_grads(
     )
     mm_kind = _resolve_mm_kind(grad_c.dtype)
     grid = (reduction_splits, M, triton.cdiv(H, block_h) * n_i_tiles)
-    _packed_u8_linear_dw_kernel[grid](
-        packed,
-        grad_c,
-        partial,
-        B,
-        M,
-        IN,
-        H,
-        rows_per_split,
-        packed.stride(0),
-        packed.stride(1),
-        packed.stride(2),
-        grad_c.stride(0),
-        grad_c.stride(1),
-        grad_c.stride(2),
-        partial.stride(0),
-        partial.stride(1),
-        partial.stride(2),
-        partial.stride(3),
-        MM_KIND=mm_kind,
-        BLOCK_B=block_b,
-        BLOCK_IN=block_in,
-        BLOCK_H=block_h,
-        N_I_TILES=n_i_tiles,
-        num_warps=4,
-    )
+    with torch.cuda.device(grad_c.device):
+        _packed_u8_linear_dw_kernel[grid](
+            packed,
+            grad_c,
+            partial,
+            B,
+            M,
+            IN,
+            H,
+            rows_per_split,
+            packed.stride(0),
+            packed.stride(1),
+            packed.stride(2),
+            grad_c.stride(0),
+            grad_c.stride(1),
+            grad_c.stride(2),
+            partial.stride(0),
+            partial.stride(1),
+            partial.stride(2),
+            partial.stride(3),
+            MM_KIND=mm_kind,
+            BLOCK_B=block_b,
+            BLOCK_IN=block_in,
+            BLOCK_H=block_h,
+            N_I_TILES=n_i_tiles,
+            num_warps=4,
+        )
     grad_weight = partial.sum(dim=0, dtype=torch.float32).to(dtype=weight_dtype)
     grad_bias = grad_c.sum(dim=0, dtype=torch.float32).to(dtype=weight_dtype)
     return grad_weight, grad_bias
