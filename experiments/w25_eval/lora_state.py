@@ -1,8 +1,9 @@
-"""Saved-state contract for all-projection rank4 LoRA on native Qwen/Llama."""
+"""Saved-state contract for selected ordinary LoRA on native Qwen/Llama."""
 from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import math
 
 import torch
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
@@ -11,6 +12,7 @@ from compressed_e2e_fintuning.v6_runtime_state import validate_e2e_immutable_res
 from e2e_common.full_lora import _logical_adapter_target_name
 from experiments.qwen3_w25.assemble_categories import _assert_state_equal, _require
 from experiments.w25_eval.model_inventory import model_inventory
+from experiments.w25_eval.subset_state import selected_layers, selected_modules, selected_names
 from experiments.qwen3_w25.export_e2e_selected import _read_json
 from train_utils.checkpoint_v6 import load_v6_training_step_meta, resolve_training_step_round_base_ref
 
@@ -19,9 +21,33 @@ RANK = 4
 ALPHA = 8.0
 
 
-def lora_storage(shapes):
-    parameters = RANK * sum(out + inp for out, inp in shapes.values())
+def lora_storage(shapes, rank=RANK):
+    _require(type(rank) is int and 0 < rank <= 16, "Require an integer LoRA rank in [1, 16].")
+    parameters = rank * sum(out + inp for out, inp in shapes.values())
     return {"parameters": parameters, "tensors": 2 * len(shapes), "storage_bits": parameters * 16}
+
+
+def lora_selection(architecture, target_layers, target_modules, *, rank, alpha, dropout):
+    """Resolve native selectors against actual projections, never dense targets."""
+    _require(type(rank) is int and 0 < rank <= 16 and math.isfinite(alpha) and alpha > 0
+             and dropout == 0.0, "Require rank<=16, positive finite alpha and zero dropout.")
+    names = selected_names(target_layers, target_modules, architecture)
+    shapes = {name: architecture["projection_shapes"][name] for name in names}
+    exact = {"rank": rank, "alpha": alpha, "dropout": dropout,
+             "rank_pattern": {}, "target_modules": sorted(names)}
+    return shapes, exact
+
+
+def saved_lora_selection(meta, architecture):
+    contract = meta["immutable_resume_contract"]
+    lora = contract["lora"]
+    shapes, exact = lora_selection(architecture, meta["target_layers"], meta["target_modules"],
+        **{key: lora[key] for key in ("rank", "alpha", "dropout")})
+    _require(lora == exact and meta.get("lora_config") in (None, exact), "Wrong exact adapter topology.")
+    _require(selected_layers(contract["target_layers"], architecture) == selected_layers(meta["target_layers"], architecture)
+             and selected_modules(contract["target_modules"], architecture) == selected_modules(meta["target_modules"], architecture),
+             "Saved selectors differ from the native immutable contract.")
+    return shapes, exact
 
 
 def validate_source(meta, architecture=None):
@@ -46,8 +72,7 @@ def validate_source(meta, architecture=None):
 
 
 def validate_configuration(meta, state, snapshot, architecture):
-    shapes = architecture["projection_shapes"]
-    categories = tuple(dict.fromkeys(name.rsplit(".", 1)[-1] for name in shapes))
+    shapes, expected_lora = saved_lora_selection(meta, architecture)
     contract = meta["immutable_resume_contract"]
     cfg, training = snapshot["canonical_config"], snapshot["training_args"]
     _require(meta["train_mode"] == contract["train_mode"] == cfg["train_mode"] == "lora",
@@ -56,16 +81,11 @@ def validate_configuration(meta, state, snapshot, architecture):
         _require(meta[key] == contract["aux"][key] == cfg["aux"][key] == "none", f"Require {key}=none.")
     _require(cfg["aux"]["residual_lora_mode"] == contract["aux"].get("residual_lora_mode", "none") == "none",
              "Residual LoRA is excluded.")
-    expected_lora = {"rank": RANK, "alpha": ALPHA, "dropout": 0.0,
-                     "rank_pattern": {}, "target_modules": sorted(shapes)}
     _require(meta["lora_config"] == contract["lora"] == expected_lora, "Wrong exact adapter topology.")
     for key in ("rank", "alpha", "dropout"):
         _require(cfg["lora"][key] == expected_lora[key], f"Snapshot LoRA {key} differs.")
-    _require(meta["target_layers"] == contract["target_layers"] == list(range(architecture["num_hidden_layers"])), "Require every actual layer.")
-    _require(meta["target_modules"] == contract["target_modules"]
-             and set(meta["target_modules"]) == set(categories), "Require all seven categories.")
-    _require(cfg["target_layers"] == "all" or cfg["target_layers"] == meta["target_layers"], "Layer selection differs.")
-    _require(cfg["target_modules"] == "all" or set(cfg["target_modules"]) == set(categories), "Category selection differs.")
+    _require(selected_names(cfg["target_layers"], cfg["target_modules"], architecture) == tuple(shapes),
+             "Canonical selectors differ from the saved LoRA targets.")
     _require(contract["runtime"]["parallel_mode"] == "dp" and contract["runtime"]["offload_mode"] == "none"
              and not contract["runtime"]["distill_hif4_act"] and contract["distributed"]["world_size"] == 1,
              "Require single-process DP without student offload or HiFloat4.")
@@ -115,8 +135,10 @@ def inspect_step(checkpoint):
     return meta, state, snapshot, Path(source), base_meta, architecture
 
 
-def project_lora_state(mutable, manifest, shapes):
+def project_lora_state(mutable, manifest, shapes, *, rank=RANK, alpha=ALPHA):
     """Mirror native finalizer: low_rank_b=A; low_rank_a=(B*alpha/r), then BF16."""
+    lora_storage(shapes, rank)
+    _require(math.isfinite(alpha) and alpha > 0, "Require positive finite LoRA alpha.")
     _require({row["name"]: row["component_class"] for row in manifest}
              == {key: "lora" for key in mutable} and len(manifest) == len(mutable) == 2 * len(shapes),
              "Selected mutable state must contain only two LoRA factors per target.")
@@ -131,16 +153,17 @@ def project_lora_state(mutable, manifest, shapes):
                  and value.dtype == torch.float32 and bool(torch.isfinite(value).all()),
                  f"Invalid selected FP32 factor: {key}.")
         out, inp = shapes[name]
-        _require(tuple(value.shape) == ((RANK, inp) if side == "A" else (out, RANK)), f"Wrong factor shape: {key}.")
+        _require(tuple(value.shape) == ((rank, inp) if side == "A" else (out, rank)), f"Wrong factor shape: {key}.")
         pairs[name][side] = value
-    _require(set(pairs) == set(shapes), "Missing LoRA target.")
+    _require(set(pairs) == set(shapes) and all(set(pair) == {"A", "B"} for pair in pairs.values()),
+             "Missing LoRA target or factor.")
     return {name + "." + key: value.contiguous() for name, pair in pairs.items() for key, value in (
         ("low_rank_b", pair["A"].to(torch.bfloat16)),
-        ("low_rank_a", pair["B"].float().mul(ALPHA / RANK).to(torch.bfloat16)))}
+        ("low_rank_a", pair["B"].float().mul(alpha / rank).to(torch.bfloat16)))}
 
 
-def audit_lora_state(original, actual, mutable, manifest, shapes):
-    projected = project_lora_state(mutable, manifest, shapes)
+def audit_lora_state(original, actual, mutable, manifest, shapes, *, rank=RANK, alpha=ALPHA):
+    projected = project_lora_state(mutable, manifest, shapes, rank=rank, alpha=alpha)
     _require(not set(original) & set(projected) and set(actual) == set(original) | set(projected),
              "Deployment must add only finalized LoRA factors.")
     frozen = _assert_state_equal({key: actual[key] for key in original}, original, "Every original tensor remains frozen")

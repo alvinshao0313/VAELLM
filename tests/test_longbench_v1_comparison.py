@@ -1,6 +1,7 @@
 """Aggregation contracts only; these synthetic scores are not benchmark results."""
 from copy import deepcopy
 import math
+from pathlib import Path
 
 import pytest
 
@@ -54,3 +55,22 @@ def test_partial_mismatched_and_corrupt_score_artifacts_are_rejected():
         mutate(bad)
         with pytest.raises(ValueError):
             compare_reports(dense, bad, archive_sha256="a" * 64)
+
+
+def test_llama_pair_uses_its_own_real_model_protocol():
+    path = Path("/home/star/models/meta-llama/Llama-3.1-8B-Instruct")
+    if not path.is_dir():
+        pytest.skip("The real local Llama metadata is required for this compatibility check.")
+    expected = protocol_record(path)
+    assert expected != protocol_record()
+    dense, compressed = score_report("dense"), score_report("compressed")
+    dense["protocol"] = deepcopy(expected)
+    compressed["protocol"] = deepcopy(expected)
+    result = compare_reports(dense, compressed, archive_sha256="a" * 64, expected_protocol=expected)
+    assert result["protocol"] == expected
+    assert result["sample_count_per_model"] == 4750
+    with pytest.raises(ValueError):
+        compare_reports(dense, compressed, archive_sha256="a" * 64)
+    compressed["protocol"] = protocol_record()
+    with pytest.raises(ValueError):
+        compare_reports(dense, compressed, archive_sha256="a" * 64, expected_protocol=expected)

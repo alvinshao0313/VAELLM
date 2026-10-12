@@ -1,4 +1,4 @@
-"""Private four-step validation of the all252 rank4 backup; no formal run CLI."""
+"""Private four-step selected-LoRA validation; no formal run CLI."""
 from __future__ import annotations
 
 import argparse
@@ -17,23 +17,25 @@ from experiments.qwen3_w25.assemble_categories import _assert_state_equal, _requ
 from experiments.qwen3_w25.export_e2e_selected import _read_json, _sha256
 from experiments.qwen3_w25.subset_step_export_callback import SubsetStepExportCallback
 from experiments.w25_eval.lora_audit import load_state
-from experiments.w25_eval.lora_state import ALPHA, RANK, lora_storage, project_lora_state, validate_source
+from experiments.w25_eval.lora_state import lora_selection, lora_storage, project_lora_state, validate_source
 from experiments.w25_eval.lora_step_callback import LoraStepExportCallback
 from experiments.w25_eval.validate_wide_subset_training import TrainingObservations
-
-
-SOURCE_ID = "f927ffda-dd5b-4d00-b63a-5e839a182d70"
 
 
 def configuration(record):
     cfg, hf, args = parse_args(record["training_argv"])
     source_meta = _read_json(Path(cfg.student_checkpoint_dir) / "checkpoint_meta.json")
-    validate_source(source_meta)
-    _require(source_meta["checkpoint_id"] == SOURCE_ID, "This candidate uses the actual best1200 source.")
+    architecture = validate_source(source_meta)
+    shapes, lora = lora_selection(architecture, cfg.target_layers, cfg.target_modules,
+                                 rank=cfg.lora.rank, alpha=cfg.lora.alpha, dropout=cfg.lora.dropout)
+    _require(source_meta["checkpoint_id"] == record["source_checkpoint_id"], "The candidate source UUID changed.")
     _require(Path(cfg.student_checkpoint_dir).resolve() == Path(record["source_checkpoint"]).resolve()
-             and cfg.train_mode == "lora" and cfg.target_layers == "all" and cfg.target_modules == "all"
-             and cfg.lora.rank == RANK and cfg.lora.alpha == ALPHA and cfg.lora.dropout == 0.0,
-             "Require fresh best1200, all252, rank4/alpha8/dropout0.")
+             and cfg.train_mode == "lora", "Require fresh ordinary LoRA on the pinned source.")
+    expected, storage = record["expected_inventory"], lora_storage(shapes, lora["rank"])
+    _require(expected["lora_tensors"] == storage["tensors"] and expected["lora_parameters"] == storage["parameters"]
+             and expected["added_BF16_bits"] == storage["storage_bits"]
+             and expected["final_tensors"] == expected["original_frozen_tensors"] + storage["tensors"],
+             "Prepared inventory does not match actual selected LoRA geometry.")
     _require(cfg.aux.norm_train_mode == cfg.aux.lm_head_train_mode == cfg.aux.residual_lora_mode == "none"
              and tuple(cfg.opt.distill_fp32_components) == ("lora",)
              and cfg.resume_from_checkpoint is None and cfg.stop_after_step is None,
@@ -54,8 +56,10 @@ def configuration(record):
 
 
 class LoraValidationCallback(LoraStepExportCallback):
-    def __init__(self, **kwargs):
+    def __init__(self, *, selected_shapes, lora_config, **kwargs):
         super().__init__(diagnostic_eval_limit=64, **kwargs)
+        self.selected_shapes = selected_shapes
+        self.lora_config = lora_config
         self.diagnostic_stop_step = 4
         self.diagnostic = {"batches": [], "optimizer_steps": [], "native_saves": []}
         self._input_hook = None
@@ -75,14 +79,13 @@ class LoraValidationCallback(LoraStepExportCallback):
         model = kwargs["model"]
         active = {name: value for name, value in model.named_parameters() if value.requires_grad}
         manifest = [{"name": name, "component_class": "lora"} for name in active]
-        architecture = validate_source(_read_json(self.source_dir / "checkpoint_meta.json"))
-        shapes = architecture["projection_shapes"]
-        storage = lora_storage(shapes)
-        projected = project_lora_state(active, manifest, shapes)
+        shapes, lora = self.selected_shapes, self.lora_config
+        storage = lora_storage(shapes, lora["rank"])
+        projected = project_lora_state(active, manifest, shapes, rank=lora["rank"], alpha=lora["alpha"])
         del projected
         _require(collect_logical_adapter_target_names(model) == set(shapes)
                  and len(active) == storage["tensors"] and sum(v.numel() for v in active.values()) == storage["parameters"],
-                 "Trainables escaped the full rank4 adapter inventory.")
+                 "Trainables escaped the selected adapter inventory.")
         optimizer = kwargs["optimizer"]
         while hasattr(optimizer, "optimizer"):
             optimizer = optimizer.optimizer
@@ -90,7 +93,8 @@ class LoraValidationCallback(LoraStepExportCallback):
                  and {id(p) for group in optimizer.param_groups for p in group["params"]} == {id(v) for v in active.values()},
                  "Optimizer must update exactly the LoRA factors.")
         self.diagnostic["trainable_inventory"] = {"lora_tensors": len(active), "lora_elements": storage["parameters"],
-            "parameter_dtype": "torch.float32", "target_count": len(shapes), "decoder_norm_head_code_trainables": 0}
+            "parameter_dtype": "torch.float32", "target_count": len(shapes), "lora_config": lora,
+            "decoder_norm_head_code_trainables": 0}
         def observe(_module, positional, values):
             ids = values.get("input_ids", positional[0] if positional else None)
             if ids is not None:
@@ -107,15 +111,20 @@ class LoraValidationCallback(LoraStepExportCallback):
 
 def train(record):
     cfg, hf, args = configuration(record)
-    _require(record.get("gpu") is not None and record.get("export_gpu") is not None, "GPU resources are not bound.")
+    _require(record.get("gpu") is not None and record.get("export_gpu") is not None
+             and str(record["gpu"]) != str(record["export_gpu"]), "Bind two distinct GPUs.")
+    architecture = validate_source(_read_json(Path(cfg.student_checkpoint_dir) / "checkpoint_meta.json"))
+    shapes, lora = lora_selection(architecture, cfg.target_layers, cfg.target_modules,
+                                 rank=cfg.lora.rank, alpha=cfg.lora.alpha, dropout=cfg.lora.dropout)
     callback = LoraValidationCallback(source_dir=cfg.student_checkpoint_dir, run_root_dir=cfg.run_root_dir,
-                                      export_cuda_visible_devices=str(record["export_gpu"]))
+                                      export_cuda_visible_devices=str(record["export_gpu"]), selected_shapes=shapes, lora_config=lora)
     configure_e2e_determinism(bool(args.full_determinism))
     set_e2e_seed(int(args.seed))
     torch.cuda.reset_peak_memory_stats()
     try:
         result = run(cfg, hf, args, extra_callbacks=(callback,))
-        _require(result["global_step"] == 4 and result["round_base_checkpoint_id"] == SOURCE_ID, "Wrong native training endpoint.")
+        _require(result["global_step"] == 4 and result["round_base_checkpoint_id"] == record["source_checkpoint_id"],
+                 "Wrong native training endpoint.")
         obs = callback.diagnostic
         _require([x["step"] for x in obs["optimizer_steps"]] == [1, 2, 3, 4]
                  and [x["step"] for x in obs["native_saves"]] == [2, 4]
@@ -134,8 +143,13 @@ def train(record):
 
 
 def verify(record):
+    cfg, _hf, _args = configuration(record)
     output = Path(record["output_dir"])
     trained = _read_json(output / "training.json")
+    expected = record["expected_inventory"]
+    architecture = validate_source(_read_json(Path(record["source_checkpoint"]) / "checkpoint_meta.json"))
+    shapes, lora = lora_selection(architecture, cfg.target_layers, cfg.target_modules,
+                                 rank=cfg.lora.rank, alpha=cfg.lora.alpha, dropout=cfg.lora.dropout)
     points = {}
     for step in (2, 4):
         d = output / f"step_{step:04d}"
@@ -143,13 +157,16 @@ def verify(record):
         _require(callback["status"] == "diagnostic_complete" and callback["diagnostic_eval_limit"] == 64
                  and set(callback["stages"]) == {"export", "audit", "mmlu", "seven"}
                  and all(x["exit_code"] == 0 for x in callback["stages"].values()), "Incomplete limited callback.")
-        _require(audit["status"] == "verified" and audit["frozen_tensors_compared"] == 3423
-                 and audit["frozen_code_banks"] == 504 and audit["changed_code_bits"] == 0
-                 and audit["serialized_tensors_compared"] == audit["reloaded_tensors_compared"] == 3927
-                 and audit["selected_lora_matches_native_bf16_cast_exactly"] and audit["lora_rank"] == 4,
+        _require(audit["status"] == "verified" and audit["source_checkpoint_id"] == record["source_checkpoint_id"]
+                 and audit["frozen_tensors_compared"] == expected["original_frozen_tensors"]
+                 and audit["frozen_code_banks"] == expected["frozen_code_banks"] and audit["changed_code_bits"] == 0
+                 and audit["serialized_tensors_compared"] == audit["reloaded_tensors_compared"] == expected["final_tensors"]
+                 and audit["selected_lora_matches_native_bf16_cast_exactly"] and audit["lora_config"] == lora
+                 and audit["selected_target_count"] == len(shapes) and audit["bit_budget"]["budget_passed"],
                  "Incomplete independent LoRA state audit.")
         _require(export["source_global_step"] == step and export["source_max_steps"] == 2000
-                 and export["restored_lora_tensors"] == 504 and export["optimizer_steps_executed"] == 0,
+                 and export["restored_lora_tensors"] == expected["lora_tensors"] and export["lora_config"] == lora
+                 and export["optimizer_steps_executed"] == 0,
                  "Export must only restore the selected step.")
         for shard, batch, leaves, count in (("mmlu", 64, 57, 3648), ("seven", 32, 7, 448)):
             raw = _read_json(d / f"{shard}.json")
@@ -167,7 +184,9 @@ def verify(record):
     compared = _assert_state_equal(native, independent, "Native final versus independently restored step4")
     del native, independent
     gc.collect()
-    report = {"status": "verified", "source_checkpoint_id": SOURCE_ID, "points": points,
+    _require(compared == expected["final_tensors"], "Native final has the wrong complete tensor inventory.")
+    report = {"status": "verified", "source_checkpoint_id": record["source_checkpoint_id"], "points": points,
+              "architecture": architecture, "lora_config": lora,
               "native_vs_step4_tensors_compared": compared, "training_report_sha256": _sha256(output / "training.json"),
               "diagnostic_not_quality": True}
     (output / "verification.json").write_text(json.dumps(report, indent=2) + "\n")

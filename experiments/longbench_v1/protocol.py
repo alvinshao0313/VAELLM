@@ -47,9 +47,38 @@ def official_files():
     return prompts, lengths, provenance
 
 
-def protocol_record():
+def model_policy(model_path):
+    """Read the local model's inference policy without loading model weights."""
+    from transformers import AutoConfig, AutoTokenizer
+    path = Path(model_path).resolve()
+    config = AutoConfig.from_pretrained(path, local_files_only=True)
+    if config.model_type not in ("qwen3", "llama"):
+        raise ValueError(f"Unsupported LongBench model type: {config.model_type}")
+    tokenizer = AutoTokenizer.from_pretrained(path, use_fast=True, local_files_only=True)
+    if not tokenizer.is_fast or tokenizer.eos_token_id is None or not tokenizer.chat_template:
+        raise ValueError("A complete original fast tokenizer/chat template is required.")
+    generation = json.loads((path / "generation_config.json").read_text())
+    eos = generation["eos_token_id"]
+    eos = [eos] if isinstance(eos, int) else list(eos)
+    if tokenizer.eos_token_id not in eos or config.max_position_embeddings < WINDOW:
+        raise ValueError("Original EOS/context configuration does not cover this protocol.")
+    pad = tokenizer.pad_token_id
+    if pad is None:
+        pad = tokenizer.eos_token_id  # Same missing-pad rule as the native training/eval tokenizer.
+    if config.model_type == "qwen3" and (eos != list(EOS_TOKEN_IDS) or pad != PAD_TOKEN_ID
+                                         or config.rope_scaling is not None):
+        raise ValueError("The existing Qwen3 protocol requires its original EOS/pad/unscaled RoPE.")
+    return {"model_type": config.model_type,
+            "attn_implementation": "flash_attention_2" if config.model_type == "qwen3" else "sdpa",
+            "rope_scaling": config.rope_scaling, "rope_theta": config.rope_theta,
+            "bos_token_id": tokenizer.bos_token_id, "tokenizer_eos_token_id": tokenizer.eos_token_id,
+            "eos_token_id": eos, "pad_token_id": pad,
+            "pad_policy": "original tokenizer pad, otherwise original tokenizer EOS"}
+
+
+def protocol_record(model_path=None):
     _, lengths, _ = official_files()
-    return {"benchmark": "LongBench_v1", "datasets": list(DATASETS), "total_samples": 4750,
+    record = {"benchmark": "LongBench_v1", "datasets": list(DATASETS), "total_samples": 4750,
             "official_code_commit": UPSTREAM_COMMIT, "dataset_revision": DATA_REVISION,
             "total_window_tokens": WINDOW, "input_budget": "32768 minus each task max_new_tokens",
             "max_new_tokens": lengths, "batch_size": 1, "seed": 42, "do_sample": False,
@@ -61,6 +90,16 @@ def protocol_record():
             "truncation_adaptation": "official retains prompt ends before chat; this Qwen3 adapter reserves template/output space exactly",
             "samsum_stop": "min_length=input_length+1; EOS=[tokenizer.eos_token_id, last token of newline]",
             "extra_fewshot": 0, "score": "official per-task metrics and max over reference answers"}
+    if model_path is not None:
+        policy = model_policy(model_path)
+        if policy["model_type"] == "llama":
+            record.update(model_type="llama", rope_scaling=policy["rope_scaling"],
+                          rope_theta=policy["rope_theta"], bos_token_id=policy["bos_token_id"],
+                          eos_token_id=policy["eos_token_id"], pad_token_id=policy["pad_token_id"],
+                          pad_policy=policy["pad_policy"], attn_implementation="sdpa",
+                          chat="original Llama chat template with its native defaults; add_generation_prompt=True",
+                          truncation_adaptation="official retains prompt ends before chat; this Llama adapter reserves template/output space exactly")
+    return record
 
 
 def input_bytes(ids):
@@ -76,14 +115,15 @@ def middle_truncate(ids, budget):
     return list(ids[:left]) + list(ids[-(budget - left):])
 
 
-def encode_example(tokenizer, dataset, record, prompts, lengths):
+def encode_example(tokenizer, dataset, record, prompts, lengths, *, protocol=None):
     prompt = prompts[dataset].format(**record)
     if dataset in BARE_TASKS:
         ids = tokenizer.encode(prompt, add_special_tokens=True)
     else:
+        kwargs = {} if protocol is not None and protocol.get("model_type") == "llama" else {"enable_thinking": False}
         ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], tokenize=True,
-            add_generation_prompt=True, enable_thinking=False)
+            add_generation_prompt=True, **kwargs)
     if not ids:
         raise ValueError("Empty LongBench prompt.")
     max_new = int(lengths[dataset])
@@ -97,13 +137,19 @@ def encode_example(tokenizer, dataset, record, prompts, lengths):
     }
 
 
-def generation_options(tokenizer, dataset, input_length, max_new_tokens):
-    if tokenizer.eos_token_id != EOS_TOKEN_IDS[0] or tokenizer.pad_token_id != PAD_TOKEN_ID:
+def generation_options(tokenizer, dataset, input_length, max_new_tokens, *, protocol=None):
+    llama = protocol is not None and protocol.get("model_type") == "llama"
+    eos = list(protocol["eos_token_id"]) if llama else list(EOS_TOKEN_IDS)
+    pad = protocol["pad_token_id"] if llama else PAD_TOKEN_ID
+    if not llama and (tokenizer.eos_token_id != EOS_TOKEN_IDS[0] or tokenizer.pad_token_id != PAD_TOKEN_ID):
         raise ValueError("Expected original Qwen3 EOS/pad identities.")
+    if llama and (tokenizer.eos_token_id not in eos or tokenizer.pad_token_id not in (None, pad)
+                  or tokenizer.bos_token_id != protocol["bos_token_id"]):
+        raise ValueError("Llama tokenizer differs from the original model policy.")
     options = {"max_new_tokens": int(max_new_tokens), "num_beams": 1,
                "do_sample": False, "temperature": 1.0, "top_p": 1.0, "top_k": 50,
-               "use_cache": True, "pad_token_id": PAD_TOKEN_ID,
-               "eos_token_id": list(EOS_TOKEN_IDS), "repetition_penalty": 1.0,
+               "use_cache": True, "pad_token_id": pad,
+               "eos_token_id": eos, "repetition_penalty": 1.0,
                "no_repeat_ngram_size": 0, "length_penalty": 1.0}
     if dataset == "samsum":
         newline = tokenizer.encode("\n", add_special_tokens=False)

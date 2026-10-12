@@ -38,3 +38,8 @@ additive 为 x+D(x)，B=0 时保持初始输出；replace 为 D(x)，正交初�
 读取当前 E2E 日志时，`grad_norm` 是裁剪前范数；总 `loss` 是日志窗口及多卡平均，分项则来自 rank0 最后一次 loss 计算，不能逐行加权相加验证总数。hidden/pre-MLP 为相对教师能量归一化的误差，爆涨证明相对误差严重异常，但没有逐层张量和梯度记录时，不能据此认定最先失稳的层或参数组。
 
 **后续证据（2026-10-01）。** 同一0920初始模型的普通rank8 LoRA搜索已完成，采用decoder冻结、residual none和head linear，12组完成5000步，最佳2500步模型独立严格重载后均分68.024489%。这支持该具体训练配方可执行；相对前述诊断还改变了head等条件，不能把稳定性改善全部归因于冻结decoder，也不据此否定所有decoder联合优化。[当前配置、正式指标与限制](../records/e2e_0920/2026-09-24_rank8_search.md)
+
+
+2026-10-06 迁移旧DoRA配方时，当前CLI已删除use_dora，CAT仅创建plain LoRA；现model-level finalizer实际手工W+sBA，不能直接拿来合并DoRA。DoRA还含每输出行的可学习magnitude与更新后权重行范数；installed PEFT0.10原生merge支持该项，当前exact PEFT config却未保存DoRA拓扑。隔离原型已用真实CPU PEFT验证FP32公式→BF16矩阵一致、magnitude梯度和导出无adapter，但未因此认定主框架支持DoRA、8B数值已通过或精度有效。若后续集成，须同时处理构造、参数收集、正确合并及实际需要的保存语义，不能只加一个use_dora开关。[发现、来源及短测边界](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
+
+2026-10-06该DoRA隔离8B配对已完成：从已做500步恢复的同after_gate边界，再以相同256训练/64留出文档进行64步plain LoRA或DoRA，原生DoRA-aware merge、2211保存/fresh和冻结码库均通过；两臂16/16留出批KL均恶化，DoRA融合后.10251968与LoRA .10267050的微小差异不能证明有益。起点也有微小数值差，不能假设逐位相同。两种融合前后logit差同时包含160个prefix decoder的FP32→BF16和packed→whole-fused切换；不得把全差归给adapter。该具体额外恢复配方不集成，不能由64步、该数据/LR/来源条件否定其他DoRA配方；短验权重已退役、证据保留。[完整配对和清理记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月6日0822保护int4尺度搜索全模型结果与三条后续运行)。

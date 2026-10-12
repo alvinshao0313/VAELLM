@@ -1,8 +1,7 @@
 """Compare two complete LongBench v1 score artifacts; never run inference/scoring.
 
-This entry deliberately lives outside longbench_v1, whose Python files are pinned
-by active prediction jobs. Scores and differences are benchmark score points,
-not a uniform accuracy percentage.
+Scores and differences are benchmark score points, not a uniform accuracy
+percentage. The file entry binds both models to their validated input archive.
 """
 from __future__ import annotations
 
@@ -36,11 +35,11 @@ def _means(tasks):
     return categories, math.fsum(tasks.values()) / len(tasks), math.fsum(categories.values()) / len(categories)
 
 
-def _validated_scores(report, kind, archive_sha256):
+def _validated_scores(report, kind, archive_sha256, expected_protocol):
     _require(report.get("schema") == "longbench_v1_scores_v1" and report.get("status") == "complete"
              and report.get("sample_count") == sum(EXPECTED_COUNTS.values()) == 4750,
              "Both score artifacts must cover all 4750 examples; partial results are forbidden.")
-    _require(report.get("archive_sha256") == archive_sha256 and report.get("protocol") == protocol_record(),
+    _require(report.get("archive_sha256") == archive_sha256 and report.get("protocol") == expected_protocol,
              "Scores must use the same verified archive and fixed LongBench v1 protocol.")
     _require(report["model"]["kind"] == kind, f"Expected the {kind} model in this input position.")
     _require(set(report["tasks"]) == set(DATASETS), "Exactly the 21 official tasks are required.")
@@ -60,10 +59,11 @@ def _validated_scores(report, kind, archive_sha256):
     return tasks, categories, task_mean, category_mean
 
 
-def compare_reports(dense, compressed, *, archive_sha256):
-    """Pure aggregation over complete, independently scored artifacts."""
-    left = _validated_scores(dense, "dense", archive_sha256)
-    right = _validated_scores(compressed, "compressed", archive_sha256)
+def compare_reports(dense, compressed, *, archive_sha256, expected_protocol=None):
+    """Aggregate complete scores using the protocol from a validated archive."""
+    expected_protocol = protocol_record() if expected_protocol is None else expected_protocol
+    left = _validated_scores(dense, "dense", archive_sha256, expected_protocol)
+    right = _validated_scores(compressed, "compressed", archive_sha256, expected_protocol)
     _require(all(dense["model"][key] == compressed["model"][key]
                  for key in ("hf_path", "hf_metadata_sha256", "hf_weight_stats")),
              "Dense and compressed results must share the original model/tokenizer identity.")
@@ -111,7 +111,8 @@ def comparison(dense_scores, compressed_scores, manifest_path):
     manifest, _ = load_archive(manifest_path)
     dense, dense_evidence = _load_scores(dense_scores, manifest_path, manifest)
     compressed, compressed_evidence = _load_scores(compressed_scores, manifest_path, manifest)
-    result = compare_reports(dense, compressed, archive_sha256=sha256(manifest_path))
+    result = compare_reports(dense, compressed, archive_sha256=sha256(manifest_path),
+                             expected_protocol=manifest["protocol"])
     result["inputs"] = {"manifest": str(Path(manifest_path).resolve()),
                         "dense_scores": dense_evidence, "compressed_scores": compressed_evidence,
                         "official_scoring_recomputed": False}

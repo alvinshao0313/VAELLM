@@ -9,7 +9,7 @@ import time
 
 from experiments.qwen3_w25.aux_step_export_callback import AuxStepExportCallback, stage_commands as fixed_stage_commands
 from experiments.qwen3_w25.step_export_callback import run_logged_stage
-from experiments.w25_eval.lora_state import inspect_step
+from experiments.w25_eval.lora_state import inspect_step, saved_lora_selection
 
 
 LOG = logging.getLogger(__name__)
@@ -35,13 +35,16 @@ class LoraStepExportCallback(AuxStepExportCallback):
             return control
         checkpoint = Path(args.output_dir).resolve() / f"checkpoint-{step}"
         meta, saved, _snapshot, source, _base, _architecture = inspect_step(checkpoint)
+        shapes, lora = saved_lora_selection(meta, _architecture)
         if saved["global_step"] != step or source.resolve() != self.source_dir:
             raise ValueError("Saved LoRA step/source differs from callback boundary.")
         output = self.run_root_dir / f"step_{step:04d}"
         output.mkdir(parents=True, exist_ok=False)
         record = {"status": "running", "source_checkpoint": str(checkpoint), "source_checkpoint_id": meta["checkpoint_id"],
             "global_step": step, "max_steps": int(args.max_steps), "export_cuda_visible_devices": self.env["CUDA_VISIBLE_DEVICES"],
-            "diagnostic_eval_limit": self.diagnostic_eval_limit, "stages": {}}
+            "diagnostic_eval_limit": self.diagnostic_eval_limit, "selected_target_count": len(shapes),
+            "lora_config": lora, "quality_scope": "limited pipeline diagnostic" if self.diagnostic_eval_limit is not None
+                else "eight-task screening only; nine-score goal additionally requires full LongBench", "stages": {}}
         path = output / ("diagnostic.json" if self.diagnostic_eval_limit is not None else "step_export.json")
         started = time.monotonic()
         try:

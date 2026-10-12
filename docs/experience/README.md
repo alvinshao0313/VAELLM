@@ -54,7 +54,7 @@ grep -RniE '编码|STE|翻码|proxy' docs/experience/lessons
 
 ## 最近专题
 
-- [Qwen3 MMLU 65、Llama3.1 迁移及 LongBench 对比](records/w25_transfer/2026-10-04_mmlu65_llama31.md)：提高知识任务要求、迁移同类压缩方案并补充压缩前后长上下文评测。
+- [Qwen3/Llama3.1 九项指标、知识恢复及 LongBench 对比](records/w25_transfer/2026-10-04_mmlu65_llama31.md)：10月12日起优先Qwen3-8B，空卡在没有可立即并行Qwen任务时继续Llama3.1-8B-Instruct迁移；两模型均以八个下游任务与完整LongBench组成九项等权综合分，相对各自BF16绝对下降不超过0.8个百分点，严格train-only、MMLU不另设门槛。
 - [Qwen3 8B 平均位宽 2.5bit 内达到八任务均分 69](records/qwen3_w25/2026-09-30_goal.md)：新服务器的数据准备、压缩基底、位宽审计及后续恢复，状态与授权见正文。
 - [LiftQuant编码恢复经验](lessons/liftquant_recovery.md)：最新状态、证据和限制见正文。
 - [硬码翻转贡献对照](records/experiments/liftquant_recovery/BIT_CONTRIBUTION_20260923.md)：最新状态、证据和限制见正文。

@@ -1,4 +1,4 @@
-"""Independently finalize one saved all-projection rank4 LoRA step, without training."""
+"""Independently finalize a saved selected LoRA step, without training."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ import torch
 
 from experiments.qwen3_w25.assemble_categories import _require
 from experiments.qwen3_w25.export_e2e_selected import _sha256
-from experiments.w25_eval.lora_state import ALPHA, RANK, inspect_step, project_lora_state, lora_storage
+from experiments.w25_eval.lora_state import inspect_step, project_lora_state, lora_storage, saved_lora_selection
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -23,6 +23,7 @@ CODE_FILES = (
     "compressed_e2e_fintuning/runtime_v6_pipeline.py", "train_utils/model_level_trainables.py",
     "train_utils/distill_precision.py", "train_utils/checkpoint_v6.py",
     "train_utils/v6_model_loader.py", "train_utils/checkpoint_bpw.py", "litebsq/vae_linear.py",
+    "experiments/w25_eval/subset_state.py", "train_utils/config/targets.py",
 )
 
 
@@ -36,18 +37,19 @@ def restore_lora_model(model, selected, checkpoint, meta, snapshot, architecture
     from train_utils.model_level_trainables import build_model_level_trainable_selection
 
     cfg = snapshot["canonical_config"]
+    shapes, lora = saved_lora_selection(meta, architecture)
     _enable_internal_decode_runtime(selected, decoder_enabled=False, sparse_enabled=False,
                                     vae_decoder_checkpoint=cfg["runtime"]["vae_decoder_checkpoint"])
     selection = build_model_level_trainable_selection(
         model, aux=AuxTrainableConfig(**cfg["aux"]), compressed_modules=selected,
-        dense_target_modules=(), rank=RANK, alpha=ALPHA, dropout=0.0, rank_explicit=True,
+        dense_target_modules=(), rank=lora["rank"], alpha=lora["alpha"], dropout=lora["dropout"], rank_explicit=True,
         fp32_components=("lora",), train_decoder=False, train_lora=True, freeze=True)
     model = selection.peft_model or model
     configure_distill_precision(selection, components=("lora",), training_args=SimpleNamespace(bf16=True, fp16=False))
-    actual = collect_exact_peft_lora_config(model, default_rank=RANK, alpha=ALPHA, dropout=0.0)
+    actual = collect_exact_peft_lora_config(model, default_rank=lora["rank"], alpha=lora["alpha"], dropout=lora["dropout"])
     _require(actual == meta["lora_config"], "Rebuilt adapter topology differs from saved state.")
     mutable, manifest = load_v6_training_model_state(str(checkpoint), map_location="cpu")
-    projected = project_lora_state(mutable, manifest, architecture["projection_shapes"])
+    projected = project_lora_state(mutable, manifest, shapes, rank=lora["rank"], alpha=lora["alpha"])
     del projected
     restore_e2e_mutable_state(model, selection=selection, selected_vae_modules=selected,
                              checkpoint_state=mutable, checkpoint_manifest=manifest)
@@ -71,7 +73,7 @@ def export_checkpoint(checkpoint, output_dir, *, device="cuda:0"):
     _require(not output.exists() and int(os.environ.get("WORLD_SIZE", "1")) == 1,
              "Use a new output and one export process.")
     meta, state, snapshot, source, base_meta, architecture = inspect_step(checkpoint)
-    shapes = architecture["projection_shapes"]
+    shapes, lora = saved_lora_selection(meta, architecture)
     device = torch.device(device)
     _require(torch.cuda.is_available() and device.type == "cuda", "Actual finalization probes require CUDA.")
     training = SimpleNamespace(**snapshot["training_args"])
@@ -88,14 +90,15 @@ def export_checkpoint(checkpoint, output_dir, *, device="cuda:0"):
     record = {"runtime": "experiments.w25_eval.lora_export", "source_checkpoint": str(checkpoint),
         "source_checkpoint_id": meta["checkpoint_id"], "round_base_dir": str(source),
         "round_base_checkpoint_id": base_meta["checkpoint_id"], "source_global_step": state["global_step"],
-        "source_max_steps": state["max_steps"], "restored_lora_tensors": lora_storage(shapes)["tensors"], "architecture": architecture,
+        "source_max_steps": state["max_steps"], "restored_lora_tensors": lora_storage(shapes, lora["rank"])["tensors"],
+        "lora_config": lora, "selected_target_count": len(shapes), "architecture": architecture,
         "optimizer_steps_executed": 0, "trainer_or_main_optimizer_constructed": False,
         "teacher_or_training_data_loaded": False, "decoder_finalization_performed": False,
         "head_fusion_performed": False, "source_files_sha256": {str(p): _sha256(p) for p in files},
         "code_sha256": {p: _sha256(REPO / p) for p in CODE_FILES}}
     model, loaded, _ = load_v6_model_checkpoint(str(source), map_location="cpu", strict=True)
     _require(loaded["checkpoint_id"] == base_meta["checkpoint_id"], "Source changed during load.")
-    selected = collect_e2e_compressed_targets(model, target_layers=tuple(range(architecture["num_hidden_layers"])),
+    selected = collect_e2e_compressed_targets(model, target_layers=tuple(meta["target_layers"]),
         target_modules=tuple(meta["target_modules"]), num_layers=architecture["num_hidden_layers"])
     _require({name for name, _ in selected} == set(shapes), "Incomplete actual LoRA targets.")
     fingerprint = _compressed_base_digest(selected)

@@ -82,30 +82,53 @@ def download_and_extract(directory, *, resume_download=False):
 
 def tokenizer_pins(path):
     path = Path(path).resolve()
-    names = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "config.json", "generation_config.json")
+    names = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "config.json", "generation_config.json",
+             "special_tokens_map.json", "added_tokens.json", "tokenizer.model")
     pins = {str(path / name): sha256(path / name) for name in names if (path / name).is_file()}
     if not (path / "tokenizer.json").is_file() or not (path / "tokenizer_config.json").is_file():
         raise ValueError("A complete local fast tokenizer is required.")
     return pins
 
 
-def prepare(directory, tokenizer_path, *, resume_download=False):
+def prepare(directory, tokenizer_path, *, resume_download=False, reuse_data_manifest=None):
     directory = Path(directory).resolve()
     if (directory / "manifest.json").exists():
         raise FileExistsError("A prepared archive already exists; validate and reuse it.")
     started = time.time()
-    data_dir = download_and_extract(directory, resume_download=resume_download)
+    if reuse_data_manifest is None:
+        data_dir = download_and_extract(directory, resume_download=resume_download)
+        raw_paths = {name: data_dir / (name + ".jsonl") for name in DATASETS}
+        reused = None
+    else:
+        source = Path(reuse_data_manifest).resolve()
+        prior = json.loads(source.read_text())
+        if (prior["data"]["repository"] != "THUDM/LongBench" or prior["data"]["revision"] != DATA_REVISION
+                or prior["data"]["zip_sha256"] != DATA_ZIP_SHA256 or prior["data"]["counts"] != EXPECTED_COUNTS):
+            raise ValueError("Reused raw data must be the pinned complete official dataset.")
+        archive = source.parent / "data.zip"
+        if archive.stat().st_size != DATA_ZIP_BYTES or sha256(archive) != DATA_ZIP_SHA256:
+            raise ValueError("Reused official data ZIP changed.")
+        raw_paths = {Path(path).stem: Path(path) for path in prior["data"]["raw_sha256"]}
+        if set(raw_paths) != set(DATASETS):
+            raise ValueError("Reused raw data must have all21 unique task files.")
+        for path, expected in prior["data"]["raw_sha256"].items():
+            if sha256(path) != expected:
+                raise ValueError(f"Reused official raw data changed: {path}")
+        reused = {"manifest": str(source), "sha256": sha256(source), "raw_only": True,
+                  "token_archive_reused": False, "official_zip": str(archive)}
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True, local_files_only=True)
-    if not tokenizer.is_fast or tokenizer.pad_token_id is None:
-        raise ValueError("Expected the original Qwen3 fast tokenizer with a pad token.")
+    if not tokenizer.is_fast:
+        raise ValueError("Expected the original fast tokenizer.")
+    protocol = protocol_record(tokenizer_path)
     pins = tokenizer_pins(tokenizer_path)
     prompts, lengths, upstream = official_files()
     tokens_path, index_path = directory / "inputs.u32", directory / "index.jsonl"
     counts, raw_hashes, offset, stats = {}, {}, 0, {}
+    directory.mkdir(parents=True, exist_ok=True)
     with tokens_path.open("xb") as tokens, index_path.open("x", encoding="utf-8") as index:
         for dataset in DATASETS:
-            raw_path = data_dir / (dataset + ".jsonl")
+            raw_path = raw_paths[dataset]
             raw_hashes[str(raw_path)] = sha256(raw_path)
             seen = set()
             stats[dataset] = {"samples": 0, "truncated": 0, "input_tokens": 0,
@@ -117,7 +140,7 @@ def prepare(directory, tokenizer_path, *, resume_download=False):
                     if identity in seen or not isinstance(item["answers"], list) or not item["answers"]:
                         raise ValueError(f"Invalid/repeated official example: {dataset}:{row_number}")
                     seen.add(identity)
-                    ids, metadata = encode_example(tokenizer, dataset, item, prompts, lengths)
+                    ids, metadata = encode_example(tokenizer, dataset, item, prompts, lengths, protocol=protocol)
                     payload = input_bytes(ids)
                     tokens.write(payload)
                     record = {"dataset": dataset, "row_index": row_number, "_id": identity,
@@ -141,7 +164,7 @@ def prepare(directory, tokenizer_path, *, resume_download=False):
         index.flush()
         os.fsync(index.fileno())
     record = {"schema": "longbench_v1_shared_inputs_v1", "status": "prepared",
-              "protocol": protocol_record(), "upstream": upstream,
+              "protocol": protocol, "upstream": upstream,
               "data": {"repository": "THUDM/LongBench", "revision": DATA_REVISION,
                        "zip_sha256": DATA_ZIP_SHA256, "raw_sha256": raw_hashes, "counts": counts},
               "tokenizer": {"path": str(Path(tokenizer_path).resolve()), "use_fast": True, "sha256": pins},
@@ -150,14 +173,20 @@ def prepare(directory, tokenizer_path, *, resume_download=False):
               "index": {"path": str(index_path), "sha256": sha256(index_path)},
               "sample_count": sum(counts.values()), "statistics": stats,
               "duration_seconds": time.time() - started}
+    if reused is not None:
+        record["raw_data_reuse"] = reused
     write_json(directory / "manifest.json", record)
     return record
 
 
 def load_archive(manifest_path, *, check_token_file=True):
     manifest = json.loads(Path(manifest_path).read_text())
-    if manifest["schema"] != "longbench_v1_shared_inputs_v1" or manifest["protocol"] != protocol_record():
+    if (manifest["schema"] != "longbench_v1_shared_inputs_v1"
+            or manifest["protocol"] != protocol_record(manifest["tokenizer"]["path"])):
         raise ValueError("Prepared LongBench protocol mismatch.")
+    for path, expected in manifest["tokenizer"]["sha256"].items():
+        if sha256(path) != expected:
+            raise ValueError(f"Prepared original tokenizer/config changed: {path}")
     if manifest["sample_count"] != 4750 or manifest["data"]["counts"] != EXPECTED_COUNTS:
         raise ValueError("Full 21-task archive required.")
     if sha256(manifest["index"]["path"]) != manifest["index"]["sha256"]:

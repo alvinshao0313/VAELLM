@@ -47,7 +47,7 @@ def check_hashes(pins):
 
 def source_pins():
     """Bind this runner and the existing loader/cache implementation it uses."""
-    paths = {ROOT / "tools/cat_eval.py"}
+    paths = {ROOT / "tools/cat_eval.py", ROOT / "experiments/w25_eval/model_inventory.py"}
     for directory in ("experiments/longbench_v1", "train_utils", "litebsq",
                       "e2e_common", "rotation", "sparse_bit_tuning"):
         paths.update((ROOT / directory).rglob("*.py"))

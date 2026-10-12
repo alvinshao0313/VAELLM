@@ -1,0 +1,136 @@
+"""Deploy and fully evaluate one prepared, isolated gate endpoint once."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import traceback
+
+from experiments.longbench_v1.common import check_hashes, check_stat, sha256, write_json
+from experiments.long_context_recovery.contract import require
+
+
+def read(path):
+    return json.loads(Path(path).read_text())
+
+
+def check(record):
+    check_hashes(record['source_sha256'])
+    check_hashes(record['input_sha256'])
+    check_stat(record['source_weight_stat'])
+    for item in record['hf_weight_stats']:
+        check_stat(item)
+    require(sha256(record['endpoint_path']) == record['endpoint_sha256'], 'The selected endpoint changed.')
+
+
+def run(record_path):
+    record_path = Path(record_path).resolve()
+    record = read(record_path)
+    output = Path(record['output_dir']).resolve()
+    code = 1
+    try:
+        require(record['status'] == 'bound_ready' and type(record['gpu']) is int
+                and os.environ.get('CUDA_VISIBLE_DEVICES') == str(record['gpu'])
+                and Path(sys.executable).resolve() == Path(record['python_executable']).resolve()
+                and Path.cwd().resolve() == Path(record['cwd']).resolve()
+                and not record['queued'] and not record['automatic_retry'],
+                'Use the bound GPU, repository and bitvae interpreter without retry or queue.')
+        require(all(os.environ.get(key) == value for key, value in record['environment'].items())
+                and all(os.environ.get(key) == '1' for key in
+                        ('HF_HUB_OFFLINE', 'HF_DATASETS_OFFLINE', 'TRANSFORMERS_OFFLINE'))
+                and os.environ.get('PYTORCH_CUDA_ALLOC_CONF') == 'expandable_segments:True'
+                and not any(key in os.environ for key in ('FLASH_ATTENTION_DETERMINISTIC', 'NVIDIA_TF32_OVERRIDE')),
+                'Keep the prepared offline, allocator and numerical environment.')
+        require(not any((output / name).exists() for name in
+                        ('final_model', 'audit.json', 'mmlu.json', 'seven.json', 'full8_summary.json', 'dispatcher.exit')),
+                'Use a fresh output; existing deployment or evaluation must not be overwritten.')
+        commands = record['stage_commands']
+        require([row['name'] for row in commands] == ['deploy', 'mmlu', 'seven'], 'Unexpected stage inventory.')
+        check(record)
+        record.update(status='running', worker_pid=os.getpid(),
+            worker_start_ticks=int(Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]),
+            started_unix=time.time(), stages={},
+            actual_environment={key: os.environ.get(key) for key in record['environment']})
+        write_json(record_path, record)
+        from experiments.qwen3_w25.step_export_callback import run_logged_stage
+        for row in commands:
+            name, command = row['name'], row['argv']
+            require(Path(command[0]).resolve() == Path(sys.executable).resolve()
+                    and '--limit' not in command and '--lm_limit' not in command, 'Do not change the interpreter or limit evaluation.')
+            record.update(status=name)
+            record['stages'][name] = {'argv': command, 'started_unix': time.time()}
+            write_json(record_path, record)
+            try:
+                status = run_logged_stage(command, name=name, output_dir=output,
+                                          env=os.environ.copy(), allowed_exit_codes=(0,))
+            finally:
+                exit_path = output / (name + '.exit')
+                if exit_path.exists():
+                    value = exit_path.read_text().strip()
+                    record['stages'][name]['exit_code'] = int(value) if value.lstrip('-').isdigit() else value
+                record['stages'][name]['finished_unix'] = time.time()
+                write_json(record_path, record)
+            require(status == 0, 'Each prepared stage must finish successfully.')
+        from experiments.w25_eval.acceptance import collect_results, validate_checkpoint
+        from experiments.gate_student_context_evaluation.prepare import budget_equal
+        model, meta, budget = validate_checkpoint(output / 'final_model', record['architecture'])
+        audit = read(output / 'audit.json')
+        require(audit['status'] == 'verified' and audit['source_checkpoint_id'] == record['source_checkpoint_id']
+                and audit['checkpoint_id'] == meta['checkpoint_id'] != record['source_checkpoint_id']
+                and audit['endpoint_sha256'] == record['endpoint_sha256']
+                and audit['patched_local_tensor_count'] == 13 and audit['frozen_outside_target_tensors'] == 3410
+                and audit['serialized_tensors_compared'] == 3423 and audit['reloaded_tensors_compared'] == 3423
+                and audit['fresh_strict_reload_state_exact'] and audit['endpoint_state_exact']
+                and audit['frozen_outside_target_exact'] and audit['native_full_weight_reload_exact']
+                and audit['integer_budget_unchanged'] and audit['rank_zero'], 'Independent deployment audit failed.')
+        budget_equal(budget, record['source_bit_budget'])
+        paths = [output / name for name in ('mmlu.json', 'seven.json')]
+        current = collect_results(paths, record['architecture'], checkpoint=(model, meta))
+        require(current['leaf_count'] == 64 and current['sample_count'] == 24742, 'Incomplete eight-task evaluation.')
+        control_paths = [Path(path) for path in record['control_result_paths']]
+        require(len(control_paths) == 2, 'Require both original-source result shards.')
+        source = Path(record['source_checkpoint']).resolve()
+        source_meta = read(source / 'checkpoint_meta.json')
+        require(source_meta['checkpoint_id'] == record['source_checkpoint_id'], 'Original control identity changed.')
+        control = collect_results(control_paths, record['architecture'], checkpoint=(source, source_meta))
+        for actual_path, control_path in zip(paths, control_paths, strict=True):
+            actual_raw, control_raw = (read(path)['evals']['lm_eval'] for path in (actual_path, control_path))
+            for field in ('configs', 'versions', 'n_shot', 'n_samples'):
+                require(actual_raw[field] == control_raw[field], f'Actual/control {actual_path.stem} {field} differs.')
+        check(record)
+        summary = {'status': 'full8_evaluation_verified', 'arm': record['arm'], 'checkpoint_dir': str(model),
+            'checkpoint_id': meta['checkpoint_id'], 'source_checkpoint_id': record['source_checkpoint_id'],
+            'endpoint_sha256': record['endpoint_sha256'], **current, 'bit_budget': budget,
+            'audit': str(output / 'audit.json'), 'audit_sha256': sha256(output / 'audit.json'),
+            'actual_configs_versions_shots_counts_equal_control': True, 'control_results': control['input_results'],
+            'control_mean_percent': control['mean_percent'],
+            'mean_delta_percentage_points': current['mean_percent'] - control['mean_percent'],
+            'task_delta_percentage_points': {task: 100 * (value - control['task_metrics'][task])
+                                             for task, value in current['task_metrics'].items()},
+            'longbench_status': 'not_evaluated', 'current_nine_item_goal_status': 'not_evaluated',
+            'goal_acceptance': False, 'scope': record['protocol']['boundary']}
+        write_json(output / 'full8_summary.json', summary)
+        record.update(status='completed', checkpoint_id=meta['checkpoint_id'], final_model=str(model),
+            mean_percent=current['mean_percent'], mmlu_percent=100 * current['task_metrics']['mmlu'],
+            full8_summary=str(output / 'full8_summary.json'), full8_summary_sha256=sha256(output / 'full8_summary.json'),
+            audit_sha256=sha256(output / 'audit.json'), longbench_status='not_evaluated',
+            current_nine_item_goal_status='not_evaluated', current_nine_item_goal_passed=False)
+        code = 0
+    except BaseException as error:
+        record.update(status='failed', error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
+        print(record['traceback'], flush=True)
+    finally:
+        record.update(dispatcher_exit_code=code, exit_code=code, finished_unix=time.time())
+        write_json(record_path, record)
+        (output / 'dispatcher.exit').write_text(str(code) + '\n')
+    return code
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--launch_record', required=True, type=Path)
+    args = parser.parse_args()
+    sys.exit(run(args.launch_record))

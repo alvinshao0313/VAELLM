@@ -6,11 +6,16 @@
 不遍历目录符号链接，不收录依赖/缓存、tokenizer 文本、运行时间标记及原始 JSON/日志。
 旧路径只列映射，不重复索引正文；历史迁移来源另见 [CATALOG](experience/CATALOG.md)。
 
-## 规则、导航与使用说明（22）
+## 规则、导航与使用说明（29）
 
 - [项目协作规范](../AGENTS.md) — `AGENTS.md`
 - [VAELLM](../README.md) — `README.md`
 - [Compressed E2E v6](../compressed_e2e_fintuning/README.md) — `compressed_e2e_fintuning/README.md`
+- [📚 FineWeb-Edu](../data/fineweb_edu_10bt_20261005/original/README.md) — `data/fineweb_edu_10bt_20261005/original/README.md`
+- [2026-10-04 长上下文原始数据检查](../data/long_context_recovery_20261004/INSPECTION.md) — `data/long_context_recovery_20261004/INSPECTION.md`
+- [LongLoRA and LongAlpaca for Long-context LLMs](../data/long_context_recovery_20261004/longalpaca/raw/README.md) — `data/long_context_recovery_20261004/longalpaca/raw/README.md`
+- [LongAlign-10k](../data/long_context_recovery_20261004/raw/README.md) — `data/long_context_recovery_20261004/raw/README.md`
+- [Dataset Card for Qasper](../data/qwen_causal_qasper_20261009/raw/README.md) — `data/qwen_causal_qasper_20261009/raw/README.md`
 - [文档管理规范](MANAGEMENT.md) — `docs/MANAGEMENT.md`
 - [VAELLM 文档入口](README.md) — `docs/README.md`
 - [CatLoRA 严格 2-bit 多保真搜索](catlora_hparam_search.md) — `docs/catlora_hparam_search.md`
@@ -28,7 +33,9 @@
 - [LiftQuant-style VAELLM recovery](../experiments/liftquant_recovery/README.md) — `experiments/liftquant_recovery/README.md`
 - [PROVENANCE.md](../experiments/liftquant_recovery/upstream/PROVENANCE.md) — `experiments/liftquant_recovery/upstream/PROVENANCE.md`
 - [Independent Linear Output W2](../experiments/linear_output/README.md) — `experiments/linear_output/README.md`
+- [LongBench 固定高敏任务 CPU 评分](../experiments/longbench_sensitive_screen/README.md) — `experiments/longbench_sensitive_screen/README.md`
 - [LongBench v1 paired evaluation](../experiments/longbench_v1/README.md) — `experiments/longbench_v1/README.md`
+- [顺序 CAT 的类别旋转块大小：兼容设计](../experiments/rotation_factor_probe/design.md) — `experiments/rotation_factor_probe/design.md`
 - [mix_bit — Mixed-Bit VAE Allocation](../mix_bit/README.md) — `mix_bit/README.md`
 
 ## 可复用经验（10）
@@ -75,7 +82,7 @@
 - [Qwen3 8B 达到69的简版说明与最快复现路径](experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_quickstart.md) — `docs/experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_quickstart.md`
 - [Qwen3 8B 压缩达到69的技术汇报](experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_report.html) — `docs/experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_report.html`
 - [Qwen3 8B 极低比特压缩达到八任务均分 69 的方案与实验证据](experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_report.md) — `docs/experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_report.md`
-- [Qwen3 MMLU 65、Llama3.1 迁移及长上下文对比](experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md) — `docs/experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md`
+- [Qwen3/Llama3.1 九项指标、知识恢复与低比特迁移](experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md) — `docs/experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md`
 
 ## 历史计划与审查（147）
 
@@ -227,8 +234,102 @@
 - [Task 9: Closed-Loop Verification Before the Expensive Formal Run](experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-brief.md) — `docs/experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-brief.md`
 - [Task 9 Report — BLOCKED (GPU memory)](experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-report.md) — `docs/experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-report.md`
 
-## 原位产物说明与自动报告（5）
+## 原位产物说明与自动报告（99）
 
+- [rawK38 QK-only fresh4000](../result/qwen3_8b_mmlu65_20261004/general_lm_qwen_k38_qkonly_s4000_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/general_lm_qwen_k38_qkonly_s4000_20261012/README.md`
+- [Llama715e FineWeb400 双学习率配对](../result/qwen3_8b_mmlu65_20261004/llama_best715e_fineweb_lr_pair_s400_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/llama_best715e_fineweb_lr_pair_s400_20261012/README.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/down_proj/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/down_proj/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/down_proj/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/down_proj/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/gate_proj/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/gate_proj/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/gate_proj/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/gate_proj/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/k_proj/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/k_proj/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/k_proj/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/k_proj/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/o_proj/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/o_proj/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/o_proj/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/o_proj/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/q_proj/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/q_proj/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/q_proj/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/q_proj/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/up_proj/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/up_proj/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/up_proj/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/up_proj/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/v_proj/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/v_proj/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/llama_category_full8/v_proj/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/llama_category_full8/v_proj/lm_eval_summary_seven.md`
+- [Llama715e 原生答案 TF fresh32](../result/qwen3_8b_mmlu65_20261004/llama_native_answer_tf_s32_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/llama_native_answer_tf_s32_20261012/README.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/output_scale_int4/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/output_scale_int4/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/output_scale_int4/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/output_scale_int4/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/rht_output_scale_int4/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/rht_output_scale_int4/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/rht_output_scale_int4/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/llama/rht_output_scale_int4/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/output_scale_int4/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/output_scale_int4/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/output_scale_int4/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/output_scale_int4/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/rht_output_scale_int4/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/rht_output_scale_int4/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/rht_output_scale_int4/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_quality/qwen3/rht_output_scale_int4/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/llama/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/llama/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/llama/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/llama/lm_eval_summary_seven.md`
+- [lm_eval_summary_mmlu.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/qwen3/lm_eval_summary_mmlu.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/qwen3/lm_eval_summary_mmlu.md`
+- [lm_eval_summary_seven.md](../result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/qwen3/lm_eval_summary_seven.md) — `result/qwen3_8b_mmlu65_20261004/protected_int4_scale_quality/qwen3/lm_eval_summary_seven.md`
+- [项目协作规范](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/AGENTS.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/AGENTS.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/HiFloat4/LICENSE) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/HiFloat4/LICENSE`
+- [HiFloat4](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/HiFloat4/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/HiFloat4/README.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/LICENSE) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/LICENSE`
+- [VAELLM](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/README.md`
+- [Compressed E2E v6](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/compressed_e2e_fintuning/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/compressed_e2e_fintuning/README.md`
+- [VAE 分组输出损失：最小下游精度对照](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/activation_loss_ab/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/activation_loss_ab/README.md`
+- [Down Layer Sensitivity Ablation](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/down_layer_sensitivity/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/down_layer_sensitivity/README.md`
+- [LiftQuant-style VAELLM recovery](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/liftquant_recovery/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/liftquant_recovery/README.md`
+- [PROVENANCE.md](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/liftquant_recovery/upstream/PROVENANCE.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/liftquant_recovery/upstream/PROVENANCE.md`
+- [Independent Linear Output W2](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/linear_output/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/linear_output/README.md`
+- [LongBench v1 paired evaluation](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/longbench_v1/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/longbench_v1/README.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/longbench_v1/upstream/LICENSE) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/experiments/longbench_v1/upstream/LICENSE`
+- [mix_bit — Mixed-Bit VAE Allocation](../result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/mix_bit/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_a0e5_sample_mean_pair/sample_mean_source/mix_bit/README.md`
+- [Qasper 完整上下文与证据上下文配对准备](../result/qwen3_8b_mmlu65_20261004/qwen_evidence_context_pair/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_evidence_context_pair/README.md`
+- [同源 HOT 连续128步预算](../result/qwen3_8b_mmlu65_20261004/qwen_hotpot_continuous_s128_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_hotpot_continuous_s128_20261012/README.md`
+- [原 F_A_HOT 的损失删除配对](../result/qwen3_8b_mmlu65_20261004/qwen_hotpot_domain_ablation_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_hotpot_domain_ablation_20261012/README.md`
+- [Qasper32 + Hotpot96 数据替换准备](../result/qwen3_8b_mmlu65_20261004/qwen_hotpot_recovery_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_hotpot_recovery_20261012/README.md`
+- [原生 L18 码与 decoder 交替短测](../result/qwen3_8b_mmlu65_20261004/qwen_native_bit_alternation_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_bit_alternation_20261012/README.md`
+- [项目协作规范](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/AGENTS.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/AGENTS.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/HiFloat4/LICENSE) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/HiFloat4/LICENSE`
+- [HiFloat4](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/HiFloat4/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/HiFloat4/README.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/LICENSE) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/LICENSE`
+- [VAELLM](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/README.md`
+- [Compressed E2E v6](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/compressed_e2e_fintuning/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/compressed_e2e_fintuning/README.md`
+- [VAE 分组输出损失：最小下游精度对照](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/activation_loss_ab/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/activation_loss_ab/README.md`
+- [Down Layer Sensitivity Ablation](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/down_layer_sensitivity/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/down_layer_sensitivity/README.md`
+- [LiftQuant-style VAELLM recovery](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/liftquant_recovery/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/liftquant_recovery/README.md`
+- [PROVENANCE.md](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/liftquant_recovery/upstream/PROVENANCE.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/liftquant_recovery/upstream/PROVENANCE.md`
+- [Independent Linear Output W2](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/linear_output/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/linear_output/README.md`
+- [LongBench v1 paired evaluation](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/longbench_v1/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/longbench_v1/README.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/longbench_v1/upstream/LICENSE) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/experiments/longbench_v1/upstream/LICENSE`
+- [mix_bit — Mixed-Bit VAE Allocation](../result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/mix_bit/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_category_rotation/source_snapshot/mix_bit/README.md`
+- [Qwen L18 down：固定 D8 / D+P8 连续短测](../result/qwen3_8b_mmlu65_20261004/qwen_native_down_protected_trajectory_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_down_protected_trajectory_20261012/README.md`
+- [Qwen 原生 B 联合投影的三个 reader 候选](../result/qwen3_8b_mmlu65_20261004/qwen_native_joint_projection_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_joint_projection_20261012/README.md`
+- [Qwen L18 gate 原生八态 group0 读出（2026-10-12）](../result/qwen3_8b_mmlu65_20261004/qwen_native_joint_readout_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_joint_readout_20261012/README.md`
+- [固定 B10 的两个保护条件点（2026-10-12）](../result/qwen3_8b_mmlu65_20261004/qwen_native_joint_readout_20261012/conditional_two_points/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_joint_readout_20261012/conditional_two_points/README.md`
+- [BF16 末态 decoder × 原生保护 q 交叉读出](../result/qwen3_8b_mmlu65_20261004/qwen_native_protected_cross_readout_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_protected_cross_readout_20261012/README.md`
+- [Qwen L18 gate 原生 INT8 保护投影（2026-10-12）](../result/qwen3_8b_mmlu65_20261004/qwen_native_protected_projection_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_protected_projection_20261012/README.md`
+- [固定 P8/D8 原生 BF16 部署与九项配对](../result/qwen3_8b_mmlu65_20261004/qwen_native_protected_trajectory_full9_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_protected_trajectory_full9_20261012/README.md`
+- [Qwen 原生共享梯度连续短测（2026-10-12）](../result/qwen3_8b_mmlu65_20261004/qwen_native_shared_trajectory_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_shared_trajectory_20261012/README.md`
+- [Qwen 原坐标 tile 邻域投影隔离原型](../result/qwen3_8b_mmlu65_20261004/qwen_native_tile_projection_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_native_tile_projection_20261012/README.md`
+- [L18 gate 原生保护 q/scale 联合投影](../result/qwen3_8b_mmlu65_20261004/qwen_protected_qscale_projection_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_protected_qscale_projection_20261012/README.md`
+- [Qwen L18 gate 五态共享梯度方向诊断（2026-10-12）](../result/qwen3_8b_mmlu65_20261004/qwen_shared_dense_direction_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_shared_dense_direction_20261012/README.md`
+- [Qwen L18 gate 单组共享 gW／D 捕获（2026-10-12）](../result/qwen3_8b_mmlu65_20261004/qwen_shared_gw_capture_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_shared_gw_capture_20261012/README.md`
+- [Qwen 共享 gW 的原始候选临界 η 扫描](../result/qwen3_8b_mmlu65_20261004/qwen_shared_gw_threshold_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_shared_gw_threshold_20261012/README.md`
+- [Qwen L18 gate 保护区 CPU 几何（2026-10-12）](../result/qwen3_8b_mmlu65_20261004/qwen_shared_protection_geometry_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_shared_protection_geometry_20261012/README.md`
+- [Qwen 三位置原生更新隔离短测](../result/qwen3_8b_mmlu65_20261004/qwen_three_site_native_projection_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_three_site_native_projection_20261012/README.md`
+- [固定 HOT 数据的 all252 native greedy OPD](../result/qwen3_8b_mmlu65_20261004/qwen_train_only_opd_hotpot_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/qwen_train_only_opd_hotpot_20261012/README.md`
+- [had.188.tur.txt](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/had.188.tur.txt) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/had.188.tur.txt`
+- [proposal.txt](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/integration_proposal/proposal.txt) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/integration_proposal/proposal.txt`
+- [项目协作规范](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/AGENTS.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/AGENTS.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/HiFloat4/LICENSE) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/HiFloat4/LICENSE`
+- [HiFloat4](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/HiFloat4/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/HiFloat4/README.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/LICENSE) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/LICENSE`
+- [VAELLM](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/README.md`
+- [Compressed E2E v6](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/compressed_e2e_fintuning/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/compressed_e2e_fintuning/README.md`
+- [VAE 分组输出损失：最小下游精度对照](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/activation_loss_ab/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/activation_loss_ab/README.md`
+- [Down Layer Sensitivity Ablation](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/down_layer_sensitivity/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/down_layer_sensitivity/README.md`
+- [LiftQuant-style VAELLM recovery](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/liftquant_recovery/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/liftquant_recovery/README.md`
+- [PROVENANCE.md](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/liftquant_recovery/upstream/PROVENANCE.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/liftquant_recovery/upstream/PROVENANCE.md`
+- [Independent Linear Output W2](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/linear_output/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/linear_output/README.md`
+- [LongBench v1 paired evaluation](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/README.md`
+- [LICENSE](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/upstream/LICENSE) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/upstream/LICENSE`
+- [mix_bit — Mixed-Bit VAE Allocation](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/mix_bit/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/mix_bit/README.md`
 - [lm_eval_summary_final.md](../result/qwen3_8b_w25_20260930/e2e_bits_block32_a005_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_190729/lm_eval/lm_eval_summary_final.md) — `result/qwen3_8b_w25_20260930/e2e_bits_block32_a005_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_190729/lm_eval/lm_eval_summary_final.md`
 - [lm_eval_summary_final.md](../result/qwen3_8b_w25_20260930/e2e_bits_block32_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md) — `result/qwen3_8b_w25_20260930/e2e_bits_block32_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md`
 - [lm_eval_summary_final.md](../result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr1e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md) — `result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr1e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md`

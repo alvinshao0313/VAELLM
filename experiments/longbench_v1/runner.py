@@ -65,11 +65,11 @@ def read_input(tokens, row):
     return torch.from_numpy(values.astype(np.int64, copy=False)).unsqueeze(0)
 
 
-def generate_one(model, tokenizer, input_ids, row, *, diagnostic):
+def generate_one(model, tokenizer, input_ids, row, *, diagnostic, protocol=None):
     from transformers import GenerationConfig
     device = model.get_input_embeddings().weight.device
     input_ids = input_ids.to(device)
-    options = generation_options(tokenizer, row["dataset"], input_ids.shape[-1], row["max_new_tokens"])
+    options = generation_options(tokenizer, row["dataset"], input_ids.shape[-1], row["max_new_tokens"], protocol=protocol)
     effective, _ = model._prepare_generation_config(GenerationConfig(**options), use_model_defaults=False)
     if any(getattr(effective, key) != value for key, value in options.items()):
         raise ValueError("Transformers changed explicit generation settings.")
@@ -181,7 +181,8 @@ def run(config_path, output, *, datasets=None, resume=False, max_runtime_seconds
             if max_runtime_seconds is not None and time.time() - report["started_unix"] >= max_runtime_seconds:
                 report["status"] = "partial_runtime_budget"
                 break
-            result = generate_one(model, tokenizer, read_input(tokens, row), row, diagnostic=diagnostic)
+            result = generate_one(model, tokenizer, read_input(tokens, row), row, diagnostic=diagnostic,
+                                  protocol=config["protocol"])
             prediction = {key: row[key] for key in
                           ("dataset", "row_index", "_id", "answers", "all_classes", "length", "input_ids_sha256")}
             prediction.update(result, input_tokens=row["input_tokens"], removed_tokens=row["removed_tokens"],

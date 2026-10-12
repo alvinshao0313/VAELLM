@@ -9,11 +9,13 @@ def main():
     parser.add_argument("--tokenizer", default="/home/star/models/Qwen/Qwen3-8B")
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--resume-download", action="store_true")
+    parser.add_argument("--reuse-data-manifest", help="Reuse verified official raw records, never another model's token IDs.")
     args = parser.parse_args()
     if args.download_only:
         print(download_and_extract(args.output, resume_download=args.resume_download))
     else:
-        record = prepare(args.output, args.tokenizer, resume_download=args.resume_download)
+        record = prepare(args.output, args.tokenizer, resume_download=args.resume_download,
+                         reuse_data_manifest=args.reuse_data_manifest)
         print(f"Prepared {record['sample_count']} samples; {record['inputs']['tokens']} shared tokens.")
 
 
