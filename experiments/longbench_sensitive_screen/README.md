@@ -97,6 +97,10 @@ PYTHONPATH=/home/star/VAELLM CUDA_VISIBLE_DEVICES='' python -B \
 
 a0历史H50累计生成1122.098677秒，完整H2950为6342.948688秒，full21为19755.716407秒；H50分别为17.69%/5.68%，不含新模型加载成本。H50相对完整H的配对收益误差MAE .221100776pp、最大 .408267136pp；55对中1对反转，完整H差距仅 .058620043pp。相对full21有3对反转，其中2对原H本身已与full21反向；小样本误差与未测低敏变化均可能改变排序，以上只是旧端点观察，不能当置信保证或固定晋级门槛。H25出现较大反转，未采用。即使H50排序正常，八项变化仍可改变九项排序。
 
+2026-10-18的新C1→T32对照确认高敏抽样本身也可反转：H50差−.2519545632，而完整高敏12项差+.5577433749、完整21差+.2409740145。T32独立H50的600条与完整预测同索引的output token／文本／官方逐题分数全部相同，C1 H50原为完整输出切片，因此不是两次生成差异；低敏9项本次差−.1813851327，也不是低敏补偿。高敏收益估计差.8096979381超出上述旧数据最大观察值，但本例H50差仍在原近分保留范围内。继续保持冻结样本、预定末点和最终全21，不从此例新定晋级阈值或挑选测试样本。[原始指标及本轮复算](../../docs/experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月18日完整九项终态与下一轮验证)。
+
 本轮新增CPU验证由唯一tmux`longbench_h50_cpu_20261012`后台完成，outer **4067911/start111403385**、worker **4067917/start111403417**，outer.exit0，实际27.206751秒，0FW/CUDA未初始化/未加载模型。新CLI分别重评a0/F_A/F_A_HOT为 **53.692011958798304 / 55.99814570806964 / 55.906648954019566**，与旧研究逐数完全一致。9类错误输入均拒绝；冻结S实际核全部600原token切片，共6,042,700 tokens，输入hash/形状/32K限制与四个依赖模块路径通过。CLI help/源码AST通过，原core/run及S实际依赖SHA保持。
 
-证据集中在[同一目录](../../result/qwen3_8b_mmlu65_20261004/longbench_h50_screen_20261012/)的cpu_report.json、三份partial原指标、core.log/outer.exit、analysis.json/calibration.log和复现validate.py；真实命令、源hash、拒绝结果及S输入报告已归并CPU报告。尚未运行GPU，CPU验证不证明新样本runner已实际完成生成或最终质量达标。
+证据集中在[同一目录](../../result/qwen3_8b_mmlu65_20261004/longbench_h50_screen_20261012/)的cpu_report.json、三份partial原指标、core.log/outer.exit、analysis.json/calibration.log和复现validate.py；真实命令、源hash、拒绝结果及S输入报告已归并CPU报告。上述CPU验证阶段尚未运行GPU，不能单独证明新样本runner完成生成或最终质量达标。
+
+2026-10-12首个真实GPU执行随后完成：QK fresh4000的step500独导UUID `d90bc33a-31b9-45b9-8d99-ffee0c2013e0`，600新预测／0续接、native及outer均0，1480.598862秒；PUBLIC CPU评分0，H50为54.1517553857，相对同600题a0e5＋.4597434269pp。252模块group8、strict UUID、FP32 RoPE、原32K／官方caps／greedy及结束时配置／源码绑定保持。[实际运行、原始指标及使用范围](../../result/qwen3_8b_mmlu65_20261004/general_lm_qwen_k38_qkonly_s4000_20261012/README.md)保留完整证据；预测位于该README注明的`/data/star/VAELLM/`目录。这验证了样本runner实际路径，仍不是完整LB21或九项收益证明；后续同路径不重复启动前GPU短测。

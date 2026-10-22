@@ -80,3 +80,71 @@ service; the caller must reserve time for an in-flight generation and loading.
 Per-example predictions include original scoring fields, IDs, input hashes,
 generated token IDs, latency and GPU peaks. Each execution records its actual
 PID/start tick, exit status, strict load audit and before/after input pins.
+
+## Full21 throughput and task partitions (2026-10-21)
+
+The read-only Qwen J32 audit found no repeated model loading or decoded-weight
+prewarm inside the example loop. The original complete run spent
+17970.392 seconds in its 4750 recorded generations and 17994.141 seconds in the
+recorded native interval; its one 252-module group8 prewarm took 2.204 seconds.
+Within that interval, loading, per-row fsync and other work outside recorded
+generations together accounted for only 23.749 seconds. The raw source is
+[the original execution report](../../result/qwen3_8b_mmlu65_20261004/qwen_c1_eta_retention128_20261020/eta001_R05/step_32/evaluation/longbench/groups/part_01/runs/1792471691752660139_652368.json)
+and the neighboring `predictions/` files. Do not change B1, output budgets or
+stopping rules to claim protocol-preserving acceleration. Generation already
+uses KV cache, and installed Transformers selects `logits_to_keep=1` for Qwen3.
+
+For a **new evaluation**, assign complete, disjoint tasks to one process and
+independent output directory per GPU. The native `--datasets` interface supports
+this without changing generation or scoring. It has no row-index shard option.
+Each worker locks all of its selected prediction files before loading its model;
+an empty file in a running all21 job is therefore not an available work unit.
+Do not add workers to such a job or launch a duplicate evaluation beside a
+previously scheduled single-card chain.
+
+CPU replay of the original per-task elapsed sums gives these fixed, largest-task
+first assignments. Entries below preserve canonical task order within each
+worker. These are generation-only estimates, excluding each worker's loading,
+final merge and candidate-specific output-length changes; no new GPU run was
+performed.
+
+| GPUs / worker | Estimated generation seconds | Complete tasks |
+| --- | ---: | --- |
+| 2 / 1 | 9042.546 | narrativeqa, multifieldqa_zh, 2wikimqa, gov_report, qmsum, triviaqa, samsum, passage_count, passage_retrieval_en, passage_retrieval_zh, repobench-p |
+| 2 / 2 | 8927.846 | qasper, multifieldqa_en, hotpotqa, musique, dureader, multi_news, vcsum, trec, lsht, lcc |
+| 3 / 1 | 6018.509 | multifieldqa_zh, hotpotqa, 2wikimqa, gov_report, triviaqa, samsum, lsht |
+| 3 / 2 | 5980.044 | narrativeqa, musique, dureader, multi_news, passage_retrieval_en, passage_retrieval_zh, lcc |
+| 3 / 3 | 5971.839 | qasper, multifieldqa_en, qmsum, vcsum, trec, passage_count, repobench-p |
+
+The estimated longest partition is 2h30m43s on two GPUs or 1h40m19s on three,
+versus 4h59m30s of serial generation. The existing
+[night evaluation planner](../../result/qwen3_8b_mmlu65_20261004/qwen_mlp_night_eval/evaluate.py)
+already supports two fixed task groups (historical longest 9236.476 seconds);
+its `make_plan` accepts only one or two groups. A three-group plan needs a small
+new candidate-specific caller; the prediction, binding and merge interfaces do
+not require two groups. The retention and current channel-scale chains instead
+assert one assigned GPU and one all21 unit. Their pinned callers must remain
+unchanged; these assignments are for a future explicitly scheduled candidate.
+
+Reuse `start_group(unit, config, config_sha)` for independent logs, launch
+identity and terminal exit records. After every worker exits successfully, call
+[bind_terminal.py](../../result/qwen3_8b_mmlu65_20261004/llama_fullqk_qkonly2000_longbench21/bind_terminal.py)
+sequentially with `--plan`, `--unit-index`, `--native-report`, `--outer-launch`,
+`--outer-exit`, and `--outer-log`. It checks exactly one owner per task, canonical
+row identity/input bytes, explicit generation options, source/config identity
+and retired processes. Only after all 4750 rows bind, set the plan to
+`prepared_not_scored` and call
+[merge_full21.py --plan](../../result/qwen3_8b_mmlu65_20261004/llama_fullqk_qkonly2000_longbench21/merge_full21.py)
+in the recorded public CPU environment. It copies the 21 complete task files,
+verifies their hashes, runs unchanged official scoring and then the original
+nine-task command. There is no concurrent plan writer or shared prediction file.
+
+For ordinary native checkpoints, retain the strict checkpoint UUID/config
+contract. For a channel-scale composite, the native UUID identifies only its
+base: every worker must use the candidate's explicit bundle consumer and bind
+the same composite identity, sidecar SHA and joint bit budget. The current
+[scale consumer](../../result/qwen3_8b_mmlu65_20261004/qwen_j32_l9_channel_scale_20261021/cs_consumer.py)
+passes `--datasets` through and records actual scale consumption per prediction
+and per execution, but its witness covers its three declared projections only.
+A future wider scale candidate must check its own complete projection scope.
+The ordinary bind/merge checks do not replace these composite-consumption checks.

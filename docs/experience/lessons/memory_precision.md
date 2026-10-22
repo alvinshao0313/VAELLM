@@ -1,6 +1,22 @@
 # 显存与精度：分清驻留对象、数值存储和验证范围
 
+2026-10-13新增原生长故事验证：e3全部decoder在线OPD＋M＋七项保持，在一张A800 80GB上实际完成最长32561-token完整prompt、两次更新及第二次非空Adam的模式往返，771.875秒、无OOM。训练峰allocated约44.0GB，模型加载/解码预热约71.6GB，reserved峰75.04GB；仍必须按整个生命周期估算，不能以训练单段44GB声称可在48GB卡启动。此证据绑定原FA2/group8、FP32 master、checkpoint层级、只在真实续写位置计算全词表logits及既有F上下CPU路径；不证明任意batch/长度/全token logits都可承载，也不是质量收益。[完整两更新与原始报告](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月13日longbench原始任务训练集与narrativeqa全文准备)。
+
 ## 问题与证据
+
+2026-10-21新增18D入口在模型加载前因GPU身份检查误拒：本机PyTorch2.6的`_CUuuid.__str__`返回裸UUID，nvidia-smi返回带`GPU-`前缀的同一值。先实读两边表示，修复仅补齐固定前缀后严格比较，保留卡身份约束；不能把表示差异当资源变化，也不应通过删检查或换卡绕过。此处零模型前向／更新，修复后CPU来源绑定不变，GPU训练与导出性质仍须由原定实际短验确认。[失败、最小修复与后续运行](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月21日较小码更新终态freshcat末点与最后类别中点)。
+
+2026-10-20四格原生读出在两片教师缓存完成后、学生0次前向时退出：新guard要求全部VAELinear的`_decoder_compute_dtype`显式等于BF16，而原生loader默认传入None，表示沿用实际输入／目标dtype。真实C1 CPU strict加载确认252模块均为None，3423源状态exact、参数仍BF16；不能将可选override字段等同实际计算精度，也不应强设override或整模cast来迁就错误检查。独立修复核effective dtype、原BF16缓存和每次真实输入，同时保留eval、冻结、no_grad、无checkpoint／KV及状态恢复条件；GPU验证范围与终态见[本次记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月20日夜间配对终态与完整更新的有限干预)。本证据定位的是诊断检查错误，不是训练精度退化或下游收益。
+
+上述10月20日修复随后在GPU3通过四格各一个完整原group、共64学生前向，含最长32561-token prompt；252模块实际BF16输入和cache命中、完整源状态与缓存恢复、释放均通过，0新增teacher前向。原失败已完成且身份完整绑定的teacher缓存可以复用；不因诊断guard修复重算，也不据这个有限验证声称完整四格诊断或下游提升。
+
+2026-10-17 C1单层down的只读P/Q/N路径诊断，首次两臂各五面板均已算完，却在最终通用部署恢复中重复全252 group8预热而OOM：reader仍持有原251冻结native cache引用，清模块字段不等于释放旧GPU张量，再预热会额外分配另一套cache。修复仅在独立诊断入口恢复原6D值、native flag及原cache引用，避免无必要的全模型重解码，并逐面板保存真实读出；未改精度、完整prompt或算法。修后两臂各80次前向完成、完整3423源状态exact／3417冻结／原cache引用保持、GPU释放0；首次160加修后160共320次学生前向，共享8次教师前向未重算。下次只读干预收尾先追踪缓存的外部引用及实际恢复范围，复用已保留的原缓存，并核完整状态；不要将此错误归因allocator碎片或由主体前向完成推断收尾安全。这是缓存生命周期的本配置实测证据，不是精度或质量提升经验。[原始报告](../../../result/qwen3_8b_mmlu65_20261004/qwen_c1_selected_down_mrqa32_20261017/path_probe/report.json)、[结果与限制](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月17日上午长预算结果与57科中间节点提前评测)。
+
+2026-10-16 native k恢复有限配对中，同round_base／初始792张量／每rank10微批／DDP2-B1-GAS2，去掉teacher模型CPU往返后四次非零更新均值26.742→8.358秒；分段同步计时表明原teacher上／下卡占主要时间，而teacher forward与student前后向接近。新增训练峰allocated约16.381GB，和实际teacher大小一致，支持在相同资源条件下优先检查搬运。但本次实际输入最大6128，未验证8192或全七类峰，不可据k的3.199倍外推整条链。两臂首预热采样梯度relL2 .000732，四次更新后采样位移relL2 .1713、cos .9854，loss有限但无exact轨迹／质量等价结论；位移差的分母是小更新，不是总权重或准确率。不得为此放宽training_step完整runtime契约或修改活动链。用户接受当前主线耗时后取消迁移，保留原A/B；诊断本身没有新质量结论。[实际计时、数值、资源与取消边界](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月16日上午完整终态与预算安排)。
+
+2026-10-15 CAT长文本迁移复核：`get_model(torch_dtype='auto')`原本保留HF的FP32 RoPE `inv_freq`，`base_reference`随后无条件`model.to(dtype=BF16)`却会舍入该buffer；student精度配置只转Parameter／BatchNorm，并不能证明teacher也保持相同路径。已有真实Qwen B4×1024对照中63/64频率改变，最大差.00115472，1691有效位置top1变化13个、teacher massTop100 KL约.00091798；既有修法跳过已同参数dtype的冗余整模cast后，与native DP logits逐位一致。forward再`.float()`不能恢复已舍入频率，旧CAT也做过该cast不是保留它的依据。新8K双CPU卸载CAT已复用该修法；真实8B CPU加载→GPU→CPU验证12.694秒／exit0，全参数BF16且冻结eval，`inv_freq`始终与原生配置FP32值精确一致。同步处理空模型构造的冗余cast，400个广播条目的dtype/layout与真实loader一致；空模型仅检查CPU/meta构造，未另启GPU驻留训练或重复logits对照。完整七类资源短验仍是修前教师，应保留版本边界，不能倒填为修后运行。此证据支持教师数值路径修正，不证明下游收益。[原始对照](../../../result/qwen3_8b_mmlu65_20261004/teacher_rope_precision/comparison.json)、[本次运行范围及迁移证据](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月15日下午先准备广覆盖校准与蒸馏数据)。
+
+2026-10-14对e3的145个norm做CPU实际值核查：fresh Adam(.9,.95)、LR1e-5及500步线性日程的前32步，精确算术位移上界约.00032010；308224个BF16源值中仅12.21%的最近半格点在该预算内，final norm只有2/4096。上界不是CUDA严格证书，可达也不等于真实更新；这说明拟定预算可能无法充分检验部署norm效果，不是norm无效的证据。另核自定义Qwen3RMSNorm在现有精度包装下使用FP32 gain乘BF16激活再转输出，与先舍入gain的BF16部署不同；不能只查输出dtype就声称两路径相同。后续若测试norm，需同时明确实际参数跨格预算、原生端点及计算语义，不能把训练loss或参数requires_grad当作有效部署更新。[实际计数、预算假设与源码边界](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月14日13时norm实际预算与任务梯度算法对照)。
 
 单模块FP32参数存储对照中，两组仍为BF16计算；代表形状的allocated仅增加0.33MiB，reserved增加24MiB。该值不能推算整模型峰值，也不能据实现通过宣称精度提升。[精度记录](../records/docs/distill_fp32_validation.md)
 
@@ -38,6 +54,8 @@
 
 ## 边界
 
+2026-10-12核对后续终态：下方K38／B4×4096的四步CPU卸载证据之后，正式2000步与五次节点八项、末点完整LB21均已完成，不能把历史短测边界当成当前实验进度。与同raw源／FineWeb／B4／2000步的1024对照相比，4096九项66.1868444754对66.2769237037，差−.0900792283pp；两者八项最高都在末点，未证明收益上限。长度与教师CPU卸载同时改变，不能单独归因于长度或offload；完整生命周期含导出／评测，也不能作为纯训练吞吐比。后续选预算应复用这组完整结果，不重复资源短测或把另一源的8192／400步局部检索结果混作同源全评。[预算复核与原始九项来源](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
+
 2026-10-04 五个真实 BF16 部署模型的只读区域诊断，teacher 提前留 GPU 时，首个 group8 decoder 预热在 allocated78.56GiB、额外申请1.47GiB处 OOM；该异常时占用不是单独测得的峰值。改成 teacher 初载 CPU，并在每个 student 加载/预热前回 CPU、预热后才回 GPU，同样 group8/BF16/数据/损失下五模型全部完成，最大实测 allocated70,587,747,328B，teacher 返回后常驻约36.93GB，没有逐模型累积。不能将 native 逐模块缓存的约50GiB训练证据外推到 batched group8 的临时解码峰值，也不能将此高 live allocation 当成仅 allocator 碎片。修复只涉及隔离诊断的设备驻留，不是分块损失或精度变更；旧失败证据保留。[完整驻留修复和五模型结果](../records/qwen3_w25/2026-09-30_goal.md)的03:03记录。
 
 2026-10-07上述K38/B4×4096改用现有teacher model/output共同CPU卸载，完全相同的四批1544/1080/4096/4096成功更新，run/outer均0；训练峰allocated74,114,097,664B、reserved81,770,053,632B、主进程peakRSS41,909,063,680B，116.43秒。末两长批稳定live allocated19,211,397,632B。这证明该真实前缀及连续padded4096可运行，未证明2000步质量或所有mask分布；没有none/cpu精确loss/gradient对照。现有CPU路径首步重置peak，不把训练峰冒称包括全部初始化。失败none峰来自中断过程，不能与成功CPU峰相减后宣称完整运行净省多少显存。[配置、真实形状和原生观察](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
@@ -51,5 +69,7 @@
 
 
 2026-10-03两份Qwen3类别快照的完整MMLU64诊断在log_softmax分配失败：allocated约37–46GiB，另有29–34GiB reserved但未用，单次请求约10–18GiB。两者BF16/strict加载、216或252模块预热均已成功，不能直接判断模型尺寸或batch本身放不下。实际诊断环境漏掉原成功流程的PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True；补齐完整成功环境（含该项及既有CUBLAS/PYTHONHASHSEED等设置）后，不改模型、batch64/32、样本或算法，两份完整八任务均成功，约449秒。表现符合碎片化，但此次同时补齐数项环境，不能宣称已单独消融证明allocator是唯一原因。复用显存证据应同时绑定实际启动环境，环境修复后直接完成原协议，不以降低batch代替。[失败日志、启动差异和完整运行证据](../records/qwen3_w25/2026-09-30_goal.md)的down_category_transition_d16_prefix。
+
+2026-10-15 Llama FW最佳成品接TF32后，同类新入口再次漏配成熟环境，MMLU batch64首批申请15.04GiB失败，另有34.13GiB reserved未用。恢复旧FW完整环境后，同一已导出成品和同batch64／seven32完成全部24742题，两个评测阶段均exit0、耗时238.56／170.64秒；LongBench另在运行。该复现增加Llama路径完整八项证据，未单独消融allocator，也没有改变评测精度或重训。已完成训练的实际环境必须保留，不能用补评环境倒填。[训练／导出、失败与独立补评记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月15日中午llama最佳fw成品接原tf32)。
 
 2026-10-08，Llama全部32个q_proj、K32/D32/S2/fullRHT、固定INT8保护的隔离两级各1000步对照保持BF16前向/部署及共同舍入初态，仅将叶参数、叶梯度积累与Adam动量由BF16改为FP32。原坐标部署加权NMSE下降.26630%，32/32矩阵均小幅改善、存储不变；末步LR3e-6的零更新比例由约99.8%降至.4%–.5%。这证实此数值组合能改善本次拟合，但效果小，不能将全部归因为参数舍入、解释正式10K平台或推出下游收益。隔离时必须同时保持`AutoEncoder.params_dtype`所控制的BSQ→decoder activation cast，不能只看autocast开关；decoder应在原生q-scale/stage-normalization融合前统一落到部署BF16。stage2不同残差是stage1干预的传递，共同probe只供诊断，最终比较真实逆旋转和保护回填后的原坐标误差。旧Qwen down全FP32负例的输入/计算/存储与此不同，继续保留其适用边界。[完整对照、独审及失败观察器修复](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月8日0920新完成的完整顺序链恢复轨迹与后续评测)。
