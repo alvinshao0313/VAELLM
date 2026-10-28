@@ -14,6 +14,7 @@
 | 设计实验、排查已知问题 | [按问题查经验](experience/README.md)，再看命中的证据 |
 | 记录实验与提炼经验 | [实验工作流程](experience/WORKFLOW.md) |
 | 混合位宽 | [模块与命令](../mix_bit/README.md)、[工程与评测经验](experience/lessons/mixed_bit_pipeline.md) |
+| 向量自适应残差阶数原型 | [down 同预算配对、码流与验证](../experiments/adaptive_vector_rvq/README.md) |
 | LiftQuant 式恢复 | [模块入口](../experiments/liftquant_recovery/README.md)、[编码优化经验](experience/lessons/liftquant_recovery.md) |
 | 分组/完整输出损失实验 | [分组输出实验](../experiments/activation_loss_ab/README.md)、[完整输出实验](../experiments/linear_output/README.md)、[经验](experience/lessons/output_losses.md) |
 | down 层敏感度实验 | [运行说明](../experiments/down_layer_sensitivity/README.md) |

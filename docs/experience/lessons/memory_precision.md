@@ -4,6 +4,12 @@
 
 ## 问题与证据
 
+2026-10-25的best abs全decoder Muon验证暴露了只读探针对autograd的副作用：`weight[row,col].detach()`先执行可导索引，仍会记录索引张量。首前向安装探针、反向checkpoint重算前卸载时，每层三MLP的两次索引各保存两份index，恰好造成saved tensors为115／103，首次M反传失败、optimizer更新为0。最小修复是`weight.detach()[row,col]`，保留实际sparse加法和模型返回的可导张量；同条件修复版两个完整M／QA／R更新及第二次非空优化器往返已实际通过。诊断中途停止追踪不能靠事后detach补救，应在诊断运算前脱离图或使用no_grad，且不得包住真实训练计算；这不是Muon或稀疏补偿的精度负例。完整两步、导出和正式训练状态见[唯一实验正文](../../../result/qwen3_8b_mmlu65_20261004/qwen_abs005_adam_muon32_pair_20261025/README.md)，[研究记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
+
+同次验证在两次更新、保存及源状态恢复完成后，收尾仍有18,786,174,976B allocated：Python3.11中`if 'modules' in locals(): del modules`生成的局部变量字典保留了模块引用，删除快速局部变量不足以释放它。弱引用复现定位后，将owner预先定义为None并在finally显式清空，移除locals查询；没有改训练或降低allocated归零要求。补验复用原两步compact，实际重载4071源字段、预热252缓存后释放allocated0，再完成CPU独导及fresh GPU重载，252缓存／aux读出exact，末次allocated0；未重复训练。原失败报告不回写，通过另一个completion记录绑定旧有效训练与新增收尾／导出证明。此例适用于被局部字典保留的强引用，不应把所有显存未释放都归因locals，也不由短验成功推断任务质量收益。证据和修改范围归上述唯一实验正文。
+
+同日，bestabs上的rank8初始空间配对又暴露了旧无sparse路径的复用边界：`install_precision_runtime`在override从None变BF16时调用`clear_decoded_weight_cache`，同时清空三个非持久sparse辅助缓存；旧LoRA安装仅恢复主权重缓存。两臂8更新及100观察计算结束后，包含全部named buffers的恢复stamp失败，而报告直到函数返回才写入，导致观察结果未落盘。真实小CPU VAELinear已复现三个辅助缓存消失、主cache identity/version与持久状态保持，恢复原辅助缓存后stamp恢复；108×3仅为拓扑推导，不能冒称已逐项检查失落的8B终态。应区分持久参数、主缓存与辅助缓存的契约，并将已经完成的结果先保存、清理状态单独记录；合并and断言在首项短路后，不能声称后续项也已核验。复用实际保存的BF16端点直接只读观察即可补结果，无需重训或构造假optimizer记录。[失败证据、CPU根因与独立接续](../../../result/qwen3_8b_mmlu65_20261004/qwen_abs005_rank8_subspace_train8_pair_20261025/README.md)。
+
 2026-10-21新增18D入口在模型加载前因GPU身份检查误拒：本机PyTorch2.6的`_CUuuid.__str__`返回裸UUID，nvidia-smi返回带`GPU-`前缀的同一值。先实读两边表示，修复仅补齐固定前缀后严格比较，保留卡身份约束；不能把表示差异当资源变化，也不应通过删检查或换卡绕过。此处零模型前向／更新，修复后CPU来源绑定不变，GPU训练与导出性质仍须由原定实际短验确认。[失败、最小修复与后续运行](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月21日较小码更新终态freshcat末点与最后类别中点)。
 
 2026-10-20四格原生读出在两片教师缓存完成后、学生0次前向时退出：新guard要求全部VAELinear的`_decoder_compute_dtype`显式等于BF16，而原生loader默认传入None，表示沿用实际输入／目标dtype。真实C1 CPU strict加载确认252模块均为None，3423源状态exact、参数仍BF16；不能将可选override字段等同实际计算精度，也不应强设override或整模cast来迁就错误检查。独立修复核effective dtype、原BF16缓存和每次真实输入，同时保留eval、冻结、no_grad、无checkpoint／KV及状态恢复条件；GPU验证范围与终态见[本次记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月20日夜间配对终态与完整更新的有限干预)。本证据定位的是诊断检查错误，不是训练精度退化或下游收益。
@@ -73,3 +79,5 @@
 2026-10-15 Llama FW最佳成品接TF32后，同类新入口再次漏配成熟环境，MMLU batch64首批申请15.04GiB失败，另有34.13GiB reserved未用。恢复旧FW完整环境后，同一已导出成品和同batch64／seven32完成全部24742题，两个评测阶段均exit0、耗时238.56／170.64秒；LongBench另在运行。该复现增加Llama路径完整八项证据，未单独消融allocator，也没有改变评测精度或重训。已完成训练的实际环境必须保留，不能用补评环境倒填。[训练／导出、失败与独立补评记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月15日中午llama最佳fw成品接原tf32)。
 
 2026-10-08，Llama全部32个q_proj、K32/D32/S2/fullRHT、固定INT8保护的隔离两级各1000步对照保持BF16前向/部署及共同舍入初态，仅将叶参数、叶梯度积累与Adam动量由BF16改为FP32。原坐标部署加权NMSE下降.26630%，32/32矩阵均小幅改善、存储不变；末步LR3e-6的零更新比例由约99.8%降至.4%–.5%。这证实此数值组合能改善本次拟合，但效果小，不能将全部归因为参数舍入、解释正式10K平台或推出下游收益。隔离时必须同时保持`AutoEncoder.params_dtype`所控制的BSQ→decoder activation cast，不能只看autocast开关；decoder应在原生q-scale/stage-normalization融合前统一落到部署BF16。stage2不同残差是stage1干预的传递，共同probe只供诊断，最终比较真实逆旋转和保护回填后的原坐标误差。旧Qwen down全FP32负例的输入/计算/存储与此不同，继续保留其适用边界。[完整对照、独审及失败观察器修复](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月8日0920新完成的完整顺序链恢复轨迹与后续评测)。
+
+2026-10-27，向量自适应RVQ的首次GPU短验在任何更新前因 `reset_peak_memory_stats("cuda:0")` 报 `Invalid device argument` 退出；`is_available()`／`device_count()` 已成功并不代表allocator完成lazy initialization。当前PyTorch 2.6该统计接口直接进入allocator，未主动初始化CUDA。把统计重置移到真实 `model.to(device)` 后，保持正式N=1,540,096、D32/K48/H128/R0、B8192和BF16路径，短验22.93秒exit0，全部阶段更新、完整计费、冻结及独立重载通过。修复只调整测量顺序；不把CPU契约通过替代GPU链验证，也不据此声称精度收益。原失败与修复证据均保留，随后正式配对才启动。[设计、原始证据路径与运行身份](../../../experiments/adaptive_vector_rvq/README.md)。

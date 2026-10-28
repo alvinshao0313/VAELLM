@@ -15,7 +15,11 @@ Linear输出实验在导出第4个模块时触发误差门限，旧runner此前�
 - 运行缓存要在状态加载后刷新，训练评测、finalization与部署的表示必须明确。低精度矩阵运算重结合不自动保持同值。
 - 成功验收后，依据后续用途清理checkpoint；恢复安全不意味着永久保留所有权重。
 
+2026-10-24子集decoder原型补充：当前`enable_trainable_decode`会重新将整个decoder设为可导；仅在初始化冻结hidden，不能保证native OPD返回后仍然冻结。三α隔离实现因此在每次恢复后重新应用24头可导／48隐藏叶冻结，并把3个独立master与packed carrier分开核查。真实码CPU两次更新、冻结补集及保存/fresh strict已验证；完整GPU OPD往返仍待，不能把此机制证据写成下游收益或完整GPU通过。适用于训练／原生推理切换时只开放decoder子集的路径，不需要修改原先全部decoder可导的实验。[原型证据与待验证范围](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
+
 2026-10-21最后类别中点独导补充：`save_v6_full_checkpoint`的返回值是保存摘要，不能当作完整v6 metadata传给`audit_state_dict`。新脚本在真实恢复／保存后因此退出，尚未进入fresh strict或GPU；修复为读取落盘`checkpoint_meta.json`，在独立输出重新导出、账本审计及3423张量独进程strict通过后才接评测。`round_base`本身不是该审计器接受的成品kind，也不能为通过检查伪改kind；须在真实category_boundary保存后用真实元数据审计。入口静态检查不能替代新增调用路径的实际运行，已成功的前序评测无需因后续导出失败重跑。[失败原件、最小修复及实际接续](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月21日较小码更新终态freshcat末点与最后类别中点)。
+
+2026-10-24异构stage兼容验证补充：packed decoder的`extract_single`可返回含裸`nn.Linear`的临时decoder，而v6按spec重建的是单模型`ParallelLinear.linear`。参数值正确并不保证保存后的键/容器契约匹配；本次真实fresh strict报16个线性层键不匹配。隔离修复按v6原生单模型容器逐值复制四个线性叶和两个norm叶，保留已融合q_scale，完整3449张量保存/fresh strict随后通过。临时旧S2视图只读compressed坐标时，其自身尺寸也须使用compressed尺寸，保护与rotation由外层只执行一次。异构v6的CPU重载不证明原预热入口兼容或CUDA数值等价；需明确独立适配器及原生零新增对照。[实际失败、修复与CPU证据](../../../result/qwen3_8b_mmlu65_20261004/qwen_b32_s3_lowrate_compat_20261024/README.md)。
 
 ## 边界
 
@@ -63,6 +67,8 @@ Linear输出实验在导出第4个模块时触发误差门限，旧runner此前�
 
 **动作**：先定位身份差异，不修改boundary或关闭检查，也不回滚其他活动实验使用的共享文件。已有原内容可精确重建时，在独立源码目录保留原版本，cwd/PYTHONPATH都指向它，模型/数据/产物路径显式指向原位置。运行必须持有明确源码副本或持续保护源码，不能仅依赖启动时已导入模块来保证后续子进程一致。
 
+2026-10-26真实类别边界分叉补充：D独立保存及fresh strict已通过，末尾却因源权重`st_blocks`对应分配空间增加4096 bytes而失败；bytes/inode/device/mtime均未变，复核源与D全部2991持久张量的完整digest及metadata/runtime SHA仍一致。分配块数量只记录空间观测，不作为文件内容不变契约；稳定stat检查仍保留，但不能代替内容hash。保留原失败报告，在单独验证报告中绑定旧fresh strict及当前完整内容复核后接续既存D，不重建权重或重跑已完成C／G。该证据确认本次是allocation-only误判，不授权忽略mtime／内容变化。[原失败、限定修复及真实接续](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_20261026/README.md#2026-10-26-2259-主体终态分叉修复与完整评测接续)。
+
 **边界**：本次CLI差异是重启阻断，不是SIGINT来源。只有KeyboardInterrupt/子进程signal退出时，不能认定OOM或算法失败，也不能推断信号发送者。无控制终端并断开stdin可隔离终端操作，但不能保证外部显式信号永不再次终止任务；仍保留正常的SIGINT/SIGTERM停止能力。本配置在独立session、stdin=/dev/null下仍第二次收到SIGINT，用户明确表示未主动停止；这证明先前终端隔离措施未解决未知发送源，不能将中断归因于SSH断线。最新边界的101个源码SHA及CPU结构校验仍通过，信号中断与源码恢复问题须分别判断。层边界恢复只保留已完成层，未完成层需从该层首步重做。
 
 
@@ -105,6 +111,8 @@ Qwen3-8B全252投影使用100% FP32码位及Adam时，精确训练侧车约194.3
 ## 持久冻结状态与可重建码缓存（2026-10-18）
 
 新BSQ主码更新短测在完成投影后被旧`frozen_stamp`拒绝；旧函数遍历`named_buffers`，混入了`persistent=False`的grouped packed及model indices缓存。真实C1模块按同一`install_banks`重建后，仅这两个缓存指针变化，13项持久状态的值精确不变。因此部署冻结契约应以`state_dict(keep_vars=True)`的持久键定义，不把允许重建的缓存对象身份纳入其中；同时保留未更新模块的缓存引用检查、全部冻结值和最终source restoration／fresh strict。隔离修正后两步实际翻码及3415冻结／3423保存重载通过，未放宽张量值、packed bits或schema合同。该边界针对允许改码的路径，不能借此省掉新码提交后的缓存失效／重建验证。[真实失败、CPU定位及GPU重跑](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月18日完整九项终态与下一轮验证)。
+
+2026-10-25，bestabs闭式rank1短测完成拟合后，因直接把GPU `state_dict` 传给只接受CPU strided张量的 `audit_state_dict` 而停止，尚未进入质量观察。修复使用已有CPU native loader，在真实CPU模型安装已保存因子，再收集metadata及4575字段计费；不以逐key设备复制假定storage共享关系不变，也不重新拟合。真实CPU审计通过，新增504个BF16 storage／43,646,976bits，其余组件保持，logical2.5989027853／packed2.6122774456；移除后原4071字段恢复。该证据仅确认内存状态账本，不能替代整模导出或任务质量；后续GPU消费者要核对同一因子和metadata。无CUDA可见时，直接强制FA2构造会失败，应复用已验证的CPU构造入口并恢复原推理policy，而非改正式注意力实现。[原失败、修复及实测证据](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
 
 ## 生成参数须检查最终有效配置（2026-10-04）
 

@@ -1,5 +1,29 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python.defaultInterpreterPath": "/home/shaoyuantian/anaconda3/envs/bitvae/bin/python"
+    "python.defaultInterpreterPath": "/home/star/miniconda3/envs/bitvae/bin/python",
+    "files.watcherExclude": {
+        "**/result/**": true,
+        "**/data/**": true,
+        "**/wandb/**": true,
+        "**/__pycache__/**": true,
+        "**/.pytest_cache/**": true,
+        "**/.cache/**": true
+    },
+    "search.exclude": {
+        "**/result/**": true,
+        "**/data/**": true,
+        "**/wandb/**": true,
+        "**/__pycache__/**": true,
+        "**/.pytest_cache/**": true,
+        "**/.cache/**": true
+    },
+    "python.analysis.exclude": [
+        "result/**",
+        "data/**",
+        "wandb/**",
+        "**/__pycache__/**",
+        "**/.pytest_cache/**",
+        "**/.cache/**"
+    ]
 }

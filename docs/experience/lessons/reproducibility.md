@@ -15,6 +15,10 @@
 - 完成验证且没有明确后续用途的权重按项目持续授权清理；正在使用的文件、原始数据和初始checkpoint受保护。文档归档不能成为删除有效证据的理由。
 - 一份结论只维护一处。旧路径仅作导航；新经验写入lessons，结果写入records，历史计划保留历史标签。
 
+2026-10-27 C/G恢复暴露了另一项snapshot边界：CPU准备核对项目根目录训练文件存在和SHA，并不能证明从snapshot导入的preset loader会读到同一文件；该loader实际以模块根目录解析相对路径，三臂在首次更新前失败。恢复缺失的数据目录映射后，实际调用全部五个preset loader核实来源，再以独立输出启动同配方，保留原失败记录及活动源码。后续应在所选导入上下文验证真正的数据解析入口，而不是只检查调用者cwd下的文件。该修复不改变抽样、split或训练数据字节，也不是已完成训练的resume。[实际故障、修复及独立接续](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_followup_20261026/README.md#10月27日数据路径修复与三个独立接续)。
+
+同日恢复后半链的GPU消费者在前向前被CPU-only入口条件拒绝：GPU可见时导入native runtime／DeepSpeed已初始化CUDA，随后通用的`not torch.cuda.is_initialized()`检查与CPU构造helper都不适用。`map_location='cpu'`只说明checkpoint加载位置，不能代替“进程从未初始化CUDA”的契约。CPU导出／审计继续隐藏CUDA并用原CPU helper；GPU消费采用现成canonical native loader和同一真实前向检查，不能把CPU-only条件套给两种命令。该故障不否定已完成训练／CPU导出；保持活动源码和原失败记录，独立验证消费后按真实原worker继续，不重训或伪造旧任务成功。[具体故障与接续](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_followup_20261026/qwen_recompression_recovery_tail_20261027/README.md)。
+
 ## 边界
 
 本库整理没有重新执行历史实验，也没有证明旧结果路径仍可重载。文档中旧权限、GPU号、删除命令和未勾选计划不构成当前操作授权；执行遵循最新项目规范。
@@ -53,3 +57,7 @@ MLP联合保护候选由已完成的gate/o记录准备时，按已知字段逐�
 2026-10-12 HOT64的H50 CPU评分再次表明，传给`tmux`客户端的环境不等于既有server中新pane的实际环境：请求PUBLIC `PYTHONPATH`后，评分仍在导入时发生`ModuleNotFoundError: experiments`。将工作目录、已确认的bitvae解释器、`PYTHONPATH`与CUDA空mask显式写入pane执行命令，并核实worker实际环境后，同一评分入口成功；没有修改评分代码或重跑GPU预测。后续用tmux启动时在实际pane设置必要环境，记录实际值而非只记录请求值；该结论针对已有tmux server的环境传递，不要求重新验证已正常运行的任务。[失败、修正及真实评分证据](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
 
 2026-10-13两个新隔离入口暴露跨实验裸模块名冲突：M4096在教师目标已生成后组合旧缓存时，旧`from data`命中新数据模块；e3三臂则在训练前因snapshot间接注册旧`continuous_bindings`，令QA512消费者取不到`DATA`。相同目录中单独导入成功不能证明多个旧入口在同一解释器内组合正确，`sys.path`顺序也不能替换已经注册的同名模块。修复限定新入口的显式缓存读取或消除无关裸模块注册，不改活跃旧实验；验证采用实际run→数据消费者的顺序，只补发生冲突的路径，保留原失败和修改前后代码绑定。缓存已成功生成不因此失效，不重跑教师；导入检查通过也不替代新训练组合所需的实际更新验证。[两次失败与修复边界](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月13日qaopd参考与长文恢复短题保留)。
+
+2026-10-26新C/G后继的真实CPU准备进一步确认，列出的八个core文件逐字相同也不足以证明完整加载上下文等价：公共Hadamard缺少full-RHT所需252／220／188因子，4032维Q/K加载失败；明确使用已有成熟snapshot后，C/G各3423字段fresh strict与源逐值核对通过。隔离入口命名`queue.py`还会遮蔽stdlib queue，实际导入检查后改为`night_queue.py`，未保留旧入口。下次先核实际导入路径与触及的模型结构，不据部分文件hash跳过新依赖边界；该修复不改变训练数学或公共代码。[原失败、实际CPU验证与固定队列](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_followup_20261026/README.md#2354实际验证与后台交付)。
+
+同轮有限队列的真实进程测试补齐嵌套超时边界：外层整体timeout之内若再次使用默认timeout，内层会另建进程组，不能仅凭外层退出认定GPU子进程也被清理。受整体限时约束的full9内层使用`--foreground`共享外层组；无外层整体timeout的独立训练／评测保留自己的timeout组。实际10秒外限退出124后，内Python与sleep均消失，独立兄弟进程未受影响；这是当前不自行脱离session的进程树证据，不是任意后台任务的通用保证。等待已交付前驱则绑定PID/start_ticks和pidfd退出事件，结束后检查完整结果与单次GPU空闲；质量未达标与执行失败分别处理，不轮询或自动重试。[真实进程组验证](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_followup_20261026/recovery/cpu_timeout_validation.json)及[有限执行记录](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_followup_20261026/README.md)。

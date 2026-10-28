@@ -10,6 +10,7 @@ additive 为 x+D(x)，B=0 时保持初始输出；replace 为 D(x)，正交初�
 
 - 比较 additive/replace 前先测初始化后的基线；不能把投影改变信息通路当成学习收益。
 - 先构造 PEFT，再确认 decoder/残差参数的 requires_grad、optimizer 分组及真实更新；模块挂上不代表在训练。
+- 2026-10-26核对用户提供的9月1日历史日志：输入norm/head开关为true，实际唯一可训练清单却是252组LoRA/504张量、final_norm=[]/post_norm_head=[]；没有后续解冻证据。历史收益只能按已记录的实际训练范围解释，不能据CLI归因于norm/head，也不能将其10000步轨迹当decoder-only长训证据。该旧日志不证明当前实现存在同一缺陷。[配置、完整节点与证据边界](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_20261026/README.md#用户补充的2026-09-01低秩恢复日志)
 - 保存模式、拓扑、权重及 exact-resume 配置；向无残差 checkpoint 首次加模块应新开训练，不沿用旧 step 状态。
 - CLI 非法值可能由 argparse 抛 SystemExit(2)，测试应校验对外协议；skip_layers 空值按实际类型契约传入，不能放宽正式解析来迁就错误 fixture。
 - 优先查已有验证和结果，再设计新的 hidden-loss 或初始化消融；相同损失项/数据/预算下比较，不能只读总 loss。
@@ -43,3 +44,13 @@ additive 为 x+D(x)，B=0 时保持初始输出；replace 为 D(x)，正交初�
 2026-10-06 迁移旧DoRA配方时，当前CLI已删除use_dora，CAT仅创建plain LoRA；现model-level finalizer实际手工W+sBA，不能直接拿来合并DoRA。DoRA还含每输出行的可学习magnitude与更新后权重行范数；installed PEFT0.10原生merge支持该项，当前exact PEFT config却未保存DoRA拓扑。隔离原型已用真实CPU PEFT验证FP32公式→BF16矩阵一致、magnitude梯度和导出无adapter，但未因此认定主框架支持DoRA、8B数值已通过或精度有效。若后续集成，须同时处理构造、参数收集、正确合并及实际需要的保存语义，不能只加一个use_dora开关。[发现、来源及短测边界](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
 
 2026-10-06该DoRA隔离8B配对已完成：从已做500步恢复的同after_gate边界，再以相同256训练/64留出文档进行64步plain LoRA或DoRA，原生DoRA-aware merge、2211保存/fresh和冻结码库均通过；两臂16/16留出批KL均恶化，DoRA融合后.10251968与LoRA .10267050的微小差异不能证明有益。起点也有微小数值差，不能假设逐位相同。两种融合前后logit差同时包含160个prefix decoder的FP32→BF16和packed→whole-fused切换；不得把全差归给adapter。该具体额外恢复配方不集成，不能由64步、该数据/LR/来源条件否定其他DoRA配方；短验权重已退役、证据保留。[完整配对和清理记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月6日0822保护int4尺度搜索全模型结果与三条后续运行)。
+
+## 初始低秩空间须用实际任务梯度检查（2026-10-25）
+
+**证据状态：已测输入空间的梯度捕获差异，任务梯度初始化匹配32步及完整九项已完成，本配置无综合收益。** Qwen bestabs 的108个MLP上，HF激活加权权重误差给出的解析rank8空间虽优于随机，却只捕获Probe逐loss梯度能量加和的1.30165%。从独立Fit训练组的实际带权任务梯度构造rank8右空间后，在case ID分离的两个Probe训练组捕获66.25795%，随机为.12447%；这是局部更新空间可达性的差异，不能解释为模型恢复了相同比例的能力。Probe联合梯度的dense分母未计算，不得把逐loss能量比改称联合损失捕获率。Fit与Probe均为既有train池，且QA域配比不同于完整训练池，不称未见泛化。[诊断、原件与边界](../../../result/qwen3_8b_mmlu65_20261004/qwen_abs005_task_gradient_rank8_probe_20261025/README.md)
+
+下一步采用零输出初始化、相同恢复训练预算的对照；初始空间获取和诊断成本另计，不称总计算量相同：写成ΔW=AB时令A0=0、B0为任务右空间转置，保持源模型初始函数、原生BF16计算、损失、数据顺序和优化器相同。Adam按因子坐标更新，故结论应称“初始化规则对照”，不能把全部差异只归于子空间。该诊断的M跨Probe余弦仍为−.08623，QA与短题保留目标仍有负内积；捕获提高与任务冲突可以同时存在，须以实际训练和完整九项取舍，不能由一阶下降方向直接晋级成品。有限求解中107/108模块收敛、一个模块达到固定预算后保留近似，不能宣称所有空间精确最优。[实验决定与完整状态](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)
+
+匹配的解析／随机输入初始化fresh32已完成正式完整九项：解析66.93704、随机66.77592，均低于同源bestabs67.02351；两臂代理gold NLL／教师KL下降、解析优于随机仍不足以证明源能力恢复。解析LongBench＋.01823也不足以抵消八项损失。随后任务梯度初始化完整九项为66.85145，较bestabs−.17206pp；LongBench＋.15621而八项−.21309。较高局部梯度捕获、较小无权AB范数及部分任务修复同时存在，仍未提高综合指标。下一次改变参数化或目标须与这些条件区分，不能仅据捕获优势继续加预算；此证据限定在该损失／数据／32步，不证明所有低秩恢复上限。[原解析／随机完整匹配评测](../../../result/qwen3_8b_mmlu65_20261004/qwen_abs005_rank8_subspace_train32_pair_20261025/evaluation_adapter/README.md)与[任务梯度完整评测](../../../result/qwen3_8b_mmlu65_20261004/qwen_abs005_task_gradient_init_train32_20261025/evaluation_adapter/README.md)。
+
+同日匹配TG32实际完成后，训练任务梯度较大、前16步每步都触发clip，而ana／random未触发；但保存BF16因素的无权乘积范数‖AB‖F在16／32均较小（TG1.20466／1.54584，ana1.34983／1.76066，random1.42828／1.91124），三个MLP类别均同向。因此梯度范数或因子自身位移不能直接当原权重更新量，也不足以选一个更低LR；这里用FP64小Gram求范数，未形成dense AB，仍不等同真实BF16输出扰动或输入敏感度。TG32的Web正确数两half提高，Med与长QA代理有代价，按完整九项决策；不将较高capture视为容量已利用或能力已恢复。本证据仅覆盖该108MLP rank8配方。[训练、动力学与后续取舍](../../../result/qwen3_8b_mmlu65_20261004/qwen_abs005_task_gradient_init_train32_20261025/README.md)
