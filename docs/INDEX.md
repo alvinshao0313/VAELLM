@@ -6,7 +6,7 @@
 不遍历目录符号链接，不收录依赖/缓存、tokenizer 文本、运行时间标记及原始 JSON/日志。
 旧路径只列映射，不重复索引正文；历史迁移来源另见 [CATALOG](experience/CATALOG.md)。
 
-## 规则、导航与使用说明（33）
+## 规则、导航与使用说明（59）
 
 - [项目协作规范](../AGENTS.md) — `AGENTS.md`
 - [VAELLM](../README.md) — `README.md`
@@ -27,18 +27,44 @@
 - [从 v6 VAE checkpoint 做逐类别恢复](guides/catlora_distill_from_checkpoint.md) — `docs/guides/catlora_distill_from_checkpoint.md`
 - [EdgeRazor 数据集接入](guides/edgerazor_dataset.md) — `docs/guides/edgerazor_dataset.md`
 - [从 BF16 Qwen3 8B 复现八任务均分 69 以上的压缩模型](guides/qwen3_8b_69_reproduction.md) — `docs/guides/qwen3_8b_69_reproduction.md`
+- [Qwen/Llama 最小研究接续包](guides/research_handoff.md) — `docs/guides/research_handoff.md`
 - [可选残差 LoRA](guides/residual_lora.md) — `docs/guides/residual_lora.md`
 - [VAE 分组输出损失：最小下游精度对照](../experiments/activation_loss_ab/README.md) — `experiments/activation_loss_ab/README.md`
+- [整36gate同父动态阶数与Rice对照](../experiments/adaptive_class_20261030/README.md) — `experiments/adaptive_class_20261030/README.md`
+- [整类 dynamic／Rice 的完整九项评测](../experiments/adaptive_class_evaluation_20261030/README.md) — `experiments/adaptive_class_evaluation_20261030/README.md`
+- [自适应残差码本的独立目标分组拟合](../experiments/adaptive_grouped_fit_20261029/README.md) — `experiments/adaptive_grouped_fit_20261029/README.md`
+- [动态残差阶数的L18／L35基础预算复现](../experiments/adaptive_layer_transfer_20261028/README.md) — `experiments/adaptive_layer_transfer_20261028/README.md`
+- [自适应残差码流的整模型恢复桥接草稿](../experiments/adaptive_native_bridge_20261029/README.md) — `experiments/adaptive_native_bridge_20261029/README.md`
+- [自适应短码流的独立完整原生模型格式](../experiments/adaptive_native_model_20261029/README.md) — `experiments/adaptive_native_model_20261029/README.md`
+- [动态三阶与INT8＋abs005的L18／L35同上限对照](../experiments/adaptive_sparse_layers_20261028/README.md) — `experiments/adaptive_sparse_layers_20261028/README.md`
+- [动态RVQ与INT8通道＋稀疏残差的同预算对照](../experiments/adaptive_sparse_pair_20261028/README.md) — `experiments/adaptive_sparse_pair_20261028/README.md`
 - [Linear 内向量自适应残差阶数](../experiments/adaptive_vector_rvq/README.md) — `experiments/adaptive_vector_rvq/README.md`
 - [当前 Qwen bestabs 的 MMLU 0／5-shot 配对](../experiments/bestabs_mmlu_shot_pair_20261027/README.md) — `experiments/bestabs_mmlu_shot_pair_20261027/README.md`
+- [C/G 对齐链原生3423完整九项评测](../experiments/cat_aligned_evaluation_20261028/README.md) — `experiments/cat_aligned_evaluation_20261028/README.md`
+- [C09／G09 对齐恢复：在线 OPD32](../experiments/cat_aligned_opd_20261028/README.md) — `experiments/cat_aligned_opd_20261028/README.md`
+- [C/G 对齐恢复：保护参数分支与 C1 组装](../experiments/cat_aligned_protection_20261028/README.md) — `experiments/cat_aligned_protection_20261028/README.md`
+- [C09/G09 与旧 best 的恢复链对齐](../experiments/cat_aligned_recovery_20261028/README.md) — `experiments/cat_aligned_recovery_20261028/README.md`
+- [C/G 对齐恢复：J32 与 B32 局部更新基准](../experiments/cat_aligned_selected_20261028/README.md) — `experiments/cat_aligned_selected_20261028/README.md`
+- [C/G 对齐链：新06末态的 abs005／Rice7](../experiments/cat_aligned_sparse_20261028/README.md) — `experiments/cat_aligned_sparse_20261028/README.md`
 - [CAT 旋转后双向归一化原型](../experiments/cat_biaxial_scale/README.md) — `experiments/cat_biaxial_scale/README.md`
+- [A控制分支的gate250／500只读节点比较](../experiments/cat_category_selection_20261029/README.md) — `experiments/cat_category_selection_20261029/README.md`
+- [从原始BF16重新生成CAT A/B完整基座](../experiments/cat_structure_fresh_20261029/README.md) — `experiments/cat_structure_fresh_20261029/README.md`
+- [完整36gate结构对照与各自live MLP后继](../experiments/cat_structure_full_20261029/README.md) — `experiments/cat_structure_full_20261029/README.md`
+- [CAT 向量长度与编解码器容量的同源筛选](../experiments/cat_structure_probe_20261029/README.md) — `experiments/cat_structure_probe_20261029/README.md`
 - [Down Layer Sensitivity Ablation](../experiments/down_layer_sensitivity/README.md) — `experiments/down_layer_sensitivity/README.md`
+- [G09 Muon：Hotpot 唯一覆盖与重复对照](../experiments/g09_hotpot_coverage_20261030/README.md) — `experiments/g09_hotpot_coverage_20261030/README.md`
+- [G09 并行恢复与阶段价值对照](../experiments/g09_recovery_20261029/README.md) — `experiments/g09_recovery_20261029/README.md`
+- [G01→G02 几何校准：原生可达性与能力保持](../experiments/geometric_calibration_20261029/README.md) — `experiments/geometric_calibration_20261029/README.md`
 - [LiftQuant-style VAELLM recovery](../experiments/liftquant_recovery/README.md) — `experiments/liftquant_recovery/README.md`
 - [PROVENANCE.md](../experiments/liftquant_recovery/upstream/PROVENANCE.md) — `experiments/liftquant_recovery/upstream/PROVENANCE.md`
 - [Independent Linear Output W2](../experiments/linear_output/README.md) — `experiments/linear_output/README.md`
+- [Llama 原保护 INT8 q 与 decoder 的同源64步配对](../experiments/llama_protected_qat_pair_20261028/README.md) — `experiments/llama_protected_qat_pair_20261028/README.md`
 - [LongBench 固定高敏任务 CPU 评分](../experiments/longbench_sensitive_screen/README.md) — `experiments/longbench_sensitive_screen/README.md`
 - [LongBench v1 paired evaluation](../experiments/longbench_v1/README.md) — `experiments/longbench_v1/README.md`
+- [夜间固定接续接口](../experiments/overnight_goal_20261029/README.md) — `experiments/overnight_goal_20261029/README.md`
+- [10月28日七路 LongBench 中断续评](../experiments/overnight_resume_20261028/README.md) — `experiments/overnight_resume_20261028/README.md`
 - [顺序 CAT 的类别旋转块大小：兼容设计](../experiments/rotation_factor_probe/design.md) — `experiments/rotation_factor_probe/design.md`
+- [Softmax 数值隔离诊断](../experiments/softmax_numerics_20261029/README.md) — `experiments/softmax_numerics_20261029/README.md`
 - [SparseBit 选择性重锚隔离对照](../experiments/sparse_bit_deoscillation/README.md) — `experiments/sparse_bit_deoscillation/README.md`
 - [mix_bit — Mixed-Bit VAE Allocation](../mix_bit/README.md) — `mix_bit/README.md`
 
@@ -55,7 +81,7 @@
 - [复现和收尾：保存最小证据，明确时间与用途](experience/lessons/reproducibility.md) — `docs/experience/lessons/reproducibility.md`
 - [残差 LoRA：初始化、训练开关和恢复语义分别验证](experience/lessons/residual_lora.md) — `docs/experience/lessons/residual_lora.md`
 
-## 实验结果与验证记录（31）
+## 实验结果与验证记录（32）
 
 - [实验记录：checkpoint distill 前缀累加 vs 独立类别](experience/records/docs/cat_distill_prefix_vs_independent.md) — `docs/experience/records/docs/cat_distill_prefix_vs_independent.md`
 - [FP32 蒸馏参数验证记录](experience/records/docs/distill_fp32_validation.md) — `docs/experience/records/docs/distill_fp32_validation.md`
@@ -88,6 +114,7 @@
 - [Qwen3 8B 极低比特压缩达到八任务均分 69 的方案与实验证据](experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_report.md) — `docs/experience/records/qwen3_w25/2026-10-04_qwen3_8b_69_report.md`
 - [CAT 旋转后双向归一化与保护通道六臂对照](experience/records/qwen3_w25/2026-10-22_cat_biaxial.md) — `docs/experience/records/qwen3_w25/2026-10-22_cat_biaxial.md`
 - [Qwen3/Llama3.1 九项指标、知识恢复与低比特迁移](experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md) — `docs/experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md`
+- [VAELLM 低比特压缩执行计划](experience/records/w25_transfer/current_plan.md) — `docs/experience/records/w25_transfer/current_plan.md`
 
 ## 历史计划与审查（147）
 
@@ -239,8 +266,9 @@
 - [Task 9: Closed-Loop Verification Before the Expensive Formal Run](experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-brief.md) — `docs/experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-brief.md`
 - [Task 9 Report — BLOCKED (GPU memory)](experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-report.md) — `docs/experience/history/reviews/2026-08-18-down-proj-mmlu-layer-sensitivity-ablation/task-9-report.md`
 
-## 原位产物说明与自动报告（297）
+## 原位产物说明与自动报告（299）
 
+- [completion.txt](../result/new_server_hardware_20261028/evidence/completion.txt) — `result/new_server_hardware_20261028/evidence/completion.txt`
 - [Qwen 压缩版 Wiki PPL／HellaSwag 与 BF16 HellaSwag 对照](../result/qwen3_8b_mmlu65_20261004/best_wiki_hellaswag_20261022/README.md) — `result/qwen3_8b_mmlu65_20261004/best_wiki_hellaswag_20261022/README.md`
 - [广覆盖逐类蒸馏数据池](../result/qwen3_8b_mmlu65_20261004/broad_distill_dataset_20261015/README.md) — `result/qwen3_8b_mmlu65_20261004/broad_distill_dataset_20261015/README.md`
 - [rawK38 QK-only fresh4000](../result/qwen3_8b_mmlu65_20261004/general_lm_qwen_k38_qkonly_s4000_20261012/README.md) — `result/qwen3_8b_mmlu65_20261004/general_lm_qwen_k38_qkonly_s4000_20261012/README.md`
@@ -533,6 +561,7 @@
 - [LongBench v1 paired evaluation](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/README.md`
 - [LICENSE](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/upstream/LICENSE) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/experiments/longbench_v1/upstream/LICENSE`
 - [mix_bit — Mixed-Bit VAE Allocation](../result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/mix_bit/README.md) — `result/qwen3_8b_mmlu65_20261004/rotation_factor_probe/source_snapshot_20261005_01/mix_bit/README.md`
+- [2026-10-29 新九项质量与存储口径 CPU 复核](../result/qwen3_8b_mmlu65_20261004/transfer_acceptance_20261029/README.md) — `result/qwen3_8b_mmlu65_20261004/transfer_acceptance_20261029/README.md`
 - [lm_eval_summary_final.md](../result/qwen3_8b_w25_20260930/e2e_bits_block32_a005_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_190729/lm_eval/lm_eval_summary_final.md) — `result/qwen3_8b_w25_20260930/e2e_bits_block32_a005_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_190729/lm_eval/lm_eval_summary_final.md`
 - [lm_eval_summary_final.md](../result/qwen3_8b_w25_20260930/e2e_bits_block32_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md) — `result/qwen3_8b_w25_20260930/e2e_bits_block32_r128_lr4e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md`
 - [lm_eval_summary_final.md](../result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr1e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md) — `result/qwen3_8b_w25_20260930/e2e_decoder_block32_lr1e5/home_star_models_Qwen_Qwen3-8B_20261001_144352/lm_eval/lm_eval_summary_final.md`

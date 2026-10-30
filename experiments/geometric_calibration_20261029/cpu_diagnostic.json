@@ -1,0 +1,77 @@
+{
+  "status": "complete_cpu_geometry_only",
+  "source_ids": [
+    "44ed6d15-abf0-46b0-a627-998a6406087a",
+    "38a7461e-a2f1-4586-80e2-b99883ef2628"
+  ],
+  "source_paths": [
+    "/data/star/VAELLM/cat_aligned_recovery_20261028/G/01_qk_fineweb2000/home_star_models_Qwen_Qwen3-8B_20261028_191743/final_model",
+    "/data/star/VAELLM/cat_aligned_recovery_20261028/G/02_online_opd32/native_final/final_model"
+  ],
+  "source_weight_stats": [
+    {
+      "path": "/data/star/VAELLM/cat_aligned_recovery_20261028/G/01_qk_fineweb2000/home_star_models_Qwen_Qwen3-8B_20261028_191743/final_model/pytorch_model.bin",
+      "size": 4782744841,
+      "mtime_ns": 1793193629971687409,
+      "inode": 170858176
+    },
+    {
+      "path": "/data/star/VAELLM/cat_aligned_recovery_20261028/G/02_online_opd32/native_final/final_model/pytorch_model.bin",
+      "size": 4782744841,
+      "mtime_ns": 1793199342624405642,
+      "inode": 170858237
+    }
+  ],
+  "projection": "model.layers.18.self_attn.k_proj",
+  "selection_rule": "median depth k_proj; full smallest attention matrix; diagnostic only",
+  "matrix_shape": [
+    1024,
+    4096
+  ],
+  "source_state_tensors_touched_per_checkpoint": 13,
+  "source_tensor_bytes_per_checkpoint": 1398976,
+  "frozen_tensors_equal": 7,
+  "decoder_parameters": 18752,
+  "decode_backend": "native CPU BF16 reference; not CUDA packed-kernel parity",
+  "decode_seconds": [
+    0.27665424600127153,
+    0.2483883350068936
+  ],
+  "svd_projection_seconds": 0.7519502549985191,
+  "rho": 0.5,
+  "alpha": 1.0,
+  "rank": 153,
+  "captured_weight_energy": 0.5000502467155457,
+  "delta_energy": 0.5091163032134073,
+  "relative_delta_norm": 0.014080253247479637,
+  "removed_delta_energy_fraction": 0.0493922600612055,
+  "retained_norm_shrink_beta": 0.974991134530331,
+  "orthogonality_relative_residual": 2.7734040486393496e-07,
+  "protected_input_columns": 64,
+  "original_delta_on_protection_energy": 0.0,
+  "unreachable_protected_energy_fraction_of_calibration_move": 0.018510979477246142,
+  "unreachable_protected_energy_fraction_of_target_delta": 0.0009618048542938835,
+  "bf16_calibration_quantization_energy_over_move": 0.056125647702118156,
+  "bf16_actual_move_energy_over_ideal_move": 0.9694364770111749,
+  "bf16_protected_changed_elements": 20761,
+  "bf16_retained_norm_calibration": 0.6967642282984903,
+  "bf16_retained_norm_shrink": 0.6974473211829018,
+  "hf_weight_relative_squared_error": {
+    "G01": 0.11625840009403404,
+    "G02": 0.11659372177445239,
+    "SPACE_FP32": 0.1164948853293222,
+    "SPACE_BF16": 0.11649465856076968,
+    "shrink_BF16": 0.11658194178981324
+  },
+  "no_capability_or_native_refit_claim": true,
+  "cuda_initialized": false,
+  "torch_version": "2.6.0+cu124",
+  "python": "/home/star/miniconda3/envs/bitvae/bin/python",
+  "cpu_threads": 4,
+  "code_sha256": "ca280c3326b7832e210f273e8c79da6a12cf1f78b809d1f26292bb30ac7d0937",
+  "native_source_sha256": {
+    "train_utils/checkpoint_v6.py": "0eabfcd426cc565599bcc3e395d7d45cd0a2629d08dc44c61698872164c85084",
+    "litebsq/vae_linear.py": "35bfac063d4a1623c8f742ab16d8c08f9f8e4162aefec7822a0c9e9ddee93afb"
+  },
+  "elapsed_seconds": 2.161283576002461
+}

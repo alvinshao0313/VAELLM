@@ -36,7 +36,7 @@ grep -RniE '编码|STE|翻码|proxy' docs/experience/lessons
 | 打包、导出、重载、精确续训 | [Checkpoint 与数值路径](lessons/checkpoint_lifecycle.md) | v6、packed、BF16、TF32、finalization |
 | 精度、显存、offload、多卡 | [资源与数值精度](lessons/memory_precision.md) | OOM、allocated、reserved、autocast |
 | token mask、prompt KD、日志统计 | [KD 语义与数据边界](lessons/kd_and_data.md) | causal、padding、prompt、mask、telemetry |
-| 码本、混合位宽、权重旋转 | [压缩配置与存储口径](lessons/compression_choices.md) | codebook、stage、bpw、Hadamard、保护通道 |
+| VAELLM本体超参、敏感条件、存储 | [参数作用与故障诊断](lessons/compression_choices.md#超参作用与故障诊断2026-10-29) | D/K/S、encoder/decoder、BSQ、batch、LR、optimizer、保护、旋转、bpw |
 | Mixed-bit 候选、缓存与质量验证 | [Mixed-bit 工程及评测经验](lessons/mixed_bit_pipeline.md) | fingerprint、tokenizer、manifest、worker、KL、PPL |
 | 旧配置、运行状态与收尾 | [复现及文档维护](lessons/reproducibility.md) | CLI、历史、清理、复现、日志 |
 
@@ -54,7 +54,8 @@ grep -RniE '编码|STE|翻码|proxy' docs/experience/lessons
 
 ## 最近专题
 
-- [Qwen3/Llama3.1 九项指标、知识恢复及 LongBench 对比](records/w25_transfer/2026-10-04_mmlu65_llama31.md)：10月12日起优先Qwen3-8B，空卡在没有可立即并行Qwen任务时继续Llama3.1-8B-Instruct迁移；两模型均以八个下游任务与完整LongBench组成九项等权综合分，相对各自BF16绝对下降不超过0.8个百分点，严格train-only、MMLU不另设门槛。
+- [当前低比特目标执行计划](records/w25_transfer/current_plan.md)：主目标、两条并行主线、阶段完成条件、当前子任务和资源安排统一维护于此；经验与历史作为依据，不另设当前计划副本。
+- [Qwen3/Llama 九项指标与可迁移压缩目标](records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月29日当前目标与完成条件)：10月29日新目标要求先完成Qwen3-8B从BF16的完整流程，再以相同规则验证其他系列模型；现行精度、位宽、数据边界与完成条件统一见正文，旧实验保留原验收口径。
 - [Qwen3 8B 平均位宽 2.5bit 内达到八任务均分 69](records/qwen3_w25/2026-09-30_goal.md)：新服务器的数据准备、压缩基底、位宽审计及后续恢复，状态与授权见正文。
 - [LiftQuant编码恢复经验](lessons/liftquant_recovery.md)：最新状态、证据和限制见正文。
 - [硬码翻转贡献对照](records/experiments/liftquant_recovery/BIT_CONTRIBUTION_20260923.md)：最新状态、证据和限制见正文。

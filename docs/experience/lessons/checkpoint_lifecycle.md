@@ -15,6 +15,10 @@ Linear输出实验在导出第4个模块时触发误差门限，旧runner此前�
 - 运行缓存要在状态加载后刷新，训练评测、finalization与部署的表示必须明确。低精度矩阵运算重结合不自动保持同值。
 - 成功验收后，依据后续用途清理checkpoint；恢复安全不意味着永久保留所有权重。
 
+2026-10-29完整compact格式原型补充：G09父进程会由bindings选择已验证full-RHT源码snapshot；仅把权重和manifest交给独立进程、沿公共rotation重建时，真实4032维因缺252阶固定Hadamard族而失败。保存字段正确不能替代运行代码依赖闭合。隔离新包显式选择同一既有snapshot并在manifest绑定相关源码SHA后，真实251个VAELinear＋1个compact及全部非投影的3437字段在独立Python进程strict exact；有效权重只读取新成品自身单一文件。不得以换block、换等价Hadamard方向或加载旧父权重掩盖缺失依赖，也不把新schema称为公共v6支持。该证据限定Qwen3/D32K48实际端点；完整GPU更新及部署证据按[本原型结果](../../../experiments/adaptive_native_model_20261029/README.md)维护，不代表跨规格或同父质量收益。
+
+同日native两阶importer实测补充：原生持久decoder已融合BSQ符号尺度和原stage统计，加载后非持久`_q_scale_fused=False`不证明未融合；只复制当前BF16值，原mean/std未保存就明确不可恢复。真实G09四种K32/34/38/48的码/参数/保护/sign/fresh exact后，K34 gate真实8193行的packed→独立stage之和FP32 relative-L2为6.58e-8，BF16约0.566%，约65.10%元素改变；新compact对相同独立getter操作仍exact。字段无损不能替代跨算子函数等价；该数值仅限逆旋转前所测行，不支持全Linear/GPU或下游结论。后续两臂共享新compact前缀并重算各自residual和误差，不加偏移补偿或把转换差归为动态收益。[接口、实际范围与原始证据](../../../experiments/adaptive_native_model_20261029/README.md#同父-native-两阶前缀-importer纯cpu接口闭合)。
+
 2026-10-24子集decoder原型补充：当前`enable_trainable_decode`会重新将整个decoder设为可导；仅在初始化冻结hidden，不能保证native OPD返回后仍然冻结。三α隔离实现因此在每次恢复后重新应用24头可导／48隐藏叶冻结，并把3个独立master与packed carrier分开核查。真实码CPU两次更新、冻结补集及保存/fresh strict已验证；完整GPU OPD往返仍待，不能把此机制证据写成下游收益或完整GPU通过。适用于训练／原生推理切换时只开放decoder子集的路径，不需要修改原先全部decoder可导的实验。[原型证据与待验证范围](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
 
 2026-10-21最后类别中点独导补充：`save_v6_full_checkpoint`的返回值是保存摘要，不能当作完整v6 metadata传给`audit_state_dict`。新脚本在真实恢复／保存后因此退出，尚未进入fresh strict或GPU；修复为读取落盘`checkpoint_meta.json`，在独立输出重新导出、账本审计及3423张量独进程strict通过后才接评测。`round_base`本身不是该审计器接受的成品kind，也不能为通过检查伪改kind；须在真实category_boundary保存后用真实元数据审计。入口静态检查不能替代新增调用路径的实际运行，已成功的前序评测无需因后续导出失败重跑。[失败原件、最小修复及实际接续](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月21日较小码更新终态freshcat末点与最后类别中点)。

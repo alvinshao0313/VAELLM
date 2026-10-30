@@ -5,13 +5,18 @@
 | 要做什么 | 从这里开始 |
 | --- | --- |
 | 协作规则与代码习惯 | [项目规范](../AGENTS.md) |
+| 推进当前低比特目标 | [唯一执行计划与阶段完成条件](experience/records/w25_transfer/current_plan.md) |
 | 了解正式训练链路 | [项目概览](../README.md) |
 | CAT 压缩与恢复 | [CAT 架构和参数](guides/cat_training.md)、[checkpoint 逐类别恢复](guides/catlora_distill_from_checkpoint.md) |
 | 从 BF16 复现 Qwen3 8B 的 69% 压缩成品 | [一键脚本与完整操作说明](guides/qwen3_8b_69_reproduction.md) |
+| 梳理当前目标、最佳与可迁移算法 | [现行验收与递进研究路线](experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月29日当前目标与完成条件)、[真实流程与迁移边界](experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月28日从优胜配方提炼可迁移算法)、[新基座对齐恢复](../experiments/cat_aligned_recovery_20261028/README.md) |
+| 并行改进压缩基座与基座后恢复 | [两条主线、当前分工与交接条件](experience/records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月29日两条并行主线与交接条件) |
+| 迁移成品、检查新服务器及SCP测速 | [研究接续包、新服务器自检与传输测试](guides/research_handoff.md) |
 | E2E 微调 | [E2E 模块说明](../compressed_e2e_fintuning/README.md) |
 | 添加残差保护或残差 LoRA | [base checkpoint residual](guides/cat_residual_from_base.md)、[残差 LoRA 配置](guides/residual_lora.md) |
 | 准备训练数据 | [EdgeRazor 接入](guides/edgerazor_dataset.md) |
 | 设计实验、排查已知问题 | [按问题查经验](experience/README.md)，再看命中的证据 |
+| 理解VAELLM超参、敏感条件和调参方向 | [本体超参作用与故障诊断](experience/lessons/compression_choices.md#超参作用与故障诊断2026-10-29)、[损失与尺度](experience/lessons/output_losses.md) |
 | 记录实验与提炼经验 | [实验工作流程](experience/WORKFLOW.md) |
 | 混合位宽 | [模块与命令](../mix_bit/README.md)、[工程与评测经验](experience/lessons/mixed_bit_pipeline.md) |
 | 向量自适应残差阶数原型 | [down 同预算配对、码流与验证](../experiments/adaptive_vector_rvq/README.md) |
