@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ARCHIVE = Path('/data/star/VAELLM/adaptive_native_model_20261029/cat_gate_prefixes/B')
 STRUCTURE = ROOT / 'experiments/cat_structure_full_20261029'
 PREPARED = Path('/data/star/VAELLM/cat_structure_full_20261029/prepared.json')
+RUNTIME_STATE = ARCHIVE / 'cat_runtime_state.pt'
 CATEGORIES = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj')
 log = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ def recipe(output):
     finally:
         sys.path[:] = previous
     c.require(Path(native.__file__).resolve().is_relative_to(RUNTIME), 'Use the explicit category-aware N fitter/runtime.')
-    runtime = torch.load(ARCHIVE / 'cat_runtime_state.pt', map_location='cpu', weights_only=True)
+    runtime = torch.load(RUNTIME_STATE, map_location='cpu', weights_only=True)
     saved = c.read(PREPARED)['arms']['B']
     cat, hf, training, vae, cfgs, identity, normalized = module.parse_recipe('B', saved['native_argv'], runtime)
     validate_cat_runtime_identity(runtime['runtime_identity'], identity)
@@ -160,7 +161,8 @@ def make_trainer(model, stage, vae, hf, output, round_base, round_meta, callback
 
 @torch.no_grad()
 def finalize(trainer, stage, native_targets):
-    model = trainer.model
+    # Remove Accelerate's output cast before changing decoder/PEFT structure.
+    model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper=False)
     # Snapshot exactly the actual ordinary PEFT merge rule before modifying it.
     expected = {}
     for name, layer in iter_named_peft_lora_layers(model):

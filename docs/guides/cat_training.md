@@ -1,5 +1,7 @@
 # CAT 训练：架构与公共参数
 
+SC-CAT定制搜索与一阶段基线构建须先读项目级[流程标准](../sc_cat_protocol.md)和[执行规范](../sc_cat_execution.md)。本页说明CAT架构及CLI用法，示例默认值不代替标准中的搜索、选优与验收规则。
+
 ## 当前架构
 
 CAT online 与 checkpoint-distill 共用 `train_utils.cat_after_category_common`：同一套目标 inventory、数据、模型级 loss、plain full-space LoRA、decoder finalize 和 v6 exact-resume 逻辑。
@@ -59,7 +61,7 @@ python tools/cat_train.py \
 
 非 `none` 模式必须提供数据源。模型级 loss 的当前列表见 [项目概览](../../README.md)，包括脚本采用的 `kl_top_mass`；K 使用独立 `--top_k`。
 
-[cat_w25_remaining.sh](../../scripts/cat_w25_remaining.sh) 是本轮无部署 LoRA 分支的在线候选入口：从原模型逐类压缩，未压缩 dense 的 rank12 LoRA 在每类后融合，同时更新已压缩前缀的 decoder；最后一类仍更新 decoder。它不能直接以全部压缩后的 checkpoint 重放 remaining-family。具体配方及验证状态见 [本轮记录](../experience/records/qwen3_w25/2026-09-30_goal.md)。
+[cat_w25_remaining.sh](../../scripts/cat_w25_remaining.sh) 是本轮无部署 LoRA 分支的在线候选入口：从原模型逐类压缩，未压缩 dense 的 rank12 LoRA 在每类后融合，同时更新已压缩前缀的 decoder；最后一类仍更新 decoder。它不能直接以全部压缩后的 checkpoint 重放 remaining-family。具体配方及验证状态见 [本轮记录](../experience/history/qwen3_w25/2026-09-30_10-04_research_log.md)。
 
 ## v6 保存
 

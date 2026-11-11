@@ -1,125 +1,103 @@
+<!-- lesson-redirect -->
+
 # Checkpoint：先持久化可恢复状态，再导出并独立重载
 
-## 问题与证据
+本专题已按“一级分类 → 二级专题 → 经验条目”拆分；以下保留旧标题锚点和完整去向，原经验正文只在目标专题维护。新总结请写入[经验分类入口](../README.md)对应专题。若并行任务仍向本文件补写，须先保留增量、核对来源后归并，不能覆盖或直接删除。
 
-Linear输出实验在导出第4个模块时触发误差门限，旧runner此前没有保存整分片训练状态，导致后续60个Linear最终状态无法从日志恢复。校验还混合BF16训练、FP32融合与TF32部署路径。[导出故障记录](../records/experiments/linear_output/RECOVERY_NOTES.md)
+<a id="按条件选择动作"></a>
 
-真实硬件审查还发现：finalization重新unpack已训练packed decoder、提前合并LoRA支路、保留FP32输出wrapper，以及已到max_steps的恢复额外多跑一步等问题。[硬件审查](../history/audits/TRAINING_STACK_HARDWARE_SMOKE_AUDIT.md)
+- **按条件选择动作** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--按条件选择动作)
 
-## 下次怎么做
+<a id="下次怎么做"></a>
 
-- 在不可逆导出前原子保存恢复必需状态；每个模块导出成功立即更新manifest，失败写明FAILED及目标，不能靠过期TRAINING标记判断进程状态。
-- 区分同精度同路径的保存等价性与部署精度变化；各自记录误差，不通过放宽一个总门限掩盖语义混用。
-- 采用fresh process strict重载；核对压缩范围、码、拓扑、冻结状态、推理输出，不能只验证文件存在。
-- step恢复验证optimizer/scheduler/RNG、可变参数和Sparse Bit状态，并比较下一步更新；到达max_steps后应进入finalization。
-- 运行缓存要在状态加载后刷新，训练评测、finalization与部署的表示必须明确。低精度矩阵运算重结合不自动保持同值。
-- 成功验收后，依据后续用途清理checkpoint；恢复安全不意味着永久保留所有权重。
+- **下次怎么做** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--下次怎么做)
 
-2026-10-29完整compact格式原型补充：G09父进程会由bindings选择已验证full-RHT源码snapshot；仅把权重和manifest交给独立进程、沿公共rotation重建时，真实4032维因缺252阶固定Hadamard族而失败。保存字段正确不能替代运行代码依赖闭合。隔离新包显式选择同一既有snapshot并在manifest绑定相关源码SHA后，真实251个VAELinear＋1个compact及全部非投影的3437字段在独立Python进程strict exact；有效权重只读取新成品自身单一文件。不得以换block、换等价Hadamard方向或加载旧父权重掩盖缺失依赖，也不把新schema称为公共v6支持。该证据限定Qwen3/D32K48实际端点；完整GPU更新及部署证据按[本原型结果](../../../experiments/adaptive_native_model_20261029/README.md)维护，不代表跨规格或同父质量收益。
+<a id="问题与证据"></a>
 
-同日native两阶importer实测补充：原生持久decoder已融合BSQ符号尺度和原stage统计，加载后非持久`_q_scale_fused=False`不证明未融合；只复制当前BF16值，原mean/std未保存就明确不可恢复。真实G09四种K32/34/38/48的码/参数/保护/sign/fresh exact后，K34 gate真实8193行的packed→独立stage之和FP32 relative-L2为6.58e-8，BF16约0.566%，约65.10%元素改变；新compact对相同独立getter操作仍exact。字段无损不能替代跨算子函数等价；该数值仅限逆旋转前所测行，不支持全Linear/GPU或下游结论。后续两臂共享新compact前缀并重算各自residual和误差，不加偏移补偿或把转换差归为动态收益。[接口、实际范围与原始证据](../../../experiments/adaptive_native_model_20261029/README.md#同父-native-两阶前缀-importer纯cpu接口闭合)。
+- **问题与证据** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--问题与证据)
 
-2026-10-24子集decoder原型补充：当前`enable_trainable_decode`会重新将整个decoder设为可导；仅在初始化冻结hidden，不能保证native OPD返回后仍然冻结。三α隔离实现因此在每次恢复后重新应用24头可导／48隐藏叶冻结，并把3个独立master与packed carrier分开核查。真实码CPU两次更新、冻结补集及保存/fresh strict已验证；完整GPU OPD往返仍待，不能把此机制证据写成下游收益或完整GPU通过。适用于训练／原生推理切换时只开放decoder子集的路径，不需要修改原先全部decoder可导的实验。[原型证据与待验证范围](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
+<a id="训练包装compact格式与子集状态的导出"></a>
 
-2026-10-21最后类别中点独导补充：`save_v6_full_checkpoint`的返回值是保存摘要，不能当作完整v6 metadata传给`audit_state_dict`。新脚本在真实恢复／保存后因此退出，尚未进入fresh strict或GPU；修复为读取落盘`checkpoint_meta.json`，在独立输出重新导出、账本审计及3423张量独进程strict通过后才接评测。`round_base`本身不是该审计器接受的成品kind，也不能为通过检查伪改kind；须在真实category_boundary保存后用真实元数据审计。入口静态检查不能替代新增调用路径的实际运行，已成功的前序评测无需因后续导出失败重跑。[失败原件、最小修复及实际接续](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月21日较小码更新终态freshcat末点与最后类别中点)。
+- **训练包装、compact格式与子集状态的导出** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--训练包装compact格式与子集状态的导出)
 
-2026-10-24异构stage兼容验证补充：packed decoder的`extract_single`可返回含裸`nn.Linear`的临时decoder，而v6按spec重建的是单模型`ParallelLinear.linear`。参数值正确并不保证保存后的键/容器契约匹配；本次真实fresh strict报16个线性层键不匹配。隔离修复按v6原生单模型容器逐值复制四个线性叶和两个norm叶，保留已融合q_scale，完整3449张量保存/fresh strict随后通过。临时旧S2视图只读compressed坐标时，其自身尺寸也须使用compressed尺寸，保护与rotation由外层只执行一次。异构v6的CPU重载不证明原预热入口兼容或CUDA数值等价；需明确独立适配器及原生零新增对照。[实际失败、修复与CPU证据](../../../result/qwen3_8b_mmlu65_20261004/qwen_b32_s3_lowrate_compat_20261024/README.md)。
+<a id="compact依赖闭合与native前缀转换"></a>
 
-## 边界
+- **compact依赖闭合与native前缀转换** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--compact依赖闭合与native前缀转换)
 
-历史硬件审查只通过单卡/单rank链路，真实多卡为hardware-deferred。本次没有复测。结果报告里旧output_alignment_v6_partial192路径与后续distill_init交付名称不同；读取当前模型必须以实际路径和最新交付记录核对，不能照搬历史“当前状态”。[后续交付说明](../records/experiments/linear_output/EXPERIMENT_SUMMARY.md)
+<a id="参数与优化器状态精度不同的重载"></a>
 
-## 层边界恢复须重建运行缓存（2026-09-23）
+- **参数与优化器状态精度不同的重载** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--参数与优化器状态精度不同的重载)
 
-**本配置实测支持**：Qwen3-8B单stage VAE逐层恢复中，block9/10各1步的连续训练与层边界恢复，在native码/decoder、输出、loss/LR、RNG和冻结状态上严格一致；注入7处过期grouped packed副本后，复用native refresh能恢复正确前向。[工程验证及原始证据](../records/experiments/liftquant_recovery/2026-09-23_engineering_equivalence.md)
+<a id="子集解冻元数据及容器契约"></a>
 
-**动作**：边界原子保存仅完成块的native状态和必要身份/样例/RNG；恢复从原初始模型开始，验证完成列表是目标前缀，匹配实际初始权重、FP teacher权重、代码、配置与token内容。复制persistent状态后同步grouped packed并清除decoded缓存，再严格比较已完成块输出。teacher前缀重放后才在保存边界恢复RNG。
+- **子集解冻、元数据及容器契约** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--子集解冻元数据及容器契约)
 
-**边界**：新block原本就建立fresh optimizer，因此层边界可不保存前一块Adam；未完成block的连续proxy/Adam/scheduler不能仅从硬码恢复。本轮各1步只验证恢复路径，未证明长训练或下游收益。
+<a id="边界"></a>
 
-## E2E中途评估改变RNG时的阶段恢复（2026-09-24）
+- **边界** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--边界)
 
-**证据状态：CPU精确对照通过、真实双卡流程已覆盖。** 当前lm-eval会重设随机状态，而Trainer的checkpoint原在评估前保存RNG；阶段暂停再恢复可能重放评估前状态，偏离连续训练。修复是在成功评估并恢复训练状态后，将各rank实际RNG写回本次checkpoint，再允许暂停；不改变连续训练原有语义。[验证及边界](../records/e2e_0910/2026-09-24_rank8_search.md)
+<a id="层边界恢复须重建运行缓存2026-09-23"></a>
 
-**当前实现约束**：启用eval_after_save时，save_steps和save_strategy属于不可变恢复契约；评估本身影响RNG，不能把降低评测频率当作无语义变化的续训加速。阶段预算只改stop_after_step，并保持其为原save_steps的整倍数；待评估完成、RNG写回并成功暂停后再恢复。当前恢复入口从checkpoint反推原run目录，`run_root_dir`不会将续训迁移到新目录；状态以resolved output为准，同一实验按step追加结果。依据为`v6_runtime_state.py`的evaluation_execution契约及`runtime_v6_pipeline.py`的阶段验证，具体运行见上述记录。
+- **层边界恢复须重建运行缓存（2026-09-23）** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--层边界恢复须重建运行缓存2026-09-23)
 
-阶段预算应独立于scheduler总steps。真实CPU Trainer含dropout/累积的连续与恢复参数、Adam、scheduler逐位一致；真实GPU非确定运行在暂停前也有差异，不能据此宣称GPU逐位等价。最终导出核切换问题已独立修复并通过同路径验收，见下节；阶段恢复通过本身不能替代导出验证。
+<a id="e2e中途评估改变rng时的阶段恢复2026-09-24"></a>
 
-## 顺序搜索保留中途最佳，部署排名须独立重载（2026-10-01收尾）
+- **E2E中途评估改变RNG时的阶段恢复（2026-09-24）** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--e2e中途评估改变rng时的阶段恢复2026-09-24)
 
-**本配置实测支持**：0920 checkpoint、rank8、四卡DP搜索于北京时间2026-10-01 02:20:35正常完成；15组配置中12组到5000步（3组1000→5000、9组2500→5000），另3组到2500步。阶段退出码、run_meta和原始指标支持真实续训完成，不等于连续训练/resume逐位审计。[配置、指标与来源](../records/e2e_0920/2026-09-24_rank8_search.md)
+<a id="顺序搜索保留中途最佳部署排名须独立重载2026-10-01收尾"></a>
 
-**导出证据边界**：早期baseline `lr3e5/step1000`训练内66.564804%→fresh process四卡strict重载66.554029%，差−0.010775个百分点。收尾前三个step2500快照也各自严格重载成功：pre-MLP权重0为68.009998%→68.024489%，0.03为67.974884%→67.859254%，0.01为67.883982%→67.742981%。排序未变但导出差值不同，不能用早期baseline差值替代各候选复评，更不能推断位级一致。
+- **顺序搜索保留中途最佳，部署排名须独立重载（2026-10-01收尾）** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--顺序搜索保留中途最佳部署排名须独立重载2026-10-01收尾)
 
-**动作**：保留中途最佳训练checkpoint直至实际导出重载比较完成，5000步终点不能替代2500步权重；搜索最高分与最终交付排名分别报告。本轮`best_result.json`已指向唯一保留的`deployments/c05_pre_mlp_hidden_loss_weight_1_step2500/model`，重载均分68.024489%，未达到69%。
+<a id="结构转换与解码核切换分开验证2026-09-24"></a>
 
-**清理与恢复边界**：控制器已清理其他生成权重及全部optimizer训练checkpoint，原数据、初始checkpoint、配置、核心日志和原始指标保留；交付模型仍可推理，但无法恢复原训练的optimizer/scheduler/RNG状态做exact-resume。147条cleanup累计124.8008 GiB为控制器历史删除文件的逻辑大小，不是本次文档收尾手动释放的空间。
+- **结构转换与解码核切换分开验证（2026-09-24）** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--结构转换与解码核切换分开验证2026-09-24)
 
-## 结构转换与解码核切换分开验证（2026-09-24）
+<a id="源码身份拒绝恢复时保留原运行版本2026-09-24"></a>
 
-**本配置实测支持，已通过真实导出及fresh strict重载，并在用户授权的隔离worktree落地。** 0910 Qwen3-8B的decoder+LoRA真实8步checkpoint：冻结decoder保持packed路径时logits逐元素相同，转换LoRA相对同路径也逐元素相同；仅由packed切到修复候选fused时，logits相对L2约0.00794。原core校验将结构转换和计算核切换合在一起，不能将这一报错直接解释为LoRA参数丢失。[同模型三阶段证据与边界](../records/e2e_0910/2026-09-24_rank8_search.md)
+- **源码身份拒绝恢复时保留原运行版本（2026-09-24）** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--源码身份拒绝恢复时保留原运行版本2026-09-24)
 
-先排除真实实现失配：本次旧fused的LayerNorm/SiLU与当前原生decoder不同，FP32 bias与末Linear舍入也有陈旧行为；真实模块对照与CUDA回归通过后才讨论不同核的正常浮点差异。结构校验应在同一部署计算路径比较转换前后，保持原门限与部署缓存；跨核误差单独记录，保存后仍须fresh strict加载复核。不能只关缓存或放宽总门限掩盖错误，也不把不同计算核全链路逐位一致当作通用要求。
+<a id="源身份的内容校验与分配空间观测"></a>
 
-**2026-10-01新服务器核查及落地**：上述修复最初只在旧隔离worktree，新block32/INT8底座的8步decoder-only E2E再次在结构finalization失败。真实K32/K48诊断确认同类LN/SiLU失配，旧patch修复H128后，H256/FP32首层W在BF16运算时仍请求229,376字节共享内存，超过A800限额。将内核原有W转换前移至两个launch的临时张量，保留autograd ctx中的原FP32 W和bias，可将H256 native/group8降至132,096字节。旧消费者全部退出后，14:26主源应用修复；16项相关回归通过，H128实际8步decoder与decoder_sparse_bit均完成finalization、独立step4导出及严格重载/冻结状态/实际位宽审计。H256实际8步也完成训练及导出。更换推理解码核后重测了三个未更新底座及joint512成品，旧结果单独保留；不能把重测差值当作训练收益，也不能用旧worktree的“修复完成”替代当前文件哈希。[新源诊断、SHA与真实结果](../records/qwen3_w25/2026-09-30_goal.md)
+- **源身份的内容校验与分配空间观测** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--源身份的内容校验与分配空间观测)
 
-独立导出训练中间checkpoint时，还须按生产侧同样的类型归一化重建不可变契约。本轮真实HF `TrainingArguments` 将eval/save strategy转成枚举，而normalized JSON保存枚举值；直接对JSON字符串执行lower会把`no`与生产侧`intervalstrategy.no`误判为不同。只在新导出入口恢复相应枚举、再调用原契约校验，未改checkpoint、原始总步数或生产语义；7项真实参数回归及两份实际step4导出通过。不能通过改原max_steps或关契约检查来导出选定步。
+<a id="信号中断与源码恢复分别取证"></a>
 
-## 源码身份拒绝恢复时保留原运行版本（2026-09-24）
+- **信号中断与源码恢复分别取证** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--信号中断与源码恢复分别取证)
 
-**本配置实测支持**：LiftQuant全层恢复被SIGINT中断后，保存边界与当前源代码仅有通用E2E CLI六行差异，严格恢复因此拒绝。隔离源码副本还原这六行后，101个训练依赖文件SHA与边界逐个相同，初始权重、teacher、参数、token、runtime及保存张量检查通过。[中断与重启记录](../records/experiments/liftquant_recovery/2026-09-24_full_layers_lr.md)
+<a id="全码位多卡断点的独立导出2026-10-02"></a>
 
-**动作**：先定位身份差异，不修改boundary或关闭检查，也不回滚其他活动实验使用的共享文件。已有原内容可精确重建时，在独立源码目录保留原版本，cwd/PYTHONPATH都指向它，模型/数据/产物路径显式指向原位置。运行必须持有明确源码副本或持续保护源码，不能仅依赖启动时已导入模块来保证后续子进程一致。
+- **全码位多卡断点的独立导出（2026-10-02）** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--全码位多卡断点的独立导出2026-10-02)
 
-2026-10-26真实类别边界分叉补充：D独立保存及fresh strict已通过，末尾却因源权重`st_blocks`对应分配空间增加4096 bytes而失败；bytes/inode/device/mtime均未变，复核源与D全部2991持久张量的完整digest及metadata/runtime SHA仍一致。分配块数量只记录空间观测，不作为文件内容不变契约；稳定stat检查仍保留，但不能代替内容hash。保留原失败报告，在单独验证报告中绑定旧fresh strict及当前完整内容复核后接续既存D，不重建权重或重跑已完成C／G。该证据确认本次是allocation-only误判，不授权忽略mtime／内容变化。[原失败、限定修复及真实接续](../../../result/qwen3_8b_mmlu65_20261004/qwen_recompression_20261026/README.md#2026-10-26-2259-主体终态分叉修复与完整评测接续)。
+<a id="cpu构造原权重读取与真实导入上下文"></a>
 
-**边界**：本次CLI差异是重启阻断，不是SIGINT来源。只有KeyboardInterrupt/子进程signal退出时，不能认定OOM或算法失败，也不能推断信号发送者。无控制终端并断开stdin可隔离终端操作，但不能保证外部显式信号永不再次终止任务；仍保留正常的SIGINT/SIGTERM停止能力。本配置在独立session、stdin=/dev/null下仍第二次收到SIGINT，用户明确表示未主动停止；这证明先前终端隔离措施未解决未知发送源，不能将中断归因于SSH断线。最新边界的101个源码SHA及CPU结构校验仍通过，信号中断与源码恢复问题须分别判断。层边界恢复只保留已完成层，未完成层需从该层首步重做。
+- **CPU构造、原权重读取与真实导入上下文** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--cpu构造原权重读取与真实导入上下文)
 
+<a id="真实翻码后的独导与回调资源预约"></a>
 
-重复SIGINT中断而缺少发送者审计时，可在既有运行外层加入系统现有的信号记录工具。本次strace 5.16以seccomp过滤全部syscall，仅记录指定中断信号；真实CPU探针验证能给出原始发送者PID/UID，且保持原有SIGINT退出语义。Python最终可能再向自身发SIGINT以还原退出状态，溯源应看第一条外部SI_USER记录，不能把随后的self-signal误判为训练主动中断。此探针未查明此前两次发送者；工具只改善取证，不表示外部中断原因已经修复，也不改变训练协议。
+- **真实翻码后的独导与回调资源预约** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--真实翻码后的独导与回调资源预约)
 
-## 全码位多卡断点的独立导出（2026-10-02）
+<a id="headnorm及配置运行字段的导出边界"></a>
 
-Qwen3-8B全252投影使用100% FP32码位及Adam时，精确训练侧车约194.3 GB。独立推理导出无需在一张卡重建全部score和optimizer：生产侧车的`packed_banks`已经物化当前score符号，CPU mmap按原chunk布局核对bank、sampler、固定尺度、轮状态及全部符号后，可直接恢复硬码，再用一张卡执行原生BF16部署转换。不能把这种导出说成恢复了optimizer或通过了exact-resume。
+- **head、norm及配置运行字段的导出边界** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--headnorm及配置运行字段的导出边界)
 
-本轮真实四卡4步/save2完成两次独立导出、冻结状态审计、limited GPU推理和回训；最终独立与原生导出的3423个持久张量及字节一致。同步保存回调等待导出与评测结束，最新训练断点的轮转与独立成品目录分开；正式每400步固定全八任务，诊断limit只在一次性验证驱动中。CPU状态审计虽不做GPU前向，当前FA2装载器仍需CUDA可见；隐藏CUDA引起的是装载前提错误，不是模型状态损坏。[实测、参数和复现证据](../records/qwen3_w25/2026-09-30_goal.md)
+<a id="残块迁移扩宽与恢复成品验证"></a>
 
-2026-10-18持续代理8步的独立导出再次遗漏这个已知前提：旧两步在GPU可见进程内成功，不能复用为`CUDA_VISIBLE_DEVICES=''`子进程的构造证据。源码确认Qwen工厂显式FA2，训练权重完整；保留原prepared／训练report／源码pins，只新增无前向CPU构造入口，临时eager构造后立即恢复FA2配置，再走canonical v6装配、保存与fresh strict。真实修复出口0、CUDA未初始化、3423张量全等／3415冻结／位宽不增，部署推理协议未改。该隔离构造适用于已核Qwen3路径，不能当通用模型兼容实现；活动旧链不原地改pins，完成后用明确修复入口接续。[本次复现、限定修复与审计](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月18日完整九项终态与下一轮验证)。
+- **残块迁移、扩宽与恢复成品验证** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--残块迁移扩宽与恢复成品验证)
 
-正式400步进一步覆盖了大量真实翻码：CPU核对全部16,024,338,432个score符号后导出成功，最终硬码相对初始源XOR15,749,205位；3423持久tensor的fresh strict重载、1407冻结tensor及实际2.456988791bpw账本均通过。该证据补足4步验证中尚无翻码的边界，不代表恢复训练状态或精度已达标；完整八任务结果仍按该保存点单独验收。
+<a id="独立导出须复现配置规范化顺序2026-10-17"></a>
 
-同步回调的GPU预约边界早于实际推理：当前StepExportCallback在进入导出阶段前先检查指定GPU没有compute进程，再依次CPU导出、审计和完整评测。因此给其他任务安排空档应截止于保存后的回调入口，不能把CPU导出耗时当作可继续占卡的时间。2026-10-02的D16 q/k排程漏算此前置检查，按实测速率预计晚于入口结束，主代理及时撤下自己本轮刚启动的q/k组并改到100%800完整回调之后；原100%训练和其他既有任务未被暂停。该事件是已识别的调度错误，不是D16质量失败或未知外部SIGTERM；精确PID、主动停止原因、原始日志与替代安排见[同一专题](../records/qwen3_w25/2026-09-30_goal.md)。
+- **独立导出须复现配置规范化顺序（2026-10-17）** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--独立导出须复现配置规范化顺序2026-10-17)
 
+<a id="持久冻结状态与可重建码缓存2026-10-18"></a>
 
-2026-10-03，Qwen3完整252投影的既有linear head/final norm方法补齐隔离周期导出，均通过真实552282/B4/1024/4步save2的两回调、回训及原生final。head训练映射按原生路径融合进原head，保持BF16形状与字节数；final norm对照只允许原model.norm.weight及decoder变化，冻结head/144其他norm/504码。短验final norm的4095个FP32元素更新，只有2个在BF16保存后保留，因此不能强制“短验BF16必须大量变化”来调高LR，也不能用FP32变化宣布部署改善。导出逐字节核所选FP32 norm转BF16，并分别记录存活量；全部3423保存/fresh、1910冻结及实际2.456988791bpw通过，有限题量仅验证流程。[原生顺序、精度差与完整验证](../records/qwen3_w25/2026-09-30_goal.md)的20:00与20:35记录。
+- **持久冻结状态与可重建码缓存（2026-10-18）** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--持久冻结状态与可重建码缓存2026-10-18)
 
-同日已有类别组装对552282与bits05导出源的本地config比较因use_cache/pad_token_id差异受阻；真实v6 loader用共同base_model_path的原HF配置构建模型，两个字段属于保存的运行状态，不能因此误判投影架构变化。新增隔离入口仅接受bool cache与None/原HF tokenizer pad id，所有其余config及252部署spec严格相同，并实际核147个非投影张量相等；复用原source-union/保存fresh/账本，未修改仍被训练使用的旧入口。12项CPU配置拒绝/接受测试与两份实际3423张量组装及完整64/32评测通过。该白名单只适用这里已证明的加载语义，不授权宽泛忽略其他config或未经证明的架构差异；正确组装也没有使两候选超过来源最好。[运行字段来源、完整证据与质量边界](../records/qwen3_w25/2026-09-30_goal.md)的20:35记录。
+<a id="cpu账本审计与实际侧车状态"></a>
 
+- **CPU账本审计与实际侧车状态** → [保存与复现经验 / 状态持久化、断点与精确续训](lifecycle/checkpoint.md#checkpoint-lifecycle--cpu账本审计与实际侧车状态)
 
-2026-10-03的R0→R1零输出残支迁移再次显示结构与计算路径须分开：原3423张量不变、新增1008张量后，同native packed的真实七类完整权重/前向相同；原R0 wholefused对新R1 native仍有最大相对L2约0.0001313的差异。未训练完整均分差+0.00876个百分点不能当作容量优化收益。真实4步/save2、两次导出回训及4431张量native/fresh一致验证通过，正式runner库存必须取新实物而非写死旧3423；没有因此要求正常跨核浮点逐位相同。[迁移、初始完整基线与短验](../records/qwen3_w25/2026-09-30_goal.md)的22:58和23:24记录。
+<a id="生成参数须检查最终有效配置2026-10-04"></a>
 
-2026-10-04隔离H128R0→H256R0采用每stage均匀复制输入Linear/LN、输出[B,0]。均匀复制才能保持LN统计；输出不对称使隐藏副本首步梯度分化。CPU数学、梯度和现有v6 pack/unpack/strict重载通过；真实552282 L0 gate/down完整native BF16矩阵与原native相同，但原wholefused相对新native仍有约0.0001254相对L2差异。此helper替换Parameter对象，应在optimizer/hooks建立前调用。[隔离实现、证据与边界](../records/qwen3_w25/2026-09-30_goal.md)的10月4日00:16记录。
+- **生成参数须检查最终有效配置（2026-10-04）** → [保存与复现经验 / 结构转换、打包、导出与独立重载](lifecycle/export.md#checkpoint-lifecycle--生成参数须检查最终有效配置2026-10-04)
 
-后续01:47–02:22已补齐同552来源、L0 gate/down两个模块的256步真实反传、独立BF16导出与完整八任务：H128/H256均分66.96068%/66.96508%，都低于源67.13033%；H256的MMLU57.94046%也低于H128的58.20396%。因此不能继续称“只有推理验证”，也没有证实扩宽带来质量收益。当时尚未验证全模型扩宽训练、best1200起点或其他更广范围/损失条件，不把该局部负结果推广为容量的普遍上限，预计位宽仍须与实际导出账本区分。来源见上述同一专题的后续扩宽对照。
-
-同日16:19补齐best1200起点的全部108个MLP配对：同task50纯KL/prompt.3、decoder3e-6、原2000/warm20调度前400步，H128/H256完整均分68.51705410%/67.83285084%、MMLU60.66087452%/60.20509899%，均低于各自未训练起点。H256实际2.4615956182bpw，108模块真实更新、其他2775张量及504码库冻结，3423保存/fresh严格一致。两臂40个窗口的token计数相同，H256训练耗时1.4524倍；相同LR不等于相同函数空间步长，不能只归因容量，也不外推所有扩宽方案无效。本配方无收益依据，不延长，退役生成权重并保留原始证据。[完整配对、初始差与资源边界](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#1619-起容量配对完整负结果及-head-1200)。
-
-2026-10-12当前a0e5为symmetric H128、`num_res_blocks=0`，外置LoRA rank0。真实库存预测允许仅gate或仅down的36模块H256，两类一起超logical2.5bit；预测不等于新成品实测。旧widen helper强制asymmetric，不能直接用于symmetric源的单因素加宽；动态save/load可表达H256也不代表当前固定原shape/库存的teacher×scope导出器已支持。旧负结果只约束既有配方，不能证明本轮容量根因；当前四格完整评测继续，首张实际可用卡衔接的既定BIT诊断已完成，四格完整九项与BIT证据齐后，再选择数据或容量方向。[当前预算、实现边界与决定](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月11日-train-only-八组完整结果与下一轮覆盖对照)。
-
-## 独立导出须复现配置规范化顺序（2026-10-17）
-
-**实测及源码支持。** C1的57科学科重配1200步独导被immutable contract拒绝，差异仅为60个数据混合权重，最大绝对差1.8513e-14。normalized快照在数据构建前保存，训练随后调用`DistillDataConfig.validate()`，重新解析`.12g`格式化的mix并归一化；旧导出器直接拿此前快照比较，遗漏了这次确定性转换。自然union臂恰无此差异，不能由它的短验通过外推所有混合配置。
-
-隔离修正版仅对快照data副本调用原生validate一次，仍用原全字段exact检查；A/B六份真实400／800／1200 checkpoint均通过，改真实概率、source顺序、prompt损失或已存contract概率均拒绝。B1200随后实际独导及原生审计通过：3423保存／fresh张量、1512 decoder、1911冻结、504硬码库不变，rank0／原位宽。此修复不训练、不修改元数据或活动依赖，也不证明恢复精度；不可用放宽容差、循环归一化到相等或复制saved值掩盖不一致。原正式链仍引用旧入口，完成训练后需用修正版接续导出。[根因、隔离验证及运行证据](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月17日上午长预算结果与57科中间节点提前评测)。
-
-## 持久冻结状态与可重建码缓存（2026-10-18）
-
-新BSQ主码更新短测在完成投影后被旧`frozen_stamp`拒绝；旧函数遍历`named_buffers`，混入了`persistent=False`的grouped packed及model indices缓存。真实C1模块按同一`install_banks`重建后，仅这两个缓存指针变化，13项持久状态的值精确不变。因此部署冻结契约应以`state_dict(keep_vars=True)`的持久键定义，不把允许重建的缓存对象身份纳入其中；同时保留未更新模块的缓存引用检查、全部冻结值和最终source restoration／fresh strict。隔离修正后两步实际翻码及3415冻结／3423保存重载通过，未放宽张量值、packed bits或schema合同。该边界针对允许改码的路径，不能借此省掉新码提交后的缓存失效／重建验证。[真实失败、CPU定位及GPU重跑](../records/w25_transfer/2026-10-04_mmlu65_llama31.md#10月18日完整九项终态与下一轮验证)。
-
-2026-10-25，bestabs闭式rank1短测完成拟合后，因直接把GPU `state_dict` 传给只接受CPU strided张量的 `audit_state_dict` 而停止，尚未进入质量观察。修复使用已有CPU native loader，在真实CPU模型安装已保存因子，再收集metadata及4575字段计费；不以逐key设备复制假定storage共享关系不变，也不重新拟合。真实CPU审计通过，新增504个BF16 storage／43,646,976bits，其余组件保持，logical2.5989027853／packed2.6122774456；移除后原4071字段恢复。该证据仅确认内存状态账本，不能替代整模导出或任务质量；后续GPU消费者要核对同一因子和metadata。无CUDA可见时，直接强制FA2构造会失败，应复用已验证的CPU构造入口并恢复原推理policy，而非改正式注意力实现。[原失败、修复及实测证据](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
-
-## 生成参数须检查最终有效配置（2026-10-04）
-
-本机 Transformers 4.51 的真实 Qwen3 LongBench 短测发现：仅传新建的 GenerationConfig，默认值 `do_sample=False` 仍可能被模型自身采样默认值替换。首次 dense 输出虽正常完成，协议不成立，已保留并排除；不能以配置对象的初值声明实际使用 greedy。
-
-独立 LongBench 入口显式传 `use_model_defaults=False`，在真实 `_prepare_generation_config` 路径核对所有已指定选项，并在预测中记录最终有效配置。CPU 回归及 dense/压缩两模型各三个真实长输入、多步 KV、512-token 摘要和 SAMSum 停止检查均通过。固定双方 EOS、pad 与特殊任务 min_length，避免模型保存状态改变比较协议。该结论针对当前版本和入口，不等于其他 API 或所有版本都有相同行为；完整评测仍须全部样本完成后评分。[原始无效短测、修复及复测](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)的 LongBench 部分。
+<!-- /lesson-redirect -->

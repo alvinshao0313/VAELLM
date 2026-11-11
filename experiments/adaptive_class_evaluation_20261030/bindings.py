@@ -34,6 +34,10 @@ BUDGET_FIELDS = ('components', 'user_linear_bits', 'packed_linear_bits', 'outsid
                  'complete_directory_bytes', 'native_target_count', 'compact_target_count', 'pending_dense_target_count')
 
 
+def command(component, *arguments):
+    return [str(PYTHON), '-B', '-u', '-m', 'experiments.adaptive_class_evaluation_20261030.' + component, *arguments]
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)

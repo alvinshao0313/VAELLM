@@ -16,6 +16,17 @@ LABELS = {
     'artifacts': '原位产物说明与自动报告', 'bridge': '工具交接状态（非长期知识）',
     'external': '第三方说明与许可证',
 }
+LESSONS = Path('docs/experience/lessons')
+LESSON_CATEGORIES = {
+    'compression': '压缩',
+    'category_recovery': '逐类别恢复',
+    'post_recovery': '压缩后恢复微调',
+    'data': '数据与监督',
+    'evaluation': '评测与诊断',
+    'experiment_design': '搜索与对照设计',
+    'runtime': '数值与运行性能',
+    'lifecycle': '保存与复现',
+}
 
 
 def category(p):
@@ -109,18 +120,65 @@ def check(root, docs, aliases):
     return bool(errors)
 
 
+def lesson_category(value):
+    for key, label in LESSON_CATEGORIES.items():
+        if value in (key, label):
+            return key
+    raise argparse.ArgumentTypeError('未知经验分类；运行 python tools/docs.py categories 查看分类。')
+
+
+def lesson_topics(root, selected):
+    directory = LESSONS / selected
+    docs, _ = inventory(root / directory)
+    return [directory / p for p in docs if p.suffix == '.md' and p.name != 'README.md']
+
+
+def searchable_text(text):
+    # Legacy entrypoints retain anchors only. A concurrent writer may append
+    # actual experience after the redirect: keep that content searchable.
+    if '<!-- lesson-redirect -->' in text and '<!-- /lesson-redirect -->' in text:
+        start = text.index('<!-- lesson-redirect -->')
+        end = text.index('<!-- /lesson-redirect -->') + len('<!-- /lesson-redirect -->')
+        return text[:start] + '\n' * text[start:end].count('\n') + text[end:]
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     index = sub.add_parser('index', help='Regenerate deterministic docs/INDEX.md')
     index.add_argument('--check', action='store_true', help='Check index freshness without writing')
     sub.add_parser('check', help='Check aliases and relative Markdown file targets; not anchor/URL validity')
+    categories = sub.add_parser('categories', help='列出经验分类、专题及检索名称')
+    categories.add_argument('--category', type=lesson_category, help='分类英文名或中文名')
     search = sub.add_parser('search', help='Search canonical text only; default excludes result/history noise')
     search.add_argument('pattern', help='Case-insensitive regular expression')
     search.add_argument('--scope', choices=['default', 'all', *LABELS], default='default')
     search.add_argument('--limit', type=int, default=40, help='Maximum matching lines; 0 for unlimited')
+    search.add_argument('--category', type=lesson_category, help='仅检索指定经验分类（英文名或中文名）')
+    search.add_argument('--topic', help='在 --category 内进一步限定专题文件名，不含 .md')
     args = parser.parse_args()
-    docs, aliases = inventory(ROOT)
+    if args.command == 'categories':
+        selected = [args.category] if args.category else LESSON_CATEGORIES
+        for key in selected:
+            topics = lesson_topics(ROOT, key)
+            print(f'{key} — {LESSON_CATEGORIES[key]}（{len(topics)} 个专题）')
+            for p in topics:
+                print(f'  {p.stem} — {title(ROOT, p)}')
+        return 0
+    if args.command == 'search' and args.topic and not args.category:
+        parser.error('--topic 必须同时指定 --category。')
+    if args.command == 'search' and args.category:
+        if args.scope not in ('default', 'lessons', 'all'):
+            parser.error('--category 仅适用于经验；不能与 records/history 等 scope 混用。')
+        docs, aliases = lesson_topics(ROOT, args.category), []
+        if args.topic:
+            available = {p.stem for p in docs}
+            if args.topic not in available:
+                parser.error('未知专题；可选：' + '、'.join(sorted(available)))
+            docs = [p for p in docs if p.stem == args.topic]
+    else:
+        docs, aliases = inventory(ROOT)
     if args.command == 'check':
         return check(ROOT, docs, aliases)
     if args.command == 'index':
@@ -142,7 +200,7 @@ def main():
     for p in docs:
         if category(p) not in scope or p in (INDEX, Path('docs/experience/CATALOG.md')):
             continue
-        for number, line in enumerate(read(ROOT, p).splitlines(), 1):
+        for number, line in enumerate(searchable_text(read(ROOT, p)).splitlines(), 1):
             if pattern.search(line):
                 print(f'{p.as_posix()}:{number}: {line[:600]}')
                 found += 1

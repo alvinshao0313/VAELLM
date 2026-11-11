@@ -18,6 +18,10 @@ from tools.cat_eval import _prepare_model_for_eval
 from train_utils.cat_runtime_state_v6 import restore_cat_runtime_state
 from . import continuation as flow, sources as s
 
+ENTRY_MODULE = 'experiments.adaptive_class_20261030.run_pipeline'
+ENTRY_ARGUMENTS = ()
+EXTRA_SOURCE_PATHS = ()
+
 
 def warm(model, count):
     result = _prepare_model_for_eval(model, 'cuda:0', 8, logging.getLogger(__name__), {})
@@ -28,7 +32,8 @@ def warm(model, count):
 @torch.no_grad()
 def logits(model, inputs):
     result = model(**{name: value.to('cuda:0') for name, value in inputs.items()}, use_cache=False, logits_to_keep=1).logits
-    c.require(result.dtype == torch.bfloat16 and torch.isfinite(result).all().item(), 'Use finite actual BF16 deployed logits.')
+    c.require(result.dtype == torch.bfloat16, 'Actual deployed logits must be BF16; got ' + str(result.dtype))
+    c.require(torch.isfinite(result).all().item(), 'Actual BF16 deployed logits contain nonfinite values.')
     return result.detach().cpu().contiguous()
 
 
@@ -53,7 +58,8 @@ def execute(args):
     args.output.mkdir(parents=True)
     started = time.monotonic()
     pins = {**s.code_identity(), **{str(path.resolve()): c.sha(path) for path in
-        (Path(__file__), Path(flow.__file__), Path(recovery.__file__), Path(recovery.__file__).with_name('training_checkpoint.py'))}}
+        (Path(__file__), Path(flow.__file__), Path(recovery.__file__), Path(recovery.__file__).with_name('training_checkpoint.py'),
+         Path(flow.__file__).with_name('initialization.py'), *EXTRA_SOURCE_PATHS)}}
     report = dict(status='running', arm=args.arm, phase='short' if args.short else 'formal', pid=os.getpid(),
         command=[sys.executable, *sys.argv], started_unix=time.time(), gpu=os.environ['CUDA_VISIBLE_DEVICES'],
         pipeline_source_sha256=pins, source_raw_manifest=str(s.ARCHIVE / 'manifest.json'),
@@ -103,7 +109,7 @@ def execute(args):
             del model, payload, probe, expected_logits
             gc.collect()
             torch.cuda.empty_cache()
-            subprocess.run([sys.executable, '-B', '-u', '-m', 'experiments.adaptive_class_20261030.run_pipeline',
+            subprocess.run([sys.executable, '-B', '-u', '-m', ENTRY_MODULE, *ENTRY_ARGUMENTS,
                 '--fresh', str(destination), '--evidence', str(evidence_path)], cwd=s.ROOT, check=True)
             reload_path = destination.parent / 'strict_reload.json'
             reloaded = c.read(reload_path)
@@ -135,7 +141,7 @@ def execute(args):
     print(dict(status=report['status'], elapsed_seconds=report['elapsed_seconds']), flush=True)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', choices=('dynamic', 'rice'))
     parser.add_argument('--artifacts', nargs='+', type=Path)
@@ -143,7 +149,7 @@ def main():
     parser.add_argument('--short', action='store_true')
     parser.add_argument('--fresh', type=Path)
     parser.add_argument('--evidence', type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     torch.set_num_threads(8)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False

@@ -43,13 +43,15 @@ def vae_train(device):
     args = SimpleNamespace(codebook_bits=8, codebook_dim=16, base_ch=32, num_res_blocks=0,
                            decoder_type='symmetric', norm_type='layer', activation_type='swish',
                            quantizer_type='BSQ', recon_loss_type='mse', parallel_layers=2,
-                           vae_weight_dtype='fp32', vae_autocast_dtype='bf16' if device == 'cuda:0' else 'fp32',
+                           vae_weight_dtype='bf16' if device == 'cuda:0' else 'fp32',
+                           vae_autocast_dtype='bf16' if device == 'cuda:0' else 'fp32',
                            use_checkpoint=False)
     apply_autoencoder_arch_defaults(args)
     torch.manual_seed(31)
     model = MultiLayerVAE(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    x = torch.randn(64, 2, 16, device=device)
+    x = torch.randn(64, 2, 16, device=device,
+                    dtype=torch.bfloat16 if device == 'cuda:0' else torch.float32)
     before = [p.detach().clone() for p in model.parameters()]
     losses = []
     for _ in range(3):

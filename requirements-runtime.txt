@@ -1,0 +1,43 @@
+# Current CAT / E2E / v6 evaluation stack; Python 3.11.
+# Install the CUDA 12.4 PyTorch wheels first (see README.md).
+-r requirements.txt
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+triton==3.2.0
+transformers==4.51.0
+tokenizers==0.21.4
+huggingface-hub==0.33.2
+accelerate==1.7.0
+peft==0.10.0
+datasets==3.6.0
+evaluate==0.4.3
+lm-eval==0.4.8
+opencompass==0.5.2
+deepspeed==0.17.5
+safetensors==0.5.3
+sentencepiece==0.2.0
+protobuf==6.31.1
+pyarrow==23.0.0
+fsspec==2023.10.0
+dill==0.3.8
+multiprocess==0.70.16
+scipy==1.15.3
+pandas==2.3.0
+matplotlib==3.10.3
+rouge==1.0.1
+rouge-score==0.1.2
+sacrebleu==2.5.1
+jieba==0.42.1
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.27.3
+sentence-transformers==5.5.1
+openai==2.38.0
+gradio-client==2.5.0
+wandb==0.25.1
+pytest==8.4.0
+ipykernel==6.29.5
+ninja==1.11.1.4
+packaging==25.0
+setuptools==80.9.0
+wheel==0.45.1

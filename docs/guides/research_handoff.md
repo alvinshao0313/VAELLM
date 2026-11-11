@@ -184,3 +184,23 @@ print(metadata['checkpoint_id'])
 ## 验证边界
 
 交付时记录真实目录迁移后的两模型 CPU strict 重载、全部持久张量相等、实际存储账本、tokenizer、归档内容与 SHA256 的检查结果，见 `validation/` 和交付校验记录。上述步骤没有在未知的新服务器运行过；没有重新演练从 BF16 开始的完整压缩链，也没有启动新的 GPU 训练或全量评测。
+
+## cmcc 新机的共用接线（2026-10-30）
+
+当前仓库为 `/home/cmcc/VAELLM`，数据和实验实体分别为 `/data1/cmcc/VAELLM/data`、`/data1/cmcc/VAELLM/artifacts`。仓库 `data/`、`artifacts/` 是到这些实体的链接。N/S 冻结运行快照已从接续归档按原 SHA256 恢复到 `result/qwen3_8b_mmlu65_20261004/` 下原有相对入口；各自 `data/` 也链接到数据实体，因为冻结 preset loader 以快照文件位置解析相对数据路径。
+
+共用常量和只读旧路径解析位于 [`experiments/cmcc_runtime_20261030/paths.py`](../../experiments/cmcc_runtime_20261030/paths.py)。它只映射已确认的旧仓库、artifact、模型根及原 `bitvae` Python，不建立 `/home/star` 或 `/data/star` 兼容目录，不修改历史 JSON、mtime、inode 或 hash。新运行须建立自己的 prepared 和实际代码／数据绑定，不能直接复用旧机 stat。
+
+恢复选集与逐文件 SHA256 见 [快照和直接 helper 清单](../../result/migration_audit_20261030/dependency_restore.json)、[helper 引用闭包清单](../../result/migration_audit_20261030/helper_restore.json)。[共用 CPU 检查](../../result/migration_audit_20261030/shared_wiring_validation.json)确认两个快照的实际导入根及 4032 维的 252 阶 Hadamard 精确正交；[数据路径检查](../../result/migration_audit_20261030/snapshot_data_validation.json)确认 N preset 的五份 EdgeRazor `train` 源可用。这些检查没有运行 8B 前向、训练或评测。
+
+[`baseline.py`](../../experiments/cmcc_runtime_20261030/baseline.py)为两分支准备共用 BF16 对照。输入阶段核新旧 LongBench token/index SHA、协议及 4750 条旧预测的输入身份和顺序；最终生成阶段复用已完成的输入及原模型官方字节验证，写出比较所需的路径、当前 stat 和对应身份 hash。任务配置、指标、生成文本和 token 等字段保持逐值相同。原始推理代码 hash 仍保留为历史来源，不把迁移绑定描述成重新执行基线。
+
+```bash
+# 已激活 bitvae，在仓库根目录；仅核输入，不需要 BF16 大权重。
+CUDA_VISIBLE_DEVICES='' python -B -m experiments.cmcc_runtime_20261030.baseline --check-inputs-only
+
+# 原 Qwen 五份 BF16 shard 全部到齐且 qwen_verified.json 通过后执行；复用固定 revision 的官方字节核证。
+CUDA_VISIBLE_DEVICES='' python -B -m experiments.cmcc_runtime_20261030.baseline
+```
+
+最终位置固定为 `/data1/cmcc/VAELLM/artifacts/cmcc_baselines_20261030/qwen3_8b/`，包含 `mmlu.json`、`seven.json`、`longbench/{config.json,scores.json,predictions/}` 与 `migration_binding.json`。只可使用 `schema=cmcc_qwen3_bf16_baseline_migration_v1`、`status=verified` 的绑定；缺完整 BF16 权重时不会生成终态，已有目录不会被覆盖。上述迁移检查不重新推理或重算评分，GPU 分支仍按各自真实运行证据验收。

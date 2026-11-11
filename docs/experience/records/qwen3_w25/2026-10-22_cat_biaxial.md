@@ -46,7 +46,7 @@ result/qwen3_8b_w25_20260930/reconstruction_block32_o3_down3/
 UUID ab0280cf-3637-47e3-b771-074b74532a54
 ```
 
-gate/up 各保护 64 个输入通道，down 为 256；索引、排序和数量完全复用。其当时排名来源是 Alpaca official train、seed31、512 个连续 packed×256 token 块，`channel_weight_actmean_abs`、input/layer scope、refresh=false，见[原始来源记录](2026-09-30_goal.md)。**不读取该成品的恢复后投影权重或 INT8 payload**；保护列来自本次原始 HF BF16 权重，重新 INT8 encode。`none` 臂不保护任何列，K/D/S 保持相同，不把释放的存储位重新分配给主码。
+gate/up 各保护 64 个输入通道，down 为 256；索引、排序和数量完全复用。其当时排名来源是 Alpaca official train、seed31、512 个连续 packed×256 token 块，`channel_weight_actmean_abs`、input/layer scope、refresh=false，见[原始来源记录](../../history/qwen3_w25/2026-09-30_10-04_research_log.md)。**不读取该成品的恢复后投影权重或 INT8 payload**；保护列来自本次原始 HF BF16 权重，重新 INT8 encode。`none` 臂不保护任何列，K/D/S 保持相同，不把释放的存储位重新分配给主码。
 
 ## 归一化数学与必须保持的目标
 

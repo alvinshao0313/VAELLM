@@ -12,13 +12,13 @@ from experiments.adaptive_native_model_20261029.handoff_validation import frozen
 from experiments.adaptive_vector_rvq import common as c
 from train_utils.cat_runtime_state_v6 import restore_cat_runtime_state
 from train_utils.cat_data_prep import LinearPrepRef, build_outlier_channel_index_plan
-from . import artifact, sources as s
+from . import artifact, initialization, sources as s
 
 CATEGORIES = recovery.CATEGORIES
 log = logging.getLogger(__name__)
 
 
-def layer_artifacts(roots, arm, *, short):
+def layer_artifacts(roots, arm, *, short, resolve_path=Path):
     found = {}
     for root in roots:
         report = c.read(root / 'report.json')
@@ -31,7 +31,7 @@ def layer_artifacts(roots, arm, *, short):
             for endpoint in group['endpoints']:
                 name = endpoint['name']
                 item = endpoint['dynamic' if arm == 'dynamic' else 'control']
-                path = Path(item['path'])
+                path = resolve_path(item['path'])
                 c.require(name not in found and c.sha(path) == item['sha256']
                     and path.stat().st_size <= endpoint['control']['actual_complete_bytes'], 'Actual whole-class field identity/cap changed or layer repeated.')
                 found[name] = path
@@ -167,14 +167,16 @@ def fit_next(model, cat, hf, training, vae, cfgs, activation_runtime, plan, *, p
     # A three-decoder fresh consumer consumes more global initialization RNG
     # than fixed2. Start each arm's next VAE from the same explicit fresh seed.
     native.set_seed(cat.seed)
-    payload = native.train_group_vae_payload(model=model, group_refs=refs, group_tag=f'whole_class.{category}.L0-35',
-        runtime_cfg=replace(cfg, steps=2) if short else cfg, vae_args=vae, training_args=training,
-        train_device=cat.train_device, convert_device=cat.convert_device, do_convert=True, batch_size=8192,
-        log_every=cat.log_every, eval_every=cat.eval_every, eval_blocks=cat.eval_blocks, gpu_resident_data=cat.gpu_resident_data,
-        activation_runtime=activation_runtime, channel_protect_mode=cat.channel_protect_mode, channel_plan=protection,
-        channel_scope=cat.channel_scope, channel_rank_metric=cat.channel_rank_metric, channel_axis=cat.channel_axis,
-        channel_quant=cat.channel_quant, channel_min_per_layer=cat.channel_min_per_layer,
-        deterministic=cat.deterministic, shuffle_seed=index * 100000 + 31)
+    with initialization.observe(native) as initializations:
+        payload = native.train_group_vae_payload(model=model, group_refs=refs, group_tag=f'whole_class.{category}.L0-35',
+            runtime_cfg=replace(cfg, steps=2) if short else cfg, vae_args=vae, training_args=training,
+            train_device=cat.train_device, convert_device=cat.convert_device, do_convert=True, batch_size=8192,
+            log_every=cat.log_every, eval_every=cat.eval_every, eval_blocks=cat.eval_blocks, gpu_resident_data=cat.gpu_resident_data,
+            activation_runtime=activation_runtime, channel_protect_mode=cat.channel_protect_mode, channel_plan=protection,
+            channel_scope=cat.channel_scope, channel_rank_metric=cat.channel_rank_metric, channel_axis=cat.channel_axis,
+            channel_quant=cat.channel_quant, channel_min_per_layer=cat.channel_min_per_layer,
+            deterministic=cat.deterministic, shuffle_seed=index * 100000 + 31)
+    c.require(len(initializations) == 2, 'Record the actual optimizer initialization for both original VAE stages.')
     c.require(c.digest(targets) == source_digest, 'Fitting modified the source before native replacement.')
     native.apply_group_vae_payload(model=model, group_refs=refs, payload=payload,
         group_tag=f'whole_class.{category}.L0-35', convert_device=cat.convert_device)
@@ -186,5 +188,6 @@ def fit_next(model, cat, hf, training, vae, cfgs, activation_runtime, plan, *, p
         actual_stages=2, actual_updates_per_stage=2 if short else 10000, schedule_steps=2 if short else 10000,
         vector_batch_per_layer=8192, shuffle_seed=index * 100000 + 31, original_M36_pooled_BSQ=True,
         fresh_VAE_initialization_seed=int(cat.seed),
+        actual_optimizer_initializations=initializations,
         gate_fields_exact=True, inventories=checkpoint.inventories(model), category_protection=cfg.channel_protect_count,
         category_rotation_block=cfg.weight_rotation_block_size)

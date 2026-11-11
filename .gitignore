@@ -56,6 +56,10 @@ notebook/
 .vscode/
 BiSCo-LLM_TNNLS_English_LaTeX/
 data/
+# Keep data/ lesson Markdown visible while datasets remain ignored.
+!/docs/experience/lessons/data/
+/docs/experience/lessons/data/*
+!/docs/experience/lessons/data/*.md
 **/plans/
 AGENTS.md
 .cursor/

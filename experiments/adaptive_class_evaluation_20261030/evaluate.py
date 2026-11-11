@@ -23,17 +23,17 @@ def make_plan(config, config_path, binding, output, gpus, pins):
     units = []
     for index, (gpu, tasks) in enumerate(zip(gpus, api.task_groups(gpus), strict=True)):
         group = output / 'longbench/groups' / f'part_{index + 1:02d}'
-        argv = [str(b.PYTHON), '-B', '-u', '-m', 'experiments.adaptive_class_evaluation_20261030.predict',
+        argv = b.command('predict',
             '--config', str(config_path), '--output', str(group), '--datasets', *tasks,
-            '--max-runtime-seconds', '86400']
+            '--max-runtime-seconds', '86400')
         units.append(dict(output_dir=str(group), datasets=tasks, expected_samples=sum(EXPECTED_COUNTS[task] for task in tasks),
             native_reports=[], outer_exit=None, launch_records=[], terminal_attempts=[], gpu=gpu, argv=argv,
             native_runtime_seconds=86400, outer_timeout_seconds=86580, termination_grace_seconds=20))
     merged = output / 'longbench/merged'
-    nine = [str(b.PYTHON), '-B', '-m', 'experiments.adaptive_class_evaluation_20261030.summarize',
+    nine = b.command('summarize',
         '--checkpoint', binding['checkpoint_dir'], '--pipeline-report', binding['pipeline_report'],
         '--compressed-results', str(output / 'full8/mmlu.json'), str(output / 'full8/seven.json'),
-        '--compressed-longbench-scores', str(merged / 'scores.json'), '--output', str(merged / 'nine_task_acceptance.json')]
+        '--compressed-longbench-scores', str(merged / 'scores.json'), '--output', str(merged / 'nine_task_acceptance.json'))
     template = b.read(b.TEMPLATE)
     return dict(schema='fixed_full21_merge_plan_v1', status='draft_awaiting_explicit_terminal_binding',
         checkpoint_id=binding['checkpoint_id'], checkpoint_format=b.FORMAT, expected_tasks=list(DATASETS), expected_samples=4750,
@@ -68,7 +68,7 @@ def evaluate(args):
     report_path = output / 'evaluation.json'
     record = dict(status='running', **binding, source_sha256=pins, gpus=args.gpus, pid=os.getpid(),
         start_ticks=int(Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]),
-        started_unix=time.time(), argv=sys.argv, initial_GPU_resource_check=resources,
+        started_unix=time.time(), argv=getattr(b, 'CLI_ARGUMENTS', sys.argv), initial_GPU_resource_check=resources,
         automatic_retry=False, automatic_resume=False, stages={})
     b.write_json(report_path, record)
     api = b.module(b.HELPERS, '_adaptive_existing_full9_execution')
@@ -92,8 +92,8 @@ def evaluate(args):
         full8_config = full8 / 'config.json'
         b.write_json(full8_config, config)
         for shard in ('mmlu', 'seven'):
-            stage(shard, [str(b.PYTHON), '-B', '-u', '-m', 'experiments.adaptive_class_evaluation_20261030.full8',
-                '--config', str(full8_config), '--shard', shard, '--output', str(full8 / (shard + '.json'))], args.gpus[0], 3600)
+            stage(shard, b.command('full8', '--config', str(full8_config), '--shard', shard,
+                '--output', str(full8 / (shard + '.json'))), args.gpus[0], 3600)
         paths = [full8 / (shard + '.json') for shard in ('mmlu', 'seven')]
         summary = full8_summary(config, paths, full8 / 'full8_summary.json')
         pins.update(summary['sample_artifacts']['sha256'])
@@ -136,7 +136,7 @@ def evaluate(args):
         b.check_hashes(plan['pins']); b.check_config(config)
         plan['status'] = 'prepared_not_scored'
         b.write_json(plan_path, plan)
-        stage('merge_nine', [str(b.PYTHON), '-B', '-m', 'experiments.adaptive_class_evaluation_20261030.merge', '--plan', str(plan_path)])
+        stage('merge_nine', b.command('merge', '--plan', str(plan_path)))
         merged = Path(plan['merged_output'])
         nine = b.read(merged / 'nine_task_acceptance.json')
         code = int((merged / 'nine_task.exit').read_text().strip())

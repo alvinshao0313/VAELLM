@@ -1,0 +1,52 @@
+{
+  "schema": "cat_auto_migrated_train_sources_v0",
+  "artifact_evidence": "result/migration_audit_20261030/snapshot_data_validation.json",
+  "checksum_evidence": "/data1/cmcc/migration/vaellm_transfer_20261030/SHA256SUMS",
+  "converted_upstream_revision_boundary": "Converted artifact SHA256 fixes actual training bytes. Original upstream revisions were not retained for the four general JSONL files; current conversion code is a reference, not proof that these files were regenerated with it.",
+  "sources": [
+    {
+      "alias": "edgerazor_ii_7m",
+      "sha256": "8a4327d6b8da08d54f6874d4ae934b1acba7ac756200616837341029745057a6",
+      "rows": 7449106,
+      "license": {"declared_license": "cc-by-sa-4.0", "source_card": "https://huggingface.co/datasets/BAAI/Infinity-Instruct", "basis": "Upstream card inspected 2026-11-04; no separate relicensing of converted records"},
+      "provenance": {"repository": "BAAI/Infinity-Instruct", "config": "7M", "split": "train", "upstream_revision": null, "conversion_reference": "tools/prepare_edgerazor_distill_jsonl.py"}
+    },
+    {
+      "alias": "edgerazor_ii_gen",
+      "sha256": "e79bf67a22414bedb75a65f0fc4c595643c189d5ef09dd3b8d6507fe040f464b",
+      "rows": 1456927,
+      "license": {"declared_license": "cc-by-sa-4.0", "source_card": "https://huggingface.co/datasets/BAAI/Infinity-Instruct", "basis": "Upstream card inspected 2026-11-04; no separate relicensing of converted records"},
+      "provenance": {"repository": "BAAI/Infinity-Instruct", "config": "Gen", "split": "train", "upstream_revision": null, "conversion_reference": "tools/prepare_edgerazor_distill_jsonl.py"}
+    },
+    {
+      "alias": "edgerazor_tulu",
+      "sha256": "94cda7d96b2b04668683d927686e91c460b879573d903d148a39b2b7de418b4d",
+      "rows": 608042,
+      "license": {"declared_license": "odc-by", "source_card": "https://huggingface.co/datasets/allenai/tulu-v3.1-mix-preview-4096-OLMoE", "basis": "Upstream card inspected 2026-11-04; source component terms remain applicable"},
+      "provenance": {"repository": "allenai/tulu-v3.1-mix-preview-4096-OLMoE", "split": "train", "upstream_revision": null, "conversion_reference": "tools/prepare_edgerazor_distill_jsonl.py"}
+    },
+    {
+      "alias": "edgerazor_am",
+      "sha256": "4f51c010bd0bb551500f7acc41024ff93e4b46942df9cbebb9b6c0616f063fbc",
+      "rows": 1400000,
+      "license": {"declared_license": "cc-by-nc-4.0", "source_card": "https://huggingface.co/datasets/a-m-team/AM-DeepSeek-R1-Distilled-1.4M", "basis": "Upstream card inspected 2026-11-04; no separate relicensing of converted records"},
+      "provenance": {"repository": "a-m-team/AM-DeepSeek-R1-Distilled-1.4M", "files": ["am_0.5M.jsonl", "am_0.9M.jsonl"], "split": "train", "upstream_revision": null, "conversion_reference": "tools/prepare_edgerazor_distill_jsonl.py"}
+    },
+    {
+      "alias": "vaellm_eval_task",
+      "sha256": "894a04aea907efebd8b0f52f040c5635750bb30dfb64d9c34e30a97421a155a1",
+      "rows": 176597,
+      "license": {"kind": "composite_upstream_source_terms", "aggregate_relicense": false, "source_cards": ["https://huggingface.co/datasets/allenai/ai2_arc", "https://huggingface.co/datasets/super_glue", "https://huggingface.co/datasets/piqa", "https://huggingface.co/datasets/winogrande", "https://huggingface.co/datasets/openbookqa", "https://huggingface.co/datasets/cais/mmlu"], "basis": "Record source-specific upstream terms; do not invent one SPDX license for the converted mixture"},
+      "provenance": {"task_train_configs": ["arc_easy", "arc_challenge", "boolq", "piqa", "winogrande", "openbookqa", "rte"], "mmlu_config": "auxiliary_train", "mmlu_split": "train", "mmlu_revision": "c30699e8356da336a370243923dbaf21066bb9fe", "artifact_split_evidence": "docs/experience/history/w25_transfer/2026-10-04_29_research_log.md:2677", "conversion_reference": "tools/prepare_vaellm_task_mix.py"}
+    }
+  ],
+  "calibration": {
+    "alias": "alpaca",
+    "repository": "vicgalle/alpaca-gpt4",
+    "revision": "f7e3ded725cb81e8e564e32feb12860f376f2b51",
+    "arrow": "/home/cmcc/.cache/huggingface/datasets/vicgalle___alpaca-gpt4/default/0.0.0/f7e3ded725cb81e8e564e32feb12860f376f2b51/alpaca-gpt4-train.arrow",
+    "rows": 52002,
+    "split": "train",
+    "license": {"declared_license": "cc-by-nc-4.0", "source_card": "https://huggingface.co/datasets/vicgalle/alpaca-gpt4", "basis": "Upstream card inspected 2026-11-04"}
+  }
+}

@@ -1,33 +1,35 @@
+<!-- lesson-redirect -->
+
 # Mixed-bit：缓存契约、代理目标与最终质量
 
-## 问题与证据
+本专题已按“一级分类 → 二级专题 → 经验条目”拆分；以下保留旧标题锚点和完整去向，原经验正文只在目标专题维护。新总结请写入[经验分类入口](../README.md)对应专题。若并行任务仍向本文件补写，须先保留增量、核对来源后归并，不能覆盖或直接删除。
 
-历史工程审查列出候选结构不匹配、子进程解释器漂移、top-k全logits搬运、worker永久等待、自定义pool路径断链以及tokenizer指纹不完整等问题。后续报告记录301项mixed-bit检查、57项集成检查及真实q_proj单步冒烟。[验收记录](../history/reviews/2026-08-05-mix-bit-hardening-and-production-readiness/task-10-report.md)
+<a id="按条件选择动作"></a>
 
-## 下次怎么做
+- **按条件选择动作** → [压缩经验 / 混合位宽、动态阶数与分配](compression/bit_allocation.md#mixed-bit-pipeline--按条件选择动作)
 
-- resume前核对实际artifact结构和metadata：stage、dim、logical bits、decoder尺寸及hash，而非只看completed文件名。
-- 子进程使用父进程实际解释器；在bitvae shell里启动不代表子进程硬编码python也正确。
-- top-k只传所需有效token的K项，避免先把完整logits搬CPU再截取；exact KL与top-k KL明确区分。
-- worker启动和运行都有超时与死亡检查；队列无消息不能无限等待。
-- 自定义manifest所在目录是pool路径来源，禁止偷偷回退默认pool。
-- tokenizer指纹覆盖content、chat template和added vocab；路径只是provenance，不能因source/reload路径不同产生伪不一致。
-- final checkpoint独立保存tokenizer并local-only strict重载；大state用流式hash，避免为校验clone整模型。
+<a id="下次怎么做"></a>
 
-## 边界
+- **下次怎么做** → [压缩经验 / 混合位宽、动态阶数与分配](compression/bit_allocation.md#mixed-bit-pipeline--下次怎么做)
 
-这些是缓存正确性和运行工程经验，不是混合位宽能提升质量的证据。上述工程验收中的单步冒烟没有执行完整35候选训练及全部cost评估；后续独立实验见下一节。当前接口和门禁仍应阅读[mix_bit说明](../../../mix_bit/README.md)。
+<a id="问题与证据"></a>
 
-2026-10-25两条已完成训练／导出／八项的配对暴露了评测衔接问题：Qwen计划只创建`longbench`，分区入口直接创建`groups/part_*`而缺失父目录；Llama导出审计已使用获准的2.6bit，实际LongBench通用loader却硬编码2.5，拒绝2.54837bit成品。两者均在生成前退出，不能记为质量负例。新增输出层级时检查实际目录创建归属；预算变更时沿实际消费者追踪限额，不能用导出审计或最终评分器的正确限额替代加载入口。恢复复用已验证权重和八项，只补未执行阶段并保留旧失败记录；相关检查限于变化的目录／预算路径，不要求对常规参数搜索重跑训练或另做完整冒烟。[失败原件、适用条件及恢复记录](../records/w25_transfer/2026-10-04_mmlu65_llama31.md)。
+- **问题与证据** → [压缩经验 / 混合位宽、动态阶数与分配](compression/bit_allocation.md#mixed-bit-pipeline--问题与证据)
 
-## 代理目标与最终质量必须分别验证
+<a id="边界"></a>
 
-最后核查：2026-09-23。证据状态：历史报告及分配摘要支持，未在本轮重跑下游评测。来源：[Qwen3-8B 混合位宽结果整理](../records/experiments/mixed_bit/qwen3_8b_vae_1to3bit.md)。
+- **边界** → [压缩经验 / 混合位宽、动态阶数与分配](compression/bit_allocation.md#mixed-bit-pipeline--边界)
 
-**问题与条件：** 252 个 Linear、均匀 2-bit 基线、top-k=256 单层替换代价、平均码流位宽≤2.0、无蒸馏恢复的历史实验中，混合方案校准 KL 降低，但 wiki-PPL 恶化。排除 1-bit 后仍未优于均匀基线的 PPL。
+<a id="评测衔接的目录与预算消费者"></a>
 
-**已知与解释：** 求解器的全局最优只针对 ΣΔKL 近似目标；将基线 KL 加上该目标产生负预测，而实际联合替换 KL 为正，表明可加预测不能直接代表最终模型。大量负代价本身不证明实现错误；估计噪声、跨层相互作用、候选质量各占多少尚属待验证解释。
+- **评测衔接的目录与预算消费者** → [评测与诊断经验 / 评测口径、完整任务与消费者](evaluation/protocol.md#mixed-bit-pipeline--评测衔接的目录与预算消费者)
 
-**下次动作：** 小规模验证组合替换的预测与实测偏差；分开记录求解目标、组装后完整模型 KL/PPL/下游质量及重载一致性。预算为≤时不强制填满，实际存储比较另外计入 decoder 和未压缩部分。不要只因 optimal、较低校准 KL 或稍高任务均值扩大实验。
+<a id="代理目标与最终质量必须分别验证"></a>
 
-**适用边界：** 这是该候选池、校准集和未恢复配置的经验，不能泛化为所有混合位宽方法无效。排除低位宽档不是已证实的通用修复。
+- **代理目标与最终质量必须分别验证** → [压缩经验 / 混合位宽、动态阶数与分配](compression/bit_allocation.md#mixed-bit-pipeline--代理目标与最终质量必须分别验证)
+
+<a id="完整任务选择的来源与依赖"></a>
+
+- **完整任务选择的来源与依赖** → [搜索与对照设计经验 / 候选、预算、代理排序与选点](experiment_design/search.md#mixed-bit-pipeline--完整任务选择的来源与依赖)
+
+<!-- /lesson-redirect -->

@@ -50,3 +50,27 @@ GPU 短验覆盖真实有限 logits、2 个 RTE likelihood 样本、所有 compa
 迁移需要本模块全部源码和 README，以及结果根 `result/qwen3_8b_mmlu65_20261004/adaptive_class_evaluation_20261030/` 的最小证据。模型与训练输入在 `/data/star/VAELLM/adaptive_class_20261030/`，原始 B 归档在 `/data/star/VAELLM/adaptive_native_model_20261029/cat_gate_prefixes/B/`；本模块未复制或修改这些权重。运行还依赖 `bindings.py` 中明确指定的 N runtime、原 HFLM sample writer、LongBench 统一工具及 BF16 基线／输入 archive。未改 `current_plan.md`，未执行 Git 操作或安装依赖；本次新增文档索引／链接检查尚未运行，交由迁移后接续。
 
 结果及源绑定保存在 `result/qwen3_8b_mmlu65_20261004/adaptive_class_evaluation_20261030/`。经验复用：[checkpoint 运行依赖与格式边界](../../docs/experience/lessons/checkpoint_lifecycle.md)、[完整逐题与 LongBench 口径](../../docs/experience/lessons/experiment_design.md)、[混合预算消费者](../../docs/experience/lessons/mixed_bit_pipeline.md)。当前无新增质量经验；短验不能证明方法收益或迁移性。
+
+## 10月30日新机接续
+
+迁移后补读真实终态：旧`cpu03`为`verified_cpu_format_and_protocol`／exit0，旧`gpu_dynamic01`为`verified_gpu_mixed_inference_diagnostic`，其LongBench为`diagnostic_complete`／exit0。动态的原有限logits、RTE两例及三个32K／KV／摘要生成case已通过，不重做同一诊断；Rice原GPU诊断未启动，仍须用其自身实际消费者补必要验证。旧证据不当作新机最终216＋36＋0成品或完整九项结果。
+
+新入口`experiments.cmcc_runtime_20261030.adaptive_evaluation`分别准备新机支持配置，并将evaluate／full8／predict／merge／summarize子进程显式路由到同一支持目录。该目录新建原canonical32K/BF16协议的config及template，绑定新机HF文件stat、现有`result/prepare_eval_20261030/longbench/manifest.json`和共享BF16基线迁移身份；历史config、template、预测和metadata不改。仍使用原mixed loader、strict状态与真实预算核对、64叶／24742题、21项／4750条、九项等权及下降严格`<0.9pp`。
+
+```bash
+CUDA_VISIBLE_DEVICES='' python -B -u -m experiments.cmcc_runtime_20261030.adaptive_evaluation \
+  --prepare /data1/cmcc/VAELLM/artifacts/adaptive_class_cmcc_20261030/evaluation_support
+
+CUDA_VISIBLE_DEVICES='' python -B -u -m experiments.cmcc_runtime_20261030.adaptive_evaluation \
+  --support /data1/cmcc/VAELLM/artifacts/adaptive_class_cmcc_20261030/evaluation_support \
+  --checkpoint /data1/cmcc/VAELLM/artifacts/adaptive_class_cmcc_20261030/dynamic/final_model \
+  --pipeline-report /data1/cmcc/VAELLM/artifacts/adaptive_class_cmcc_20261030/dynamic/report.json \
+  --output result/qwen3_8b_mmlu65_20261004/adaptive_class_cmcc_20261030/dynamic \
+  --gpus 5,6,7
+```
+
+支持配置准备已在tmux`adaptive_cmcc_eval_support_20261030`真实exit0，状态`verified_cmcc_mixed_evaluation_support`；绑定完整Qwen权重与共享`cmcc_baselines_20261030/qwen3_8b/migration_binding.json`真实verified身份。随后从本轮`short_rice/04_gate_proj/round_base`完成CPU格式／协议验证和Rice必要GPU推理，分别为tmux`adaptive_cmcc_eval_cpu_20261030`、`adaptive_cmcc_rice_diagnostic_gpu2_20261030`（GPU2，shell85667／worker85669）；均exit0，UUID`d61b6ea0-ed72-415c-b687-c2f9fbaa3e6b`。原始证据为`result/qwen3_8b_mmlu65_20261004/adaptive_class_cmcc_20261030/{cpu_rice,gpu_rice}/report.json`，核心日志和exit位于artifact根`adaptive_class_cmcc_20261030/evaluation_{cpu,gpu}_rice.{log,exit}`。
+
+CPU实际核对完整64叶／24742题与21项／4750条协议，并拒绝partial当final。GPU原生144模块group8预热、所有36个Rice compact实际解码、finite真实logits、RTE两例和逐题原件通过；三个原定生成case分别为repobench-p输入32704／生成64、gov_report输入32256／生成512、samsum输入18047／生成35。有限题量不提供方法质量结论，不将原生预热或这份partial模型预算写成最终216＋36验收。
+
+这份round_base仅为144native＋36Rice＋72dense；恢复因`trl`缺失在首次更新前停止，独立推理诊断不依赖该训练库，也不证明训练或down末态。正式评测仍依赖本臂formal末点及同UUID strict证据，当前未启动完整九项。

@@ -6,11 +6,11 @@
 
 ## 最快启动方法
 
-在当前服务器中，激活环境后运行下面的后台命令。`--gpus 0,1` 是示例，请换成两张空闲的 A800 80GB；两张卡都参与计算。
+在当前服务器中，确认模型和数据实际位置并激活环境后运行下面的后台命令。先将示例中的 `/path/to/Qwen3-8B` 改为本机模型目录。`--gpus 0,1` 是示例，请换成两张空闲的 A800 80GB；两张卡都参与计算。
 
 ```bash
-cd /home/star/VAELLM
-source /home/star/miniconda3/etc/profile.d/conda.sh
+cd /home/cmcc/VAELLM
+source /home/cmcc/miniconda3/etc/profile.d/conda.sh
 conda activate bitvae
 which python
 python -V
@@ -20,7 +20,7 @@ RUN_DIR="result/qwen3_8b_69_from_bf16_$(date +%Y%m%d_%H%M%S)"
 mkdir -p result
 (
   set -o noclobber
-  OUTPUT_DIR="$RUN_DIR" nohup bash scripts/reproduce_qwen3_8b_69_from_bf16.sh \
+  MODEL_PATH=/path/to/Qwen3-8B OUTPUT_DIR="$RUN_DIR" nohup bash scripts/reproduce_qwen3_8b_69_from_bf16.sh \
     --gpus 0,1 > "$RUN_DIR.log" 2>&1 < /dev/null
 ) &
 ```
@@ -28,10 +28,10 @@ mkdir -p result
 已有 tmux 会话时，也可以在其中直接运行：
 
 ```bash
-bash scripts/reproduce_qwen3_8b_69_from_bf16.sh --gpus 0,1
+MODEL_PATH=/path/to/Qwen3-8B bash scripts/reproduce_qwen3_8b_69_from_bf16.sh --gpus 0,1
 ```
 
-脚本默认从 `/home/star/models/Qwen/Qwen3-8B` 读取 BF16 模型，并自动使用带时间戳的新输出目录。需要改变路径时，只修改输入与输出位置：
+脚本的旧默认模型路径为 `/home/star/models/Qwen/Qwen3-8B`，当前 `cmcc` 服务器须用 `MODEL_PATH` 指定本机实际位置；默认输出目录带时间戳。也可显式指定输出位置：
 
 ```bash
 MODEL_PATH=/path/to/Qwen3-8B \
@@ -74,7 +74,7 @@ data/edgerazor_qwen3/task_vaellm_eval_instruct.jsonl
 如果只想检查本地输入，不启动 GPU 训练，可以执行：
 
 ```bash
-bash scripts/reproduce_qwen3_8b_69_from_bf16.sh --check_inputs
+MODEL_PATH=/path/to/Qwen3-8B bash scripts/reproduce_qwen3_8b_69_from_bf16.sh --check_inputs
 ```
 
 这项检查验证原模型目录、五份训练文件和任务文件身份，并报告环境版本；不会加载整模型做前向，也不等于校准/评测缓存或完整训练已通过运行验证。
